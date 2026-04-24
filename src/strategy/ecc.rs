@@ -509,3 +509,46 @@ impl CryptoStrategy for EccStrategy {
         self.iv.clone()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_header_cycle() {
+        let mut strategy = EccStrategy::new();
+        strategy.curve_name = "test-curve".to_string();
+        strategy.digest_algo = "SHA3-256".to_string();
+        strategy.ephemeral_pubkey = vec![1, 2, 3, 4];
+        strategy.salt = vec![5, 6];
+        strategy.iv = vec![7, 8, 9];
+
+        let header = strategy.serialize_header();
+        
+        let mut strategy2 = EccStrategy::new();
+        let pos = strategy2.deserialize_header(&header).expect("Deserialization failed");
+        
+        assert_eq!(pos, header.len());
+        assert_eq!(strategy2.curve_name, "test-curve");
+        assert_eq!(strategy2.digest_algo, "SHA3-256");
+        assert_eq!(strategy2.ephemeral_pubkey, vec![1, 2, 3, 4]);
+        assert_eq!(strategy2.salt, vec![5, 6]);
+        assert_eq!(strategy2.iv, vec![7, 8, 9]);
+    }
+
+    #[test]
+    fn test_signature_header_cycle() {
+        let mut strategy = EccStrategy::new();
+        strategy.curve_name = "sig-curve".to_string();
+        strategy.digest_algo = "SHA3-512".to_string();
+
+        let header = strategy.serialize_signature_header();
+        
+        let mut strategy2 = EccStrategy::new();
+        let pos = strategy2.deserialize_signature_header(&header).expect("Sig deserialization failed");
+        
+        assert_eq!(pos, header.len());
+        assert_eq!(strategy2.curve_name, "sig-curve");
+        assert_eq!(strategy2.digest_algo, "SHA3-512");
+    }
+}
