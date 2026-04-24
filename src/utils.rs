@@ -94,3 +94,37 @@ pub fn unwrap_from_pem(pem: &str, label: &str) -> Result<Vec<u8>> {
         
     BASE64.decode(b64).map_err(|e| CryptoError::Parameter(format!("Invalid base64: {}", e)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pem_cycle() {
+        let data = b"Hello, unit test!";
+        let label = "TEST LABEL";
+        let pem = wrap_to_pem(data, label);
+        assert!(pem.starts_with("-----BEGIN TEST LABEL-----"));
+        assert!(pem.trim().ends_with("-----END TEST LABEL-----"));
+        
+        let unwrapped = unwrap_from_pem(&pem, label).unwrap();
+        assert_eq!(unwrapped, data);
+    }
+
+    #[test]
+    fn test_pem_wrap_long_data() {
+        let data = vec![0x41u8; 128]; // 'A' repeated 128 times
+        let pem = wrap_to_pem(&data, "LONG");
+        let lines: Vec<&str> = pem.lines().collect();
+        // Header + at least 2 lines of base64 + Footer
+        assert!(lines.len() >= 4);
+    }
+
+    #[test]
+    fn test_secure_buffer() {
+        let buf = SecureBuffer::new(32).unwrap();
+        assert_eq!(buf.as_slice().len(), 32);
+        // We can't easily test mlock/zeroize in unit tests without more complex mocks,
+        // but we ensure it doesn't crash.
+    }
+}
