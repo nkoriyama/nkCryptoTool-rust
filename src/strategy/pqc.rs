@@ -102,50 +102,28 @@ impl CryptoStrategy for PqcStrategy {
         self.key_provider = Some(provider);
     }
 
-    fn generate_encryption_key_pair(&self, key_paths: &HashMap<String, String>, _passphrase: Option<&str>) -> Result<()> {
+    fn generate_encryption_key_pair(&self, key_paths: &HashMap<String, String>, passphrase: Option<&str>) -> Result<()> {
         let pub_path = key_paths.get("public-key")
             .ok_or(CryptoError::Parameter("Missing public key path".to_string()))?;
         let priv_path = key_paths.get("private-key")
             .ok_or(CryptoError::Parameter("Missing private key path".to_string()))?;
 
         let use_tpm = key_paths.get("use-tpm").map(|s| s == "true").unwrap_or(false);
+        let (pk, sk) = pqcrypto_mlkem::mlkem1024::keypair();
+        
+        let pub_pem = utils::wrap_to_pem(&self.wrap_spki(pk.as_bytes()), "PUBLIC KEY");
+        fs::write(pub_path, pub_pem)?;
 
         if use_tpm {
-            // ML-KEM doesn't have a standard PKey type in older OpenSSL, 
-            // so we wrap the raw secret key.
-            let (pk, sk) = pqcrypto_mlkem::mlkem1024::keypair();
-            
-            // To use provider.wrap_key, we need a PKey.
-            // Since OpenSSL 3.5+ supports ML-KEM, we could potentially create one.
-            // But for now, we'll follow the manual wrapping if PKey creation fails.
-            
-            let pub_pem = utils::wrap_to_pem(&self.wrap_spki(pk.as_bytes()), "PUBLIC KEY");
-            fs::write(pub_path, pub_pem)?;
-
-            // We need to store the raw key in a way that TPM can wrap it.
-            // Current provider.wrap_key takes PKey.
-            // Let's assume for now we only support TPM for standard ECC keys 
-            // OR we need to extend provider to wrap raw bytes.
-            // In C++, it supports any EVP_PKEY.
-            
-            // For PQC, we'll try to create an EVP_PKEY if possible, or skip TPM for now.
-            // (The user asked if we can, I'm implementing the mechanism).
-            
-            let priv_pem = utils::wrap_to_pem(&self.wrap_pkcs8(sk.as_bytes()), "PRIVATE KEY");
-            fs::write(priv_path, priv_pem)?;
-            
-            Ok(())
+            let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
+            let wrapped = provider.wrap_raw(sk.as_bytes(), passphrase)?;
+            fs::write(priv_path, wrapped)?;
         } else {
-            let (pk, sk) = pqcrypto_mlkem::mlkem1024::keypair();
-            
-            let pub_pem = utils::wrap_to_pem(&self.wrap_spki(pk.as_bytes()), "PUBLIC KEY");
-            fs::write(pub_path, pub_pem)?;
-
             let priv_pem = utils::wrap_to_pem(&self.wrap_pkcs8(sk.as_bytes()), "PRIVATE KEY");
             fs::write(priv_path, priv_pem)?;
-
-            Ok(())
         }
+
+        Ok(())
     }
 
     fn generate_signing_key_pair(&self, key_paths: &HashMap<String, String>, passphrase: Option<&str>) -> Result<()> {
@@ -230,8 +208,7 @@ impl CryptoStrategy for PqcStrategy {
         
         let raw_priv = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            let pkey = provider.unwrap_key(&pem_str, passphrase)?;
-            pkey.private_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?
+            provider.unwrap_raw(&pem_str, passphrase)?
         } else {
             let der = utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?;
             self.unwrap_pkcs8(&der)?
@@ -342,7 +319,7 @@ impl CryptoStrategy for PqcStrategy {
         let pkey = PKey::public_key_from_pem(&pub_bytes)
             .map_err(|e| CryptoError::PublicKeyLoad(e.to_string()))?;
 
-        let ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let mut ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         unsafe {
             if ffi::EVP_DigestVerifyInit(ctx.as_ptr(), ptr::null_mut(), ptr::null(), ptr::null_mut(), pkey.as_ptr()) != 1 {
                 return Err(CryptoError::OpenSSL("EVP_DigestVerifyInit failed".to_string()));
@@ -491,7 +468,7 @@ impl CryptoStrategy for PqcStrategy {
             return Err(CryptoError::FileRead("Strategy mismatch".to_string()));
         }
 
-        let read_string = |p: &mut usize| -> Result<String> {
+        let mut read_string = |p: &mut usize| -> Result<String> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete string header".to_string())); }
             let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
             *p += 4;
@@ -501,7 +478,7 @@ impl CryptoStrategy for PqcStrategy {
             Ok(s)
         };
 
-        let read_vec = |p: &mut usize| -> Result<Vec<u8>> {
+        let mut read_vec = |p: &mut usize| -> Result<Vec<u8>> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete vec header".to_string())); }
             let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
             *p += 4;
