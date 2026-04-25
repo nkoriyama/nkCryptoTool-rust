@@ -11,7 +11,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt, BufReader};
 use tokio::sync::mpsc;
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
 
 pub struct CryptoProcessor {
     strategy: Option<Box<dyn CryptoStrategy>>,

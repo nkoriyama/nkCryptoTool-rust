@@ -1,6 +1,9 @@
+pub mod tpm;
+
 use crate::error::Result;
 use openssl::pkey::{PKey, Private};
 use std::sync::Arc;
+use self::tpm::TpmKeyProvider;
 
 pub trait KeyProvider: Send + Sync {
     fn wrap_key(&self, _pkey: &PKey<Private>, _passphrase: Option<&str>) -> Result<String> {
@@ -23,3 +26,12 @@ impl DefaultKeyProvider {
 }
 
 impl KeyProvider for DefaultKeyProvider {}
+
+pub fn create_best_provider() -> SharedKeyProvider {
+    let tpm = TpmKeyProvider::new();
+    if tpm.is_available() {
+        Arc::new(tpm)
+    } else {
+        Arc::new(DefaultKeyProvider::new())
+    }
+}

@@ -1,7 +1,7 @@
 use clap::Parser;
 use nk_crypto_tool::config::{CryptoConfig, CryptoMode, Operation};
 use nk_crypto_tool::processor::CryptoProcessor;
-use nk_crypto_tool::key::DefaultKeyProvider;
+use nk_crypto_tool::key::create_best_provider;
 use std::sync::Arc;
 
 #[derive(Parser, Debug)]
@@ -113,7 +113,7 @@ async fn main() -> anyhow::Result<()> {
         CryptoMode::Hybrid => CryptoProcessor::new(CryptoMode::Hybrid),
     };
 
-    let provider = Arc::new(DefaultKeyProvider::new());
+    let provider = create_best_provider();
     processor.set_key_provider(provider);
 
     processor.process(&config, Some(Arc::new(|progress| {

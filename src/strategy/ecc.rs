@@ -39,9 +39,6 @@ pub struct EccStrategy {
     // Signature/Verification keys
     sign_key: Option<PKey<Private>>,
     verify_key: Option<PKey<Public>>,
-
-    // TPM state
-    is_tpm_wrapped: bool,
 }
 
 impl EccStrategy {
@@ -59,7 +56,6 @@ impl EccStrategy {
             ephemeral_pubkey: Vec::new(),
             sign_key: None,
             verify_key: None,
-            is_tpm_wrapped: false,
         }
     }
 
@@ -189,12 +185,13 @@ impl CryptoStrategy for EccStrategy {
             .or_else(|| key_paths.get("recipient-ecdh-privkey"))
             .ok_or(CryptoError::PrivateKeyLoad("Missing private key path".to_string()))?;
 
-        let priv_key = if self.is_tpm_wrapped {
+        let priv_bytes = fs::read(privkey_path)?;
+        let pem_str = String::from_utf8_lossy(&priv_bytes);
+
+        let priv_key = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            let wrapped_pem = fs::read_to_string(privkey_path)?;
-            provider.unwrap_key(&wrapped_pem, passphrase)?
+            provider.unwrap_key(&pem_str, passphrase)?
         } else {
-            let priv_bytes = fs::read(privkey_path)?;
             if let Some(pass) = passphrase {
                 PKey::private_key_from_pem_passphrase(&priv_bytes, pass.as_bytes())
                     .map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
@@ -282,12 +279,19 @@ impl CryptoStrategy for EccStrategy {
 
     fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: Option<&str>, digest_algo: &str) -> Result<()> {
         let priv_bytes = fs::read(priv_key_path)?;
-        let pkey = if let Some(pass) = passphrase {
-            PKey::private_key_from_pem_passphrase(&priv_bytes, pass.as_bytes())
-                .map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
+        let pem_str = String::from_utf8_lossy(&priv_bytes);
+
+        let pkey = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
+            let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
+            provider.unwrap_key(&pem_str, passphrase)?
         } else {
-            PKey::private_key_from_pem(&priv_bytes)
-                .map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
+            if let Some(pass) = passphrase {
+                PKey::private_key_from_pem_passphrase(&priv_bytes, pass.as_bytes())
+                    .map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
+            } else {
+                PKey::private_key_from_pem(&priv_bytes)
+                    .map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
+            }
         };
 
         let md = MessageDigest::from_name(digest_algo)
