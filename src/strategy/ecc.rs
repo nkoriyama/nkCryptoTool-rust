@@ -1,33 +1,21 @@
 use crate::error::{CryptoError, Result};
 use crate::key::SharedKeyProvider;
 use crate::strategy::{CryptoStrategy, StrategyType};
-use openssl::cipher::Cipher;
-use openssl::cipher_ctx::CipherCtx;
-use openssl::derive::Deriver;
-use openssl::ec::{EcGroup, EcKey};
-use openssl::hash::MessageDigest;
-use openssl::md_ctx::MdCtx;
-use openssl::nid::Nid;
-use openssl::pkey::{PKey, Private, Public};
-use openssl::rand::rand_bytes;
-use openssl::symm::Cipher as SymmCipher;
+use crate::backend::{self, AeadBackend, HashBackend};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use hkdf::Hkdf;
 use sha3::Sha3_256;
-use openssl_sys as ffi;
-use std::ptr;
-use foreign_types::ForeignType;
 
 pub struct EccStrategy {
     key_provider: Option<SharedKeyProvider>,
     curve_name: String,
     digest_algo: String,
     
-    // Cipher context for streaming
-    cipher_ctx: Option<CipherCtx>,
-    md_ctx: Option<MdCtx>,
+    // Abstract context for streaming
+    aead_ctx: Option<backend::Aead>,
+    hash_ctx: Option<backend::Hash>,
     
     // Key states
     encryption_key: Vec<u8>,
@@ -36,9 +24,9 @@ pub struct EccStrategy {
     shared_secret: Vec<u8>,
     ephemeral_pubkey: Vec<u8>,
     
-    // Signature/Verification keys
-    sign_key: Option<PKey<Private>>,
-    verify_key: Option<PKey<Public>>,
+    // Signing keys (stored as DER to be backend-agnostic)
+    sign_key_der: Option<Vec<u8>>,
+    verify_key_der: Option<Vec<u8>>,
 }
 
 impl EccStrategy {
@@ -47,15 +35,15 @@ impl EccStrategy {
             key_provider: None,
             curve_name: "prime256v1".to_string(),
             digest_algo: "SHA3-512".to_string(),
-            cipher_ctx: None,
-            md_ctx: None,
+            aead_ctx: None,
+            hash_ctx: None,
             encryption_key: Vec::new(),
             iv: Vec::new(),
             salt: Vec::new(),
             shared_secret: Vec::new(),
             ephemeral_pubkey: Vec::new(),
-            sign_key: None,
-            verify_key: None,
+            sign_key_der: None,
+            verify_key_der: None,
         }
     }
 
@@ -86,31 +74,30 @@ impl CryptoStrategy for EccStrategy {
 
         let use_tpm = key_paths.get("use-tpm").map(|s| s == "true").unwrap_or(false);
 
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        let ec_key = EcKey::generate(&group)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        let pkey = PKey::from_ec_key(ec_key)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        // Use backend to generate key pair.
+        let (priv_der, pub_der) = backend::generate_ecc_key_pair(&self.curve_name)?;
 
         if use_tpm {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            let key_der = pkey.private_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            let wrapped = provider.wrap_raw(&key_der, passphrase)?;
+            let wrapped = provider.wrap_raw(&priv_der, passphrase)?;
             fs::write(priv_path, wrapped)?;
         } else {
             let priv_pem = if let Some(pass) = passphrase {
-                pkey.private_key_to_pem_pkcs8_passphrase(SymmCipher::aes_256_cbc(), pass.as_bytes())
+                #[cfg(feature = "backend-openssl")]
+                {
+                    let pkey = openssl::pkey::PKey::private_key_from_der(&priv_der).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+                    pkey.private_key_to_pem_pkcs8_passphrase(openssl::symm::Cipher::aes_256_cbc(), pass.as_bytes())
+                        .map_err(|e| CryptoError::OpenSSL(e.to_string()))?
+                }
+                #[cfg(not(feature = "backend-openssl"))]
+                return Err(CryptoError::OpenSSL("Encrypted PEM export only supported in OpenSSL backend for now".to_string()));
             } else {
-                pkey.private_key_to_pem_pkcs8()
-            }.map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+                crate::utils::wrap_to_pem(&priv_der, "PRIVATE KEY").into_bytes()
+            };
             fs::write(priv_path, priv_pem)?;
         }
 
-        let pub_pem = pkey.public_key_to_pem()
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        fs::write(pub_path, pub_pem)?;
-
+        fs::write(pub_path, crate::utils::wrap_to_pem(&pub_der, "PUBLIC KEY"))?;
         Ok(())
     }
 
@@ -127,36 +114,33 @@ impl CryptoStrategy for EccStrategy {
             .or_else(|| key_paths.get("recipient-ecdh-pubkey"))
             .ok_or(CryptoError::PublicKeyLoad("Missing recipient public key".to_string()))?;
 
-        let pubkey_bytes = fs::read(pubkey_path)?;
-        let recipient_pub = PKey::public_key_from_pem(&pubkey_bytes)
-            .map_err(|e| CryptoError::PublicKeyLoad(e.to_string()))?;
+        let pubkey_pem = fs::read_to_string(pubkey_path)?;
+        let recipient_pub_der = crate::utils::unwrap_from_pem(&pubkey_pem, "PUBLIC KEY")?;
 
         // Generate ephemeral key
-        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        let ec_key = EcKey::generate(&group)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        let ephemeral_key = PKey::from_ec_key(ec_key)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let (ephem_priv, ephem_pub) = backend::generate_ecc_key_pair(&self.curve_name)?;
 
-        // ECDH
-        let mut deriver = Deriver::new(&ephemeral_key)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        deriver.set_peer(&recipient_pub)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        
-        self.shared_secret = deriver.derive_to_vec()
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        // ECDH via backend
+        self.shared_secret = backend::ecc_dh(&ephem_priv, &recipient_pub_der)?;
 
-        // Ephemeral public key bytes
-        self.ephemeral_pubkey = ephemeral_key.public_key_to_pem()
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        // Ephemeral public key as PEM for the header
+        self.ephemeral_pubkey = crate::utils::wrap_to_pem(&ephem_pub, "PUBLIC KEY").into_bytes();
 
         // Salt and IV
         self.salt = vec![0u8; 16];
         self.iv = vec![0u8; 12];
-        rand_bytes(&mut self.salt).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        rand_bytes(&mut self.iv).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        
+        #[cfg(feature = "backend-openssl")]
+        openssl::rand::rand_bytes(&mut self.salt).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        #[cfg(feature = "backend-openssl")]
+        openssl::rand::rand_bytes(&mut self.iv).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        
+        #[cfg(feature = "backend-rustcrypto")]
+        {
+            use rand_core::{RngCore, OsRng};
+            OsRng.fill_bytes(&mut self.salt);
+            OsRng.fill_bytes(&mut self.iv);
+        }
 
         // HKDF
         self.encryption_key = self.hkdf_derive(
@@ -166,17 +150,9 @@ impl CryptoStrategy for EccStrategy {
             "ecc-encryption"
         )?;
 
-        // Initialize AES-GCM
-        let mut ctx = CipherCtx::new()
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        ctx.encrypt_init(Some(Cipher::aes_256_gcm()), None, None)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        ctx.set_iv_length(self.iv.len())
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        ctx.encrypt_init(None, Some(&self.encryption_key), Some(&self.iv))
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-
-        self.cipher_ctx = Some(ctx);
+        // Initialize AEAD via backend
+        let ctx = backend::new_encrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
+        self.aead_ctx = Some(ctx);
 
         Ok(())
     }
@@ -189,31 +165,17 @@ impl CryptoStrategy for EccStrategy {
         let priv_bytes = fs::read(privkey_path)?;
         let pem_str = String::from_utf8_lossy(&priv_bytes);
 
-        let priv_key = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
+        let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            let key_der = provider.unwrap_raw(&pem_str, passphrase)?;
-            PKey::private_key_from_der(&key_der).map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
+            provider.unwrap_raw(&pem_str, passphrase)?
         } else {
-            if let Some(pass) = passphrase {
-                PKey::private_key_from_pem_passphrase(&priv_bytes, pass.as_bytes())
-                    .map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
-            } else {
-                PKey::private_key_from_pem(&priv_bytes)
-                    .map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
-            }
+            crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
 
-        let recipient_pub = PKey::public_key_from_pem(&self.ephemeral_pubkey)
-            .map_err(|e| CryptoError::PublicKeyLoad(e.to_string()))?;
+        let recipient_pub_der = crate::utils::unwrap_from_pem(&String::from_utf8_lossy(&self.ephemeral_pubkey), "PUBLIC KEY")?;
 
-        // ECDH
-        let mut deriver = Deriver::new(&priv_key)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        deriver.set_peer(&recipient_pub)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        
-        self.shared_secret = deriver.derive_to_vec()
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        // ECDH via backend
+        self.shared_secret = backend::ecc_dh(&priv_key_der, &recipient_pub_der)?;
 
         // HKDF
         self.encryption_key = self.hkdf_derive(
@@ -223,59 +185,47 @@ impl CryptoStrategy for EccStrategy {
             "ecc-encryption"
         )?;
 
-        // Initialize AES-GCM for decryption
-        let mut ctx = CipherCtx::new()
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        ctx.decrypt_init(Some(Cipher::aes_256_gcm()), None, None)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        ctx.set_iv_length(self.iv.len())
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        ctx.decrypt_init(None, Some(&self.encryption_key), Some(&self.iv))
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-
-        self.cipher_ctx = Some(ctx);
+        // Initialize AEAD via backend
+        let ctx = backend::new_decrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
+        self.aead_ctx = Some(ctx);
 
         Ok(())
     }
 
     fn encrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        let ctx = self.cipher_ctx.as_mut().ok_or(CryptoError::OpenSSL("Cipher context not initialized".to_string()))?;
+        let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
         let mut out = vec![0u8; data.len() + 16];
-        let n = ctx.cipher_update(data, Some(&mut out))
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let n = ctx.update(data, &mut out)?;
         out.truncate(n);
         Ok(out)
     }
 
     fn decrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>> {
-        let ctx = self.cipher_ctx.as_mut().ok_or(CryptoError::OpenSSL("Cipher context not initialized".to_string()))?;
+        let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
         let mut out = vec![0u8; data.len() + 16];
-        let n = ctx.cipher_update(data, Some(&mut out))
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let n = ctx.update(data, &mut out)?;
         out.truncate(n);
         Ok(out)
     }
 
     fn finalize_encryption(&mut self) -> Result<Vec<u8>> {
-        let ctx = self.cipher_ctx.as_mut().ok_or(CryptoError::OpenSSL("Cipher context not initialized".to_string()))?;
+        let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
         let mut out = vec![0u8; 16];
-        let n = ctx.cipher_final(&mut out)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let n = ctx.finalize(&mut out)?;
         out.truncate(n);
         
         let mut tag = vec![0u8; 16];
-        ctx.tag(&mut tag).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        ctx.get_tag(&mut tag)?;
         out.extend_from_slice(&tag);
         
         Ok(out)
     }
 
     fn finalize_decryption(&mut self, tag: &[u8]) -> Result<()> {
-        let ctx = self.cipher_ctx.as_mut().ok_or(CryptoError::OpenSSL("Cipher context not initialized".to_string()))?;
-        ctx.set_tag(tag).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
+        ctx.set_tag(tag)?;
         let mut out = vec![0u8; 16];
-        ctx.cipher_final(&mut out)
-            .map_err(|_| CryptoError::SignatureVerification)?;
+        ctx.finalize(&mut out).map_err(|_| CryptoError::SignatureVerification)?;
         Ok(())
     }
 
@@ -283,93 +233,50 @@ impl CryptoStrategy for EccStrategy {
         let priv_bytes = fs::read(priv_key_path)?;
         let pem_str = String::from_utf8_lossy(&priv_bytes);
 
-        let pkey = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
+        let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            let key_der = provider.unwrap_raw(&pem_str, passphrase)?;
-            PKey::private_key_from_der(&key_der).map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
+            provider.unwrap_raw(&pem_str, passphrase)?
         } else {
-            if let Some(pass) = passphrase {
-                PKey::private_key_from_pem_passphrase(&priv_bytes, pass.as_bytes())
-                    .map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
-            } else {
-                PKey::private_key_from_pem(&priv_bytes)
-                    .map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
-            }
+            crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
 
-        let md = MessageDigest::from_name(digest_algo)
-            .ok_or(CryptoError::Parameter(format!("Invalid digest: {}", digest_algo)))?;
+        let mut ctx = backend::new_hash(digest_algo)?;
+        ctx.init_sign(&priv_key_der)?;
         
-        let mut ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        unsafe {
-            if ffi::EVP_DigestSignInit(ctx.as_ptr(), ptr::null_mut(), md.as_ptr(), ptr::null_mut(), pkey.as_ptr()) != 1 {
-                return Err(CryptoError::OpenSSL("EVP_DigestSignInit failed".to_string()));
-            }
-        }
-        
-        self.sign_key = Some(pkey);
-        self.md_ctx = Some(ctx);
+        self.sign_key_der = Some(priv_key_der);
+        self.hash_ctx = Some(ctx);
         self.digest_algo = digest_algo.to_string();
         Ok(())
     }
 
     fn prepare_verification(&mut self, pub_key_path: &Path, digest_algo: &str) -> Result<()> {
         let pub_bytes = fs::read(pub_key_path)?;
-        let pkey = PKey::public_key_from_pem(&pub_bytes)
-            .map_err(|e| CryptoError::PublicKeyLoad(e.to_string()))?;
+        let pub_der = crate::utils::unwrap_from_pem(&String::from_utf8_lossy(&pub_bytes), "PUBLIC KEY")?;
 
-        let md = MessageDigest::from_name(digest_algo)
-            .ok_or(CryptoError::Parameter(format!("Invalid digest: {}", digest_algo)))?;
+        let mut ctx = backend::new_hash(digest_algo)?;
+        ctx.init_verify(&pub_der)?;
         
-        let mut ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        unsafe {
-            if ffi::EVP_DigestVerifyInit(ctx.as_ptr(), ptr::null_mut(), md.as_ptr(), ptr::null_mut(), pkey.as_ptr()) != 1 {
-                return Err(CryptoError::OpenSSL("EVP_DigestVerifyInit failed".to_string()));
-            }
-        }
-        
-        self.verify_key = Some(pkey);
-        self.md_ctx = Some(ctx);
+        self.verify_key_der = Some(pub_der);
+        self.hash_ctx = Some(ctx);
         self.digest_algo = digest_algo.to_string();
         Ok(())
     }
 
     fn update_hash(&mut self, data: &[u8]) -> Result<()> {
-        let ctx = self.md_ctx.as_mut().ok_or(CryptoError::OpenSSL("MD context not initialized".to_string()))?;
-        if self.sign_key.is_some() {
-            ctx.digest_sign_update(data).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        } else {
-            ctx.digest_verify_update(data).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        }
-        Ok(())
+        let ctx = self.hash_ctx.as_mut().ok_or(CryptoError::Parameter("Hash context not initialized".to_string()))?;
+        ctx.update(data)
     }
 
     fn sign_hash(&mut self) -> Result<Vec<u8>> {
-        let ctx = self.md_ctx.as_mut().ok_or(CryptoError::OpenSSL("MD context not initialized".to_string()))?;
-        let mut sig_len = 0;
-        unsafe {
-            if ffi::EVP_DigestSignFinal(ctx.as_ptr(), ptr::null_mut(), &mut sig_len) != 1 {
-                return Err(CryptoError::OpenSSL("EVP_DigestSignFinal failed to get length".to_string()));
-            }
-        }
-        let mut sig = vec![0u8; sig_len];
-        unsafe {
-            if ffi::EVP_DigestSignFinal(ctx.as_ptr(), sig.as_mut_ptr(), &mut sig_len) != 1 {
-                return Err(CryptoError::OpenSSL("EVP_DigestSignFinal failed".to_string()));
-            }
-        }
-        sig.truncate(sig_len);
-        Ok(sig)
+        let ctx = self.hash_ctx.as_mut().ok_or(CryptoError::Parameter("Hash context not initialized".to_string()))?;
+        let key_der = self.sign_key_der.as_ref().ok_or(CryptoError::Parameter("Sign key missing".to_string()))?;
+        ctx.finalize_sign(key_der)
     }
 
     fn verify_hash(&mut self, signature: &[u8]) -> Result<bool> {
-        let ctx = self.md_ctx.as_mut().ok_or(CryptoError::OpenSSL("MD context not initialized".to_string()))?;
-        unsafe {
-            let r = ffi::EVP_DigestVerifyFinal(ctx.as_ptr(), signature.as_ptr(), signature.len());
-            if r == 1 { Ok(true) }
-            else if r == 0 { Ok(false) }
-            else { Err(CryptoError::SignatureVerification) }
-        }
+        let ctx = self.hash_ctx.as_mut().ok_or(CryptoError::Parameter("Hash context not initialized".to_string()))?;
+        let key_der = self.verify_key_der.as_ref().ok_or(CryptoError::Parameter("Verify key missing".to_string()))?;
+        ctx.finalize_verify(key_der, signature)
     }
 
     fn serialize_signature_header(&self) -> Vec<u8> {
@@ -402,7 +309,7 @@ impl CryptoStrategy for EccStrategy {
             return Err(CryptoError::FileRead("Signature strategy mismatch".to_string()));
         }
 
-        let mut read_string = |p: &mut usize| -> Result<String> {
+        let read_string = |p: &mut usize| -> Result<String> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete string header".to_string())); }
             let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
             *p += 4;
@@ -471,7 +378,7 @@ impl CryptoStrategy for EccStrategy {
             return Err(CryptoError::FileRead("Strategy mismatch".to_string()));
         }
 
-        let mut read_string = |p: &mut usize| -> Result<String> {
+        let read_string = |p: &mut usize| -> Result<String> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete string header".to_string())); }
             let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
             *p += 4;
