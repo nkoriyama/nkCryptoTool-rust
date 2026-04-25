@@ -1,6 +1,5 @@
 use crate::error::{CryptoError, Result};
 use crate::key::KeyProvider;
-use openssl::pkey::{PKey, Private};
 use openssl::cipher::Cipher;
 use openssl::cipher_ctx::CipherCtx;
 use openssl::rand::rand_bytes;
@@ -58,9 +57,7 @@ impl KeyProvider for TpmKeyProvider {
             .unwrap_or(false)
     }
 
-    fn wrap_key(&self, pkey: &PKey<Private>, passphrase: Option<&str>) -> Result<String> {
-        let key_der = pkey.private_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-
+    fn wrap_raw(&self, data: &[u8], passphrase: Option<&str>) -> Result<String> {
         let mut aes_key = vec![0u8; 32];
         let mut iv = vec![0u8; 12];
         rand_bytes(&mut aes_key).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
@@ -68,8 +65,8 @@ impl KeyProvider for TpmKeyProvider {
 
         let mut ctx = CipherCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         ctx.encrypt_init(Some(Cipher::aes_256_gcm()), Some(&aes_key), Some(&iv)).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        let mut ciphertext = vec![0u8; key_der.len() + 16];
-        let n = ctx.cipher_update(&key_der, Some(&mut ciphertext)).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let mut ciphertext = vec![0u8; data.len() + 16];
+        let n = ctx.cipher_update(data, Some(&mut ciphertext)).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         let final_n = ctx.cipher_final(&mut ciphertext[n..]).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         ciphertext.truncate(n + final_n);
         let mut tag = vec![0u8; 16];
@@ -129,7 +126,7 @@ impl KeyProvider for TpmKeyProvider {
         Ok(output)
     }
 
-    fn unwrap_key(&self, wrapped_pem: &str, passphrase: Option<&str>) -> Result<PKey<Private>> {
+    fn unwrap_raw(&self, wrapped_pem: &str, passphrase: Option<&str>) -> Result<Vec<u8>> {
         let mut p_b64 = String::new();
         let mut r_b64 = String::new();
         let mut e_b64 = String::new();
@@ -208,9 +205,10 @@ impl KeyProvider for TpmKeyProvider {
         
         let mut decrypted = vec![0u8; ciphertext.len() + 16];
         let n = ctx.cipher_update(&ciphertext, Some(&mut decrypted)).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        let final_n = ctx.cipher_final(&mut decrypted[n..]).map_err(|_| CryptoError::SignatureVerification)?;
+        let mut final_n = 0;
+        ctx.cipher_final(&mut decrypted[n..]).map_err(|_| CryptoError::SignatureVerification)?;
         decrypted.truncate(n + final_n);
 
-        PKey::private_key_from_der(&decrypted).map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))
+        Ok(decrypted)
     }
 }
