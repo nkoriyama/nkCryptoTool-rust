@@ -95,7 +95,8 @@ impl CryptoStrategy for EccStrategy {
 
         if use_tpm {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            let wrapped = provider.wrap_key(&pkey, passphrase)?;
+            let key_der = pkey.private_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+            let wrapped = provider.wrap_raw(&key_der, passphrase)?;
             fs::write(priv_path, wrapped)?;
         } else {
             let priv_pem = if let Some(pass) = passphrase {
@@ -190,7 +191,8 @@ impl CryptoStrategy for EccStrategy {
 
         let priv_key = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            provider.unwrap_key(&pem_str, passphrase)?
+            let key_der = provider.unwrap_raw(&pem_str, passphrase)?;
+            PKey::private_key_from_der(&key_der).map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
         } else {
             if let Some(pass) = passphrase {
                 PKey::private_key_from_pem_passphrase(&priv_bytes, pass.as_bytes())
@@ -283,7 +285,8 @@ impl CryptoStrategy for EccStrategy {
 
         let pkey = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            provider.unwrap_key(&pem_str, passphrase)?
+            let key_der = provider.unwrap_raw(&pem_str, passphrase)?;
+            PKey::private_key_from_der(&key_der).map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
         } else {
             if let Some(pass) = passphrase {
                 PKey::private_key_from_pem_passphrase(&priv_bytes, pass.as_bytes())
@@ -297,7 +300,7 @@ impl CryptoStrategy for EccStrategy {
         let md = MessageDigest::from_name(digest_algo)
             .ok_or(CryptoError::Parameter(format!("Invalid digest: {}", digest_algo)))?;
         
-        let ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let mut ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         unsafe {
             if ffi::EVP_DigestSignInit(ctx.as_ptr(), ptr::null_mut(), md.as_ptr(), ptr::null_mut(), pkey.as_ptr()) != 1 {
                 return Err(CryptoError::OpenSSL("EVP_DigestSignInit failed".to_string()));
@@ -318,7 +321,7 @@ impl CryptoStrategy for EccStrategy {
         let md = MessageDigest::from_name(digest_algo)
             .ok_or(CryptoError::Parameter(format!("Invalid digest: {}", digest_algo)))?;
         
-        let ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let mut ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         unsafe {
             if ffi::EVP_DigestVerifyInit(ctx.as_ptr(), ptr::null_mut(), md.as_ptr(), ptr::null_mut(), pkey.as_ptr()) != 1 {
                 return Err(CryptoError::OpenSSL("EVP_DigestVerifyInit failed".to_string()));
@@ -399,7 +402,7 @@ impl CryptoStrategy for EccStrategy {
             return Err(CryptoError::FileRead("Signature strategy mismatch".to_string()));
         }
 
-        let read_string = |p: &mut usize| -> Result<String> {
+        let mut read_string = |p: &mut usize| -> Result<String> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete string header".to_string())); }
             let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
             *p += 4;
@@ -468,7 +471,7 @@ impl CryptoStrategy for EccStrategy {
             return Err(CryptoError::FileRead("Strategy mismatch".to_string()));
         }
 
-        let read_string = |p: &mut usize| -> Result<String> {
+        let mut read_string = |p: &mut usize| -> Result<String> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete string header".to_string())); }
             let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
             *p += 4;
@@ -478,7 +481,7 @@ impl CryptoStrategy for EccStrategy {
             Ok(s)
         };
 
-        let read_vec = |p: &mut usize| -> Result<Vec<u8>> {
+        let mut read_vec = |p: &mut usize| -> Result<Vec<u8>> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete vec header".to_string())); }
             let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
             *p += 4;

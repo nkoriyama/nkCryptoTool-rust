@@ -142,7 +142,8 @@ impl CryptoStrategy for PqcStrategy {
 
         if use_tpm {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            let wrapped = provider.wrap_key(&pkey, passphrase)?;
+            let key_der = pkey.private_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+            let wrapped = provider.wrap_raw(&key_der, passphrase)?;
             fs::write(priv_path, wrapped)?;
         } else {
             let priv_pem = pkey.private_key_to_pem_pkcs8().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
@@ -291,7 +292,8 @@ impl CryptoStrategy for PqcStrategy {
 
         let pkey = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            provider.unwrap_key(&pem_str, passphrase)?
+            let key_der = provider.unwrap_raw(&pem_str, passphrase)?;
+            PKey::private_key_from_der(&key_der).map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?
         } else {
             if let Some(pass) = passphrase {
                 PKey::private_key_from_pem_passphrase(&priv_bytes, pass.as_bytes())
@@ -302,7 +304,7 @@ impl CryptoStrategy for PqcStrategy {
             }
         };
 
-        let ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let mut ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         unsafe {
             if ffi::EVP_DigestSignInit(ctx.as_ptr(), ptr::null_mut(), ptr::null(), ptr::null_mut(), pkey.as_ptr()) != 1 {
                 return Err(CryptoError::OpenSSL("EVP_DigestSignInit failed".to_string()));
@@ -375,7 +377,7 @@ impl CryptoStrategy for PqcStrategy {
         header.extend_from_slice(&1u16.to_le_bytes());
         header.push(self.get_strategy_type() as u8);
 
-        let add_string = |h: &mut Vec<u8>, s: &str| {
+        let mut add_string = |h: &mut Vec<u8>, s: &str| {
             h.extend_from_slice(&(s.len() as u32).to_le_bytes());
             h.extend_from_slice(s.as_bytes());
         };
@@ -468,7 +470,7 @@ impl CryptoStrategy for PqcStrategy {
             return Err(CryptoError::FileRead("Strategy mismatch".to_string()));
         }
 
-        let mut read_string = |p: &mut usize| -> Result<String> {
+        let read_string = |p: &mut usize| -> Result<String> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete string header".to_string())); }
             let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
             *p += 4;
