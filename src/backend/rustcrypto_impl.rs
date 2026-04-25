@@ -17,7 +17,7 @@ mod rc_internal {
     pub use aes_gcm::aead::consts;
     
     // ECDSA
-    pub use p256::ecdsa::{SigningKey, VerifyingKey, Signature, signature::{Signer, Verifier}};
+    pub use p256::ecdsa::{SigningKey, VerifyingKey, Signature, signature::{hazmat::{PrehashSigner, PrehashVerifier}}};
 
     // PQC (ML-DSA)
     pub use pqcrypto_mldsa::mldsa87::{SecretKey as MldsaSecretKey, PublicKey as MldsaPublicKey, detached_sign, verify_detached_signature, DetachedSignature as MldsaSignature};
@@ -217,8 +217,10 @@ impl HashBackend for RustCryptoHash {
                 let sig = detached_sign(&hash_bytes, &sk);
                 Ok(sig.as_bytes().to_vec())
             } else {
-                let sk = SigningKey::from_pkcs8_der(key_der).map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?;
-                let signature: Signature = sk.sign(&hash_bytes);
+                let sk_raw = SecretKey::from_pkcs8_der(key_der).or_else(|_| SecretKey::from_sec1_der(key_der))
+                    .map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?;
+                let sig_key = SigningKey::from(&sk_raw);
+                let signature: Signature = sig_key.sign_prehash(&hash_bytes).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
                 Ok(signature.to_der().to_bytes().to_vec())
             }
         }
@@ -246,7 +248,7 @@ impl HashBackend for RustCryptoHash {
             } else {
                 let vk = VerifyingKey::from_public_key_der(key_der).map_err(|e| CryptoError::PublicKeyLoad(e.to_string()))?;
                 let sig = Signature::from_der(signature).map_err(|e| CryptoError::Parameter(e.to_string()))?;
-                Ok(vk.verify(&hash_bytes, &sig).is_ok())
+                Ok(vk.verify_prehash(&hash_bytes, &sig).is_ok())
             }
         }
         #[cfg(not(feature = "backend-rustcrypto"))]
@@ -291,7 +293,8 @@ pub fn ecc_dh(my_priv_der: &[u8], peer_pub_der: &[u8]) -> Result<Vec<u8>> {
     #[cfg(feature = "backend-rustcrypto")]
     {
         use rc_internal::*;
-        let sk = SecretKey::from_pkcs8_der(my_priv_der).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let sk = SecretKey::from_pkcs8_der(my_priv_der).or_else(|_| SecretKey::from_sec1_der(my_priv_der))
+            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         let pk = PublicKey::from_public_key_der(peer_pub_der).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         let shared_secret = p256::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
         Ok(shared_secret.raw_secret_bytes().to_vec())
