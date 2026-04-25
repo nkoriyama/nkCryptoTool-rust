@@ -205,8 +205,7 @@ impl KeyProvider for TpmKeyProvider {
         
         let mut decrypted = vec![0u8; ciphertext.len() + 16];
         let n = ctx.cipher_update(&ciphertext, Some(&mut decrypted)).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        let mut final_n = 0;
-        ctx.cipher_final(&mut decrypted[n..]).map_err(|_| CryptoError::SignatureVerification)?;
+        let final_n = ctx.cipher_final(&mut decrypted[n..]).map_err(|_| CryptoError::SignatureVerification)?;
         decrypted.truncate(n + final_n);
 
         Ok(decrypted)
