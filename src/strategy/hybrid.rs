@@ -90,7 +90,6 @@ impl CryptoStrategy for HybridStrategy {
         self.encryption_key = self.hkdf_derive(&combined_secret, 32, &self.salt, "hybrid-encryption")?;
         
         combined_secret.zeroize();
-        // Zeroizing clones too is good practice
         let mut pqc_ss_mut = pqc_ss;
         let mut ecc_ss_mut = ecc_ss;
         pqc_ss_mut.zeroize();
