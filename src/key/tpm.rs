@@ -1,8 +1,6 @@
 use crate::error::{CryptoError, Result};
 use crate::key::KeyProvider;
-use openssl::cipher::Cipher;
-use openssl::cipher_ctx::CipherCtx;
-use openssl::rand::rand_bytes;
+use crate::backend::{self, AeadBackend};
 use std::process::{Command, Stdio};
 use std::io::Write;
 use std::fs;
@@ -60,17 +58,26 @@ impl KeyProvider for TpmKeyProvider {
     fn wrap_raw(&self, data: &[u8], passphrase: Option<&str>) -> Result<String> {
         let mut aes_key = vec![0u8; 32];
         let mut iv = vec![0u8; 12];
-        rand_bytes(&mut aes_key).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        rand_bytes(&mut iv).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        
+        #[cfg(feature = "backend-openssl")]
+        openssl::rand::rand_bytes(&mut aes_key).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        #[cfg(feature = "backend-openssl")]
+        openssl::rand::rand_bytes(&mut iv).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        
+        #[cfg(feature = "backend-rustcrypto")]
+        {
+            use rand_core::{RngCore, OsRng};
+            OsRng.fill_bytes(&mut aes_key);
+            OsRng.fill_bytes(&mut iv);
+        }
 
-        let mut ctx = CipherCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        ctx.encrypt_init(Some(Cipher::aes_256_gcm()), Some(&aes_key), Some(&iv)).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let mut ctx = backend::new_encrypt("AES-256-GCM", &aes_key, &iv)?;
         let mut ciphertext = vec![0u8; data.len() + 16];
-        let n = ctx.cipher_update(data, Some(&mut ciphertext)).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        let final_n = ctx.cipher_final(&mut ciphertext[n..]).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let n = ctx.update(data, &mut ciphertext)?;
+        let final_n = ctx.finalize(&mut ciphertext[n..])?;
         ciphertext.truncate(n + final_n);
         let mut tag = vec![0u8; 16];
-        ctx.tag(&mut tag).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        ctx.get_tag(&mut tag)?;
 
         let primary_ctx = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
         let aes_file = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
@@ -83,7 +90,7 @@ impl KeyProvider for TpmKeyProvider {
         let sess_path = session_file.path().to_str().unwrap();
         let sess_arg = format!("session:{}", sess_path);
         let pctx_path = primary_ctx.path().to_str().unwrap();
-        let aes_path = aes_file.path().to_str().unwrap();
+        let aes_path_str = aes_file.path().to_str().unwrap();
         let upath = pub_file.path().to_str().unwrap();
         let rpath = priv_file.path().to_str().unwrap();
 
@@ -92,7 +99,7 @@ impl KeyProvider for TpmKeyProvider {
 
         let mut create_args = vec![
             "tpm2_create", "-C", pctx_path,
-            "-i", aes_path,
+            "-i", aes_path_str,
             "-u", upath,
             "-r", rpath,
             "-P", &sess_arg,
@@ -167,7 +174,7 @@ impl KeyProvider for TpmKeyProvider {
         let upath = pub_file.path().to_str().unwrap();
         let rpath = priv_file.path().to_str().unwrap();
         let kctx_path = key_ctx.path().to_str().unwrap();
-        let aes_path = aes_file.path().to_str().unwrap();
+        let aes_path_str = aes_file.path().to_str().unwrap();
 
         self.run_tpm_cmd(&["tpm2_startauthsession", "--hmac-session", "-S", sess_path], None)?;
         self.run_tpm_cmd(&["tpm2_createprimary", "-C", "o", "-c", pctx_path, "-Q"], None)?;
@@ -192,20 +199,19 @@ impl KeyProvider for TpmKeyProvider {
 
         self.run_tpm_cmd(&[
             "tpm2_unseal", "-c", kctx_path,
-            "-o", aes_path,
+            "-o", aes_path_str,
             "-p", &auth_arg, "-Q"
         ], pass_bytes)?;
 
         Command::new("tpm2_flushcontext").arg(sess_path).env("TCTI", "device:/dev/tpmrm0").status().ok();
 
-        let aes_key = fs::read(aes_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        let mut ctx = CipherCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        ctx.decrypt_init(Some(Cipher::aes_256_gcm()), Some(&aes_key), Some(&iv)).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        ctx.set_tag(&tag).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let aes_key = fs::read(aes_path_str).map_err(|e| CryptoError::FileRead(e.to_string()))?;
+        let mut ctx = backend::new_decrypt("AES-256-GCM", &aes_key, &iv)?;
+        ctx.set_tag(&tag)?;
         
         let mut decrypted = vec![0u8; ciphertext.len() + 16];
-        let n = ctx.cipher_update(&ciphertext, Some(&mut decrypted)).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        let final_n = ctx.cipher_final(&mut decrypted[n..]).map_err(|_| CryptoError::SignatureVerification)?;
+        let n = ctx.update(&ciphertext, &mut decrypted)?;
+        let final_n = ctx.finalize(&mut decrypted[n..]).map_err(|_| CryptoError::SignatureVerification)?;
         decrypted.truncate(n + final_n);
 
         Ok(decrypted)
