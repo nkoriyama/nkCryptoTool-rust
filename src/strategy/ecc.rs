@@ -82,11 +82,11 @@ impl CryptoStrategy for EccStrategy {
             let wrapped = provider.wrap_raw(&priv_der, passphrase)?;
             fs::write(priv_path, wrapped)?;
         } else {
-            let priv_pem = if let Some(pass) = passphrase {
+            let priv_pem = if let Some(_pass) = passphrase {
                 #[cfg(feature = "backend-openssl")]
                 {
                     let pkey = openssl::pkey::PKey::private_key_from_der(&priv_der).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-                    pkey.private_key_to_pem_pkcs8_passphrase(openssl::symm::Cipher::aes_256_cbc(), pass.as_bytes())
+                    pkey.private_key_to_pem_pkcs8_passphrase(openssl::symm::Cipher::aes_256_cbc(), _pass.as_bytes())
                         .map_err(|e| CryptoError::OpenSSL(e.to_string()))?
                 }
                 #[cfg(not(feature = "backend-openssl"))]
@@ -388,7 +388,7 @@ impl CryptoStrategy for EccStrategy {
             Ok(s)
         };
 
-        let mut read_vec = |p: &mut usize| -> Result<Vec<u8>> {
+        let read_vec = |p: &mut usize| -> Result<Vec<u8>> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete vec header".to_string())); }
             let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
             *p += 4;

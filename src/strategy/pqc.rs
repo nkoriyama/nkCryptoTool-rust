@@ -85,6 +85,26 @@ impl PqcStrategy {
         if der.len() < 3168 { return Err(CryptoError::Parameter("DER too short".to_string())); }
         Ok(der[der.len() - 3168..].to_vec())
     }
+
+    // ML-DSA-87 SPKI wrapping (OID 2.16.840.1.101.3.4.3.36)
+    #[cfg(not(feature = "backend-openssl"))]
+    fn wrap_mldsa_spki(&self, raw_pub: &[u8]) -> Vec<u8> {
+        let mut der = vec![0x30, 0x82, 0x0a, 0x33];
+        der.extend_from_slice(&[0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x24]); // OID
+        der.extend_from_slice(&[0x03, 0x82, 0x0a, 0x23, 0x00]);
+        der.extend_from_slice(raw_pub);
+        der
+    }
+
+    #[cfg(not(feature = "backend-openssl"))]
+    fn wrap_mldsa_pkcs8(&self, raw_priv: &[u8]) -> Vec<u8> {
+        let mut der = vec![0x30, 0x82, 0x13, 0x33];
+        der.extend_from_slice(&[0x02, 0x01, 0x00]);
+        der.extend_from_slice(&[0x30, 0x0b, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x24]);
+        der.extend_from_slice(&[0x04, 0x82, 0x13, 0x21]);
+        der.extend_from_slice(raw_priv);
+        der
+    }
 }
 
 impl CryptoStrategy for PqcStrategy {
@@ -128,39 +148,39 @@ impl CryptoStrategy for PqcStrategy {
 
         let use_tpm = key_paths.get("use-tpm").map(|s| s == "true").unwrap_or(false);
 
-        // ML-DSA-87 NID is 1196. This is currently backend-specific.
-        #[cfg(feature = "backend-openssl")]
         let (priv_der, pub_der) = {
-            use openssl::pkey::Id;
-            use openssl::pkey_ctx::PkeyCtx;
-            let mut pctx = PkeyCtx::new_id(Id::from_raw(1196))
-                .map_err(|e| CryptoError::OpenSSL(format!("ML-DSA-87 not supported via NID 1196: {}", e)))?;
-            pctx.keygen_init().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            let pkey = pctx.keygen().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            (
-                pkey.private_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?,
-                pkey.public_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?
-            )
-        };
-        #[cfg(not(feature = "backend-openssl"))]
-        return Err(CryptoError::OpenSSL("PQC signing key gen not implemented for this backend".to_string()));
-
-        #[cfg(feature = "backend-openssl")]
-        {
-            if use_tpm {
-                let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-                let wrapped = provider.wrap_raw(&priv_der, passphrase)?;
-                fs::write(priv_path, wrapped)?;
-            } else {
-                let pkey = openssl::pkey::PKey::private_key_from_der(&priv_der).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-                let priv_pem = pkey.private_key_to_pem_pkcs8().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-                fs::write(priv_path, priv_pem)?;
+            #[cfg(feature = "backend-openssl")]
+            {
+                use openssl::pkey::Id;
+                use openssl::pkey_ctx::PkeyCtx;
+                let mut pctx = PkeyCtx::new_id(Id::from_raw(1196))
+                    .map_err(|e| CryptoError::OpenSSL(format!("ML-DSA-87 not supported via NID 1196: {}", e)))?;
+                pctx.keygen_init().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+                let pkey = pctx.keygen().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+                (
+                    pkey.private_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?,
+                    pkey.public_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?
+                )
             }
+            #[cfg(not(feature = "backend-openssl"))]
+            {
+                use pqcrypto_traits::sign::{PublicKey as _, SecretKey as _};
+                let (pk, sk) = pqcrypto_mldsa::mldsa87::keypair();
+                (self.wrap_mldsa_pkcs8(sk.as_bytes()), self.wrap_mldsa_spki(pk.as_bytes()))
+            }
+        };
 
-            let pkey = openssl::pkey::PKey::public_key_from_der(&pub_der).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            let pub_pem = pkey.public_key_to_pem().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            fs::write(pub_path, pub_pem)?;
+        if use_tpm {
+            let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
+            let wrapped = provider.wrap_raw(&priv_der, passphrase)?;
+            fs::write(priv_path, wrapped)?;
+        } else {
+            let priv_pem = crate::utils::wrap_to_pem(&priv_der, "PRIVATE KEY");
+            fs::write(priv_path, priv_pem)?;
         }
+
+        let pub_pem = crate::utils::wrap_to_pem(&pub_der, "PUBLIC KEY");
+        fs::write(pub_path, pub_pem)?;
 
         Ok(())
     }
@@ -444,7 +464,7 @@ impl CryptoStrategy for PqcStrategy {
             Ok(s)
         };
 
-        let mut read_vec = |p: &mut usize| -> Result<Vec<u8>> {
+        let read_vec = |p: &mut usize| -> Result<Vec<u8>> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete vec header".to_string())); }
             let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
             *p += 4;

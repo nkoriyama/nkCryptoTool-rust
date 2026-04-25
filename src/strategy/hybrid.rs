@@ -1,7 +1,7 @@
 use crate::error::{CryptoError, Result};
 use crate::key::SharedKeyProvider;
 use crate::strategy::{CryptoStrategy, StrategyType, ecc::EccStrategy, pqc::PqcStrategy};
-use crate::backend::{AeadBackend, HashBackend};
+use crate::backend::AeadBackend;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -41,23 +41,23 @@ impl CryptoStrategy for HybridStrategy {
         let mut ecc_paths = key_paths.clone();
         let mut pqc_paths = key_paths.clone();
         
-        // ECC keys for hybrid
-        let ecc_pub = key_paths.get("hybrid-ecc-public-key")
-            .or_else(|| key_paths.get("recipient-ecdh-pubkey"))
+        // ECC keys for hybrid - Match names in processor.rs
+        let ecc_pub = key_paths.get("public-ecdh-key")
+            .or_else(|| key_paths.get("hybrid-ecc-public-key"))
             .cloned().unwrap_or_else(|| key_paths.get("public-key").cloned().unwrap_or_default().replace(".key", "_ecdh.key"));
-        let ecc_priv = key_paths.get("hybrid-ecc-private-key")
-            .or_else(|| key_paths.get("recipient-ecdh-privkey"))
+        let ecc_priv = key_paths.get("private-ecdh-key")
+            .or_else(|| key_paths.get("hybrid-ecc-private-key"))
             .cloned().unwrap_or_else(|| key_paths.get("private-key").cloned().unwrap_or_default().replace(".key", "_ecdh.key"));
         
         ecc_paths.insert("public-key".to_string(), ecc_pub);
         ecc_paths.insert("private-key".to_string(), ecc_priv);
 
-        // PQC keys for hybrid
-        let pqc_pub = key_paths.get("hybrid-pqc-public-key")
-            .or_else(|| key_paths.get("recipient-mlkem-pubkey"))
+        // PQC keys for hybrid - Match names in processor.rs
+        let pqc_pub = key_paths.get("public-mlkem-key")
+            .or_else(|| key_paths.get("hybrid-pqc-public-key"))
             .cloned().unwrap_or_else(|| key_paths.get("public-key").cloned().unwrap_or_default().replace(".key", "_mlkem.key"));
-        let pqc_priv = key_paths.get("hybrid-pqc-private-key")
-            .or_else(|| key_paths.get("recipient-mlkem-privkey"))
+        let pqc_priv = key_paths.get("private-mlkem-key")
+            .or_else(|| key_paths.get("hybrid-pqc-private-key"))
             .cloned().unwrap_or_else(|| key_paths.get("private-key").cloned().unwrap_or_default().replace(".key", "_mlkem.key"));
             
         pqc_paths.insert("public-key".to_string(), pqc_pub);
@@ -76,6 +76,7 @@ impl CryptoStrategy for HybridStrategy {
         let mut ecc_paths = key_paths.clone();
         let mut pqc_paths = key_paths.clone();
         
+        // Map common hybrid argument names to sub-strategy expectations
         if let Some(p) = key_paths.get("recipient-ecdh-pubkey") { ecc_paths.insert("recipient-pubkey".to_string(), p.clone()); }
         if let Some(p) = key_paths.get("recipient-mlkem-pubkey") { pqc_paths.insert("recipient-pubkey".to_string(), p.clone()); }
         
@@ -108,8 +109,8 @@ impl CryptoStrategy for HybridStrategy {
         let mut ecc_paths = key_paths.clone();
         let mut pqc_paths = key_paths.clone();
         
-        if let Some(p) = key_paths.get("recipient-ecdh-privkey") { ecc_paths.insert("user-privkey".to_string(), p.clone()); }
-        if let Some(p) = key_paths.get("recipient-mlkem-privkey") { pqc_paths.insert("user-privkey".to_string(), p.clone()); }
+        if let Some(p) = key_paths.get("user-ecdh-privkey") { ecc_paths.insert("user-privkey".to_string(), p.clone()); }
+        if let Some(p) = key_paths.get("user-mlkem-privkey") { pqc_paths.insert("user-privkey".to_string(), p.clone()); }
         
         self.ecc.prepare_decryption(&ecc_paths, passphrase)?;
         self.pqc.prepare_decryption(&pqc_paths, passphrase)?;
