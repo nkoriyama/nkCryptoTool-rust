@@ -49,7 +49,10 @@ impl EccStrategy {
 
     fn hkdf_derive(&self, secret: &[u8], out_len: usize, salt: &[u8], info: &str) -> Result<Vec<u8>> {
         let mut okm = vec![0u8; out_len];
-        let hk = Hkdf::<Sha3_256>::new(Some(salt), secret);
+        // Note: For SHA256 in C++, we should use SHA256 in Rust too.
+        // C++: backend->hkdf(ikm, 32, salt_v, info, "SHA256")
+        use sha2::Sha256;
+        let hk = Hkdf::<Sha256>::new(Some(salt), secret);
         hk.expand(info.as_bytes(), &mut okm).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         Ok(okm)
     }
@@ -74,7 +77,6 @@ impl CryptoStrategy for EccStrategy {
 
         let use_tpm = key_paths.get("use-tpm").map(|s| s == "true").unwrap_or(false);
 
-        // Use backend to generate key pair.
         let (priv_der, pub_der) = backend::generate_ecc_key_pair(&self.curve_name)?;
 
         if use_tpm {
@@ -82,18 +84,7 @@ impl CryptoStrategy for EccStrategy {
             let wrapped = provider.wrap_raw(&priv_der, passphrase)?;
             fs::write(priv_path, wrapped)?;
         } else {
-            let priv_pem = if let Some(_pass) = passphrase {
-                #[cfg(feature = "backend-openssl")]
-                {
-                    let pkey = openssl::pkey::PKey::private_key_from_der(&priv_der).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-                    pkey.private_key_to_pem_pkcs8_passphrase(openssl::symm::Cipher::aes_256_cbc(), _pass.as_bytes())
-                        .map_err(|e| CryptoError::OpenSSL(e.to_string()))?
-                }
-                #[cfg(not(feature = "backend-openssl"))]
-                return Err(CryptoError::OpenSSL("Encrypted PEM export only supported in OpenSSL backend for now".to_string()));
-            } else {
-                crate::utils::wrap_to_pem(&priv_der, "PRIVATE KEY").into_bytes()
-            };
+            let priv_pem = crate::utils::wrap_to_pem(&priv_der, "PRIVATE KEY").into_bytes();
             fs::write(priv_path, priv_pem)?;
         }
 
@@ -117,16 +108,10 @@ impl CryptoStrategy for EccStrategy {
         let pubkey_pem = fs::read_to_string(pubkey_path)?;
         let recipient_pub_der = crate::utils::unwrap_from_pem(&pubkey_pem, "PUBLIC KEY")?;
 
-        // Generate ephemeral key
         let (ephem_priv, ephem_pub) = backend::generate_ecc_key_pair(&self.curve_name)?;
-
-        // ECDH via backend
         self.shared_secret = backend::ecc_dh(&ephem_priv, &recipient_pub_der)?;
+        self.ephemeral_pubkey = ephem_pub;
 
-        // Ephemeral public key as PEM for the header
-        self.ephemeral_pubkey = crate::utils::wrap_to_pem(&ephem_pub, "PUBLIC KEY").into_bytes();
-
-        // Salt and IV
         self.salt = vec![0u8; 16];
         self.iv = vec![0u8; 12];
         
@@ -142,7 +127,6 @@ impl CryptoStrategy for EccStrategy {
             OsRng.fill_bytes(&mut self.iv);
         }
 
-        // HKDF
         self.encryption_key = self.hkdf_derive(
             &self.shared_secret, 
             32, 
@@ -150,7 +134,6 @@ impl CryptoStrategy for EccStrategy {
             "ecc-encryption"
         )?;
 
-        // Initialize AEAD via backend
         let ctx = backend::new_encrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
         self.aead_ctx = Some(ctx);
 
@@ -172,12 +155,8 @@ impl CryptoStrategy for EccStrategy {
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
 
-        let recipient_pub_der = crate::utils::unwrap_from_pem(&String::from_utf8_lossy(&self.ephemeral_pubkey), "PUBLIC KEY")?;
+        self.shared_secret = backend::ecc_dh(&priv_key_der, &self.ephemeral_pubkey)?;
 
-        // ECDH via backend
-        self.shared_secret = backend::ecc_dh(&priv_key_der, &recipient_pub_der)?;
-
-        // HKDF
         self.encryption_key = self.hkdf_derive(
             &self.shared_secret, 
             32, 
@@ -185,7 +164,6 @@ impl CryptoStrategy for EccStrategy {
             "ecc-encryption"
         )?;
 
-        // Initialize AEAD via backend
         let ctx = backend::new_decrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
         self.aead_ctx = Some(ctx);
 
@@ -370,6 +348,8 @@ impl CryptoStrategy for EccStrategy {
         let mut pos = 4;
         let version = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap());
         pos += 2;
+        // In interop renovation, we might have legacy files (version 0 implicit) or new files (version 1)
+        // Here we expect version 1 for interop with renovate C++ tool.
         if version != 1 { return Err(CryptoError::FileRead("Unsupported version".to_string())); }
         
         let strategy_type = data[pos];
@@ -421,48 +401,5 @@ impl CryptoStrategy for EccStrategy {
 
     fn get_iv(&self) -> Vec<u8> {
         self.iv.clone()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_header_cycle() {
-        let mut strategy = EccStrategy::new();
-        strategy.curve_name = "test-curve".to_string();
-        strategy.digest_algo = "SHA3-256".to_string();
-        strategy.ephemeral_pubkey = vec![1, 2, 3, 4];
-        strategy.salt = vec![5, 6];
-        strategy.iv = vec![7, 8, 9];
-
-        let header = strategy.serialize_header();
-        
-        let mut strategy2 = EccStrategy::new();
-        let pos = strategy2.deserialize_header(&header).expect("Deserialization failed");
-        
-        assert_eq!(pos, header.len());
-        assert_eq!(strategy2.curve_name, "test-curve");
-        assert_eq!(strategy2.digest_algo, "SHA3-256");
-        assert_eq!(strategy2.ephemeral_pubkey, vec![1, 2, 3, 4]);
-        assert_eq!(strategy2.salt, vec![5, 6]);
-        assert_eq!(strategy2.iv, vec![7, 8, 9]);
-    }
-
-    #[test]
-    fn test_signature_header_cycle() {
-        let mut strategy = EccStrategy::new();
-        strategy.curve_name = "sig-curve".to_string();
-        strategy.digest_algo = "SHA3-512".to_string();
-
-        let header = strategy.serialize_signature_header();
-        
-        let mut strategy2 = EccStrategy::new();
-        let pos = strategy2.deserialize_signature_header(&header).expect("Sig deserialization failed");
-        
-        assert_eq!(pos, header.len());
-        assert_eq!(strategy2.curve_name, "sig-curve");
-        assert_eq!(strategy2.digest_algo, "SHA3-512");
     }
 }

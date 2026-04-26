@@ -3,11 +3,11 @@ use crate::error::Result;
 pub mod openssl_impl;
 pub mod rustcrypto_impl;
 
-#[cfg(feature = "backend-openssl")]
+#[cfg(all(feature = "backend-openssl", not(feature = "backend-rustcrypto")))]
 pub use openssl_impl as crypto_impl;
-#[cfg(feature = "backend-openssl")]
+#[cfg(all(feature = "backend-openssl", not(feature = "backend-rustcrypto")))]
 pub use openssl_impl::OpenSslAead as Aead;
-#[cfg(feature = "backend-openssl")]
+#[cfg(all(feature = "backend-openssl", not(feature = "backend-rustcrypto")))]
 pub use openssl_impl::OpenSslHash as Hash;
 
 #[cfg(feature = "backend-rustcrypto")]

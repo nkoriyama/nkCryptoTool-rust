@@ -18,9 +18,6 @@ mod rc_internal {
     
     // ECDSA
     pub use p256::ecdsa::{SigningKey, VerifyingKey, Signature, signature::{hazmat::{PrehashSigner, PrehashVerifier}}};
-
-    // PQC (ML-DSA)
-    pub use pqcrypto_mldsa::mldsa87::{SecretKey as MldsaSecretKey, PublicKey as MldsaPublicKey, detached_sign, verify_detached_signature, DetachedSignature as MldsaSignature};
 }
 
 pub type Aead = RustCryptoAead;
@@ -205,24 +202,15 @@ impl HashBackend for RustCryptoHash {
         #[cfg(feature = "backend-rustcrypto")]
         {
             use rc_internal::*;
-            use pqcrypto_traits::sign::{SecretKey as _, DetachedSignature as _};
             let hash_bytes = if let Some(d) = self.digest_256.take() { d.finalize().to_vec() }
                             else if let Some(d) = self.digest_512.take() { d.finalize().to_vec() }
                             else { return Err(CryptoError::Parameter("Digest not init".to_string())); };
             
-            if key_der.len() > 1000 { // Heuristic for ML-DSA
-                // Extract raw key from PKCS#8
-                let raw_sk = &key_der[key_der.len() - 4896..];
-                let sk = MldsaSecretKey::from_bytes(raw_sk).map_err(|_| CryptoError::PrivateKeyLoad("Invalid ML-DSA key".to_string()))?;
-                let sig = detached_sign(&hash_bytes, &sk);
-                Ok(sig.as_bytes().to_vec())
-            } else {
-                let sk_raw = SecretKey::from_pkcs8_der(key_der).or_else(|_| SecretKey::from_sec1_der(key_der))
-                    .map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?;
-                let sig_key = SigningKey::from(&sk_raw);
-                let signature: Signature = sig_key.sign_prehash(&hash_bytes).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-                Ok(signature.to_der().to_bytes().to_vec())
-            }
+            let sk_raw = SecretKey::from_pkcs8_der(key_der).or_else(|_| SecretKey::from_sec1_der(key_der))
+                .map_err(|e| CryptoError::PrivateKeyLoad(e.to_string()))?;
+            let sig_key = SigningKey::from(&sk_raw);
+            let signature: Signature = sig_key.sign_prehash(&hash_bytes).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+            Ok(signature.to_der().to_bytes().to_vec())
         }
         #[cfg(not(feature = "backend-rustcrypto"))]
         {
@@ -235,21 +223,13 @@ impl HashBackend for RustCryptoHash {
         #[cfg(feature = "backend-rustcrypto")]
         {
             use rc_internal::*;
-            use pqcrypto_traits::sign::{PublicKey as _, DetachedSignature as _};
             let hash_bytes = if let Some(d) = self.digest_256.take() { d.finalize().to_vec() }
                             else if let Some(d) = self.digest_512.take() { d.finalize().to_vec() }
                             else { return Err(CryptoError::Parameter("Digest not init".to_string())); };
             
-            if key_der.len() > 1000 { // Heuristic for ML-DSA
-                let raw_pk = &key_der[key_der.len() - 2592..];
-                let pk = MldsaPublicKey::from_bytes(raw_pk).map_err(|_| CryptoError::PublicKeyLoad("Invalid ML-DSA key".to_string()))?;
-                let sig = MldsaSignature::from_bytes(signature).map_err(|_| CryptoError::Parameter("Invalid ML-DSA signature".to_string()))?;
-                Ok(verify_detached_signature(&sig, &hash_bytes, &pk).is_ok())
-            } else {
-                let vk = VerifyingKey::from_public_key_der(key_der).map_err(|e| CryptoError::PublicKeyLoad(e.to_string()))?;
-                let sig = Signature::from_der(signature).map_err(|e| CryptoError::Parameter(e.to_string()))?;
-                Ok(vk.verify_prehash(&hash_bytes, &sig).is_ok())
-            }
+            let vk = VerifyingKey::from_public_key_der(key_der).map_err(|e| CryptoError::PublicKeyLoad(e.to_string()))?;
+            let sig = Signature::from_der(signature).map_err(|e| CryptoError::Parameter(e.to_string()))?;
+            Ok(vk.verify_prehash(&hash_bytes, &sig).is_ok())
         }
         #[cfg(not(feature = "backend-rustcrypto"))]
         {
