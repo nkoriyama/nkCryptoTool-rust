@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) 2024-2026 Naohiro KORIYAMA <nkoriyama@gmail.com>
+ *
+ * This file is part of nkCryptoTool.
+ */
+
 use std::process::Command;
 use std::fs;
 use std::path::Path;
