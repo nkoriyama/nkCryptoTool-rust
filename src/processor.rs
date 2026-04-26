@@ -182,6 +182,8 @@ impl CryptoProcessor {
         if let Some(ref p) = config.recipient_mlkem_pubkey { key_paths.insert("recipient-mlkem-pubkey".to_string(), p.clone()); }
         if let Some(ref p) = config.recipient_ecdh_pubkey { key_paths.insert("recipient-ecdh-pubkey".to_string(), p.clone()); }
         key_paths.insert("digest-algo".to_string(), config.digest_algo.clone());
+        key_paths.insert("kem-algo".to_string(), config.pqc_kem_algo.clone());
+        key_paths.insert("dsa-algo".to_string(), config.pqc_dsa_algo.clone());
 
         let mut strategy = self.strategy.take().ok_or(CryptoError::Parameter("Strategy already in use".to_string()))?;
         strategy.prepare_encryption(&key_paths)?;
@@ -234,8 +236,10 @@ impl CryptoProcessor {
 
         let mut key_paths = HashMap::new();
         if let Some(ref p) = config.user_privkey { key_paths.insert("user-privkey".to_string(), p.clone()); }
-        if let Some(ref p) = config.user_mlkem_privkey { key_paths.insert("recipient-mlkem-privkey".to_string(), p.clone()); }
-        if let Some(ref p) = config.user_ecdh_privkey { key_paths.insert("recipient-ecdh-privkey".to_string(), p.clone()); }
+        if let Some(ref p) = config.user_mlkem_privkey { key_paths.insert("user-mlkem-privkey".to_string(), p.clone()); }
+        if let Some(ref p) = config.user_ecdh_privkey { key_paths.insert("user-ecdh-privkey".to_string(), p.clone()); }
+        key_paths.insert("kem-algo".to_string(), config.pqc_kem_algo.clone());
+        key_paths.insert("dsa-algo".to_string(), config.pqc_dsa_algo.clone());
         
         strategy.prepare_decryption(&key_paths, config.passphrase.as_deref())?;
 
@@ -401,6 +405,8 @@ impl CryptoProcessor {
             key_paths.insert("private-key".to_string(), format!("{}/private_enc_{}.key", config.key_dir, config.mode.to_string().to_lowercase()));
         }
         if config.use_tpm { key_paths.insert("use-tpm".to_string(), "true".to_string()); }
+        key_paths.insert("kem-algo".to_string(), config.pqc_kem_algo.clone());
+        key_paths.insert("dsa-algo".to_string(), config.pqc_dsa_algo.clone());
 
         std::fs::create_dir_all(&config.key_dir)?;
         if let Some(ref s) = self.strategy {
@@ -415,6 +421,8 @@ impl CryptoProcessor {
         key_paths.insert("signing-public-key".to_string(), format!("{}/public_sign_{}.key", config.key_dir, config.mode.to_string().to_lowercase()));
         key_paths.insert("signing-private-key".to_string(), format!("{}/private_sign_{}.key", config.key_dir, config.mode.to_string().to_lowercase()));
         if config.use_tpm { key_paths.insert("use-tpm".to_string(), "true".to_string()); }
+        key_paths.insert("kem-algo".to_string(), config.pqc_kem_algo.clone());
+        key_paths.insert("dsa-algo".to_string(), config.pqc_dsa_algo.clone());
 
         std::fs::create_dir_all(&config.key_dir)?;
         if let Some(ref s) = self.strategy {

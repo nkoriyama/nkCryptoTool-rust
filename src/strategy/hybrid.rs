@@ -41,25 +41,13 @@ impl CryptoStrategy for HybridStrategy {
         let mut ecc_paths = key_paths.clone();
         let mut pqc_paths = key_paths.clone();
         
-        // ECC keys for hybrid - Match names in processor.rs
-        let ecc_pub = key_paths.get("public-ecdh-key")
-            .or_else(|| key_paths.get("hybrid-ecc-public-key"))
-            .cloned().unwrap_or_else(|| key_paths.get("public-key").cloned().unwrap_or_default().replace(".key", "_ecdh.key"));
-        let ecc_priv = key_paths.get("private-ecdh-key")
-            .or_else(|| key_paths.get("hybrid-ecc-private-key"))
-            .cloned().unwrap_or_else(|| key_paths.get("private-key").cloned().unwrap_or_default().replace(".key", "_ecdh.key"));
-        
+        let ecc_pub = key_paths.get("public-ecdh-key").cloned().unwrap_or_else(|| key_paths.get("public-key").cloned().unwrap_or_default().replace(".key", "_ecdh.key"));
+        let ecc_priv = key_paths.get("private-ecdh-key").cloned().unwrap_or_else(|| key_paths.get("private-key").cloned().unwrap_or_default().replace(".key", "_ecdh.key"));
         ecc_paths.insert("public-key".to_string(), ecc_pub);
         ecc_paths.insert("private-key".to_string(), ecc_priv);
 
-        // PQC keys for hybrid - Match names in processor.rs
-        let pqc_pub = key_paths.get("public-mlkem-key")
-            .or_else(|| key_paths.get("hybrid-pqc-public-key"))
-            .cloned().unwrap_or_else(|| key_paths.get("public-key").cloned().unwrap_or_default().replace(".key", "_mlkem.key"));
-        let pqc_priv = key_paths.get("private-mlkem-key")
-            .or_else(|| key_paths.get("hybrid-pqc-private-key"))
-            .cloned().unwrap_or_else(|| key_paths.get("private-key").cloned().unwrap_or_default().replace(".key", "_mlkem.key"));
-            
+        let pqc_pub = key_paths.get("public-mlkem-key").cloned().unwrap_or_else(|| key_paths.get("public-key").cloned().unwrap_or_default().replace(".key", "_mlkem.key"));
+        let pqc_priv = key_paths.get("private-mlkem-key").cloned().unwrap_or_else(|| key_paths.get("private-key").cloned().unwrap_or_default().replace(".key", "_mlkem.key"));
         pqc_paths.insert("public-key".to_string(), pqc_pub);
         pqc_paths.insert("private-key".to_string(), pqc_priv);
         
@@ -69,14 +57,12 @@ impl CryptoStrategy for HybridStrategy {
     }
 
     fn generate_signing_key_pair(&self, key_paths: &HashMap<String, String>, passphrase: Option<&str>) -> Result<()> {
-        self.generate_encryption_key_pair(key_paths, passphrase)
+        self.pqc.generate_signing_key_pair(key_paths, passphrase)
     }
 
     fn prepare_encryption(&mut self, key_paths: &HashMap<String, String>) -> Result<()> {
         let mut ecc_paths = key_paths.clone();
         let mut pqc_paths = key_paths.clone();
-        
-        // Map common hybrid argument names to sub-strategy expectations
         if let Some(p) = key_paths.get("recipient-ecdh-pubkey") { ecc_paths.insert("recipient-pubkey".to_string(), p.clone()); }
         if let Some(p) = key_paths.get("recipient-mlkem-pubkey") { pqc_paths.insert("recipient-pubkey".to_string(), p.clone()); }
         
@@ -85,14 +71,12 @@ impl CryptoStrategy for HybridStrategy {
         
         let ss_ecc = self.ecc.get_shared_secret();
         let ss_pqc = self.pqc.get_shared_secret();
-        
         let mut combined_ss = ss_ecc;
         combined_ss.extend_from_slice(&ss_pqc);
         
         self.salt = self.ecc.get_salt();
         self.iv = self.ecc.get_iv();
         
-        // HKDF
         use hkdf::Hkdf;
         use sha3::Sha3_256;
         let mut okm = vec![0u8; 32];
@@ -108,7 +92,6 @@ impl CryptoStrategy for HybridStrategy {
     fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: Option<&str>) -> Result<()> {
         let mut ecc_paths = key_paths.clone();
         let mut pqc_paths = key_paths.clone();
-        
         if let Some(p) = key_paths.get("user-ecdh-privkey") { ecc_paths.insert("user-privkey".to_string(), p.clone()); }
         if let Some(p) = key_paths.get("user-mlkem-privkey") { pqc_paths.insert("user-privkey".to_string(), p.clone()); }
         
@@ -117,7 +100,6 @@ impl CryptoStrategy for HybridStrategy {
         
         let ss_ecc = self.ecc.get_shared_secret();
         let ss_pqc = self.pqc.get_shared_secret();
-        
         let mut combined_ss = ss_ecc;
         combined_ss.extend_from_slice(&ss_pqc);
         
@@ -154,7 +136,6 @@ impl CryptoStrategy for HybridStrategy {
         let mut out = vec![0u8; 16];
         let n = ctx.finalize(&mut out)?;
         out.truncate(n);
-        
         let mut tag = vec![0u8; 16];
         ctx.get_tag(&mut tag)?;
         out.extend_from_slice(&tag);
@@ -169,20 +150,20 @@ impl CryptoStrategy for HybridStrategy {
         Ok(())
     }
 
-    fn prepare_signing(&mut self, _priv_key_path: &Path, _passphrase: Option<&str>, _digest_algo: &str) -> Result<()> {
-        Err(CryptoError::Parameter("Hybrid signing not implemented".to_string()))
+    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: Option<&str>, digest_algo: &str) -> Result<()> {
+        self.pqc.prepare_signing(priv_key_path, passphrase, digest_algo)
     }
 
-    fn prepare_verification(&mut self, _pub_key_path: &Path, _digest_algo: &str) -> Result<()> {
-        Err(CryptoError::Parameter("Hybrid verification not implemented".to_string()))
+    fn prepare_verification(&mut self, pub_key_path: &Path, digest_algo: &str) -> Result<()> {
+        self.pqc.prepare_verification(pub_key_path, digest_algo)
     }
 
-    fn update_hash(&mut self, _data: &[u8]) -> Result<()> { Ok(()) }
-    fn sign_hash(&mut self) -> Result<Vec<u8>> { Ok(Vec::new()) }
-    fn verify_hash(&mut self, _signature: &[u8]) -> Result<bool> { Ok(true) }
+    fn update_hash(&mut self, data: &[u8]) -> Result<()> { self.pqc.update_hash(data) }
+    fn sign_hash(&mut self) -> Result<Vec<u8>> { self.pqc.sign_hash() }
+    fn verify_hash(&mut self, signature: &[u8]) -> Result<bool> { self.pqc.verify_hash(signature) }
 
-    fn serialize_signature_header(&self) -> Vec<u8> { Vec::new() }
-    fn deserialize_signature_header(&mut self, _data: &[u8]) -> Result<usize> { Ok(0) }
+    fn serialize_signature_header(&self) -> Vec<u8> { self.pqc.serialize_signature_header() }
+    fn deserialize_signature_header(&mut self, data: &[u8]) -> Result<usize> { self.pqc.deserialize_signature_header(data) }
 
     fn get_metadata(&self, _magic: &str) -> HashMap<String, String> {
         let mut m = HashMap::new();
@@ -193,7 +174,7 @@ impl CryptoStrategy for HybridStrategy {
     }
 
     fn get_header_size(&self) -> usize {
-        4 + 2 + 1 + 4 + self.ecc.serialize_header().len() + 4 + self.pqc.serialize_header().len()
+        4 + 2 + 1 + 4 + self.ecc.get_header_size() + 4 + self.pqc.get_header_size()
     }
 
     fn serialize_header(&self) -> Vec<u8> {
@@ -230,7 +211,6 @@ impl CryptoStrategy for HybridStrategy {
         
         self.salt = self.ecc.get_salt();
         self.iv = self.ecc.get_iv();
-        
         Ok(pos)
     }
 
