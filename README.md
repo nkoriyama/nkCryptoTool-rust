@@ -74,6 +74,19 @@ cargo build --release --no-default-features --features backend-rustcrypto
 | **OpenSSL (Default)** | **~2.5 GB/s** | **~2.7 GB/s** |
 | **RustCrypto (Pure Rust)** | **~2.6 GB/s** | **~2.8 GB/s** |
 
+## **統一ヘッダーフォーマット (Unified Header Format)**
+
+本ツールで暗号化されたファイル (`.nkct`) および署名ファイル (`.nkcs`) は、C++/Rust間および全バックエンド間での完全な相互運用性を確保するため、以下の **Version 1 統一ヘッダー形式** を採用しています。
+
+| オフセット | サイズ | 内容 | 説明 |
+| :--- | :--- | :--- | :--- |
+| 0 | 4 bytes | マジック | 暗号化: `NKCT`, 署名: `NKCS` |
+| 4 | 2 bytes | バージョン | `1` (uint16_t, リトルエンディアン) |
+| 6 | 1 byte | 戦略タイプ | `0: ECC`, `1: PQC`, `2: Hybrid` |
+| 7〜 | 可変 | ストラテジーデータ | アルゴリズム名、Salt、IV、KEM暗号文など |
+
+※ 文字列やバイナリ配列は、`[4バイトの長さ(uint32_t)][実データ]` の形式で連続して格納されます。
+
 ## **相互運用性 (Interoperability)**
 
 * **C++版との互換性**: 既存の `nkCryptoTool` (C++) とバイナリレベルで完全な互換性があります。
