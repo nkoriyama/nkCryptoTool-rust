@@ -1,3 +1,9 @@
+/*
+ * Copyright (c) 2024-2026 Naohiro KORIYAMA <nkoriyama@gmail.com>
+ *
+ * This file is part of nkCryptoTool.
+ */
+
 use clap::Parser;
 use nk_crypto_tool::config::{CryptoConfig, CryptoMode, Operation};
 use nk_crypto_tool::processor::CryptoProcessor;
