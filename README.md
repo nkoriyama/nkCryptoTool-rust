@@ -78,9 +78,11 @@ cargo build --release --no-default-features --features backend-rustcrypto
 
 ### **2. PQC (耐量子計算機暗号)**
 *   **アルゴリズム**: NIST標準の ML-KEM (Kyber) および ML-DSA (Dilithium) を採用。
-*   **互換性の仕組み**: 
-    *   最新のドラフトに基づいた **ASN.1 構造** を共通採用しています。
-    *   **OID (Object Identifier)**: 全実装で以下の標準/共通識別子を使用し、メタデータを識別します（出典: **NIST CSOR**, **FIPS 203/204**）。
+*   **ASN.1 構造**: 業界標準のデータ構造を共通採用しています。
+    *   **秘密鍵**: PKCS#8 (OneAsymmetricKey, RFC 5208/5958)
+    *   **公開鍵**: SubjectPublicKeyInfo (SPKI, RFC 5280)
+*   **OID (Object Identifier)**: 全実装で以下の標準/共通識別子を使用し、メタデータを識別します（出典: **NIST CSOR**, **FIPS 203/204**）。
+
         *   ML-KEM-768: `2.16.840.1.101.3.4.4.2` (id-alg-ml-kem-768)
         *   ML-DSA-65: `2.16.840.1.101.3.4.3.18` (id-ml-dsa-65)
     *   バイナリレベルで同一のラップ処理を行うため、Rust版で生成した PQC 鍵を C++版のバックエンドで直接読み込むことが可能です。
