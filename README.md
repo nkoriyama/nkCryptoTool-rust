@@ -78,14 +78,32 @@ cargo build --release --no-default-features --features backend-rustcrypto
 
 ### **2. PQC (耐量子計算機暗号)**
 *   **アルゴリズム**: NIST標準の ML-KEM (Kyber) および ML-DSA (Dilithium) を採用。
-*   **ASN.1 構造**: 業界標準のデータ構造を共通採用しています。
-    *   **秘密鍵**: PKCS#8 (OneAsymmetricKey, RFC 5208/5958)
-    *   **公開鍵**: SubjectPublicKeyInfo (SPKI, RFC 5280)
-*   **OID (Object Identifier)**: 全実装で以下の標準/共通識別子を使用し、メタデータを識別します（出典: **NIST CSOR**, **FIPS 203/204**）。
+*   **ASN.1 構造**: IETFドラフトに基づいた標準的なデータ構造を共通採用しています。
+    *   **公開鍵 (SubjectPublicKeyInfo)**:
+        ```asn1
+        SEQUENCE {
+          algorithm        AlgorithmIdentifier, -- 種類 (OID: 2.16.840.1.101.3.4.4.2 等)
+          subjectPublicKey BIT STRING           -- 生の公開鍵バイナリ
+        }
+        ```
+    *   **秘密鍵 (PKCS#8 / OneAsymmetricKey)**:
+        ```asn1
+        SEQUENCE {
+          version           INTEGER (0),
+          privateKeyAlgorithm AlgorithmIdentifier,
+          privateKey        OCTET STRING {
+            SEQUENCE {
+              seed          OCTET STRING,       -- 鍵生成シード (xi / d,z)
+              rawKey        OCTET STRING        -- 生の秘密鍵バイナリ
+            }
+          }
+        }
+        ```
+*   **OID (Object Identifier)**: 全実装で以下の標準識別子を使用します（出典: **NIST CSOR**, **FIPS 203/204**）。
+    *   ML-KEM-768: `2.16.840.1.101.3.4.4.2` (id-alg-ml-kem-768)
+    *   ML-DSA-65: `2.16.840.1.101.3.4.3.18` (id-ml-dsa-65)
+*   これにより、Rust版で生成した PQC 鍵を C++版で直接読み込むといった、バイナリレベルの相互運用性を実現しています。
 
-        *   ML-KEM-768: `2.16.840.1.101.3.4.4.2` (id-alg-ml-kem-768)
-        *   ML-DSA-65: `2.16.840.1.101.3.4.3.18` (id-ml-dsa-65)
-    *   バイナリレベルで同一のラップ処理を行うため、Rust版で生成した PQC 鍵を C++版のバックエンドで直接読み込むことが可能です。
 
 ### **3. TPM 保護**
 *   秘密鍵を TPM 2.0 で保護する場合、独自の **TPM Wrapped Blob** 形式（PEMラップ）を採用していますが、このパースロジックも C++/Rust 間で統一されています。
@@ -103,12 +121,17 @@ cargo build --release --no-default-features --features backend-rustcrypto
 
 本ツールで暗号化されたファイル (`.nkct`) および署名ファイル (`.nkcs`) は、C++/Rust間および全バックエンド間での完全な相互運用性を確保するため、以下の **Version 1 統一ヘッダー形式** を採用しています。
 
-| オフセット | サイズ | 内容 | 説明 |
-| :--- | :--- | :--- | :--- |
-| 0 | 4 bytes | マジック | 暗号化: `NKCT`, 署名: `NKCS` |
-| 4 | 2 bytes | バージョン | `1` (uint16_t, リトルエンディアン) |
-| 6 | 1 byte | 戦略タイプ | `0: ECC`, `1: PQC`, `2: Hybrid` |
-| 7〜 | 可変 | ストラテジーデータ | アルゴリズム名、Salt、IV、KEM暗号文など |
+### **バイナリレイアウト (Version 1)**
+
+```mermaid
+packet-beta
+0-31: "Magic (NKCT/NKCS)"
+32-47: "Version (1)"
+48-55: "Strategy Type (0/1/2)"
+56-119: "Strategy Data (Variable Length ...)"
+```
+
+すべての数値は**リトルエンディアン (Little-Endian)** で記録されます。
 
 ※ 文字列やバイナリ配列は、`[4バイトの長さ(uint32_t)][実データ]` の形式で連続して格納されます。
 
