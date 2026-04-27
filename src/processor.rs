@@ -20,6 +20,8 @@ use std::sync::Arc;
 
 pub type ProgressCallback = Arc<dyn Fn(f64) + Send + Sync>;
 
+const BUF_SIZE: usize = 1024 * 1024;
+
 pub struct CryptoProcessor {
     strategy: Option<Box<dyn CryptoStrategy>>,
     key_provider: Option<SharedKeyProvider>,
@@ -73,11 +75,11 @@ impl CryptoProcessor {
         
         let reader_handle = tokio::spawn(async move {
             let file = File::open(&input_path_str).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let mut reader = BufReader::new(file);
+            let mut reader = BufReader::with_capacity(BUF_SIZE, file);
             let mut total_read = 0u64;
             
             loop {
-                let mut buffer = vec![0u8; 64 * 1024];
+                let mut buffer = vec![0u8; BUF_SIZE];
                 let n = reader.read(&mut buffer).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
                 if n == 0 { break; }
                 buffer.truncate(n);
@@ -136,11 +138,11 @@ impl CryptoProcessor {
         
         let reader_handle = tokio::spawn(async move {
             let file = File::open(&input_path_str).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let mut reader = BufReader::new(file);
+            let mut reader = BufReader::with_capacity(BUF_SIZE, file);
             let mut total_read = 0u64;
             
             loop {
-                let mut buffer = vec![0u8; 64 * 1024];
+                let mut buffer = vec![0u8; BUF_SIZE];
                 let n = reader.read(&mut buffer).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
                 if n == 0 { break; }
                 buffer.truncate(n);
@@ -286,12 +288,12 @@ impl CryptoProcessor {
 
         let reader_handle = tokio::spawn(async move {
             let file = File::open(&input_path).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let mut reader = BufReader::new(file);
+            let mut reader = BufReader::with_capacity(BUF_SIZE, file);
             let mut total_read = 0u64;
             let mut chunk_idx = 0u64;
             
             loop {
-                let mut buffer = vec![0u8; 64 * 1024];
+                let mut buffer = vec![0u8; BUF_SIZE];
                 let n = reader.read(&mut buffer).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
                 if n == 0 { break; }
                 buffer.truncate(n);
@@ -354,12 +356,12 @@ impl CryptoProcessor {
         let reader_handle = tokio::spawn(async move {
             let mut file = File::open(&input_path).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
             file.seek(std::io::SeekFrom::Start(header_size)).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let mut reader = BufReader::new(file);
+            let mut reader = BufReader::with_capacity(BUF_SIZE, file);
             let mut total_read = 0u64;
             let mut chunk_idx = 0u64;
             
             while total_read < ciphertext_size {
-                let to_read = std::cmp::min(64 * 1024, ciphertext_size - total_read) as usize;
+                let to_read = std::cmp::min(BUF_SIZE as u64, ciphertext_size - total_read) as usize;
                 let mut buffer = vec![0u8; to_read];
                 let n = reader.read_exact(&mut buffer).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
                 if tx_crypto.send((chunk_idx, buffer)).await.is_err() { break; }
