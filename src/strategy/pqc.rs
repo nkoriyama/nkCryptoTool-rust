@@ -330,29 +330,34 @@ impl CryptoStrategy for PqcStrategy {
         let der = crate::utils::unwrap_from_pem(&pem, "PUBLIC KEY")?;
         let raw_pub = self.unwrap_pqc_der(&der, true);
         
-        let (ss_bytes, ct_bytes) = match self.kem_algo.as_str() {
-            "ML-KEM-512" => {
-                use fips203::ml_kem_512::*;
-                let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
-                    .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
-                let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
-                (ss.into_bytes().to_vec(), ct.into_bytes().to_vec())
-            },
-            "ML-KEM-768" => {
-                use fips203::ml_kem_768::*;
-                let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
-                    .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
-                let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
-                (ss.into_bytes().to_vec(), ct.into_bytes().to_vec())
-            },
-            "ML-KEM-1024" => {
-                use fips203::ml_kem_1024::*;
-                let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
-                    .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
-                let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
-                (ss.into_bytes().to_vec(), ct.into_bytes().to_vec())
-            },
-            _ => return Err(CryptoError::Parameter(format!("Unsupported KEM: {}", self.kem_algo))),
+        let (ss_bytes, ct_bytes) = if cfg!(feature = "backend-openssl") {
+            backend::pqc_encap(&der)?
+        } else {
+            let raw_pub = self.unwrap_pqc_der(&der, true);
+            match self.kem_algo.as_str() {
+                "ML-KEM-512" => {
+                    use fips203::ml_kem_512::*;
+                    let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                        .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
+                    let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
+                    (ss.into_bytes().to_vec(), ct.into_bytes().to_vec())
+                },
+                "ML-KEM-768" => {
+                    use fips203::ml_kem_768::*;
+                    let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                        .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
+                    let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
+                    (ss.into_bytes().to_vec(), ct.into_bytes().to_vec())
+                },
+                "ML-KEM-1024" => {
+                    use fips203::ml_kem_1024::*;
+                    let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                        .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
+                    let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
+                    (ss.into_bytes().to_vec(), ct.into_bytes().to_vec())
+                },
+                _ => return Err(CryptoError::Parameter(format!("Unsupported KEM: {}", self.kem_algo))),
+            }
         };
         
         self.shared_secret = ss_bytes;
