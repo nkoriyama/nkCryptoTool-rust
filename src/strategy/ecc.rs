@@ -12,7 +12,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use hkdf::Hkdf;
-use sha3::Sha3_256;
 
 pub struct EccStrategy {
     key_provider: Option<SharedKeyProvider>,
@@ -55,8 +54,6 @@ impl EccStrategy {
 
     fn hkdf_derive(&self, secret: &[u8], out_len: usize, salt: &[u8], info: &str) -> Result<Vec<u8>> {
         let mut okm = vec![0u8; out_len];
-        // Note: For SHA256 in C++, we should use SHA256 in Rust too.
-        // C++: backend->hkdf(ikm, 32, salt_v, info, "SHA256")
         use sha2::Sha256;
         let hk = Hkdf::<Sha256>::new(Some(salt), secret);
         hk.expand(info.as_bytes(), &mut okm).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
@@ -102,6 +99,23 @@ impl CryptoStrategy for EccStrategy {
         self.generate_encryption_key_pair(key_paths, passphrase)
     }
 
+    fn regenerate_public_key(&self, priv_path: &Path, pub_path: &Path, passphrase: &mut Option<String>) -> Result<()> {
+        let priv_bytes = fs::read(priv_path)?;
+        let pem_str = String::from_utf8_lossy(&priv_bytes);
+        
+        let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
+            let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
+            provider.unwrap_raw(&pem_str, passphrase.as_deref())?
+        } else {
+            *passphrase = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref())?;
+            crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
+        };
+
+        let pub_der = backend::extract_public_key(&priv_key_der, passphrase.as_deref())?;
+        fs::write(pub_path, crate::utils::wrap_to_pem(&pub_der, "PUBLIC KEY"))?;
+        Ok(())
+    }
+
     fn prepare_encryption(&mut self, key_paths: &HashMap<String, String>) -> Result<()> {
         if let Some(algo) = key_paths.get("digest-algo") {
             self.digest_algo = algo.clone();
@@ -115,7 +129,7 @@ impl CryptoStrategy for EccStrategy {
         let recipient_pub_der = crate::utils::unwrap_from_pem(&pubkey_pem, "PUBLIC KEY")?;
 
         let (ephem_priv, ephem_pub) = backend::generate_ecc_key_pair(&self.curve_name)?;
-        self.shared_secret = backend::ecc_dh(&ephem_priv, &recipient_pub_der)?;
+        self.shared_secret = backend::ecc_dh(&ephem_priv, &recipient_pub_der, None)?;
         self.ephemeral_pubkey = ephem_pub;
 
         self.salt = vec![0u8; 16];
@@ -146,7 +160,7 @@ impl CryptoStrategy for EccStrategy {
         Ok(())
     }
 
-    fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: Option<&str>) -> Result<()> {
+    fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<String>) -> Result<()> {
         let privkey_path = key_paths.get("user-privkey")
             .or_else(|| key_paths.get("recipient-ecdh-privkey"))
             .ok_or(CryptoError::PrivateKeyLoad("Missing private key path".to_string()))?;
@@ -156,12 +170,13 @@ impl CryptoStrategy for EccStrategy {
 
         let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            provider.unwrap_raw(&pem_str, passphrase)?
+            provider.unwrap_raw(&pem_str, passphrase.as_deref())?
         } else {
+            *passphrase = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref())?;
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
 
-        self.shared_secret = backend::ecc_dh(&priv_key_der, &self.ephemeral_pubkey)?;
+        self.shared_secret = backend::ecc_dh(&priv_key_der, &self.ephemeral_pubkey, passphrase.as_deref())?;
 
         self.encryption_key = self.hkdf_derive(
             &self.shared_secret, 
@@ -213,19 +228,20 @@ impl CryptoStrategy for EccStrategy {
         Ok(())
     }
 
-    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: Option<&str>, digest_algo: &str) -> Result<()> {
+    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: &mut Option<String>, digest_algo: &str) -> Result<()> {
         let priv_bytes = fs::read(priv_key_path)?;
         let pem_str = String::from_utf8_lossy(&priv_bytes);
 
         let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            provider.unwrap_raw(&pem_str, passphrase)?
+            provider.unwrap_raw(&pem_str, passphrase.as_deref())?
         } else {
+            *passphrase = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref())?;
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
 
         let mut ctx = backend::new_hash(digest_algo)?;
-        ctx.init_sign(&priv_key_der)?;
+        ctx.init_sign(&priv_key_der, passphrase.as_deref())?;
         
         self.sign_key_der = Some(priv_key_der);
         self.hash_ctx = Some(ctx);
@@ -354,8 +370,6 @@ impl CryptoStrategy for EccStrategy {
         let mut pos = 4;
         let version = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap());
         pos += 2;
-        // In interop renovation, we might have legacy files (version 0 implicit) or new files (version 1)
-        // Here we expect version 1 for interop with renovate C++ tool.
         if version != 1 { return Err(CryptoError::FileRead("Unsupported version".to_string())); }
         
         let strategy_type = data[pos];

@@ -301,6 +301,23 @@ impl CryptoStrategy for PqcStrategy {
         Ok(())
     }
 
+    fn regenerate_public_key(&self, priv_path: &Path, pub_path: &Path, passphrase: &mut Option<String>) -> Result<()> {
+        let priv_bytes = fs::read(priv_path)?;
+        let pem_str = String::from_utf8_lossy(&priv_bytes);
+        
+        let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
+            let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
+            provider.unwrap_raw(&pem_str, passphrase.as_deref())?
+        } else {
+            *passphrase = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref())?;
+            crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
+        };
+
+        let pub_der = backend::extract_public_key(&priv_key_der, passphrase.as_deref())?;
+        fs::write(pub_path, crate::utils::wrap_to_pem(&pub_der, "PUBLIC KEY"))?;
+        Ok(())
+    }
+
     fn prepare_encryption(&mut self, key_paths: &HashMap<String, String>) -> Result<()> {
         if let Some(algo) = key_paths.get("kem-algo") { self.kem_algo = algo.clone(); }
         if let Some(algo) = key_paths.get("digest-algo") { self.digest_algo = algo.clone(); }
@@ -351,7 +368,7 @@ impl CryptoStrategy for PqcStrategy {
         Ok(())
     }
 
-    fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: Option<&str>) -> Result<()> {
+    fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<String>) -> Result<()> {
         if let Some(algo) = key_paths.get("kem-algo") { self.kem_algo = algo.clone(); }
         if let Some(algo) = key_paths.get("dsa-algo") { self.dsa_algo = algo.clone(); }
 
@@ -364,38 +381,48 @@ impl CryptoStrategy for PqcStrategy {
         
         let wrapped_priv = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            provider.unwrap_raw(&pem_str, passphrase)?
+            provider.unwrap_raw(&pem_str, passphrase.as_deref())?
         } else {
+            *passphrase = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref())?;
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
-        let raw_priv = self.unwrap_pqc_der(&wrapped_priv, false);
-        
-        let ss_bytes = match self.kem_algo.as_str() {
-            "ML-KEM-512" => {
-                use fips203::ml_kem_512::*;
-                let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
-                    .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
-                let ct = CipherText::try_from_bytes(self.kem_ct.clone().try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
-                    .map_err(|_| CryptoError::FileRead("Invalid CT".to_string()))?;
-                sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decaps failed".to_string()))?.into_bytes().to_vec()
-            },
-            "ML-KEM-768" => {
-                use fips203::ml_kem_768::*;
-                let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
-                    .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
-                let ct = CipherText::try_from_bytes(self.kem_ct.clone().try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
-                    .map_err(|_| CryptoError::FileRead("Invalid CT".to_string()))?;
-                sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decaps failed".to_string()))?.into_bytes().to_vec()
-            },
-            "ML-KEM-1024" => {
-                use fips203::ml_kem_1024::*;
-                let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
-                    .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
-                let ct = CipherText::try_from_bytes(self.kem_ct.clone().try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
-                    .map_err(|_| CryptoError::FileRead("Invalid CT".to_string()))?;
-                sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decaps failed".to_string()))?.into_bytes().to_vec()
-            },
-            _ => return Err(CryptoError::Parameter(format!("Unsupported KEM: {}", self.kem_algo))),
+
+        // If backend is OpenSSL 3.5, we could use backend::pqc_decap with passphrase.
+        // For pure-Rust with fips203, we must manually decrypt with OpenSSL if needed.
+        // Here we try to use backend::pqc_decap if available to support encrypted keys.
+        let ss_bytes = if cfg!(feature = "backend-openssl") {
+            backend::pqc_decap(&wrapped_priv, &self.kem_ct, passphrase.as_deref())?
+        } else {
+            // Pure Rust or WolfSSL without robust PQC decap:
+            // For now, assume it's already decrypted if unwrap_from_pem succeeded.
+            let raw_priv = self.unwrap_pqc_der(&wrapped_priv, false);
+            match self.kem_algo.as_str() {
+                "ML-KEM-512" => {
+                    use fips203::ml_kem_512::*;
+                    let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                        .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+                    let ct = CipherText::try_from_bytes(self.kem_ct.clone().try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
+                        .map_err(|_| CryptoError::FileRead("Invalid CT".to_string()))?;
+                    sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decaps failed".to_string()))?.into_bytes().to_vec()
+                },
+                "ML-KEM-768" => {
+                    use fips203::ml_kem_768::*;
+                    let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                        .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+                    let ct = CipherText::try_from_bytes(self.kem_ct.clone().try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
+                        .map_err(|_| CryptoError::FileRead("Invalid CT".to_string()))?;
+                    sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decaps failed".to_string()))?.into_bytes().to_vec()
+                },
+                "ML-KEM-1024" => {
+                    use fips203::ml_kem_1024::*;
+                    let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                        .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+                    let ct = CipherText::try_from_bytes(self.kem_ct.clone().try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
+                        .map_err(|_| CryptoError::FileRead("Invalid CT".to_string()))?;
+                    sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decaps failed".to_string()))?.into_bytes().to_vec()
+                },
+                _ => return Err(CryptoError::Parameter(format!("Unsupported KEM: {}", self.kem_algo))),
+            }
         };
         
         self.shared_secret = ss_bytes;
@@ -442,17 +469,28 @@ impl CryptoStrategy for PqcStrategy {
         Ok(())
     }
 
-    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: Option<&str>, digest_algo: &str) -> Result<()> {
+    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: &mut Option<String>, digest_algo: &str) -> Result<()> {
         let priv_bytes = fs::read(priv_key_path)?;
         let pem_str = String::from_utf8_lossy(&priv_bytes);
 
         let wrapped_priv = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            provider.unwrap_raw(&pem_str, passphrase)?
+            provider.unwrap_raw(&pem_str, passphrase.as_deref())?
         } else {
+            *passphrase = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref())?;
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
-        let raw_priv = self.unwrap_pqc_der(&wrapped_priv, false);
+        
+        // Similarly for signing, if it was encrypted we need to decrypt it before unwrap_pqc_der
+        // or let backend handle it.
+        let raw_priv = if cfg!(feature = "backend-openssl") {
+             // For now, in Rust PQC we use fips crates which need raw bytes.
+             // We can use a temporary EVP_PKEY to export raw bytes if encrypted.
+             let exported = backend::extract_raw_private_key(&wrapped_priv, passphrase.as_deref())?;
+             self.unwrap_pqc_der(&exported, false)
+        } else {
+             self.unwrap_pqc_der(&wrapped_priv, false)
+        };
         
         self.sign_key_der = Some(raw_priv);
         self.digest_algo = digest_algo.to_string();

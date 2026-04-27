@@ -66,6 +66,13 @@ impl CryptoStrategy for HybridStrategy {
         self.pqc.generate_signing_key_pair(key_paths, passphrase)
     }
 
+    fn regenerate_public_key(&self, priv_path: &Path, pub_path: &Path, passphrase: &mut Option<String>) -> Result<()> {
+        // For hybrid, we typically only regenerate the PQC part for signing, 
+        // or we don't have a clear single path. 
+        // Here we delegate to PQC strategy as a default.
+        self.pqc.regenerate_public_key(priv_path, pub_path, passphrase)
+    }
+
     fn prepare_encryption(&mut self, key_paths: &HashMap<String, String>) -> Result<()> {
         let mut ecc_paths = key_paths.clone();
         let mut pqc_paths = key_paths.clone();
@@ -87,7 +94,7 @@ impl CryptoStrategy for HybridStrategy {
         use sha3::Sha3_256;
         let mut okm = vec![0u8; 32];
         let hk = Hkdf::<Sha3_256>::new(Some(&self.salt), &combined_ss);
-        hk.expand(b"hybrid-encryption", &mut okm).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        hk.expand(b"hybrid-encryption", &mut okm).map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
         self.encryption_key = okm;
         
         let ctx = crate::backend::new_encrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
@@ -95,7 +102,7 @@ impl CryptoStrategy for HybridStrategy {
         Ok(())
     }
 
-    fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: Option<&str>) -> Result<()> {
+    fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<String>) -> Result<()> {
         let mut ecc_paths = key_paths.clone();
         let mut pqc_paths = key_paths.clone();
         if let Some(p) = key_paths.get("user-ecdh-privkey") { ecc_paths.insert("user-privkey".to_string(), p.clone()); }
@@ -113,7 +120,7 @@ impl CryptoStrategy for HybridStrategy {
         use sha3::Sha3_256;
         let mut okm = vec![0u8; 32];
         let hk = Hkdf::<Sha3_256>::new(Some(&self.salt), &combined_ss);
-        hk.expand(b"hybrid-encryption", &mut okm).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        hk.expand(b"hybrid-encryption", &mut okm).map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
         self.encryption_key = okm;
         
         let ctx = crate::backend::new_decrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
@@ -156,7 +163,7 @@ impl CryptoStrategy for HybridStrategy {
         Ok(())
     }
 
-    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: Option<&str>, digest_algo: &str) -> Result<()> {
+    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: &mut Option<String>, digest_algo: &str) -> Result<()> {
         self.pqc.prepare_signing(priv_key_path, passphrase, digest_algo)
     }
 

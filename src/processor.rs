@@ -49,24 +49,33 @@ impl CryptoProcessor {
     }
 
     pub async fn process(&mut self, config: &CryptoConfig, progress_callback: Option<ProgressCallback>) -> Result<()> {
+        let mut passphrase = config.passphrase.clone();
         match config.operation {
             Operation::Encrypt => self.encrypt_file(config, progress_callback).await,
-            Operation::Decrypt => self.decrypt_file(config, progress_callback).await,
-            Operation::Sign => self.sign_file(config, progress_callback).await,
+            Operation::Decrypt => self.decrypt_file(config, &mut passphrase, progress_callback).await,
+            Operation::Sign => self.sign_file(config, &mut passphrase, progress_callback).await,
             Operation::Verify => self.verify_file(config, progress_callback).await,
             Operation::GenerateEncKey => self.generate_encryption_key_pair(config),
             Operation::GenerateSignKey => self.generate_signing_key_pair(config),
+            Operation::RegeneratePubKey => self.regenerate_pubkey(config, &mut passphrase),
             _ => Err(CryptoError::Parameter("Unsupported operation".to_string())),
         }
     }
 
-    pub async fn sign_file(&mut self, config: &CryptoConfig, progress_callback: Option<ProgressCallback>) -> Result<()> {
+    fn regenerate_pubkey(&self, config: &CryptoConfig, passphrase: &mut Option<String>) -> Result<()> {
+        let priv_path = config.regenerate_privkey_path.as_ref().ok_or(CryptoError::Parameter("No private key path".to_string()))?;
+        let pub_path = config.regenerate_pubkey_path.as_ref().ok_or(CryptoError::Parameter("No public key path".to_string()))?;
+        let strategy = self.strategy.as_ref().ok_or(CryptoError::Parameter("Strategy not initialized".to_string()))?;
+        strategy.regenerate_public_key(Path::new(priv_path), Path::new(pub_path), passphrase)
+    }
+
+    pub async fn sign_file(&mut self, config: &CryptoConfig, passphrase: &mut Option<String>, progress_callback: Option<ProgressCallback>) -> Result<()> {
         let input_path = config.input_files.first().ok_or(CryptoError::Parameter("No input file".to_string()))?;
         let signature_path = config.signature_file.as_ref().ok_or(CryptoError::Parameter("No signature output path".to_string()))?;
         let priv_key_path = config.signing_privkey.as_ref().ok_or(CryptoError::Parameter("No signing private key".to_string()))?;
 
         let mut strategy = self.strategy.take().ok_or(CryptoError::Parameter("Strategy not initialized".to_string()))?;
-        strategy.prepare_signing(Path::new(priv_key_path), config.passphrase.as_deref(), &config.digest_algo)?;
+        strategy.prepare_signing(Path::new(priv_key_path), passphrase, &config.digest_algo)?;
 
         let total_input_size = tokio::fs::metadata(input_path).await?.len();
         let input_path_str = input_path.to_string();
@@ -220,7 +229,7 @@ impl CryptoProcessor {
         }
     }
 
-    pub async fn decrypt_file(&mut self, config: &CryptoConfig, progress_callback: Option<ProgressCallback>) -> Result<()> {
+    pub async fn decrypt_file(&mut self, config: &CryptoConfig, passphrase: &mut Option<String>, progress_callback: Option<ProgressCallback>) -> Result<()> {
         let input_path = config.input_files.first().ok_or(CryptoError::Parameter("No input file".to_string()))?;
         let output_path = config.output_file.as_ref().ok_or(CryptoError::Parameter("No output file".to_string()))?;
 
@@ -249,7 +258,7 @@ impl CryptoProcessor {
         key_paths.insert("kem-algo".to_string(), config.pqc_kem_algo.clone());
         key_paths.insert("dsa-algo".to_string(), config.pqc_dsa_algo.clone());
         
-        strategy.prepare_decryption(&key_paths, config.passphrase.as_deref())?;
+        strategy.prepare_decryption(&key_paths, passphrase)?;
 
         let input_path_str = input_path.to_string();
         let output_path_str = output_path.to_string();

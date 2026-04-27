@@ -28,10 +28,14 @@ pub trait CryptoStrategy: Send + Sync {
     // Key Generation
     fn generate_encryption_key_pair(&self, key_paths: &HashMap<String, String>, passphrase: Option<&str>) -> Result<()>;
     fn generate_signing_key_pair(&self, key_paths: &HashMap<String, String>, passphrase: Option<&str>) -> Result<()>;
+    fn regenerate_public_key(&self, priv_path: &Path, pub_path: &Path, passphrase: &mut Option<String>) -> Result<()> {
+        let _ = (priv_path, pub_path, passphrase);
+        Err(crate::error::CryptoError::Parameter("Not implemented".to_string()))
+    }
 
     // Encryption / Decryption Pipeline
     fn prepare_encryption(&mut self, key_paths: &HashMap<String, String>) -> Result<()>;
-    fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: Option<&str>) -> Result<()>;
+    fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<String>) -> Result<()>;
     
     fn encrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>>;
     fn decrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>>;
@@ -40,7 +44,7 @@ pub trait CryptoStrategy: Send + Sync {
     fn finalize_decryption(&mut self, tag: &[u8]) -> Result<()>;
 
     // Signing / Verification
-    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: Option<&str>, digest_algo: &str) -> Result<()>;
+    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: &mut Option<String>, digest_algo: &str) -> Result<()>;
     fn prepare_verification(&mut self, pub_key_path: &Path, digest_algo: &str) -> Result<()>;
     
     fn update_hash(&mut self, data: &[u8]) -> Result<()>;

@@ -244,7 +244,7 @@ impl HashBackend for RustCryptoHash {
         }
     }
 
-    fn init_sign(&mut self, _key_der: &[u8]) -> Result<()> {
+    fn init_sign(&mut self, _key_der: &[u8], _passphrase: Option<&str>) -> Result<()> {
         Ok(())
     }
 
@@ -253,12 +253,12 @@ impl HashBackend for RustCryptoHash {
     }
 }
 
-pub fn generate_ecc_key_pair(curve: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn generate_ecc_key_pair(curve_name: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     #[cfg(feature = "backend-rustcrypto")]
     {
         use rc_internal::*;
-        if curve != "prime256v1" {
-            return Err(CryptoError::Parameter(format!("Unsupported curve: {}", curve)));
+        if curve_name != "prime256v1" {
+            return Err(CryptoError::Parameter(format!("Unsupported curve: {}", curve_name)));
         }
         let secret_key = SecretKey::random(&mut OsRng);
         let public_key = secret_key.public_key();
@@ -270,12 +270,12 @@ pub fn generate_ecc_key_pair(curve: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
     {
-        let _ = curve;
+        let _ = curve_name;
         Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string()))
     }
 }
 
-pub fn ecc_dh(my_priv_der: &[u8], peer_pub_der: &[u8]) -> Result<Vec<u8>> {
+pub fn ecc_dh(my_priv_der: &[u8], peer_pub_der: &[u8], _passphrase: Option<&str>) -> Result<Vec<u8>> {
     #[cfg(feature = "backend-rustcrypto")]
     {
         use rc_internal::*;
@@ -287,9 +287,33 @@ pub fn ecc_dh(my_priv_der: &[u8], peer_pub_der: &[u8]) -> Result<Vec<u8>> {
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
     {
-        let _ = (my_priv_der, peer_pub_der);
+        let _ = (my_priv_der, peer_pub_der, _passphrase);
         Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string()))
     }
+}
+
+pub fn extract_public_key(priv_der: &[u8], _passphrase: Option<&str>) -> Result<Vec<u8>> {
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        use rc_internal::*;
+        let sk = SecretKey::from_pkcs8_der(priv_der).or_else(|_| SecretKey::from_sec1_der(priv_der))
+            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let pk = sk.public_key();
+        pk.to_public_key_der().map_err(|e| CryptoError::OpenSSL(e.to_string())).map(|d| d.as_bytes().to_vec())
+    }
+    #[cfg(not(feature = "backend-rustcrypto"))]
+    {
+        let _ = (priv_der, _passphrase);
+        Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string()))
+    }
+}
+
+pub fn pqc_decap(_priv_der: &[u8], _kem_ct: &[u8], _passphrase: Option<&str>) -> Result<Vec<u8>> {
+    Err(CryptoError::Parameter("PQC not implemented in RustCrypto backend".to_string()))
+}
+
+pub fn extract_raw_private_key(priv_der: &[u8], _passphrase: Option<&str>) -> Result<Vec<u8>> {
+    Ok(priv_der.to_vec())
 }
 
 pub fn new_encrypt(cipher: &str, key: &[u8], iv: &[u8]) -> Result<Aead> {
