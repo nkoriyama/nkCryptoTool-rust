@@ -65,6 +65,29 @@ cargo build --release --no-default-features --features backend-rustcrypto
 * 検証:
   `nk-crypto-tool --mode ecc --verify --signing-pubkey <pub.key> --signature <file.sig> <input.txt>`
 
+## **鍵の互換性と標準フォーマット**
+
+本ツールで生成される鍵ペアは、異なる実装（C++版/Rust版）や異なるバックエンド（OpenSSL/WolfSSL/RustCrypto）の間で、変換なしにそのまま相互利用可能です。
+
+### **1. ECC (楕円曲線暗号)**
+*   **構造**: NIST P-256 (prime256v1) 曲線を使用。
+*   **形式**: 業界標準の **PEM (Privacy-Enhanced Mail)** 形式で保存。
+    *   **秘密鍵**: PKCS#8 構造（TPM保護なしの場合）
+    *   **公開鍵**: SubjectPublicKeyInfo (SPKI) 構造
+*   これにより、`ssh-keygen` や `openssl` コマンド等、標準的なツールとの高い親和性を確保しています。
+
+### **2. PQC (耐量子計算機暗号)**
+*   **アルゴリズム**: NIST標準の ML-KEM (Kyber) および ML-DSA (Dilithium) を採用。
+*   **互換性の仕組み**: 
+    *   最新のドラフトに基づいた **ASN.1 構造** を共通採用しています。
+    *   **OID (Object Identifier)**: 全実装で以下の標準/共通識別子を使用し、メタデータを識別します。
+        *   ML-KEM-768: `1.3.6.1.4.1.2.267.12.6.2` (等価)
+        *   ML-DSA-65: `1.3.6.1.4.1.2.267.12.8.5` (等価)
+    *   バイナリレベルで同一のラップ処理を行うため、Rust版で生成した PQC 鍵を C++版のバックエンドで直接読み込むことが可能です。
+
+### **3. TPM 保護**
+*   秘密鍵を TPM 2.0 で保護する場合、独自の **TPM Wrapped Blob** 形式（PEMラップ）を採用していますが、このパースロジックも C++/Rust 間で統一されています。
+
 ## **パフォーマンス**
 
 9GB の ISO ファイルを用いたベンチマーク結果（Gen4 NVMe 環境）。バックエンドによる性能差は極めて小さく、どちらもディスクI/Oの限界に近い性能を発揮します。
