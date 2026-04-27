@@ -80,9 +80,9 @@ cargo build --release --no-default-features --features backend-rustcrypto
 *   **アルゴリズム**: NIST標準の ML-KEM (Kyber) および ML-DSA (Dilithium) を採用。
 *   **互換性の仕組み**: 
     *   最新のドラフトに基づいた **ASN.1 構造** を共通採用しています。
-    *   **OID (Object Identifier)**: 全実装で以下の標準/共通識別子を使用し、メタデータを識別します。
-        *   ML-KEM-768: `1.3.6.1.4.1.2.267.12.6.2` (等価)
-        *   ML-DSA-65: `1.3.6.1.4.1.2.267.12.8.5` (等価)
+    *   **OID (Object Identifier)**: 全実装で以下の標準/共通識別子を使用し、メタデータを識別します（出典: **NIST CSOR**, **FIPS 203/204**）。
+        *   ML-KEM-768: `2.16.840.1.101.3.4.4.2` (id-alg-ml-kem-768)
+        *   ML-DSA-65: `2.16.840.1.101.3.4.3.18` (id-ml-dsa-65)
     *   バイナリレベルで同一のラップ処理を行うため、Rust版で生成した PQC 鍵を C++版のバックエンドで直接読み込むことが可能です。
 
 ### **3. TPM 保護**
