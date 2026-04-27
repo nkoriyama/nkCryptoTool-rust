@@ -66,6 +66,10 @@ pub fn extract_public_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<V
     crypto_impl::extract_public_key(priv_der, passphrase)
 }
 
+pub fn pqc_encap(peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    crypto_impl::pqc_encap(peer_pub_der)
+}
+
 pub fn pqc_decap(priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
     crypto_impl::pqc_decap(priv_der, kem_ct, passphrase)
 }
