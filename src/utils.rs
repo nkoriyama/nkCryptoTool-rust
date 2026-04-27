@@ -88,18 +88,43 @@ pub fn wrap_to_pem(data: &[u8], label: &str) -> String {
 
 pub fn unwrap_from_pem(pem: &str, label: &str) -> Result<Vec<u8>> {
     let begin = format!("-----BEGIN {}-----", label);
+    let begin_enc = format!("-----BEGIN ENCRYPTED {}-----", label);
     let end = format!("-----END {}-----", label);
-    
-    let start_idx = pem.find(&begin).ok_or(CryptoError::Parameter("Missing PEM header".to_string()))? + begin.len();
-    let end_idx = pem.find(&end).ok_or(CryptoError::Parameter("Missing PEM footer".to_string()))?;
-    
+    let end_enc = format!("-----END ENCRYPTED {}-----", label);
+
+    let (start_idx, actual_end) = if let Some(idx) = pem.find(&begin) {
+        (idx + begin.len(), end)
+    } else if let Some(idx) = pem.find(&begin_enc) {
+        (idx + begin_enc.len(), end_enc)
+    } else {
+        return Err(CryptoError::Parameter(format!("Missing PEM header for {}", label)));
+    };
+
+    let end_idx = pem.find(&actual_end).ok_or(CryptoError::Parameter(format!("Missing PEM footer for {}", label)))?;
+
     let b64 = pem[start_idx..end_idx]
         .replace('\n', "")
         .replace('\r', "")
         .replace(' ', "");
-        
-    BASE64.decode(b64).map_err(|e| CryptoError::Parameter(format!("Invalid base64: {}", e)))
+
+    BASE64.decode(b64).map_err(|e| CryptoError::Parameter(format!("Base64 decode error: {}", e)))
 }
+
+pub fn is_encrypted_pem(pem: &str) -> bool {
+    pem.contains("ENCRYPTED")
+}
+
+pub fn get_passphrase_if_needed(content: &str, provided_passphrase: Option<&str>) -> Result<Option<String>> {
+    if let Some(pass) = provided_passphrase {
+        return Ok(Some(pass.to_string()));
+    }
+    if is_encrypted_pem(content) {
+        let pass = get_masked_passphrase()?;
+        return Ok(Some(pass));
+    }
+    Ok(None)
+}
+
 
 #[cfg(test)]
 mod tests {

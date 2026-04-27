@@ -38,7 +38,7 @@ pub trait HashBackend {
     fn update(&mut self, data: &[u8]) -> Result<()>;
     fn finalize_sign(&mut self, key_der: &[u8]) -> Result<Vec<u8>>;
     fn finalize_verify(&mut self, key_der: &[u8], signature: &[u8]) -> Result<bool>;
-    fn init_sign(&mut self, key_der: &[u8]) -> Result<()>;
+    fn init_sign(&mut self, key_der: &[u8], passphrase: Option<&str>) -> Result<()>;
     fn init_verify(&mut self, key_der: &[u8]) -> Result<()>;
 }
 
@@ -58,6 +58,18 @@ pub fn generate_ecc_key_pair(curve: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     crypto_impl::generate_ecc_key_pair(curve)
 }
 
-pub fn ecc_dh(my_priv_der: &[u8], peer_pub_der: &[u8]) -> Result<Vec<u8>> {
-    crypto_impl::ecc_dh(my_priv_der, peer_pub_der)
+pub fn ecc_dh(my_priv_der: &[u8], peer_pub_der: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+    crypto_impl::ecc_dh(my_priv_der, peer_pub_der, passphrase)
+}
+
+pub fn extract_public_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+    crypto_impl::extract_public_key(priv_der, passphrase)
+}
+
+pub fn pqc_decap(priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+    crypto_impl::pqc_decap(priv_der, kem_ct, passphrase)
+}
+
+pub fn extract_raw_private_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+    crypto_impl::extract_raw_private_key(priv_der, passphrase)
 }

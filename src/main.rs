@@ -101,7 +101,15 @@ async fn main() -> anyhow::Result<()> {
         else if args.gen_sign_key { Operation::GenerateSignKey }
         else { anyhow::bail!("No operation specified") };
 
-    let passphrase = args.passphrase.filter(|s| !s.is_empty());
+    // Initial passphrase from CLI args
+    let mut passphrase = args.passphrase.filter(|s| !s.is_empty());
+
+    // If it's a key generation operation and no passphrase was provided, 
+    // we should ask for one by default (unless --no-passphrase is set).
+    if (operation == Operation::GenerateEncKey || operation == Operation::GenerateSignKey) 
+        && passphrase.is_none() && !args.no_passphrase {
+        passphrase = Some(nk_crypto_tool::utils::get_and_verify_passphrase("Generate new key pair")?);
+    }
 
     let mut config = CryptoConfig::default();
     config.mode = args.mode;
@@ -123,6 +131,9 @@ async fn main() -> anyhow::Result<()> {
     config.pqc_dsa_algo = args.dsa_algo;
     config.passphrase = passphrase;
     config.use_tpm = args.use_tpm;
+
+    // Add paths for regenerate-pubkey (if you decide to expose it in CLI)
+    // For now, it's used internally or for interop.
 
     let mut processor = match config.mode {
         CryptoMode::ECC => CryptoProcessor::new(CryptoMode::ECC),
