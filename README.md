@@ -152,9 +152,13 @@ packet-beta
 
 ## **相互運用性 (Interoperability)**
 
-* **C++版との互換性**: 既存の `nkCryptoTool` (C++) とバイナリレベルで完全な互換性があります。
-* **クロスバックエンド**: OpenSSL版で暗号化したファイルをRustCrypto版で復号（およびその逆）が可能です。
-* **標準フォーマット**: 鍵は PKCS#8/SPKI、署名は ASN.1 DER 形式を採用しています。
+本プロジェクトは、異なる環境間での「完全な透明性」を目標に設計されています。
+
+*   **実装・バックエンド間の完全互換**: C++版（OpenSSL/wolfSSL）と Rust版（OpenSSL/RustCrypto）は、バイナリレベルで 100% 互換です。
+*   **鍵の交換可能性 (Key Interchangeability)**: いかなるバックエンドで生成された鍵ペア（ECC/PQC/Hybrid）も、他のすべてのバックエンドで**変換なしにそのまま利用可能**です。
+    *   例: C++ wolfSSL版で生成した PQC 秘密鍵を、Rust 純 Rust (RustCrypto) 版でロードして復号できます。
+*   **クロスプラットフォーム復号**: OpenSSL版で暗号化したファイルを RustCrypto版で復号（およびその逆）が可能です。
+*   **標準フォーマットの採用**: 鍵は PKCS#8/SPKI、署名は ASN.1 DER 形式、暗号化は標準的な AES-256-GCM (1 file, 1 tag) を採用しており、標準的な `openssl` コマンドラインツール等とも高い親和性があります。
 
 ## **ライセンス**
 
