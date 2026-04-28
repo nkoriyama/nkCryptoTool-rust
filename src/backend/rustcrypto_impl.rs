@@ -508,29 +508,29 @@ pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> 
     {
         use fips203::traits::{Encaps, SerDes};
         let raw_pub = unwrap_pqc_der_internal(peer_pub_der, true);
-        match algo {
-            "ML-KEM-512" => {
-                use fips203::ml_kem_512::EncapsKey;
-                let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
-                    .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
-                let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
-                Ok((ss.into_bytes().to_vec(), ct.into_bytes().to_vec()))
-            },
-            "ML-KEM-768" => {
-                use fips203::ml_kem_768::EncapsKey;
-                let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
-                    .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
-                let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
-                Ok((ss.into_bytes().to_vec(), ct.into_bytes().to_vec()))
-            },
-            "ML-KEM-1024" => {
-                use fips203::ml_kem_1024::EncapsKey;
-                let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
-                    .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
-                let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
-                Ok((ss.into_bytes().to_vec(), ct.into_bytes().to_vec()))
-            },
-            _ => Err(CryptoError::Parameter(format!("Unsupported KEM: {}", algo))),
+        let actual_len = raw_pub.len();
+        
+        // Match algorithm based on key size if the provided algo doesn't match
+        if actual_len == 800 {
+            use fips203::ml_kem_512::EncapsKey;
+            let pk = EncapsKey::try_from_bytes(raw_pub.try_into().unwrap())
+                .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
+            let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
+            Ok((ss.into_bytes().to_vec(), ct.into_bytes().to_vec()))
+        } else if actual_len == 1184 {
+            use fips203::ml_kem_768::EncapsKey;
+            let pk = EncapsKey::try_from_bytes(raw_pub.try_into().unwrap())
+                .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
+            let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
+            Ok((ss.into_bytes().to_vec(), ct.into_bytes().to_vec()))
+        } else if actual_len == 1568 {
+            use fips203::ml_kem_1024::EncapsKey;
+            let pk = EncapsKey::try_from_bytes(raw_pub.try_into().unwrap())
+                .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
+            let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
+            Ok((ss.into_bytes().to_vec(), ct.into_bytes().to_vec()))
+        } else {
+            Err(CryptoError::Parameter(format!("Unsupported or mismatched KEM key size: {}", actual_len)))
         }
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
@@ -542,38 +542,34 @@ pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option<
     {
         let _ = passphrase;
         let raw_priv = unwrap_pqc_der_internal(priv_der, false);
-        match algo {
-            "ML-KEM-512" => {
-                use fips203::ml_kem_512::{DecapsKey, CipherText};
-                let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
-                    .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
-                let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
-                    .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
-                let ss = sk.try_decaps(&ct)
-                    .map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
-                Ok(ss.into_bytes().to_vec())
-            },
-            "ML-KEM-768" => {
-                use fips203::ml_kem_768::{DecapsKey, CipherText};
-                let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
-                    .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
-                let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
-                    .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
-                let ss = sk.try_decaps(&ct)
-                    .map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
-                Ok(ss.into_bytes().to_vec())
-            },
-            "ML-KEM-1024" => {
-                use fips203::ml_kem_1024::{DecapsKey, CipherText};
-                let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
-                    .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
-                let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
-                    .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
-                let ss = sk.try_decaps(&ct)
-                    .map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
-                Ok(ss.into_bytes().to_vec())
-            },
-            _ => Err(CryptoError::Parameter(format!("Unsupported KEM: {}", algo))),
+        let actual_len = raw_priv.len();
+
+        if actual_len == 1632 {
+            use fips203::ml_kem_512::{DecapsKey, CipherText};
+            let sk = DecapsKey::try_from_bytes(raw_priv.try_into().unwrap())
+                .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+            let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
+                .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
+            let ss = sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
+            Ok(ss.into_bytes().to_vec())
+        } else if actual_len == 2400 {
+            use fips203::ml_kem_768::{DecapsKey, CipherText};
+            let sk = DecapsKey::try_from_bytes(raw_priv.try_into().unwrap())
+                .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+            let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
+                .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
+            let ss = sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
+            Ok(ss.into_bytes().to_vec())
+        } else if actual_len == 3168 {
+            use fips203::ml_kem_1024::{DecapsKey, CipherText};
+            let sk = DecapsKey::try_from_bytes(raw_priv.try_into().unwrap())
+                .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+            let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
+                .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
+            let ss = sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
+            Ok(ss.into_bytes().to_vec())
+        } else {
+             Err(CryptoError::Parameter(format!("Unsupported or mismatched KEM key size: {}", actual_len)))
         }
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
