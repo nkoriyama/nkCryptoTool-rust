@@ -2,11 +2,5 @@
 test_keys/
 pqc_keys/
 hybrid_keys/
-*.bin
-test_input*.txt
-test_decrypted*.txt
-*.enc
-*.dec
-*.bin
 bench_keys/
 /target_rustcrypto
