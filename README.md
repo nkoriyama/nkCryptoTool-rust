@@ -110,12 +110,20 @@ cargo build --release --no-default-features --features backend-rustcrypto
 
 ## **パフォーマンス**
 
-9GB の ISO ファイルを用いたベンチマーク結果（Gen4 NVMe 環境）。バックエンドによる性能差は極めて小さく、どちらもディスクI/Oの限界に近い性能を発揮します。
+2.0 GiB の大容量ファイルを用いた最新のベンチマーク結果（Gen4 NVMe / x86_64 環境）。
+Tokio による非同期 I/O パイプラインにより、ディスク I/O の限界に近い性能を発揮します。
 
-| 構成 | 暗号化速度 | 復号速度 |
-| :--- | :--- | :--- |
-| **OpenSSL (Default)** | **~2.5 GB/s** | **~2.7 GB/s** |
-| **RustCrypto (Pure Rust)** | **~2.6 GB/s** | **~2.8 GB/s** |
+| 実装 | バックエンド | モード | 暗号化速度 | 復号速度 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Rust** | **OpenSSL** | **Hybrid (PQC+ECC)** | **~3.4 GiB/s** | **~3.8 GiB/s** |
+| **Rust** | **OpenSSL** | ECC (P-256) | ~3.4 GiB/s | ~3.7 GiB/s |
+| **Rust** | **RustCrypto** | ECC (P-256) | ~1.6 GiB/s | ~1.9 GiB/s |
+| C++ | OpenSSL | Hybrid (PQC+ECC) | ~3.0 GiB/s | ~2.9 GiB/s |
+| C++ | wolfSSL | Hybrid (PQC+ECC) | ~2.1 GiB/s | ~2.0 GiB/s |
+
+*   **OpenSSL バックエンド**: 暗号化エンジンに OpenSSL の高度なアセンブリ最適化を使用し、最も高いスループットを実現します。
+*   **RustCrypto バックエンド**: 外部依存のない純 Rust 実装。最適化により wolfSSL に迫る 1.6 GiB/s 超を達成しています。
+*   **非同期パイプライン**: Rust 版では I/O と暗号化を分離して並列実行するため、特に巨大ファイルにおいて C++ 版を上回る効率を実現しています。
 
 ## **統一ヘッダーフォーマット (Unified Header Format)**
 

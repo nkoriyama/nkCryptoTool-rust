@@ -105,14 +105,41 @@ impl AeadBackend for RustCryptoAead {
         #[cfg(feature = "backend-rustcrypto")]
         {
             use rc_internal::*;
-            let ctr = self.ctr.as_mut().ok_or(CryptoError::Parameter("CTR not init".to_string()))?;
             let ghash = self.ghash.as_mut().ok_or(CryptoError::Parameter("GHASH not init".to_string()))?;
+            let ctr = self.ctr.as_mut().ok_or(CryptoError::Parameter("CTR not init".to_string()))?;
             
-            output[..input.len()].copy_from_slice(input);
-            ctr.apply_keystream(&mut output[..input.len()]);
+            // Current manual interleave for speed
+            // We use 128 bytes (8 blocks) chunks to keep everything in registers/L1
+            let mut pos = 0;
+            const CHUNK_SIZE: usize = 128;
             
-            let aad_or_cipher = if self._is_encrypt { &output[..input.len()] } else { input };
-            ghash.update_padded(aad_or_cipher);
+            while pos + CHUNK_SIZE <= input.len() {
+                let in_chunk = &input[pos..pos + CHUNK_SIZE];
+                let out_chunk = &mut output[pos..pos + CHUNK_SIZE];
+                
+                // 1. CTR processing and 2. GHASH update in the same logical flow
+                // Note: ctr.apply_keystream is already quite fast, but we can't 
+                // easily interleave it without accessing low-level CTR state.
+                // However, doing them in small chunks already helps with L1 cache.
+                out_chunk.copy_from_slice(in_chunk);
+                ctr.apply_keystream(out_chunk);
+                
+                let aad_or_cipher = if self._is_encrypt { out_chunk } else { in_chunk };
+                ghash.update_padded(aad_or_cipher);
+                
+                pos += CHUNK_SIZE;
+            }
+            
+            // Handle remaining bytes
+            if pos < input.len() {
+                let in_rem = &input[pos..];
+                let out_rem = &mut output[pos..];
+                out_rem.copy_from_slice(in_rem);
+                ctr.apply_keystream(out_rem);
+                
+                let aad_or_cipher = if self._is_encrypt { out_rem } else { in_rem };
+                ghash.update_padded(aad_or_cipher);
+            }
             
             self._data_len += input.len() as u64;
             Ok(input.len())
