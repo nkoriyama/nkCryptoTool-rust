@@ -74,12 +74,6 @@ struct Args {
     dsa_algo: String,
 
     #[arg(long)]
-    passphrase: Option<String>,
-
-    #[arg(long)]
-    no_passphrase: bool,
-
-    #[arg(long)]
     use_tpm: bool,
 
     #[arg(num_args = 1..)]
@@ -91,6 +85,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    if std::is_x86_feature_detected!("aes") {
+        println!("AES-NI is available!");
+    }
+
     let args = Args::parse();
 
     let operation = if args.encrypt { Operation::Encrypt }
@@ -101,13 +100,12 @@ async fn main() -> anyhow::Result<()> {
         else if args.gen_sign_key { Operation::GenerateSignKey }
         else { anyhow::bail!("No operation specified") };
 
-    // Initial passphrase from CLI args
-    let mut passphrase = args.passphrase.filter(|s| !s.is_empty());
+    // Initial passphrase from CLI args is now removed for security.
+    let mut passphrase = None;
 
-    // If it's a key generation operation and no passphrase was provided, 
-    // we should ask for one by default (unless --no-passphrase is set).
-    if (operation == Operation::GenerateEncKey || operation == Operation::GenerateSignKey) 
-        && passphrase.is_none() && !args.no_passphrase {
+    // If it's a key generation operation, we should ask for one by default 
+    // to protect the new private key.
+    if operation == Operation::GenerateEncKey || operation == Operation::GenerateSignKey {
         passphrase = Some(nk_crypto_tool::utils::get_and_verify_passphrase("Generate new key pair")?);
     }
 

@@ -296,7 +296,64 @@ pub fn extract_public_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<V
     { let _ = (priv_der, passphrase); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
 }
 
-pub fn pqc_encap(peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn pqc_keygen_kem(_algo: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    Err(CryptoError::Parameter("PQC keygen not supported in this OpenSSL version".to_string()))
+}
+
+pub fn pqc_keygen_dsa(_algo: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    Err(CryptoError::Parameter("PQC keygen not supported in this OpenSSL version".to_string()))
+}
+
+pub fn pqc_sign(_algo: &str, priv_der: &[u8], message: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+    #[cfg(feature = "backend-openssl")]
+    {
+        let pkey = load_private_key_robust(priv_der, passphrase)?;
+        let ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        // PQC DSA in OpenSSL uses DigestSign with NULL digest
+        unsafe {
+            if ffi::EVP_DigestSignInit(ctx.as_ptr(), ptr::null_mut(), ptr::null(), ptr::null_mut(), pkey.as_ptr()) != 1 {
+                return Err(CryptoError::OpenSSL("EVP_DigestSignInit failed".to_string()));
+            }
+        }
+        let mut sig_len = 0;
+        unsafe {
+            if ffi::EVP_DigestSign(ctx.as_ptr(), ptr::null_mut(), &mut sig_len, message.as_ptr(), message.len()) != 1 {
+                return Err(CryptoError::OpenSSL("EVP_DigestSign (length) failed".to_string()));
+            }
+        }
+        let mut sig = vec![0u8; sig_len as usize];
+        unsafe {
+            if ffi::EVP_DigestSign(ctx.as_ptr(), sig.as_mut_ptr(), &mut sig_len, message.as_ptr(), message.len()) != 1 {
+                return Err(CryptoError::OpenSSL("EVP_DigestSign failed".to_string()));
+            }
+        }
+        sig.truncate(sig_len as usize);
+        Ok(sig)
+    }
+    #[cfg(not(feature = "backend-openssl"))]
+    { let _ = (priv_der, message, passphrase, _algo); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
+}
+
+pub fn pqc_verify(_algo: &str, pub_der: &[u8], message: &[u8], signature: &[u8]) -> Result<bool> {
+    #[cfg(feature = "backend-openssl")]
+    {
+        let pkey = load_public_key_robust(pub_der)?;
+        let ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        unsafe {
+            if ffi::EVP_DigestVerifyInit(ctx.as_ptr(), ptr::null_mut(), ptr::null(), ptr::null_mut(), pkey.as_ptr()) != 1 {
+                return Err(CryptoError::OpenSSL("EVP_DigestVerifyInit failed".to_string()));
+            }
+            let r = ffi::EVP_DigestVerify(ctx.as_ptr(), signature.as_ptr(), signature.len(), message.as_ptr(), message.len());
+            if r == 1 { Ok(true) }
+            else if r == 0 { Ok(false) }
+            else { Err(CryptoError::SignatureVerification) }
+        }
+    }
+    #[cfg(not(feature = "backend-openssl"))]
+    { let _ = (pub_der, message, signature, _algo); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
+}
+
+pub fn pqc_encap(_algo: &str, peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     #[cfg(feature = "backend-openssl")]
     {
         let pkey = load_public_key_robust(peer_pub_der)?;
@@ -326,10 +383,10 @@ pub fn pqc_encap(peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         }
     }
     #[cfg(not(feature = "backend-openssl"))]
-    { let _ = peer_pub_der; Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
+    { let _ = (peer_pub_der, _algo); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
 }
 
-pub fn pqc_decap(priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+pub fn pqc_decap(_algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
     #[cfg(feature = "backend-openssl")]
     {
         let pkey = load_private_key_robust(priv_der, passphrase)?;
@@ -356,7 +413,7 @@ pub fn pqc_decap(priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Re
         }
     }
     #[cfg(not(feature = "backend-openssl"))]
-    { let _ = (priv_der, kem_ct, passphrase); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
+    { let _ = (priv_der, kem_ct, passphrase, _algo); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
 }
 
 pub fn extract_raw_private_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {

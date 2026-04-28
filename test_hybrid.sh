@@ -8,7 +8,7 @@ rm -rf hybrid_keys
 mkdir hybrid_keys
 
 echo "1. Generating Hybrid encryption keys..."
-$EXE --mode hybrid --gen-enc-key --key-dir hybrid_keys --passphrase "testpass"
+NK_PASSPHRASE="testpass" $EXE --mode hybrid --gen-enc-key --key-dir hybrid_keys
 
 echo "2. Creating a test file..."
 echo "Hello from Rust Hybrid nkCryptoTool!" > test_input_hybrid.txt
@@ -17,14 +17,13 @@ echo "3. Encrypting the test file..."
 $EXE --mode hybrid --encrypt \
     --recipient-mlkem-pubkey hybrid_keys/public_enc_hybrid_mlkem.key \
     --recipient-ecdh-pubkey hybrid_keys/public_enc_hybrid_ecdh.key \
-    --output test_encrypted_hybrid.bin test_input_hybrid.txt
+    --output-file test_encrypted_hybrid.bin test_input_hybrid.txt
 
 echo "4. Decrypting the test file..."
-$EXE --mode hybrid --decrypt \
+NK_PASSPHRASE="testpass" $EXE --mode hybrid --decrypt \
     --user-mlkem-privkey hybrid_keys/private_enc_hybrid_mlkem.key \
     --user-ecdh-privkey hybrid_keys/private_enc_hybrid_ecdh.key \
-    --passphrase "testpass" \
-    --output test_decrypted_hybrid.txt test_encrypted_hybrid.bin
+    --output-file test_decrypted_hybrid.txt test_encrypted_hybrid.bin
 
 echo "5. Verifying the result..."
 diff test_input_hybrid.txt test_decrypted_hybrid.txt

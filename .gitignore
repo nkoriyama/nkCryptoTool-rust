@@ -9,3 +9,4 @@ test_decrypted*.txt
 *.dec
 *.bin
 bench_keys/
+/target_rustcrypto

@@ -196,18 +196,44 @@ impl KeyProvider for TpmKeyProvider {
 
         let mut auth_arg = sess_arg;
         let mut pass_bytes = None;
+
         if let Some(pass) = passphrase {
             if !pass.is_empty() {
                 auth_arg += "+-";
                 pass_bytes = Some(pass.as_bytes());
             }
+        } else {
+            // Smart prompt: try without password first, but tpm2_unseal will fail if needed.
+            // Better approach: Since we don't know if the TPM key has a password, 
+            // we can either catch the error or ask if it fails.
+            // For now, let's follow the pattern of utils.rs and ask if it's missing.
+            // However, TPM blobs don't explicitly say "ENCRYPTED" in a standard way like PEM.
+            // We'll attempt unseal, and if it fails with an auth error, we could retry.
+            // But to keep it simple and consistent with the "smart prompt" goal:
+            // We'll check if we can get a hint, or just allow the user to provide it.
         }
 
-        self.run_tpm_cmd(&[
+        let res = self.run_tpm_cmd(&[
             "tpm2_unseal", "-c", kctx_path,
             "-o", aes_path_str,
             "-p", &auth_arg, "-Q"
-        ], pass_bytes)?;
+        ], pass_bytes);
+
+        if res.is_err() && passphrase.is_none() {
+            // If failed and no passphrase was provided, try asking for one
+            if let Ok(pass) = crate::utils::get_masked_passphrase() {
+                let retry_auth_arg = format!("session:{}+-", sess_path);
+                self.run_tpm_cmd(&[
+                    "tpm2_unseal", "-c", kctx_path,
+                    "-o", aes_path_str,
+                    "-p", &retry_auth_arg, "-Q"
+                ], Some(pass.as_bytes()))?;
+            } else {
+                return Err(res.err().unwrap());
+            }
+        } else {
+            res?;
+        }
 
         Command::new("tpm2_flushcontext").arg(sess_path).env("TCTI", "device:/dev/tpmrm0").status().ok();
 
