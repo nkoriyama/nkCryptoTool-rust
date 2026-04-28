@@ -8,6 +8,11 @@ use crate::error::{CryptoError, Result};
 use crate::backend::{AeadBackend, HashBackend};
 
 #[cfg(feature = "backend-rustcrypto")]
+use fips203::traits::{KeyGen as _, SerDes as _, Decaps as _};
+#[cfg(feature = "backend-rustcrypto")]
+use fips204::traits::{KeyGen as _, SerDes as _, Signer as _, Verifier as _};
+
+#[cfg(feature = "backend-rustcrypto")]
 mod rc_internal {
     pub use p256::{PublicKey, SecretKey};
     pub use p256::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
@@ -308,8 +313,244 @@ pub fn extract_public_key(priv_der: &[u8], _passphrase: Option<&str>) -> Result<
     }
 }
 
-pub fn pqc_decap(_priv_der: &[u8], _kem_ct: &[u8], _passphrase: Option<&str>) -> Result<Vec<u8>> {
-    Err(CryptoError::Parameter("PQC not implemented in RustCrypto backend".to_string()))
+#[cfg(feature = "backend-rustcrypto")]
+fn read_asn1_len(der: &[u8], pos: &mut usize) -> usize {
+    if *pos >= der.len() { return 0; }
+    let b = der[*pos];
+    *pos += 1;
+    if b < 128 { return b as usize; }
+    let n = (b & 0x7F) as usize;
+    if *pos + n > der.len() || n > 4 { return 0; }
+    let mut res = 0usize;
+    for _ in 0..n {
+        res = (res << 8) | (der[*pos] as usize);
+        *pos += 1;
+    }
+    res
+}
+
+#[cfg(feature = "backend-rustcrypto")]
+fn unwrap_pqc_der_internal(der: &[u8], is_public: bool) -> Vec<u8> {
+    if der.is_empty() || der[0] != 0x30 { return der.to_vec(); }
+    let mut best = Vec::new();
+    for i in 0..der.len().saturating_sub(4) {
+        let tag = der[i];
+        if tag == 0x04 || (is_public && tag == 0x03) {
+            let mut pos = i + 1;
+            let o_len = read_asn1_len(der, &mut pos);
+            if o_len > 0 && pos + o_len <= der.len() {
+                let mut actual_len = o_len;
+                let mut data_start = pos;
+                if tag == 0x03 {
+                    if actual_len > 1 && der[data_start] == 0x00 { data_start += 1; actual_len -= 1; }
+                    else { continue; }
+                }
+                if [1632, 2400, 3168, 2560, 4032, 4896, 800, 1184, 1568, 1312, 1952, 2592].contains(&actual_len) {
+                    return der[data_start..data_start + actual_len].to_vec();
+                }
+                if actual_len > 32 && der[data_start] == 0x30 {
+                    let inner = unwrap_pqc_der_internal(&der[data_start..data_start + actual_len], is_public);
+                    if [1632, 2400, 3168, 2560, 4032, 4896, 800, 1184, 1568, 1312, 1952, 2592].contains(&inner.len()) { return inner; }
+                }
+                if actual_len > best.len() { best = der[data_start..data_start + actual_len].to_vec(); }
+            }
+        }
+    }
+    if best.is_empty() { der.to_vec() } else { best }
+}
+
+pub fn pqc_keygen_kem(algo: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        use rc_internal::OsRng;
+        use rand_core::RngCore;
+        let mut d = [0u8; 32];
+        let mut z = [0u8; 32];
+        OsRng.fill_bytes(&mut d);
+        OsRng.fill_bytes(&mut z);
+        match algo {
+            "ML-KEM-512" => {
+                use fips203::ml_kem_512::KG;
+                let (pk, sk) = KG::keygen_from_seed(d, z);
+                Ok((sk.into_bytes().to_vec(), pk.into_bytes().to_vec()))
+            },
+            "ML-KEM-768" => {
+                use fips203::ml_kem_768::KG;
+                let (pk, sk) = KG::keygen_from_seed(d, z);
+                Ok((sk.into_bytes().to_vec(), pk.into_bytes().to_vec()))
+            },
+            "ML-KEM-1024" => {
+                use fips203::ml_kem_1024::KG;
+                let (pk, sk) = KG::keygen_from_seed(d, z);
+                Ok((sk.into_bytes().to_vec(), pk.into_bytes().to_vec()))
+            },
+            _ => Err(CryptoError::Parameter(format!("Unsupported KEM: {}", algo))),
+        }
+    }
+    #[cfg(not(feature = "backend-rustcrypto"))]
+    { let _ = algo; Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
+}
+
+pub fn pqc_keygen_dsa(algo: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        use rc_internal::OsRng;
+        use rand_core::RngCore;
+        let mut xi = [0u8; 32];
+        OsRng.fill_bytes(&mut xi);
+        match algo {
+            "ML-DSA-44" => {
+                let (pk, sk) = fips204::ml_dsa_44::KG::keygen_from_seed(&xi);
+                Ok((sk.into_bytes().to_vec(), pk.into_bytes().to_vec()))
+            },
+            "ML-DSA-65" => {
+                let (pk, sk) = fips204::ml_dsa_65::KG::keygen_from_seed(&xi);
+                Ok((sk.into_bytes().to_vec(), pk.into_bytes().to_vec()))
+            },
+            "ML-DSA-87" => {
+                let (pk, sk) = fips204::ml_dsa_87::KG::keygen_from_seed(&xi);
+                Ok((sk.into_bytes().to_vec(), pk.into_bytes().to_vec()))
+            },
+            _ => Err(CryptoError::Parameter(format!("Unsupported DSA: {}", algo))),
+        }
+    }
+    #[cfg(not(feature = "backend-rustcrypto"))]
+    { let _ = algo; Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
+}
+
+pub fn pqc_sign(algo: &str, priv_der: &[u8], message: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        let _ = passphrase; // In pure-Rust we assume it's already unwrapped or we don't support PKCS8-Encrypted yet here
+        let raw_priv = unwrap_pqc_der_internal(priv_der, false);
+        match algo {
+            "ML-DSA-44" => {
+                let sk = fips204::ml_dsa_44::PrivateKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                    .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+                Ok(sk.try_sign(message, &[]).map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?.to_vec())
+            },
+            "ML-DSA-65" => {
+                let sk = fips204::ml_dsa_65::PrivateKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                    .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+                Ok(sk.try_sign(message, &[]).map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?.to_vec())
+            },
+            "ML-DSA-87" => {
+                let sk = fips204::ml_dsa_87::PrivateKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                    .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+                Ok(sk.try_sign(message, &[]).map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?.to_vec())
+            },
+            _ => Err(CryptoError::Parameter(format!("Unsupported DSA: {}", algo))),
+        }
+    }
+    #[cfg(not(feature = "backend-rustcrypto"))]
+    { let _ = (algo, priv_der, message, passphrase); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
+}
+
+pub fn pqc_verify(algo: &str, pub_der: &[u8], message: &[u8], signature: &[u8]) -> Result<bool> {
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        let raw_pub = unwrap_pqc_der_internal(pub_der, true);
+        match algo {
+            "ML-DSA-44" => {
+                let pk = fips204::ml_dsa_44::PublicKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                    .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
+                let sig_arr: [u8; 2420] = signature.try_into().map_err(|_| CryptoError::Parameter("Invalid sig size".to_string()))?;
+                Ok(pk.verify(message, &sig_arr, &[]))
+            },
+            "ML-DSA-65" => {
+                let pk = fips204::ml_dsa_65::PublicKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                    .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
+                let sig_arr: [u8; 3309] = signature.try_into().map_err(|_| CryptoError::Parameter("Invalid sig size".to_string()))?;
+                Ok(pk.verify(message, &sig_arr, &[]))
+            },
+            "ML-DSA-87" => {
+                let pk = fips204::ml_dsa_87::PublicKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                    .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
+                let sig_arr: [u8; 4627] = signature.try_into().map_err(|_| CryptoError::Parameter("Invalid sig size".to_string()))?;
+                Ok(pk.verify(message, &sig_arr, &[]))
+            },
+            _ => Err(CryptoError::Parameter(format!("Unsupported DSA: {}", algo))),
+        }
+    }
+    #[cfg(not(feature = "backend-rustcrypto"))]
+    { let _ = (algo, pub_der, message, signature); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
+}
+
+pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        use fips203::traits::{Encaps, SerDes};
+        let raw_pub = unwrap_pqc_der_internal(peer_pub_der, true);
+        match algo {
+            "ML-KEM-512" => {
+                use fips203::ml_kem_512::EncapsKey;
+                let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                    .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
+                let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
+                Ok((ss.into_bytes().to_vec(), ct.into_bytes().to_vec()))
+            },
+            "ML-KEM-768" => {
+                use fips203::ml_kem_768::EncapsKey;
+                let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                    .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
+                let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
+                Ok((ss.into_bytes().to_vec(), ct.into_bytes().to_vec()))
+            },
+            "ML-KEM-1024" => {
+                use fips203::ml_kem_1024::EncapsKey;
+                let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                    .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
+                let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
+                Ok((ss.into_bytes().to_vec(), ct.into_bytes().to_vec()))
+            },
+            _ => Err(CryptoError::Parameter(format!("Unsupported KEM: {}", algo))),
+        }
+    }
+    #[cfg(not(feature = "backend-rustcrypto"))]
+    { let _ = (algo, peer_pub_der); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
+}
+
+pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        let _ = passphrase;
+        let raw_priv = unwrap_pqc_der_internal(priv_der, false);
+        match algo {
+            "ML-KEM-512" => {
+                use fips203::ml_kem_512::{DecapsKey, CipherText};
+                let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                    .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+                let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
+                    .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
+                let ss = sk.try_decaps(&ct)
+                    .map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
+                Ok(ss.into_bytes().to_vec())
+            },
+            "ML-KEM-768" => {
+                use fips203::ml_kem_768::{DecapsKey, CipherText};
+                let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                    .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+                let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
+                    .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
+                let ss = sk.try_decaps(&ct)
+                    .map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
+                Ok(ss.into_bytes().to_vec())
+            },
+            "ML-KEM-1024" => {
+                use fips203::ml_kem_1024::{DecapsKey, CipherText};
+                let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                    .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+                let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
+                    .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
+                let ss = sk.try_decaps(&ct)
+                    .map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
+                Ok(ss.into_bytes().to_vec())
+            },
+            _ => Err(CryptoError::Parameter(format!("Unsupported KEM: {}", algo))),
+        }
+    }
+    #[cfg(not(feature = "backend-rustcrypto"))]
+    { let _ = (algo, priv_der, kem_ct, passphrase); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
 }
 
 pub fn extract_raw_private_key(priv_der: &[u8], _passphrase: Option<&str>) -> Result<Vec<u8>> {

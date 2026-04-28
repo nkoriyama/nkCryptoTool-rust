@@ -39,6 +39,9 @@ impl SecureBuffer {
 }
 
 pub fn get_masked_passphrase() -> Result<String> {
+    if let Ok(pass) = std::env::var("NK_PASSPHRASE") {
+        return Ok(pass);
+    }
     print!("Enter passphrase: ");
     io::stdout().flush()?;
     let password = read_password()?;
@@ -46,6 +49,9 @@ pub fn get_masked_passphrase() -> Result<String> {
 }
 
 pub fn get_and_verify_passphrase(prompt: &str) -> Result<String> {
+    if let Ok(pass) = std::env::var("NK_PASSPHRASE") {
+        return Ok(pass);
+    }
     println!("{}", prompt);
     print!("Enter passphrase: ");
     io::stdout().flush()?;

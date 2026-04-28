@@ -17,6 +17,8 @@ fn get_bin() -> String {
     bin.to_string()
 }
 
+const TEST_PASSPHRASE: &str = "test-passphrase-123";
+
 #[test]
 fn test_ecc_e2e_cycle() {
     let bin = get_bin();
@@ -25,6 +27,7 @@ fn test_ecc_e2e_cycle() {
 
     // 1. Key Generation
     let status = Command::new(&bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
         .args(["--mode", "ecc", "--gen-enc-key", "--key-dir", key_dir])
         .status().expect("Failed to execute gen-enc-key");
     assert!(status.success());
@@ -48,6 +51,7 @@ fn test_ecc_e2e_cycle() {
 
     // 3. Decryption
     let status = Command::new(&bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
         .args([
             "--mode", "ecc", "--decrypt",
             "--user-privkey", &format!("{}/private_enc_ecc.key", key_dir),
@@ -76,6 +80,7 @@ fn test_ecc_signing_e2e() {
 
     // 1. Key Generation
     let status = Command::new(&bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
         .args(["--mode", "ecc", "--gen-sign-key", "--key-dir", key_dir])
         .status().expect("Failed to execute gen-sign-key");
     assert!(status.success());
@@ -86,6 +91,7 @@ fn test_ecc_signing_e2e() {
     fs::write(input_file, "Message to sign").unwrap();
 
     let status = Command::new(&bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
         .args([
             "--mode", "ecc", "--sign",
             "--signing-privkey", &format!("{}/private_sign_ecc.key", key_dir),
@@ -120,6 +126,7 @@ fn test_pqc_e2e_cycle() {
 
     // 1. Key Generation
     let status = Command::new(&bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
         .args(["--mode", "pqc", "--gen-enc-key", "--key-dir", key_dir])
         .status().expect("Failed to execute gen-enc-key");
     assert!(status.success());
@@ -143,6 +150,7 @@ fn test_pqc_e2e_cycle() {
 
     // 3. Decryption
     let status = Command::new(&bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
         .args([
             "--mode", "pqc", "--decrypt",
             "--user-privkey", &format!("{}/private_enc_pqc.key", key_dir),
@@ -171,6 +179,7 @@ fn test_hybrid_e2e_cycle() {
 
     // 1. Key Generation
     let status = Command::new(&bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
         .args(["--mode", "hybrid", "--gen-enc-key", "--key-dir", key_dir])
         .status().expect("Failed to execute gen-enc-key");
     assert!(status.success());
@@ -195,6 +204,7 @@ fn test_hybrid_e2e_cycle() {
 
     // 3. Decryption
     let status = Command::new(&bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
         .args([
             "--mode", "hybrid", "--decrypt",
             "--user-mlkem-privkey", &format!("{}/private_enc_hybrid_mlkem.key", key_dir),

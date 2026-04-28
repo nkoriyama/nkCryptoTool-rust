@@ -47,6 +47,8 @@ fn cleanup(path: &str) {
     let _ = fs::remove_dir_all(path);
 }
 
+const TEST_PASSPHRASE: &str = "interop-test-pass";
+
 #[test]
 fn test_ecc_interop_encryption_bidirectional() {
     let openssl_bin = get_bin("openssl");
@@ -65,7 +67,9 @@ fn test_ecc_interop_encryption_bidirectional() {
     let dec_file_1 = Path::new(data_dir).join("output_1.dec");
 
     // Gen key with OpenSSL
-    assert!(Command::new(&openssl_bin).args(["--mode", "ecc", "--gen-enc-key", "--key-dir", key_dir_1.to_str().unwrap()]).status().unwrap().success());
+    assert!(Command::new(&openssl_bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["--mode", "ecc", "--gen-enc-key", "--key-dir", key_dir_1.to_str().unwrap()]).status().unwrap().success());
     // Encrypt with OpenSSL
     assert!(Command::new(&openssl_bin).args([
         "--mode", "ecc", "--encrypt", 
@@ -74,12 +78,14 @@ fn test_ecc_interop_encryption_bidirectional() {
         input_file.to_str().unwrap()
     ]).status().unwrap().success());
     // Decrypt with RustCrypto
-    assert!(Command::new(&rustcrypto_bin).args([
-        "--mode", "ecc", "--decrypt", 
-        "--user-privkey", key_dir_1.join("private_enc_ecc.key").to_str().unwrap(),
-        "--output-file", dec_file_1.to_str().unwrap(),
-        enc_file_1.to_str().unwrap()
-    ]).status().unwrap().success());
+    assert!(Command::new(&rustcrypto_bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args([
+            "--mode", "ecc", "--decrypt", 
+            "--user-privkey", key_dir_1.join("private_enc_ecc.key").to_str().unwrap(),
+            "--output-file", dec_file_1.to_str().unwrap(),
+            enc_file_1.to_str().unwrap()
+        ]).status().unwrap().success());
     assert_eq!(fs::read_to_string(dec_file_1).unwrap(), content);
 
     // Case 2: RustCrypto Encrypt -> OpenSSL Decrypt
@@ -88,7 +94,9 @@ fn test_ecc_interop_encryption_bidirectional() {
     let dec_file_2 = Path::new(data_dir).join("output_2.dec");
 
     // Gen key with RustCrypto
-    assert!(Command::new(&rustcrypto_bin).args(["--mode", "ecc", "--gen-enc-key", "--key-dir", key_dir_2.to_str().unwrap()]).status().unwrap().success());
+    assert!(Command::new(&rustcrypto_bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["--mode", "ecc", "--gen-enc-key", "--key-dir", key_dir_2.to_str().unwrap()]).status().unwrap().success());
     // Encrypt with RustCrypto
     assert!(Command::new(&rustcrypto_bin).args([
         "--mode", "ecc", "--encrypt", 
@@ -97,12 +105,14 @@ fn test_ecc_interop_encryption_bidirectional() {
         input_file.to_str().unwrap()
     ]).status().unwrap().success());
     // Decrypt with OpenSSL
-    assert!(Command::new(&openssl_bin).args([
-        "--mode", "ecc", "--decrypt", 
-        "--user-privkey", key_dir_2.join("private_enc_ecc.key").to_str().unwrap(),
-        "--output-file", dec_file_2.to_str().unwrap(),
-        enc_file_2.to_str().unwrap()
-    ]).status().unwrap().success());
+    assert!(Command::new(&openssl_bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args([
+            "--mode", "ecc", "--decrypt", 
+            "--user-privkey", key_dir_2.join("private_enc_ecc.key").to_str().unwrap(),
+            "--output-file", dec_file_2.to_str().unwrap(),
+            enc_file_2.to_str().unwrap()
+        ]).status().unwrap().success());
     assert_eq!(fs::read_to_string(dec_file_2).unwrap(), content);
 
     cleanup(data_dir);
@@ -124,13 +134,17 @@ fn test_ecc_interop_signature_bidirectional() {
     let key_dir_1 = Path::new(data_dir).join("keys_1");
     let sig_file_1 = Path::new(data_dir).join("output_1.sig");
 
-    assert!(Command::new(&openssl_bin).args(["--mode", "ecc", "--gen-sign-key", "--key-dir", key_dir_1.to_str().unwrap()]).status().unwrap().success());
-    assert!(Command::new(&openssl_bin).args([
-        "--mode", "ecc", "--sign", 
-        "--signing-privkey", key_dir_1.join("private_sign_ecc.key").to_str().unwrap(),
-        "--signature", sig_file_1.to_str().unwrap(),
-        input_file.to_str().unwrap()
-    ]).status().unwrap().success());
+    assert!(Command::new(&openssl_bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["--mode", "ecc", "--gen-sign-key", "--key-dir", key_dir_1.to_str().unwrap()]).status().unwrap().success());
+    assert!(Command::new(&openssl_bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args([
+            "--mode", "ecc", "--sign", 
+            "--signing-privkey", key_dir_1.join("private_sign_ecc.key").to_str().unwrap(),
+            "--signature", sig_file_1.to_str().unwrap(),
+            input_file.to_str().unwrap()
+        ]).status().unwrap().success());
     assert!(Command::new(&rustcrypto_bin).args([
         "--mode", "ecc", "--verify", 
         "--signing-pubkey", key_dir_1.join("public_sign_ecc.key").to_str().unwrap(),
@@ -142,13 +156,17 @@ fn test_ecc_interop_signature_bidirectional() {
     let key_dir_2 = Path::new(data_dir).join("keys_2");
     let sig_file_2 = Path::new(data_dir).join("output_2.sig");
 
-    assert!(Command::new(&rustcrypto_bin).args(["--mode", "ecc", "--gen-sign-key", "--key-dir", key_dir_2.to_str().unwrap()]).status().unwrap().success());
-    assert!(Command::new(&rustcrypto_bin).args([
-        "--mode", "ecc", "--sign", 
-        "--signing-privkey", key_dir_2.join("private_sign_ecc.key").to_str().unwrap(),
-        "--signature", sig_file_2.to_str().unwrap(),
-        input_file.to_str().unwrap()
-    ]).status().unwrap().success());
+    assert!(Command::new(&rustcrypto_bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["--mode", "ecc", "--gen-sign-key", "--key-dir", key_dir_2.to_str().unwrap()]).status().unwrap().success());
+    assert!(Command::new(&rustcrypto_bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args([
+            "--mode", "ecc", "--sign", 
+            "--signing-privkey", key_dir_2.join("private_sign_ecc.key").to_str().unwrap(),
+            "--signature", sig_file_2.to_str().unwrap(),
+            input_file.to_str().unwrap()
+        ]).status().unwrap().success());
     assert!(Command::new(&openssl_bin).args([
         "--mode", "ecc", "--verify", 
         "--signing-pubkey", key_dir_2.join("public_sign_ecc.key").to_str().unwrap(),
@@ -173,7 +191,9 @@ fn test_pqc_interop_encryption_bidirectional() {
 
     // Gen key with RustCrypto (guaranteed to work)
     let key_dir = Path::new(data_dir).join("keys");
-    assert!(Command::new(&rustcrypto_bin).args(["--mode", "pqc", "--gen-enc-key", "--key-dir", key_dir.to_str().unwrap()]).status().unwrap().success());
+    assert!(Command::new(&rustcrypto_bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["--mode", "pqc", "--gen-enc-key", "--key-dir", key_dir.to_str().unwrap()]).status().unwrap().success());
 
     // RustCrypto Encrypt -> OpenSSL Decrypt
     let enc_file = Path::new(data_dir).join("output.enc");
@@ -186,12 +206,14 @@ fn test_pqc_interop_encryption_bidirectional() {
         input_file.to_str().unwrap()
     ]).status().unwrap().success());
 
-    assert!(Command::new(&openssl_bin).args([
-        "--mode", "pqc", "--decrypt", 
-        "--user-privkey", key_dir.join("private_enc_pqc.key").to_str().unwrap(),
-        "--output-file", dec_file.to_str().unwrap(),
-        enc_file.to_str().unwrap()
-    ]).status().unwrap().success());
+    assert!(Command::new(&openssl_bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args([
+            "--mode", "pqc", "--decrypt", 
+            "--user-privkey", key_dir.join("private_enc_pqc.key").to_str().unwrap(),
+            "--output-file", dec_file.to_str().unwrap(),
+            enc_file.to_str().unwrap()
+        ]).status().unwrap().success());
 
     assert_eq!(fs::read_to_string(dec_file).unwrap(), content);
 

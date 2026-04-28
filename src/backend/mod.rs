@@ -66,14 +66,30 @@ pub fn extract_public_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<V
     crypto_impl::extract_public_key(priv_der, passphrase)
 }
 
-pub fn pqc_encap(peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
-    crypto_impl::pqc_encap(peer_pub_der)
-}
-
-pub fn pqc_decap(priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
-    crypto_impl::pqc_decap(priv_der, kem_ct, passphrase)
-}
-
 pub fn extract_raw_private_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
     crypto_impl::extract_raw_private_key(priv_der, passphrase)
+}
+
+pub fn pqc_keygen_kem(algo: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    crypto_impl::pqc_keygen_kem(algo)
+}
+
+pub fn pqc_keygen_dsa(algo: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+    crypto_impl::pqc_keygen_dsa(algo)
+}
+
+pub fn pqc_sign(algo: &str, priv_der: &[u8], message: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+    crypto_impl::pqc_sign(algo, priv_der, message, passphrase)
+}
+
+pub fn pqc_verify(algo: &str, pub_der: &[u8], message: &[u8], signature: &[u8]) -> Result<bool> {
+    crypto_impl::pqc_verify(algo, pub_der, message, signature)
+}
+
+pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+    crypto_impl::pqc_encap(algo, peer_pub_der)
+}
+
+pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+    crypto_impl::pqc_decap(algo, priv_der, kem_ct, passphrase)
 }
