@@ -110,20 +110,27 @@ cargo build --release --no-default-features --features backend-rustcrypto
 
 ## **パフォーマンス**
 
-2.0 GiB の大容量ファイルを用いた最新のベンチマーク結果（Gen4 NVMe / x86_64 環境）。
-Tokio による非同期 I/O パイプラインにより、ディスク I/O の限界に近い性能を発揮します。
+2.0 GiB の大容量ファイルを用いた最新のベンチマーク結果（Gen4 NVMe / x86_64 / Linux 環境）。
+Tokio による非同期 I/O パイプラインにより、全バックエンドでディスク I/O の限界に近い性能を発揮します。
 
-| 実装 | バックエンド | モード | 暗号化速度 | 復号速度 |
-| :--- | :--- | :--- | :--- | :--- |
-| **Rust** | **OpenSSL** | **Hybrid (PQC+ECC)** | **~3.4 GiB/s** | **~3.8 GiB/s** |
-| **Rust** | **OpenSSL** | ECC (P-256) | ~3.4 GiB/s | ~3.7 GiB/s |
-| **Rust** | **RustCrypto** | ECC (P-256) | ~1.6 GiB/s | ~1.9 GiB/s |
-| C++ | OpenSSL | Hybrid (PQC+ECC) | ~3.0 GiB/s | ~2.9 GiB/s |
-| C++ | wolfSSL | Hybrid (PQC+ECC) | ~2.1 GiB/s | ~2.0 GiB/s |
+| バックエンド (言語) | モード | 暗号化速度 | 復号速度 |
+| :--- | :--- | :--- | :--- |
+| **OpenSSL (Rust)** | **Hybrid (PQC+ECC)** | **~3.7 GiB/s** | **~3.8 GiB/s** |
+| **OpenSSL (Rust)** | PQC (ML-KEM-1024) | ~3.7 GiB/s | ~3.8 GiB/s |
+| **OpenSSL (Rust)** | ECC (P-256) | ~3.5 GiB/s | ~3.8 GiB/s |
+| OpenSSL (C++) | Hybrid (PQC+ECC) | ~2.7 GiB/s | ~2.8 GiB/s |
+| OpenSSL (C++) | PQC (ML-KEM-1024) | ~3.0 GiB/s | ~3.1 GiB/s |
+| OpenSSL (C++) | ECC (P-256) | ~2.7 GiB/s | ~2.8 GiB/s |
+| wolfSSL (C++) | Hybrid (PQC+ECC) | ~2.1 GiB/s | ~2.1 GiB/s |
+| wolfSSL (C++) | PQC (ML-KEM-1024) | ~1.9 GiB/s | ~1.9 GiB/s |
+| wolfSSL (C++) | ECC (P-256) | ~1.9 GiB/s | ~1.9 GiB/s |
+| **RustCrypto (Rust)** | **Hybrid (PQC+ECC)** | **~1.6 GiB/s** | **~1.7 GiB/s** |
+| **RustCrypto (Rust)** | PQC (ML-KEM-1024) | ~1.5 GiB/s | ~1.7 GiB/s |
+| **RustCrypto (Rust)** | ECC (P-256) | ~1.7 GiB/s | ~1.7 GiB/s |
 
-*   **OpenSSL バックエンド**: 暗号化エンジンに OpenSSL の高度なアセンブリ最適化を使用し、最も高いスループットを実現します。
-*   **RustCrypto バックエンド**: 外部依存のない純 Rust 実装。最適化により wolfSSL に迫る 1.6 GiB/s 超を達成しています。
-*   **非同期パイプライン**: Rust 版では I/O と暗号化を分離して並列実行するため、特に巨大ファイルにおいて C++ 版を上回る効率を実現しています。
+*   **OpenSSL バックエンド (Rust)**: 暗号化エンジンに OpenSSL の高度なアセンブリ最適化を使用しつつ、Rust の非同期 I/O パイプラインで並列化することで、C++ 版を凌駕する最高のスループットを実現します。
+*   **RustCrypto バックエンド**: 外部依存のない純 Rust 実装。SIMD 最適化（AES-NI / PCLMULQDQ）の有効化により、wolfSSL に匹敵する 1.6 GiB/s 超を達成しています。
+*   **相互運用性**: いかなる組み合わせで暗号化されたデータも、全てのバックエンドで相互に復号可能です。
 
 ## **統一ヘッダーフォーマット (Unified Header Format)**
 
