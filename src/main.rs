@@ -96,7 +96,7 @@ struct Args {
 async fn main() -> anyhow::Result<()> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::is_x86_feature_detected!("aes") {
-        println!("AES-NI is available!");
+        eprintln!("AES-NI is available!");
     }
 
     let args = Args::parse();
