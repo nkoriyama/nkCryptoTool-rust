@@ -20,6 +20,8 @@ pub enum Operation {
     WrapKey,
     UnwrapKey,
     Info,
+    Listen,
+    Connect,
     None,
 }
 
@@ -82,6 +84,9 @@ pub struct CryptoConfig {
     pub use_parallel: bool,
     pub is_recursive: bool,
 
+    pub listen_addr: Option<String>,
+    pub connect_addr: Option<String>,
+
     // For regenerate-pubkey
     pub regenerate_privkey_path: Option<String>,
     pub regenerate_pubkey_path: Option<String>,
@@ -114,6 +119,8 @@ impl Default for CryptoConfig {
             pqc_dsa_algo: "ML-DSA-65".to_string(),
             use_parallel: false,
             is_recursive: false,
+            listen_addr: None,
+            connect_addr: None,
             regenerate_privkey_path: None,
             regenerate_pubkey_path: None,
         }

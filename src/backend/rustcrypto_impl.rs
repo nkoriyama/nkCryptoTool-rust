@@ -132,7 +132,7 @@ impl AeadBackend for RustCryptoAead {
                     }
                     if pos < input.len() {
                         let in_rem = &input[pos..];
-                        let out_rem = &mut output[pos..];
+                        let out_rem = &mut output[pos..pos + in_rem.len()];
                         out_rem.copy_from_slice(in_rem);
                         ctr.apply_keystream(out_rem);
                         let aad_or_cipher = if self._is_encrypt { out_rem } else { in_rem };
@@ -140,9 +140,10 @@ impl AeadBackend for RustCryptoAead {
                     }
                 },
                 AeadMode::ChaChaPoly { cipher, poly } => {
-                    output.copy_from_slice(input);
-                    cipher.apply_keystream(output);
-                    let aad_or_cipher = if self._is_encrypt { output } else { input };
+                    let out_slice = &mut output[..input.len()];
+                    out_slice.copy_from_slice(input);
+                    cipher.apply_keystream(out_slice);
+                    let aad_or_cipher = if self._is_encrypt { out_slice } else { input };
                     poly.update_padded(aad_or_cipher);
                 }
             }
@@ -591,6 +592,26 @@ pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option<
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
     { let _ = (algo, priv_der, kem_ct, passphrase); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
+}
+
+pub fn hkdf(ikm: &[u8], length: usize, salt: &[u8], info: &str, md_name: &str) -> Result<Vec<u8>> {
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        use rc_internal::*;
+        use hkdf::Hkdf;
+        
+        let mut okm = vec![0u8; length];
+        if md_name.contains("256") {
+            let h = Hkdf::<Sha3_256>::new(Some(salt), ikm);
+            h.expand(info.as_bytes(), &mut okm).map_err(|_| CryptoError::Parameter("HKDF expand failed".to_string()))?;
+        } else {
+            let h = Hkdf::<Sha3_512>::new(Some(salt), ikm);
+            h.expand(info.as_bytes(), &mut okm).map_err(|_| CryptoError::Parameter("HKDF expand failed".to_string()))?;
+        }
+        Ok(okm)
+    }
+    #[cfg(not(feature = "backend-rustcrypto"))]
+    { let _ = (ikm, length, salt, info, md_name); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
 }
 
 pub fn extract_raw_private_key(priv_der: &[u8], _passphrase: Option<&str>) -> Result<Vec<u8>> {

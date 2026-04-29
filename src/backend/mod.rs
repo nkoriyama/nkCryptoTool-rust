@@ -93,3 +93,7 @@ pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> 
 pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
     crypto_impl::pqc_decap(algo, priv_der, kem_ct, passphrase)
 }
+
+pub fn hkdf(ikm: &[u8], length: usize, salt: &[u8], info: &str, md_name: &str) -> Result<Vec<u8>> {
+    crypto_impl::hkdf(ikm, length, salt, info, md_name)
+}
