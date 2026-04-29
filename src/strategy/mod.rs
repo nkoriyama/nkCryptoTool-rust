@@ -51,6 +51,15 @@ pub trait CryptoStrategy: Send + Sync {
     fn sign_hash(&mut self) -> Result<Vec<u8>>;
     fn verify_hash(&mut self, signature: &[u8]) -> Result<bool>;
 
+    fn sign_full(&mut self, message: &[u8]) -> Result<Vec<u8>> {
+        self.update_hash(message)?;
+        self.sign_hash()
+    }
+    fn verify_full(&mut self, message: &[u8], signature: &[u8]) -> Result<bool> {
+        self.update_hash(message)?;
+        self.verify_hash(signature)
+    }
+
     // Header Serialization
     fn serialize_signature_header(&self) -> Vec<u8>;
     fn deserialize_signature_header(&mut self, data: &[u8]) -> Result<usize>;

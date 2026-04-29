@@ -12,14 +12,23 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 use hkdf::Hkdf;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct EccStrategy {
+    #[zeroize(skip)]
     key_provider: Option<SharedKeyProvider>,
+    #[zeroize(skip)]
     curve_name: String,
+    #[zeroize(skip)]
     digest_algo: String,
+    #[zeroize(skip)]
+    aead_algo: String,
     
     // Abstract context for streaming
+    #[zeroize(skip)]
     aead_ctx: Option<backend::Aead>,
+    #[zeroize(skip)]
     hash_ctx: Option<backend::Hash>,
     
     // Key states
@@ -40,6 +49,7 @@ impl EccStrategy {
             key_provider: None,
             curve_name: "prime256v1".to_string(),
             digest_algo: "SHA3-512".to_string(),
+            aead_algo: "AES-256-GCM".to_string(),
             aead_ctx: None,
             hash_ctx: None,
             encryption_key: Vec::new(),
@@ -120,6 +130,9 @@ impl CryptoStrategy for EccStrategy {
         if let Some(algo) = key_paths.get("digest-algo") {
             self.digest_algo = algo.clone();
         }
+        if let Some(algo) = key_paths.get("aead-algo") {
+            self.aead_algo = algo.clone();
+        }
 
         let pubkey_path = key_paths.get("recipient-pubkey")
             .or_else(|| key_paths.get("recipient-ecdh-pubkey"))
@@ -154,7 +167,7 @@ impl CryptoStrategy for EccStrategy {
             "ecc-encryption"
         )?;
 
-        let ctx = backend::new_encrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
+        let ctx = backend::new_encrypt(&self.aead_algo, &self.encryption_key, &self.iv)?;
         self.aead_ctx = Some(ctx);
 
         Ok(())
@@ -185,7 +198,7 @@ impl CryptoStrategy for EccStrategy {
             "ecc-encryption"
         )?;
 
-        let ctx = backend::new_decrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
+        let ctx = backend::new_decrypt(&self.aead_algo, &self.encryption_key, &self.iv)?;
         self.aead_ctx = Some(ctx);
 
         Ok(())
@@ -193,7 +206,7 @@ impl CryptoStrategy for EccStrategy {
 
     fn encrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        let mut out = vec![0u8; data.len() + 16];
+        let mut out = vec![0u8; data.len()];
         let n = ctx.update(data, &mut out)?;
         out.truncate(n);
         Ok(out)
@@ -201,7 +214,7 @@ impl CryptoStrategy for EccStrategy {
 
     fn decrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        let mut out = vec![0u8; data.len() + 16];
+        let mut out = vec![0u8; data.len()];
         let n = ctx.update(data, &mut out)?;
         out.truncate(n);
         Ok(out)
@@ -299,7 +312,7 @@ impl CryptoStrategy for EccStrategy {
         if &data[0..4] != b"NKCS" { return Err(CryptoError::FileRead("Invalid signature magic".to_string())); }
         
         let mut pos = 4;
-        let version = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap());
+        let version = u16::from_le_bytes(data[pos..pos+2].try_into().map_err(|_| CryptoError::FileRead("Invalid version".to_string()))?);
         pos += 2;
         if version != 1 { return Err(CryptoError::FileRead("Unsupported signature version".to_string())); }
         
@@ -311,7 +324,7 @@ impl CryptoStrategy for EccStrategy {
 
         let read_string = |p: &mut usize| -> Result<String> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete string header".to_string())); }
-            let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(data[*p..*p+4].try_into().map_err(|_| CryptoError::FileRead("Invalid length".to_string()))?) as usize;
             *p += 4;
             if data.len() < *p + len { return Err(CryptoError::FileRead("Incomplete string data".to_string())); }
             let s = String::from_utf8_lossy(&data[*p..*p+len]).to_string();
@@ -336,13 +349,14 @@ impl CryptoStrategy for EccStrategy {
         4 + 2 + 1 + 
         4 + self.curve_name.len() + 
         4 + self.digest_algo.len() + 
-        4 + self.ephemeral_pubkey.len() + 4 + self.salt.len() + 4 + self.iv.len()
+        4 + self.ephemeral_pubkey.len() + 4 + self.salt.len() + 4 + self.iv.len() +
+        4 + self.aead_algo.len()
     }
 
     fn serialize_header(&self) -> Vec<u8> {
         let mut header = Vec::new();
         header.extend_from_slice(b"NKCT");
-        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&2u16.to_le_bytes());
         header.push(self.get_strategy_type() as u8);
 
         header.extend_from_slice(&(self.curve_name.len() as u32).to_le_bytes());
@@ -359,6 +373,9 @@ impl CryptoStrategy for EccStrategy {
         
         header.extend_from_slice(&(self.iv.len() as u32).to_le_bytes());
         header.extend_from_slice(&self.iv);
+
+        header.extend_from_slice(&(self.aead_algo.len() as u32).to_le_bytes());
+        header.extend_from_slice(self.aead_algo.as_bytes());
         
         header
     }
@@ -368,9 +385,8 @@ impl CryptoStrategy for EccStrategy {
         if &data[0..4] != b"NKCT" { return Err(CryptoError::FileRead("Invalid magic".to_string())); }
         
         let mut pos = 4;
-        let version = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap());
+        let version = u16::from_le_bytes(data[pos..pos+2].try_into().map_err(|_| CryptoError::FileRead("Invalid version".to_string()))?);
         pos += 2;
-        if version != 1 { return Err(CryptoError::FileRead("Unsupported version".to_string())); }
         
         let strategy_type = data[pos];
         pos += 1;
@@ -380,7 +396,7 @@ impl CryptoStrategy for EccStrategy {
 
         let read_string = |p: &mut usize| -> Result<String> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete string header".to_string())); }
-            let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(data[*p..*p+4].try_into().map_err(|_| CryptoError::FileRead("Invalid length".to_string()))?) as usize;
             *p += 4;
             if data.len() < *p + len { return Err(CryptoError::FileRead("Incomplete string data".to_string())); }
             let s = String::from_utf8_lossy(&data[*p..*p+len]).to_string();
@@ -390,7 +406,7 @@ impl CryptoStrategy for EccStrategy {
 
         let read_vec = |p: &mut usize| -> Result<Vec<u8>> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete vec header".to_string())); }
-            let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(data[*p..*p+4].try_into().map_err(|_| CryptoError::FileRead("Invalid length".to_string()))?) as usize;
             *p += 4;
             if data.len() < *p + len { return Err(CryptoError::FileRead("Incomplete string data".to_string())); }
             let v = data[*p..*p+len].to_vec();
@@ -403,6 +419,12 @@ impl CryptoStrategy for EccStrategy {
         self.ephemeral_pubkey = read_vec(&mut pos)?;
         self.salt = read_vec(&mut pos)?;
         self.iv = read_vec(&mut pos)?;
+
+        if version >= 2 {
+            self.aead_algo = read_string(&mut pos)?;
+        } else {
+            self.aead_algo = "AES-256-GCM".to_string();
+        }
 
         Ok(pos)
     }

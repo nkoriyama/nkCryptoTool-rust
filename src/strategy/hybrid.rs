@@ -10,13 +10,16 @@ use crate::strategy::{CryptoStrategy, StrategyType, ecc::EccStrategy, pqc::PqcSt
 use crate::backend::AeadBackend;
 use std::collections::HashMap;
 use std::path::Path;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct HybridStrategy {
     ecc: EccStrategy,
     pqc: PqcStrategy,
     encryption_key: Vec<u8>,
     iv: Vec<u8>,
     salt: Vec<u8>,
+    #[zeroize(skip)]
     aead_ctx: Option<crate::backend::Aead>,
 }
 
@@ -130,7 +133,7 @@ impl CryptoStrategy for HybridStrategy {
 
     fn encrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        let mut out = vec![0u8; data.len() + 16];
+        let mut out = vec![0u8; data.len()];
         let n = ctx.update(data, &mut out)?;
         out.truncate(n);
         Ok(out)
@@ -138,7 +141,7 @@ impl CryptoStrategy for HybridStrategy {
 
     fn decrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        let mut out = vec![0u8; data.len() + 16];
+        let mut out = vec![0u8; data.len()];
         let n = ctx.update(data, &mut out)?;
         out.truncate(n);
         Ok(out)
@@ -174,6 +177,9 @@ impl CryptoStrategy for HybridStrategy {
     fn update_hash(&mut self, data: &[u8]) -> Result<()> { self.pqc.update_hash(data) }
     fn sign_hash(&mut self) -> Result<Vec<u8>> { self.pqc.sign_hash() }
     fn verify_hash(&mut self, signature: &[u8]) -> Result<bool> { self.pqc.verify_hash(signature) }
+
+    fn sign_full(&mut self, message: &[u8]) -> Result<Vec<u8>> { self.pqc.sign_full(message) }
+    fn verify_full(&mut self, message: &[u8], signature: &[u8]) -> Result<bool> { self.pqc.verify_full(message, signature) }
 
     fn serialize_signature_header(&self) -> Vec<u8> { self.pqc.serialize_signature_header() }
     fn deserialize_signature_header(&mut self, data: &[u8]) -> Result<usize> { self.pqc.deserialize_signature_header(data) }
@@ -212,12 +218,12 @@ impl CryptoStrategy for HybridStrategy {
         if &data[0..4] != b"NKCT" { return Err(CryptoError::FileRead("Invalid magic".to_string())); }
         
         let mut pos = 7;
-        let ecc_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+        let ecc_len = u32::from_le_bytes(data[pos..pos+4].try_into().map_err(|_| CryptoError::FileRead("Invalid length".to_string()))?) as usize;
         pos += 4;
         self.ecc.deserialize_header(&data[pos..pos+ecc_len])?;
         pos += ecc_len;
         
-        let pqc_len = u32::from_le_bytes(data[pos..pos+4].try_into().unwrap()) as usize;
+        let pqc_len = u32::from_le_bytes(data[pos..pos+4].try_into().map_err(|_| CryptoError::FileRead("Invalid length".to_string()))?) as usize;
         pos += 4;
         self.pqc.deserialize_header(&data[pos..pos+pqc_len])?;
         pos += pqc_len;

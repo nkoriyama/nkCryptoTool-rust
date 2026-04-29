@@ -14,14 +14,21 @@ use std::path::Path;
 use hkdf::Hkdf;
 use sha3::Sha3_256;
 use rand_core::{OsRng, RngCore};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct PqcStrategy {
+    #[zeroize(skip)]
     key_provider: Option<SharedKeyProvider>,
+    #[zeroize(skip)]
     kem_algo: String,
+    #[zeroize(skip)]
     dsa_algo: String,
+    #[zeroize(skip)]
     digest_algo: String,
     
     // Abstract contexts
+    #[zeroize(skip)]
     aead_ctx: Option<backend::Aead>,
     
     // Message buffer for ML-DSA (no pre-hash in Pure-mode)
@@ -84,9 +91,10 @@ impl CryptoStrategy for PqcStrategy {
 
         let use_tpm = key_paths.get("use-tpm").map(|s| s == "true").unwrap_or(false);
 
-        let (sk_bytes, pk_bytes) = backend::pqc_keygen_kem(&kem_algo)?;
+        let (sk_bytes, pk_bytes, seed) = backend::pqc_keygen_kem(&kem_algo)?;
 
-        let pub_pem = crate::utils::wrap_to_pem(&pk_bytes, "PUBLIC KEY");
+        let spki = crate::utils::wrap_pqc_pub_to_spki(&pk_bytes, &kem_algo)?;
+        let pub_pem = crate::utils::wrap_to_pem(&spki, "PUBLIC KEY");
         fs::write(pub_path, pub_pem)?;
 
         if use_tpm {
@@ -94,7 +102,8 @@ impl CryptoStrategy for PqcStrategy {
             let wrapped = provider.wrap_raw(&sk_bytes, passphrase)?;
             fs::write(priv_path, wrapped)?;
         } else {
-            let priv_pem = crate::utils::wrap_to_pem(&sk_bytes, "PRIVATE KEY");
+            let pkcs8 = crate::utils::wrap_pqc_priv_to_pkcs8(&sk_bytes, &kem_algo, seed.as_deref())?;
+            let priv_pem = crate::utils::wrap_to_pem(&pkcs8, "PRIVATE KEY");
             fs::write(priv_path, priv_pem)?;
         }
 
@@ -111,9 +120,10 @@ impl CryptoStrategy for PqcStrategy {
 
         let use_tpm = key_paths.get("use-tpm").map(|s| s == "true").unwrap_or(false);
 
-        let (sk_bytes, pk_bytes) = backend::pqc_keygen_dsa(&dsa_algo)?;
+        let (sk_bytes, pk_bytes, seed) = backend::pqc_keygen_dsa(&dsa_algo)?;
 
-        let pub_pem = crate::utils::wrap_to_pem(&pk_bytes, "PUBLIC KEY");
+        let spki = crate::utils::wrap_pqc_pub_to_spki(&pk_bytes, &dsa_algo)?;
+        let pub_pem = crate::utils::wrap_to_pem(&spki, "PUBLIC KEY");
         fs::write(pub_path, pub_pem)?;
 
         if use_tpm {
@@ -121,7 +131,8 @@ impl CryptoStrategy for PqcStrategy {
             let wrapped = provider.wrap_raw(&sk_bytes, passphrase)?;
             fs::write(priv_path, wrapped)?;
         } else {
-            let priv_pem = crate::utils::wrap_to_pem(&sk_bytes, "PRIVATE KEY");
+            let pkcs8 = crate::utils::wrap_pqc_priv_to_pkcs8(&sk_bytes, &dsa_algo, seed.as_deref())?;
+            let priv_pem = crate::utils::wrap_to_pem(&pkcs8, "PRIVATE KEY");
             fs::write(priv_path, priv_pem)?;
         }
 
@@ -202,7 +213,7 @@ impl CryptoStrategy for PqcStrategy {
 
     fn encrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        let mut out = vec![0u8; data.len() + 16];
+        let mut out = vec![0u8; data.len()];
         let n = ctx.update(data, &mut out)?;
         out.truncate(n);
         Ok(out)
@@ -210,7 +221,7 @@ impl CryptoStrategy for PqcStrategy {
 
     fn decrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>> {
         let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        let mut out = vec![0u8; data.len() + 16];
+        let mut out = vec![0u8; data.len()];
         let n = ctx.update(data, &mut out)?;
         out.truncate(n);
         Ok(out)
@@ -280,6 +291,16 @@ impl CryptoStrategy for PqcStrategy {
         backend::pqc_verify(&self.dsa_algo, pub_der, &self.message_buffer, signature)
     }
 
+    fn sign_full(&mut self, message: &[u8]) -> Result<Vec<u8>> {
+        let priv_der = self.sign_key_der.as_ref().ok_or(CryptoError::Parameter("Sign key missing".to_string()))?;
+        backend::pqc_sign(&self.dsa_algo, priv_der, message, None)
+    }
+
+    fn verify_full(&mut self, message: &[u8], signature: &[u8]) -> Result<bool> {
+        let pub_der = self.verify_key_der.as_ref().ok_or(CryptoError::Parameter("Verify key missing".to_string()))?;
+        backend::pqc_verify(&self.dsa_algo, pub_der, message, signature)
+    }
+
     fn serialize_signature_header(&self) -> Vec<u8> {
         let mut header = Vec::new();
         header.extend_from_slice(b"NKCS");
@@ -303,7 +324,7 @@ impl CryptoStrategy for PqcStrategy {
         if &data[0..4] != b"NKCS" { return Err(CryptoError::FileRead("Invalid signature magic".to_string())); }
         
         let mut pos = 4;
-        let version = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap());
+        let version = u16::from_le_bytes(data[pos..pos+2].try_into().map_err(|_| CryptoError::FileRead("Invalid version".to_string()))?);
         pos += 2;
         if version != 1 { return Err(CryptoError::FileRead("Unsupported signature version".to_string())); }
         
@@ -315,7 +336,7 @@ impl CryptoStrategy for PqcStrategy {
 
         let read_string = |p: &mut usize| -> Result<String> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete string header".to_string())); }
-            let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(data[*p..*p+4].try_into().map_err(|_| CryptoError::FileRead("Invalid length".to_string()))?) as usize;
             *p += 4;
             if data.len() < *p + len { return Err(CryptoError::FileRead("Incomplete string data".to_string())); }
             let s = String::from_utf8_lossy(&data[*p..*p+len]).to_string();
@@ -373,7 +394,7 @@ impl CryptoStrategy for PqcStrategy {
         if &data[0..4] != b"NKCT" { return Err(CryptoError::FileRead("Invalid magic".to_string())); }
         
         let mut pos = 4;
-        let version = u16::from_le_bytes(data[pos..pos+2].try_into().unwrap());
+        let version = u16::from_le_bytes(data[pos..pos+2].try_into().map_err(|_| CryptoError::FileRead("Invalid version".to_string()))?);
         pos += 2;
         if version != 1 { return Err(CryptoError::FileRead("Unsupported version".to_string())); }
         
@@ -385,7 +406,7 @@ impl CryptoStrategy for PqcStrategy {
 
         let read_string = |p: &mut usize| -> Result<String> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete string header".to_string())); }
-            let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(data[*p..*p+4].try_into().map_err(|_| CryptoError::FileRead("Invalid length".to_string()))?) as usize;
             *p += 4;
             if data.len() < *p + len { return Err(CryptoError::FileRead("Incomplete string data".to_string())); }
             let s = String::from_utf8_lossy(&data[*p..*p+len]).to_string();
@@ -395,7 +416,7 @@ impl CryptoStrategy for PqcStrategy {
 
         let read_vec = |p: &mut usize| -> Result<Vec<u8>> {
             if data.len() < *p + 4 { return Err(CryptoError::FileRead("Incomplete vec header".to_string())); }
-            let len = u32::from_le_bytes(data[*p..*p+4].try_into().unwrap()) as usize;
+            let len = u32::from_le_bytes(data[*p..*p+4].try_into().map_err(|_| CryptoError::FileRead("Invalid length".to_string()))?) as usize;
             *p += 4;
             if data.len() < *p + len { return Err(CryptoError::FileRead("Incomplete string data".to_string())); }
             let v = data[*p..*p+len].to_vec();
