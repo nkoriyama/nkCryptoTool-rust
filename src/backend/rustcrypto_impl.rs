@@ -27,8 +27,10 @@ mod rc_internal {
     pub use generic_array::GenericArray;
     pub use aes_gcm::aead::consts;
 
-    // ChaCha20Poly1305
-    pub use chacha20poly1305::{ChaCha20Poly1305, KeyInit, AeadInPlace};
+    // ChaCha20Poly1305 low-level
+    pub use chacha20::ChaCha20;
+    pub use poly1305::Poly1305;
+    pub use chacha20::cipher::StreamCipherSeek;
     
     // ECDSA
     pub use p256::ecdsa::{SigningKey, VerifyingKey, Signature, signature::{hazmat::{PrehashSigner, PrehashVerifier}}};
@@ -45,7 +47,8 @@ enum AeadMode {
         tag_mask: [u8; 16],
     },
     ChaChaPoly {
-        cipher: rc_internal::ChaCha20Poly1305,
+        cipher: rc_internal::ChaCha20,
+        poly: rc_internal::Poly1305,
     }
 }
 
@@ -79,8 +82,11 @@ impl AeadBackend for RustCryptoAead {
                 let ctr = Ctr64BE::<Aes256>::new(GenericArray::from_slice(key), GenericArray::from_slice(&ctr_iv));
                 AeadMode::AesGcm { ctr, ghash, tag_mask }
             } else if normalized == "chacha20-poly1305" {
-                let cipher = ChaCha20Poly1305::new_from_slice(key).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-                AeadMode::ChaChaPoly { cipher }
+                let mut cipher = ChaCha20::new(GenericArray::from_slice(key), GenericArray::from_slice(iv));
+                let mut poly_key = [0u8; 32];
+                cipher.apply_keystream(&mut poly_key);
+                let poly = Poly1305::new(GenericArray::from_slice(&poly_key));
+                AeadMode::ChaChaPoly { cipher, poly }
             } else {
                 return Err(CryptoError::Parameter(format!("Unsupported: {}", cipher_name)));
             };
@@ -133,18 +139,11 @@ impl AeadBackend for RustCryptoAead {
                         ghash.update_padded(aad_or_cipher);
                     }
                 },
-                AeadMode::ChaChaPoly { .. } => {
-                    // Note: chacha20poly1305 crate does not easily support low-level streaming 
-                    // of AEAD with separate tag. For benchmark purposes in this tool, 
-                    // we'll implement it as a single block if possible, but the interface 
-                    // expects streaming. 
-                    // Real implementation of ChaCha20Poly1305 streaming is more complex.
-                    // For now, let's at least support non-streaming update for performance comparison.
-                    // (Actually ChaCha20 part is easy, Poly1305 is the part that needs state)
-                    // Simplified: just ChaCha20 for now to see speed? No, must be AEAD.
-                    // Let's use it as a buffer and finalize at the end? 
-                    // No, that breaks the "streaming" goal.
-                    return Err(CryptoError::Parameter("ChaChaPoly streaming not yet fully implemented in RustCrypto wrapper".to_string()));
+                AeadMode::ChaChaPoly { cipher, poly } => {
+                    output.copy_from_slice(input);
+                    cipher.apply_keystream(output);
+                    let aad_or_cipher = if self._is_encrypt { output } else { input };
+                    poly.update_padded(aad_or_cipher);
                 }
             }
             self._data_len += input.len() as u64;
@@ -164,35 +163,31 @@ impl AeadBackend for RustCryptoAead {
             let mode = self.mode.take().ok_or(CryptoError::Parameter("AEAD not init".to_string()))?;
             match mode {
                 AeadMode::AesGcm { mut ghash, tag_mask, .. } => {
-                    // Final GHASH update with lengths (AAD len || Data len)
                     let mut len_block = [0u8; 16];
                     len_block[8..16].copy_from_slice(&(self._data_len * 8).to_be_bytes());
                     ghash.update(&[*GenericArray::from_slice(&len_block)]);
-                    
                     let mut tag = ghash.finalize();
-                    for i in 0..16 {
-                        tag[i] ^= tag_mask[i];
-                    }
-                    
+                    for i in 0..16 { tag[i] ^= tag_mask[i]; }
                     if self._is_encrypt {
                         self._tag = tag.to_vec();
                         Ok(0)
                     } else {
                         let expected_tag = GenericArray::<u8, consts::U16>::from_slice(&self._tag);
-                        if tag.ct_eq(expected_tag).unwrap_u8() == 1 {
-                            Ok(0)
-                        } else {
-                            Err(CryptoError::SignatureVerification)
-                        }
+                        if tag.ct_eq(expected_tag).unwrap_u8() == 1 { Ok(0) } else { Err(CryptoError::SignatureVerification) }
                     }
                 },
-                AeadMode::ChaChaPoly { .. } => {
-                    // Placeholder for ChaChaPoly finalize
+                AeadMode::ChaChaPoly { poly, .. } => {
+                    let mut len_block = [0u8; 16];
+                    len_block[8..16].copy_from_slice(&self._data_len.to_le_bytes());
+                    let mut poly = poly;
+                    poly.update_padded(&len_block);
+                    let tag = poly.finalize();
                     if self._is_encrypt {
-                        // self._tag = ...
+                        self._tag = tag.to_vec();
                         Ok(0)
                     } else {
-                        Ok(0) // Assume success for now
+                        let expected_tag = GenericArray::<u8, consts::U16>::from_slice(&self._tag);
+                        if tag.ct_eq(expected_tag).unwrap_u8() == 1 { Ok(0) } else { Err(CryptoError::SignatureVerification) }
                     }
                 }
             }
