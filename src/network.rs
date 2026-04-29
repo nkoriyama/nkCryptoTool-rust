@@ -24,10 +24,10 @@ impl NetworkProcessor {
     pub async fn listen(config: &CryptoConfig) -> Result<()> {
         let addr = config.listen_addr.as_ref().ok_or(CryptoError::Parameter("Missing listen address".to_string()))?;
         let listener = TcpListener::bind(addr).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        println!("Listening on {}...", addr);
+        eprintln!("Listening on {}...", addr);
 
         let (mut stream, peer) = listener.accept().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        println!("Connection accepted from {}", peer);
+        eprintln!("Connection accepted from {}", peer);
 
         // 1. Receive Client Hello
         let mut magic = [0u8; 4];
@@ -67,7 +67,7 @@ impl NetworkProcessor {
             if !backend::pqc_verify(&config.pqc_dsa_algo, &pubkey_der, &transcript, &client_sig)? {
                 return Err(CryptoError::SignatureVerification);
             }
-            println!("Client authenticated successfully.");
+            eprintln!("Client authenticated successfully.");
         } else if config.signing_pubkey.is_some() {
             return Err(CryptoError::Parameter("Server requires authentication but client did not provide signature".to_string()));
         }
@@ -117,17 +117,17 @@ impl NetworkProcessor {
         if let Some(privkey_path) = &config.signing_privkey {
             let privkey_pem = std::fs::read_to_string(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
             let privkey_der = crate::utils::unwrap_from_pem(&privkey_pem, "PRIVATE KEY")?;
-            let mut pass = config.passphrase.clone();
-            let sig = backend::pqc_sign(&config.pqc_dsa_algo, &privkey_der, &server_transcript, pass.as_deref())?;
+            let pass = config.passphrase.as_deref();
+            let sig = backend::pqc_sign(&config.pqc_dsa_algo, &privkey_der, &server_transcript, pass)?;
             
             stream.write_all(&[1u8]).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
             Self::write_vec(&mut stream, &sig).await?;
-            println!("Sent server signature for authentication.");
+            eprintln!("Sent server signature for authentication.");
         } else {
             stream.write_all(&[0u8]).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
         }
 
-        println!("Handshake completed. Using AEAD: {}", aead_name);
+        eprintln!("Handshake completed. Using AEAD: {}", aead_name);
 
         // 4. Data Transfer (Receive)
         let mut aead = backend::new_decrypt(&aead_name, &encryption_key, &iv)?;
@@ -153,8 +153,9 @@ impl NetworkProcessor {
             stdout.flush().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
         }
         
-        // Finalize (ignore tag for now in this simple pipe, but should verify in production)
+        // Finalize
         let _ = aead.finalize(&mut out_buffer);
+        eprintln!("Connection closed. Data transfer complete.");
 
         Ok(())
     }
@@ -162,7 +163,7 @@ impl NetworkProcessor {
     pub async fn connect(config: &CryptoConfig) -> Result<()> {
         let addr = config.connect_addr.as_ref().ok_or(CryptoError::Parameter("Missing connect address".to_string()))?;
         let mut stream = TcpStream::connect(addr).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        println!("Connected to {}", addr);
+        eprintln!("Connected to {}", addr);
 
         // 1. Client Key Generation
         let (client_ecc_priv, client_ecc_pub) = backend::generate_ecc_key_pair("prime256v1")?;
@@ -192,12 +193,12 @@ impl NetworkProcessor {
         if let Some(privkey_path) = &config.signing_privkey {
             let privkey_pem = std::fs::read_to_string(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
             let privkey_der = crate::utils::unwrap_from_pem(&privkey_pem, "PRIVATE KEY")?;
-            let mut pass = config.passphrase.clone();
-            let sig = backend::pqc_sign(&config.pqc_dsa_algo, &privkey_der, &transcript, pass.as_deref())?;
+            let pass = config.passphrase.as_deref();
+            let sig = backend::pqc_sign(&config.pqc_dsa_algo, &privkey_der, &transcript, pass)?;
             
             stream.write_all(&[1u8]).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
             Self::write_vec(&mut stream, &sig).await?;
-            println!("Sent client signature for authentication.");
+            eprintln!("Sent client signature for authentication.");
         } else {
             stream.write_all(&[0u8]).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
         }
@@ -235,7 +236,7 @@ impl NetworkProcessor {
             if !backend::pqc_verify(&config.pqc_dsa_algo, &pubkey_der, &server_transcript, &server_sig)? {
                 return Err(CryptoError::SignatureVerification);
             }
-            println!("Server authenticated successfully.");
+            eprintln!("Server authenticated successfully.");
         } else if config.signing_pubkey.is_some() {
             return Err(CryptoError::Parameter("Client requires authentication but server did not provide signature".to_string()));
         }
@@ -251,7 +252,7 @@ impl NetworkProcessor {
         let hk = Hkdf::<Sha3_256>::new(Some(&salt), &combined_ss);
         hk.expand(b"hybrid-encryption", &mut encryption_key).map_err(|e| CryptoError::Parameter(e.to_string()))?;
 
-        println!("Handshake completed. Sending data...");
+        eprintln!("Handshake completed. Sending data...");
 
         // 5. Data Transfer (Send)
         let mut aead = backend::new_encrypt(&config.aead_algo, &encryption_key, &iv)?;
@@ -272,6 +273,7 @@ impl NetworkProcessor {
 
         // Send EOF
         stream.write_all(&0u32.to_le_bytes()).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+        eprintln!("Data transfer complete.");
 
         Ok(())
     }
