@@ -11,6 +11,7 @@ pub mod key;
 pub mod strategy;
 pub mod processor;
 pub mod backend;
+pub mod network;
 
 pub use error::CryptoError;
 pub use processor::{CryptoProcessor, ProgressCallback};

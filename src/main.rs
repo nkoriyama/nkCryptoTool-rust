@@ -64,6 +64,12 @@ struct Args {
     #[arg(long)]
     signature: Option<String>,
 
+    #[arg(long)]
+    listen: Option<String>,
+
+    #[arg(long)]
+    connect: Option<String>,
+
     #[arg(long, default_value = "SHA3-512")]
     digest_algo: String,
 
@@ -101,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
         else if args.verify { Operation::Verify }
         else if args.gen_enc_key { Operation::GenerateEncKey }
         else if args.gen_sign_key { Operation::GenerateSignKey }
+        else if args.listen.is_some() { Operation::Listen }
+        else if args.connect.is_some() { Operation::Connect }
         else { anyhow::bail!("No operation specified") };
 
     // Initial passphrase from CLI args is now removed for security.
@@ -133,6 +141,16 @@ async fn main() -> anyhow::Result<()> {
     config.pqc_dsa_algo = args.dsa_algo;
     config.passphrase = passphrase;
     config.use_tpm = args.use_tpm;
+    config.listen_addr = args.listen;
+    config.connect_addr = args.connect;
+
+    if operation == Operation::Listen {
+        nk_crypto_tool::network::NetworkProcessor::listen(&config).await?;
+        return Ok(());
+    } else if operation == Operation::Connect {
+        nk_crypto_tool::network::NetworkProcessor::connect(&config).await?;
+        return Ok(());
+    }
 
     // Add paths for regenerate-pubkey (if you decide to expose it in CLI)
     // For now, it's used internally or for interop.
