@@ -77,48 +77,15 @@ impl CryptoProcessor {
         let mut strategy = self.strategy.take().ok_or(CryptoError::Parameter("Strategy not initialized".to_string()))?;
         strategy.prepare_signing(Path::new(priv_key_path), passphrase, &config.digest_algo)?;
 
-        let total_input_size = tokio::fs::metadata(input_path).await?.len();
-        let input_path_str = input_path.to_string();
+        let input_file = std::fs::File::open(input_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
+        let mmap = crate::utils::Mmap::new(&input_file)?;
         
-        let (tx_hash, mut rx_hash) = mpsc::channel::<Vec<u8>>(32);
+        if let Some(ref cb) = progress_callback { cb(0.5); }
+        let signature = strategy.sign_full(mmap.as_slice())?;
+        if let Some(ref cb) = progress_callback { cb(1.0); }
         
-        let reader_handle = tokio::spawn(async move {
-            let file = File::open(&input_path_str).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let mut reader = BufReader::with_capacity(BUF_SIZE, file);
-            let mut total_read = 0u64;
-            
-            loop {
-                let mut buffer = vec![0u8; BUF_SIZE];
-                let n = reader.read(&mut buffer).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                if n == 0 { break; }
-                buffer.truncate(n);
-                if tx_hash.send(buffer).await.is_err() { break; }
-                total_read += n as u64;
-                if total_read >= total_input_size { break; }
-            }
-            Ok::<(), CryptoError>(())
-        });
-
-        let hash_task = tokio::spawn(async move {
-            let mut total_hashed = 0u64;
-            while let Some(data) = rx_hash.recv().await {
-                strategy.update_hash(&data)?;
-                total_hashed += data.len() as u64;
-                if let Some(ref cb) = progress_callback {
-                    cb(total_hashed as f64 / total_input_size as f64);
-                }
-            }
-            let signature = strategy.sign_hash()?;
-            let header = strategy.serialize_signature_header();
-            Ok::<(Box<dyn CryptoStrategy>, Vec<u8>, Vec<u8>), CryptoError>((strategy, header, signature))
-        });
-
-        let (r1, r2) = tokio::try_join!(reader_handle, hash_task)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        
-        r1?;
-        let (s, header, signature) = r2?;
-        self.strategy = Some(s);
+        let header = strategy.serialize_signature_header();
+        self.strategy = Some(strategy);
 
         let mut output_file = std::fs::File::create(signature_path)?;
         use std::io::Write;
@@ -140,47 +107,14 @@ impl CryptoProcessor {
 
         strategy.prepare_verification(Path::new(pub_key_path), &config.digest_algo)?;
 
-        let total_input_size = tokio::fs::metadata(input_path).await?.len();
-        let input_path_str = input_path.to_string();
+        let input_file = std::fs::File::open(input_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
+        let mmap = crate::utils::Mmap::new(&input_file)?;
         
-        let (tx_hash, mut rx_hash) = mpsc::channel::<Vec<u8>>(32);
+        if let Some(ref cb) = progress_callback { cb(0.5); }
+        let success = strategy.verify_full(mmap.as_slice(), &signature)?;
+        if let Some(ref cb) = progress_callback { cb(1.0); }
         
-        let reader_handle = tokio::spawn(async move {
-            let file = File::open(&input_path_str).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let mut reader = BufReader::with_capacity(BUF_SIZE, file);
-            let mut total_read = 0u64;
-            
-            loop {
-                let mut buffer = vec![0u8; BUF_SIZE];
-                let n = reader.read(&mut buffer).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                if n == 0 { break; }
-                buffer.truncate(n);
-                if tx_hash.send(buffer).await.is_err() { break; }
-                total_read += n as u64;
-                if total_read >= total_input_size { break; }
-            }
-            Ok::<(), CryptoError>(())
-        });
-
-        let hash_task = tokio::spawn(async move {
-            let mut total_hashed = 0u64;
-            while let Some(data) = rx_hash.recv().await {
-                strategy.update_hash(&data)?;
-                total_hashed += data.len() as u64;
-                if let Some(ref cb) = progress_callback {
-                    cb(total_hashed as f64 / total_input_size as f64);
-                }
-            }
-            let success = strategy.verify_hash(&signature)?;
-            Ok::<(Box<dyn CryptoStrategy>, bool), CryptoError>((strategy, success))
-        });
-
-        let (r1, r2) = tokio::try_join!(reader_handle, hash_task)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        
-        r1?;
-        let (s, success) = r2?;
-        self.strategy = Some(s);
+        self.strategy = Some(strategy);
 
         if success {
             println!("Signature verified successfully.");
@@ -326,8 +260,9 @@ impl CryptoProcessor {
             Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
         });
 
+        let output_path_clone = output_path.clone();
         let writer_handle = tokio::spawn(async move {
-            let mut file = File::create(&output_path).await.map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+            let mut file = File::create(&output_path_clone).await.map_err(|e| CryptoError::FileWrite(e.to_string()))?;
             file.write_all(&header).await.map_err(|e| CryptoError::FileWrite(e.to_string()))?;
             
             let mut total_written = 0u64;
@@ -345,8 +280,18 @@ impl CryptoProcessor {
         let (r1, r2, r3) = tokio::try_join!(reader_handle, crypto_task, writer_handle)
             .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
 
-        r1?; r3?;
-        Ok(r2?)
+        if let Err(e) = r1.and(r3) {
+            tokio::fs::remove_file(&output_path).await.ok();
+            return Err(e);
+        }
+        
+        match r2 {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                tokio::fs::remove_file(&output_path).await.ok();
+                Err(e)
+            }
+        }
     }
 
     async fn run_pipelined_decrypt(
@@ -389,8 +334,9 @@ impl CryptoProcessor {
             Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
         });
 
+        let output_path_clone = output_path.clone();
         let writer_handle = tokio::spawn(async move {
-            let mut file = File::create(&output_path).await.map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+            let mut file = File::create(&output_path_clone).await.map_err(|e| CryptoError::FileWrite(e.to_string()))?;
             let mut total_written = 0u64;
             while let Some((_, data)) = rx_writer.recv().await {
                 file.write_all(&data).await.map_err(|e| CryptoError::FileWrite(e.to_string()))?;
@@ -406,8 +352,18 @@ impl CryptoProcessor {
         let (r1, r2, r3) = tokio::try_join!(reader_handle, crypto_task, writer_handle)
             .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
 
-        r1?; r3?;
-        Ok(r2?)
+        if let Err(e) = r1.and(r3) {
+            tokio::fs::remove_file(&output_path).await.ok();
+            return Err(e);
+        }
+        
+        match r2 {
+            Ok(s) => Ok(s),
+            Err(e) => {
+                tokio::fs::remove_file(&output_path).await.ok();
+                Err(e)
+            }
+        }
     }
 
     pub fn generate_encryption_key_pair(&self, config: &CryptoConfig) -> Result<()> {

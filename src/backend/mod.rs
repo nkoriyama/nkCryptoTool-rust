@@ -70,11 +70,11 @@ pub fn extract_raw_private_key(priv_der: &[u8], passphrase: Option<&str>) -> Res
     crypto_impl::extract_raw_private_key(priv_der, passphrase)
 }
 
-pub fn pqc_keygen_kem(algo: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn pqc_keygen_kem(algo: &str) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
     crypto_impl::pqc_keygen_kem(algo)
 }
 
-pub fn pqc_keygen_dsa(algo: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn pqc_keygen_dsa(algo: &str) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
     crypto_impl::pqc_keygen_dsa(algo)
 }
 

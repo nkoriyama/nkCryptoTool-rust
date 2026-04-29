@@ -116,8 +116,10 @@ impl AeadBackend for OpenSslAead {
         #[cfg(feature = "backend-openssl")]
         {
             let mut ctx = CipherCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            let cipher = match cipher_name {
-                "AES-256-GCM" => Cipher::aes_256_gcm(),
+            let normalized_name = cipher_name.to_lowercase();
+            let cipher = match normalized_name.as_str() {
+                "aes-256-gcm" => Cipher::aes_256_gcm(),
+                "chacha20-poly1305" => Cipher::chacha20_poly1305(),
                 _ => return Err(CryptoError::Parameter(format!("Unsupported cipher: {}", cipher_name))),
             };
             ctx.encrypt_init(Some(cipher), None, None).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
@@ -136,8 +138,10 @@ impl AeadBackend for OpenSslAead {
         #[cfg(feature = "backend-openssl")]
         {
             let mut ctx = CipherCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            let cipher = match cipher_name {
-                "AES-256-GCM" => Cipher::aes_256_gcm(),
+            let normalized_name = cipher_name.to_lowercase();
+            let cipher = match normalized_name.as_str() {
+                "aes-256-gcm" => Cipher::aes_256_gcm(),
+                "chacha20-poly1305" => Cipher::chacha20_poly1305(),
                 _ => return Err(CryptoError::Parameter(format!("Unsupported cipher: {}", cipher_name))),
             };
             ctx.decrypt_init(Some(cipher), None, None).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
@@ -296,11 +300,11 @@ pub fn extract_public_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<V
     { let _ = (priv_der, passphrase); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
 }
 
-pub fn pqc_keygen_kem(_algo: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn pqc_keygen_kem(_algo: &str) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
     Err(CryptoError::Parameter("PQC keygen not supported in this OpenSSL version".to_string()))
 }
 
-pub fn pqc_keygen_dsa(_algo: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn pqc_keygen_dsa(_algo: &str) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
     Err(CryptoError::Parameter("PQC keygen not supported in this OpenSSL version".to_string()))
 }
 

@@ -38,6 +38,7 @@ ctr = { version = "0.9", optional = true }
 ghash = { version = "0.5", optional = true }
 subtle = { version = "2.5", optional = true }
 generic-array = { version = "0.14", optional = true }
+chacha20poly1305 = "0.10.1"
 
 [features]
 default = ["backend-openssl"]

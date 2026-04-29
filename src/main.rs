@@ -67,6 +67,9 @@ struct Args {
     #[arg(long, default_value = "SHA3-512")]
     digest_algo: String,
 
+    #[arg(long, default_value = "AES-256-GCM")]
+    aead_algo: String,
+
     #[arg(long, default_value = "ML-KEM-768")]
     kem_algo: String,
 
@@ -125,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
     config.signing_pubkey = args.signing_pubkey;
     config.signature_file = args.signature;
     config.digest_algo = args.digest_algo;
+    config.aead_algo = args.aead_algo;
     config.pqc_kem_algo = args.kem_algo;
     config.pqc_dsa_algo = args.dsa_algo;
     config.passphrase = passphrase;
