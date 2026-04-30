@@ -70,6 +70,9 @@ struct Args {
     #[arg(long)]
     connect: Option<String>,
 
+    #[arg(long)]
+    chat: bool,
+
     #[arg(long, default_value = "SHA3-512")]
     digest_algo: String,
 
@@ -143,6 +146,7 @@ async fn main() -> anyhow::Result<()> {
     config.use_tpm = args.use_tpm;
     config.listen_addr = args.listen;
     config.connect_addr = args.connect;
+    config.chat_mode = args.chat;
 
     if operation == Operation::Listen {
         nk_crypto_tool::network::NetworkProcessor::listen(&config).await?;
