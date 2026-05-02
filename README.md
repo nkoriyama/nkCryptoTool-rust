@@ -134,16 +134,35 @@ Tokio による非同期 I/O パイプラインにより、全バックエンド
 
 ## **統一ヘッダーフォーマット (Unified Header Format)**
 
-本ツールで暗号化されたファイル (`.nkct`) および署名ファイル (`.nkcs`) は、C++/Rust間および全バックエンド間での完全な相互運用性を確保するため、以下の **Version 1 統一ヘッダー形式** を採用しています。
+本ツールで暗号化されたファイル (`.nkct`) および署名ファイル (`.nkcs`) は、C++/Rust間および全バックエンド間での完全な相互運用性を確保するため、以下の統一ヘッダー形式を採用しています。
 
-### **バイナリレイアウト (Version 1)**
+### **バイナリレイアウト (.nkct / 暗号化ファイル)**
+
+最新の暗号化ファイルでは **Version 2** ヘッダーを採用しており、使用された AEAD アルゴリズム名がヘッダーに含まれます。これにより、AES-256-GCM と ChaCha20-Poly1305 を動的に切り替えて復号することが可能です。
 
 ```mermaid
 packet-beta
-0-31: "Magic (NKCT/NKCS)"
-32-47: "Version (1)"
-48-55: "Strategy Type (0/1/2)"
+0-31: "Magic (NKCT)"
+32-47: "Version (2)"
+48-55: "Strategy Type (1:ECC / 2:PQC / 3:Hybrid)"
 56-119: "Strategy Data (Variable Length ...)"
+```
+
+**Strategy Data の構成 (Version 2):**
+*   **ECC**: `CurveName`, `DigestAlgo`, `EphemeralPubKey`, `Salt`, `IV`, `AEADAlgo`
+*   **PQC**: `KEMAlgo`, `DSAAlgo`, `KEM-CT`, `Salt`, `IV`, `AEADAlgo`
+*   **Hybrid**: `ECCHeaderLength`, `ECCHeader`, `PQCHeaderLength`, `PQCHeader` (Hybrid自体の外枠バージョンは1)
+
+### **バイナリレイアウト (.nkcs / 署名ファイル)**
+
+署名ファイルは現在 **Version 1** を使用しています。
+
+```mermaid
+packet-beta
+0-31: "Magic (NKCS)"
+32-47: "Version (1)"
+48-55: "Strategy Type (1:ECC / 2:PQC / 3:Hybrid)"
+56-119: "Signature Data (Variable Length ...)"
 ```
 
 すべての数値は**リトルエンディアン (Little-Endian)** で記録されます。
