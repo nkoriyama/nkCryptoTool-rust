@@ -13,6 +13,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, AsyncBufReadExt};
 use std::io::Write;
 use hkdf::Hkdf;
 use sha3::Sha3_256;
+use zeroize::Zeroizing;
 
 const BUF_SIZE: usize = 1024 * 1024;
 const MAX_CHUNK_SIZE: usize = 64 * 1024 * 1024; // 64MB DoS protection
@@ -34,9 +35,27 @@ impl NetworkProcessor {
         let listener = TcpListener::bind(addr).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
         eprintln!("Listening on {}...", addr);
 
-        let (mut stream, peer) = listener.accept().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        eprintln!("Connection accepted from {}", peer);
+        loop {
+            let (stream, peer) = listener.accept().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+            eprintln!("Connection accepted from {}", peer);
 
+            // Add timeout for handshake to prevent connection holding DoS (#2 fix)
+            match tokio::time::timeout(std::time::Duration::from_secs(15), Self::handle_server_connection(stream, config)).await {
+                Ok(Ok(_)) => break, // Successfully handled one session (point-to-point tool style)
+                Ok(Err(e)) => {
+                    eprintln!("Connection error with {}: {}", peer, e);
+                    continue;
+                }
+                Err(_) => {
+                    eprintln!("Handshake timeout with {}", peer);
+                    continue;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_server_connection(mut stream: TcpStream, config: &CryptoConfig) -> Result<()> {
         // 1. Receive Client Hello
         let mut magic = [0u8; 4];
         stream.read_exact(&mut magic).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
@@ -71,6 +90,8 @@ impl NetworkProcessor {
         // 1.5 Handle Client Authentication
         let mut auth_flag = [0u8; 1];
         stream.read_exact(&mut auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+        transcript.extend_from_slice(&auth_flag); // #1 fix: include auth_flag in transcript
+
         if auth_flag[0] == 1 {
             let client_sig = Self::read_vec(&mut stream).await?;
             let pubkey_path = config.signing_pubkey.as_ref().ok_or(CryptoError::Parameter("Client sent signature but no peer public key provided for verification".to_string()))?;
@@ -129,9 +150,13 @@ impl NetworkProcessor {
         stream.write_all(&server_hello_data).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
         // 3.5 Server Authentication
+        let server_auth_flag = if config.signing_privkey.is_some() { [1u8] } else { [0u8] };
+        server_transcript.extend_from_slice(&server_auth_flag); // #1 fix: include auth_flag in transcript
+
         if let Some(privkey_path) = &config.signing_privkey {
-            let privkey_pem = std::fs::read_to_string(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let privkey_der = crate::utils::unwrap_from_pem(&privkey_pem, "PRIVATE KEY")?;
+            // #4 fix: Wrap secret keys in Zeroizing
+            let privkey_pem = Zeroizing::new(std::fs::read_to_string(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
+            let privkey_der = Zeroizing::new(crate::utils::unwrap_from_pem(&privkey_pem, "PRIVATE KEY")?);
             let pass = config.passphrase.as_deref().map(|x| x.as_str());
             let sig = backend::pqc_sign(&config.pqc_dsa_algo, &privkey_der, &server_transcript, pass)?;
             stream.write_all(&[1u8]).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
@@ -219,9 +244,13 @@ impl NetworkProcessor {
         Self::write_vec(&mut stream, &client_ecc_pub).await?;
         Self::write_vec(&mut stream, &client_kem_pub).await?;
 
+        let auth_flag = if config.signing_privkey.is_some() { [1u8] } else { [0u8] };
+        transcript.extend_from_slice(&auth_flag); // #1 fix: include auth_flag in transcript
+
         if let Some(privkey_path) = &config.signing_privkey {
-            let privkey_pem = std::fs::read_to_string(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let privkey_der = crate::utils::unwrap_from_pem(&privkey_pem, "PRIVATE KEY")?;
+            // #4 fix: Wrap secret keys in Zeroizing
+            let privkey_pem = Zeroizing::new(std::fs::read_to_string(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
+            let privkey_der = Zeroizing::new(crate::utils::unwrap_from_pem(&privkey_pem, "PRIVATE KEY")?);
             let pass = config.passphrase.as_deref().map(|x| x.as_str());
             let sig = backend::pqc_sign(&config.pqc_dsa_algo, &privkey_der, &transcript, pass)?;
             stream.write_all(&[1u8]).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
@@ -248,6 +277,8 @@ impl NetworkProcessor {
 
         let mut auth_flag = [0u8; 1];
         stream.read_exact(&mut auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+        server_transcript.extend_from_slice(&auth_flag); // #1 fix: include auth_flag in transcript
+
         if auth_flag[0] == 1 {
             let server_sig = Self::read_vec(&mut stream).await?;
             let pubkey_path = config.signing_pubkey.as_ref().ok_or(CryptoError::Parameter("Server sent signature but no peer public key provided for verification".to_string()))?;
@@ -329,7 +360,7 @@ impl NetworkProcessor {
         let (mut stream_rx, mut stream_tx) = stream.into_split();
 
         // 1. Receiver Task (B1/B2/B6 fix)
-        let rx_task = tokio::spawn(async move {
+        let mut rx_task = tokio::spawn(async move {
             let mut out_buf = vec![0u8; 65536 + 64];
             loop {
                 let mut len_bytes = [0u8; 4];
@@ -372,43 +403,61 @@ impl NetworkProcessor {
         print!("> ");
         let _ = std::io::stdout().flush();
 
-        while let Some(line) = stdin_reader.next_line().await.map_err(|e| CryptoError::FileRead(e.to_string()))? {
-            if line.is_empty() { 
-                print!("> ");
-                let _ = std::io::stdout().flush();
-                continue; 
+        loop {
+            tokio::select! {
+                line_opt = stdin_reader.next_line() => {
+                    let line = match line_opt {
+                        Ok(Some(l)) => l,
+                        Ok(None) => break,
+                        Err(e) => return Err(CryptoError::FileRead(e.to_string())),
+                    };
+                    if line.is_empty() { 
+                        print!("> ");
+                        let _ = std::io::stdout().flush();
+                        continue; 
+                    }
+                    let data = line.as_bytes();
+                    
+                    // Generate dynamic nonce per message
+                    let mut nonce = vec![0u8; 12];
+                    #[cfg(feature = "backend-openssl")]
+                    openssl::rand::rand_bytes(&mut nonce).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+                    #[cfg(feature = "backend-rustcrypto")]
+                    {
+                        use rand_core::{RngCore, OsRng};
+                        OsRng.fill_bytes(&mut nonce);
+                    }
+
+                    let mut tx_aead = backend::new_encrypt(aead_name, &tx_key, &nonce)?;
+                    let mut encrypted = vec![0u8; data.len() + 32];
+                    let n = tx_aead.update(data, &mut encrypted)?;
+                    let final_n = tx_aead.finalize(&mut encrypted[n..])?;
+                    
+                    let mut tag = vec![0u8; 16];
+                    tx_aead.get_tag(&mut tag)?;
+
+                    // Packet: [12:Nonce][Ciphertext][16:Tag]
+                    let mut packet = Vec::with_capacity(12 + n + final_n + 16);
+                    packet.extend_from_slice(&nonce);
+                    packet.extend_from_slice(&encrypted[..n + final_n]);
+                    packet.extend_from_slice(&tag);
+
+                    stream_tx.write_all(&(packet.len() as u32).to_le_bytes()).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                    stream_tx.write_all(&packet).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                    
+                    print!("> ");
+                    let _ = std::io::stdout().flush();
+                }
+                res = &mut rx_task => {
+                    // #3 fix: Propagate rx_task end to sender loop
+                    match res {
+                        Ok(Ok(_)) => eprintln!("\r--- Peer disconnected gracefully ---"),
+                        Ok(Err(e)) => eprintln!("\r--- Receiver task failed: {} ---", e),
+                        Err(e) => eprintln!("\r--- Receiver task panicked: {} ---", e),
+                    }
+                    break;
+                }
             }
-            let data = line.as_bytes();
-            
-            // Generate dynamic nonce per message
-            let mut nonce = vec![0u8; 12];
-            #[cfg(feature = "backend-openssl")]
-            openssl::rand::rand_bytes(&mut nonce).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            #[cfg(feature = "backend-rustcrypto")]
-            {
-                use rand_core::{RngCore, OsRng};
-                OsRng.fill_bytes(&mut nonce);
-            }
-
-            let mut tx_aead = backend::new_encrypt(aead_name, &tx_key, &nonce)?;
-            let mut encrypted = vec![0u8; data.len() + 32];
-            let n = tx_aead.update(data, &mut encrypted)?;
-            let final_n = tx_aead.finalize(&mut encrypted[n..])?;
-            
-            let mut tag = vec![0u8; 16];
-            tx_aead.get_tag(&mut tag)?;
-
-            // Packet: [12:Nonce][Ciphertext][16:Tag]
-            let mut packet = Vec::with_capacity(12 + n + final_n + 16);
-            packet.extend_from_slice(&nonce);
-            packet.extend_from_slice(&encrypted[..n + final_n]);
-            packet.extend_from_slice(&tag);
-
-            stream_tx.write_all(&(packet.len() as u32).to_le_bytes()).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            stream_tx.write_all(&packet).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            
-            print!("> ");
-            let _ = std::io::stdout().flush();
         }
 
         rx_task.abort();
