@@ -40,12 +40,26 @@ impl NetworkProcessor {
         let listener = TcpListener::bind(addr).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
         eprintln!("Listening on {}...", addr);
 
+        use tokio::sync::Semaphore;
+        use std::sync::Arc;
+        let semaphore = Arc::new(Semaphore::new(100)); // #1 Fix: limit to 100 concurrent connections
+
         loop {
-            let (stream, peer) = listener.accept().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+            let accept_res = listener.accept().await;
+            let (stream, peer) = match accept_res {
+                Ok(res) => res,
+                Err(e) => {
+                    eprintln!("accept error: {}", e);
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await; // #3 Fix: avoid busy loop on temporary errors
+                    continue;
+                }
+            };
             eprintln!("Connection accepted from {}", peer);
 
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
             let config_clone = config.clone(); // Clone config for the task
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = Self::handle_server_connection(stream, &config_clone).await {
                     eprintln!("Connection error with {}: {}", peer, e);
                 }
@@ -124,10 +138,10 @@ impl NetworkProcessor {
             let salt = Sha3_256::digest(&server_transcript).to_vec();
 
             let hk = Hkdf::<Sha3_256>::new(Some(&salt), &combined_ss);
-            let mut s2c_key = vec![0u8; 32];
-            let mut s2c_iv = vec![0u8; 12];
-            let mut c2s_key = vec![0u8; 32];
-            let mut c2s_iv = vec![0u8; 12];
+            let mut s2c_key = Zeroizing::new(vec![0u8; 32]);
+            let mut s2c_iv = Zeroizing::new(vec![0u8; 12]);
+            let mut c2s_key = Zeroizing::new(vec![0u8; 32]);
+            let mut c2s_iv = Zeroizing::new(vec![0u8; 12]);
             
             hk.expand(b"s2c-key", &mut s2c_key).map_err(|e| CryptoError::Parameter(e.to_string()))?;
             hk.expand(b"s2c-iv", &mut s2c_iv).map_err(|e| CryptoError::Parameter(e.to_string()))?;
@@ -148,7 +162,7 @@ impl NetworkProcessor {
                 Self::write_vec(&mut stream, &sig).await?;
                 eprintln!("Sent server signature for authentication.");
             }
-            Ok::<(String, Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>), CryptoError>((aead_name, s2c_key, s2c_iv, c2s_key, c2s_iv))
+            Ok::<(String, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>), CryptoError>((aead_name, s2c_key, s2c_iv, c2s_key, c2s_iv))
         }).await;
 
         let (aead_name, s2c_key, _s2c_iv, c2s_key, c2s_iv) = match handshake_data {
@@ -291,10 +305,10 @@ impl NetworkProcessor {
         let salt = Sha3_256::digest(&server_transcript).to_vec();
 
         let hk = Hkdf::<Sha3_256>::new(Some(&salt), &combined_ss);
-        let mut s2c_key = vec![0u8; 32];
-        let mut s2c_iv = vec![0u8; 12];
-        let mut c2s_key = vec![0u8; 32];
-        let mut c2s_iv = vec![0u8; 12];
+        let mut s2c_key = Zeroizing::new(vec![0u8; 32]);
+        let mut s2c_iv = Zeroizing::new(vec![0u8; 12]);
+        let mut c2s_key = Zeroizing::new(vec![0u8; 32]);
+        let mut c2s_iv = Zeroizing::new(vec![0u8; 12]);
         hk.expand(b"s2c-key", &mut s2c_key).map_err(|e| CryptoError::Parameter(e.to_string()))?;
         hk.expand(b"s2c-iv", &mut s2c_iv).map_err(|e| CryptoError::Parameter(e.to_string()))?;
         hk.expand(b"c2s-key", &mut c2s_key).map_err(|e| CryptoError::Parameter(e.to_string()))?;
@@ -332,16 +346,17 @@ impl NetworkProcessor {
 
     async fn chat_loop(stream: TcpStream, aead_name: &str, s2c_key: &[u8], c2s_key: &[u8], is_server: bool) -> Result<()> {
         let (rx_key, tx_key) = if is_server {
-            (c2s_key.to_vec(), s2c_key.to_vec())
+            (Zeroizing::new(c2s_key.to_vec()), Zeroizing::new(s2c_key.to_vec()))
         } else {
-            (s2c_key.to_vec(), c2s_key.to_vec())
+            (Zeroizing::new(s2c_key.to_vec()), Zeroizing::new(c2s_key.to_vec()))
         };
 
         let aead_name_str = aead_name.to_string();
         let (mut stream_rx, mut stream_tx) = stream.into_split();
 
         let mut rx_task = tokio::spawn(async move {
-            let mut out_buf = vec![0u8; 65536 + 64];
+            let mut out_buf = vec![0u8; 70000]; // #2 Fix: Match MAX packet size
+            let mut seen_nonces = std::collections::HashSet::new(); // #4 Fix: Replay protection
             loop {
                 let mut len_bytes = [0u8; 4];
                 if stream_rx.read_exact(&mut len_bytes).await.is_err() { break; }
@@ -357,6 +372,11 @@ impl NetworkProcessor {
                 
                 let (nonce, rest) = packet.split_at(12);
                 let (ciphertext, tag) = rest.split_at(rest.len() - 16);
+                
+                // #4 Fix: Prevent nonce replay
+                if !seen_nonces.insert(nonce.to_vec()) {
+                    return Err(CryptoError::Parameter("Replayed nonce detected".to_string()));
+                }
                 
                 let mut rx_aead = backend::new_decrypt(&aead_name_str, &rx_key, nonce)?;
                 rx_aead.set_tag(tag)?;
@@ -393,7 +413,11 @@ impl NetworkProcessor {
                         let _ = std::io::stdout().flush();
                         continue; 
                     }
-                    let data = line.as_bytes();
+                    let mut data = line.as_bytes();
+                    if data.len() > 65000 {
+                        data = &data[..65000];
+                        eprintln!("Warning: Message truncated to 65000 bytes.");
+                    }
                     
                     let mut nonce = vec![0u8; 12];
                     #[cfg(feature = "backend-openssl")]
