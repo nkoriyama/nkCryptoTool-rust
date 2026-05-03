@@ -1,0 +1,44 @@
+warning: unused import: `crate::backend`
+ --> src/key/tpm.rs:9:5
+  |
+9 | use crate::backend;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::backend::AeadBackend`
+  --> src/key/tpm.rs:10:5
+   |
+10 | use crate::backend::AeadBackend;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `sha3::Sha3_256`
+  --> src/network.rs:15:5
+   |
+15 | use sha3::Sha3_256;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused variable: `algo`
+   --> src/backend/rustcrypto_impl.rs:519:18
+    |
+519 | pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Ve...
+    |                  ^^^^ help: if this is intentional, prefix it with an underscore: `_algo`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `algo`
+   --> src/backend/rustcrypto_impl.rs:550:18
+    |
+550 | pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], _p...
+    |                  ^^^^ help: if this is intentional, prefix it with an underscore: `_algo`
+
+warning: `nk-crypto-tool` (lib) generated 5 warnings (run `cargo fix --lib -p nk-crypto-tool` to apply 5 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running `target/debug/nk-crypto-tool --mode pqc --listen '127.0.0.1:9978' --chat --allow-unauth`
+AES-NI is available!
+Listening on 127.0.0.1:9978...
+Connection accepted from 127.0.0.1:42484
+Handshake completed. Using AEAD: AES-256-GCM
+--- Chat mode started ---
+> --- Chat ended ---
+Connection with 127.0.0.1:42484 closed. Waiting for next...
