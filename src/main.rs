@@ -74,6 +74,9 @@ struct Args {
     #[arg(long)]
     chat: bool,
 
+    #[arg(long)]
+    allow_unauth: bool,
+
     #[arg(long, default_value = "SHA3-512")]
     digest_algo: String,
 
@@ -148,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
     config.listen_addr = args.listen;
     config.connect_addr = args.connect;
     config.chat_mode = args.chat;
+    config.allow_unauth = args.allow_unauth;
 
     if operation == Operation::Listen {
         nk_crypto_tool::network::NetworkProcessor::listen(&config).await?;

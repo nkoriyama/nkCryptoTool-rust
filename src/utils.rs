@@ -51,6 +51,7 @@ pub fn get_masked_passphrase() -> Result<String> {
 
 pub fn get_and_verify_passphrase(prompt: &str) -> Result<String> {
     if let Ok(pass) = std::env::var("NK_PASSPHRASE") {
+        eprintln!("WARNING: Using passphrase from NK_PASSPHRASE environment variable. This is less secure than interactive entry.");
         return Ok(pass);
     }
     println!("{}", prompt);

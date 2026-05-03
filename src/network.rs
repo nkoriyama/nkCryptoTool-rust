@@ -17,11 +17,18 @@ use sha3::Sha3_256;
 const BUF_SIZE: usize = 1024 * 1024;
 const MAX_CHUNK_SIZE: usize = 64 * 1024 * 1024; // 64MB DoS protection
 const MAGIC_CT: &[u8; 4] = b"NKCT";
-const PROTOCOL_VERSION: u16 = 3;
+const PROTOCOL_VERSION: u16 = 4;
 
 pub struct NetworkProcessor;
 
 impl NetworkProcessor {
+    fn validate_aead(name: &str) -> Result<()> {
+        match name {
+            "AES-256-GCM" | "ChaCha20-Poly1305" => Ok(()),
+            _ => Err(CryptoError::Parameter(format!("Unsupported or insecure AEAD: {}", name))),
+        }
+    }
+
     pub async fn listen(config: &CryptoConfig) -> Result<()> {
         let addr = config.listen_addr.as_ref().ok_or(CryptoError::Parameter("Missing listen address".to_string()))?;
         let listener = TcpListener::bind(addr).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
@@ -38,13 +45,16 @@ impl NetworkProcessor {
         let mut version_bytes = [0u8; 2];
         stream.read_exact(&mut version_bytes).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
         let version = u16::from_le_bytes(version_bytes);
-        if version < 2 { return Err(CryptoError::Parameter("Unsupported protocol version".to_string())); }
+        if version != PROTOCOL_VERSION { 
+            return Err(CryptoError::Parameter(format!("Unsupported protocol version: {}. Expected: {}", version, PROTOCOL_VERSION))); 
+        }
 
         let mut transcript = Vec::new();
         transcript.extend_from_slice(MAGIC_CT);
         transcript.extend_from_slice(&version.to_le_bytes());
 
         let aead_name = Self::read_string(&mut stream).await?;
+        Self::validate_aead(&aead_name)?; // #3 validation
         transcript.extend_from_slice(&(aead_name.len() as u32).to_le_bytes());
         transcript.extend_from_slice(aead_name.as_bytes());
 
@@ -53,6 +63,8 @@ impl NetworkProcessor {
         transcript.extend_from_slice(&client_ecc_pub);
 
         let client_kem_pub = Self::read_vec(&mut stream).await?;
+        transcript.extend_from_slice(&(client_ecc_pub.len() as u32).to_le_bytes());
+        transcript.extend_from_slice(&client_ecc_pub);
         transcript.extend_from_slice(&(client_kem_pub.len() as u32).to_le_bytes());
         transcript.extend_from_slice(&client_kem_pub);
 
@@ -71,6 +83,8 @@ impl NetworkProcessor {
             eprintln!("Client authenticated successfully.");
         } else if config.signing_pubkey.is_some() {
             return Err(CryptoError::Parameter("Server requires authentication but client did not provide signature".to_string()));
+        } else if !config.allow_unauth {
+            return Err(CryptoError::Parameter("Unauthenticated connections are disabled by default. Use --allow-unauth to enable.".to_string()));
         }
 
         // 2. Server Key Generation & Handshake
@@ -81,14 +95,15 @@ impl NetworkProcessor {
         let mut combined_ss = ss_ecc;
         combined_ss.extend_from_slice(&kem_ss);
         
-        let mut salt = vec![0u8; 16];
-        #[cfg(feature = "backend-openssl")]
-        openssl::rand::rand_bytes(&mut salt).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        #[cfg(feature = "backend-rustcrypto")]
-        {
-            use rand_core::{RngCore, OsRng};
-            OsRng.fill_bytes(&mut salt);
-        }
+        // #5: Derive salt from transcript instead of plain server-generated salt
+        use sha3::{Digest, Sha3_256};
+        let mut hasher = Sha3_256::new();
+        hasher.update(&transcript);
+        hasher.update(&(server_ecc_pub.len() as u32).to_le_bytes());
+        hasher.update(&server_ecc_pub);
+        hasher.update(&(kem_ct.len() as u32).to_le_bytes());
+        hasher.update(&kem_ct);
+        let salt = hasher.finalize();
 
         let hk = Hkdf::<Sha3_256>::new(Some(&salt), &combined_ss);
         let mut s2c_key = vec![0u8; 32];
@@ -108,7 +123,7 @@ impl NetworkProcessor {
         server_hello_data.extend_from_slice(&server_ecc_pub);
         server_hello_data.extend_from_slice(&(kem_ct.len() as u32).to_le_bytes());
         server_hello_data.extend_from_slice(&kem_ct);
-        server_hello_data.extend_from_slice(&salt);
+        // Salt is no longer explicitly sent, it's derived
         server_transcript.extend_from_slice(&server_hello_data);
 
         stream.write_all(&server_hello_data).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
@@ -133,7 +148,11 @@ impl NetworkProcessor {
         } else {
             let mut aead = backend::new_decrypt(&aead_name, &c2s_key, &c2s_iv)?;
             let mut out_buffer = vec![0u8; BUF_SIZE + 32];
-            let mut stdout = tokio::io::stdout();
+            
+            // #1 fix: Buffer to a temporary file before verification
+            use tempfile::NamedTempFile;
+            let mut temp_file = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+            
             loop {
                 let mut len_bytes = [0u8; 4];
                 match stream.read_exact(&mut len_bytes).await {
@@ -147,8 +166,8 @@ impl NetworkProcessor {
                 let mut encrypted_chunk = vec![0u8; chunk_len];
                 stream.read_exact(&mut encrypted_chunk).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
                 let n = aead.update(&encrypted_chunk, &mut out_buffer)?;
-                stdout.write_all(&out_buffer[..n]).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                stdout.flush().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                use std::io::Write as _;
+                temp_file.write_all(&out_buffer[..n]).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
             }
             
             // Read tag sent by client (last 16 bytes)
@@ -157,7 +176,18 @@ impl NetworkProcessor {
             aead.set_tag(&tag)?;
 
             let final_n = aead.finalize(&mut out_buffer)?;
-            stdout.write_all(&out_buffer[..final_n]).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+            if final_n > 0 {
+                use std::io::Write as _;
+                temp_file.write_all(&out_buffer[..final_n]).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+            }
+
+            // GCM verification passed. Now release data to stdout or target file.
+            eprintln!("GCM verification successful. Releasing data...");
+            let mut stdout = tokio::io::stdout();
+            let mut reader = tokio::fs::File::open(temp_file.path()).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+            tokio::io::copy(&mut reader, &mut stdout).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+            stdout.flush().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+
             eprintln!("Connection closed. Data transfer complete and verified.");
         }
         Ok(())
@@ -167,6 +197,8 @@ impl NetworkProcessor {
         let addr = config.connect_addr.as_ref().ok_or(CryptoError::Parameter("Missing connect address".to_string()))?;
         let mut stream = TcpStream::connect(addr).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
         eprintln!("Connected to {}", addr);
+
+        Self::validate_aead(&config.aead_algo)?; // #3 validation
 
         let (client_ecc_priv, client_ecc_pub) = backend::generate_ecc_key_pair("prime256v1")?;
         let (client_kem_priv, client_kem_pub, _) = backend::pqc_keygen_kem(&config.pqc_kem_algo)?;
@@ -196,6 +228,9 @@ impl NetworkProcessor {
             Self::write_vec(&mut stream, &sig).await?;
             eprintln!("Sent client signature for authentication.");
         } else {
+            if !config.allow_unauth {
+                return Err(CryptoError::Parameter("Unauthenticated connections are disabled by default. Use --allow-unauth to enable.".to_string()));
+            }
             stream.write_all(&[0u8]).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
         }
 
@@ -206,10 +241,8 @@ impl NetworkProcessor {
         let kem_ct = Self::read_vec(&mut stream).await?;
         server_hello_data.extend_from_slice(&(kem_ct.len() as u32).to_le_bytes());
         server_hello_data.extend_from_slice(&kem_ct);
-        let mut salt = [0u8; 16];
-        stream.read_exact(&mut salt).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        server_hello_data.extend_from_slice(&salt);
-
+        // Salt is no longer received, it's derived from transcript
+        
         let mut server_transcript = transcript.clone();
         server_transcript.extend_from_slice(&server_hello_data);
 
@@ -226,12 +259,20 @@ impl NetworkProcessor {
             eprintln!("Server authenticated successfully.");
         } else if config.signing_pubkey.is_some() {
             return Err(CryptoError::Parameter("Client requires authentication but server did not provide signature".to_string()));
+        } else if !config.allow_unauth {
+            return Err(CryptoError::Parameter("Unauthenticated connections are disabled by default. Use --allow-unauth to enable.".to_string()));
         }
 
         let ss_ecc = backend::ecc_dh(&client_ecc_priv, &server_ecc_pub, None)?;
         let kem_ss = backend::pqc_decap(&config.pqc_kem_algo, &client_kem_priv, &kem_ct, None)?;
         let mut combined_ss = ss_ecc;
         combined_ss.extend_from_slice(&kem_ss);
+
+        // #5: Derive salt from transcript
+        use sha3::{Digest, Sha3_256};
+        let mut hasher = Sha3_256::new();
+        hasher.update(&server_transcript);
+        let salt = hasher.finalize();
 
         let hk = Hkdf::<Sha3_256>::new(Some(&salt), &combined_ss);
         let mut s2c_key = vec![0u8; 32];

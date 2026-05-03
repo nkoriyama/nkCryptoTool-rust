@@ -6,13 +6,12 @@
 
 use crate::error::{CryptoError, Result};
 use crate::key::KeyProvider;
-use crate::backend::{self, AeadBackend};
+use crate::backend;
+use crate::backend::AeadBackend;
 use std::process::{Command, Stdio};
-use std::io::Write;
+use std::io::{Write};
 use std::fs;
 use tempfile::NamedTempFile;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use base64::Engine;
 
 pub struct TpmKeyProvider;
 
@@ -35,7 +34,7 @@ impl TpmKeyProvider {
         let mut child = cmd.spawn().map_err(|e| CryptoError::OpenSSL(format!("Failed to spawn TPM tool {}: {}", args[0], e)))?;
 
         if let Some(data) = stdin_data {
-            let mut stdin = child.stdin.take().unwrap();
+            let mut stdin = child.stdin.take().ok_or_else(|| CryptoError::OpenSSL("stdin not piped".to_string()))?;
             stdin.write_all(data).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         }
 
@@ -53,52 +52,25 @@ impl TpmKeyProvider {
 
 impl KeyProvider for TpmKeyProvider {
     fn is_available(&self) -> bool {
-        Command::new("tpm2_getcap")
-            .arg("properties-fixed")
-            .env("TCTI", "device:/dev/tpmrm0")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        self.run_tpm_cmd(&["tpm2_getcap", "properties-fixed"], None).is_ok()
     }
 
-    fn wrap_raw(&self, data: &[u8], passphrase: Option<&str>) -> Result<String> {
-        let mut aes_key = vec![0u8; 32];
-        let mut iv = vec![0u8; 12];
-        
-        #[cfg(feature = "backend-openssl")]
-        openssl::rand::rand_bytes(&mut aes_key).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        #[cfg(feature = "backend-openssl")]
-        openssl::rand::rand_bytes(&mut iv).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        
-        #[cfg(feature = "backend-rustcrypto")]
-        {
-            use rand_core::{RngCore, OsRng};
-            OsRng.fill_bytes(&mut aes_key);
-            OsRng.fill_bytes(&mut iv);
-        }
-
-        let mut ctx = backend::new_encrypt("AES-256-GCM", &aes_key, &iv)?;
-        let mut ciphertext = vec![0u8; data.len() + 16];
-        let n = ctx.update(data, &mut ciphertext)?;
-        let final_n = ctx.finalize(&mut ciphertext[n..])?;
-        ciphertext.truncate(n + final_n);
-        let mut tag = vec![0u8; 16];
-        ctx.get_tag(&mut tag)?;
-
+    fn wrap_raw(&self, aes_key: &[u8], passphrase: Option<&str>) -> Result<String> {
         let primary_ctx = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-        let aes_file = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
         let pub_file = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
         let priv_file = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+        let aes_file = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
         let session_file = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+        let key_ctx = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
 
-        fs::write(aes_file.path(), &aes_key).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+        fs::write(aes_file.path(), aes_key).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
 
-        let sess_path = session_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid temp file path".to_string()))?;
-        let sess_arg = format!("session:{}", sess_path);
-        let pctx_path = primary_ctx.path().to_str().unwrap_or(""); // Still using unwrap_or for temporary string building but let's be strict
-        let aes_path_str = aes_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
+        let sess_path = session_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
+        let pctx_path = primary_ctx.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
         let upath = pub_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
         let rpath = priv_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
+        let kctx_path = key_ctx.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
+        let aes_path_str = aes_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
 
         self.run_tpm_cmd(&["tpm2_startauthsession", "--hmac-session", "-S", sess_path], None)?;
         self.run_tpm_cmd(&["tpm2_createprimary", "-C", "o", "-c", pctx_path, "-Q"], None)?;
@@ -108,61 +80,57 @@ impl KeyProvider for TpmKeyProvider {
             "-i", aes_path_str,
             "-u", upath,
             "-r", rpath,
-            "-P", &sess_arg,
+            "-c", kctx_path,
+            "-a", "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noauthread|decrypt|sign",
             "-Q"
         ];
 
-        let mut pass_bytes = None;
-        if let Some(pass) = passphrase {
-            if !pass.is_empty() {
-                create_args.push("-p");
-                create_args.push("-");
-                pass_bytes = Some(pass.as_bytes());
-            }
+        let pass_bytes = passphrase.map(|s| s.as_bytes());
+        let auth_arg = if passphrase.is_some() { format!("session:{}+-", sess_path) } else { "".to_string() };
+        if passphrase.is_some() {
+            create_args.push("-p");
+            create_args.push(&auth_arg);
         }
 
         self.run_tpm_cmd(&create_args, pass_bytes)?;
+
+        let mut out_data = Vec::new();
+        out_data.extend_from_slice(b"-----BEGIN TPM WRAPPED BLOB-----\n");
+        let pub_blob = fs::read(pub_file.path()).map_err(|e| CryptoError::FileRead(e.to_string()))?;
+        let priv_blob = fs::read(priv_file.path()).map_err(|e| CryptoError::FileRead(e.to_string()))?;
+        
+        let mut combined = Vec::new();
+        combined.extend_from_slice(&(pub_blob.len() as u32).to_le_bytes());
+        combined.extend_from_slice(&pub_blob);
+        combined.extend_from_slice(&priv_blob);
+        
+        use base64::{Engine as _, engine::general_purpose};
+        let b64 = general_purpose::STANDARD.encode(&combined);
+        for chunk in b64.as_bytes().chunks(64) {
+            out_data.extend_from_slice(chunk);
+            out_data.push(b'\n');
+        }
+        out_data.extend_from_slice(b"-----END TPM WRAPPED BLOB-----\n");
+
         Command::new("tpm2_flushcontext").arg(sess_path).env("TCTI", "device:/dev/tpmrm0").status().ok();
-
-        let pub_blob = fs::read(upath).map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        let priv_blob = fs::read(rpath).map_err(|e| CryptoError::FileRead(e.to_string()))?;
-
-        let mut output = String::new();
-        output.push_str("-----BEGIN TPM WRAPPED BLOB-----\n");
-        output.push_str(&format!("P={}\n", BASE64.encode(pub_blob)));
-        output.push_str(&format!("R={}\n", BASE64.encode(priv_blob)));
-        output.push_str(&format!("E={}\n", BASE64.encode(ciphertext)));
-        output.push_str(&format!("I={}\n", BASE64.encode(iv)));
-        output.push_str(&format!("T={}\n", BASE64.encode(tag)));
-        output.push_str("-----END TPM WRAPPED BLOB-----\n");
-
-        Ok(output)
+        
+        Ok(String::from_utf8_lossy(&out_data).to_string())
     }
 
-    fn unwrap_raw(&self, wrapped_pem: &str, passphrase: Option<&str>) -> Result<Vec<u8>> {
-        let mut p_b64 = String::new();
-        let mut r_b64 = String::new();
-        let mut e_b64 = String::new();
-        let mut i_b64 = String::new();
-        let mut t_b64 = String::new();
-
-        for line in wrapped_pem.lines() {
-            if line.starts_with("P=") { p_b64 = line[2..].trim().to_string(); }
-            else if line.starts_with("R=") { r_b64 = line[2..].trim().to_string(); }
-            else if line.starts_with("E=") { e_b64 = line[2..].trim().to_string(); }
-            else if line.starts_with("I=") { i_b64 = line[2..].trim().to_string(); }
-            else if line.starts_with("T=") { t_b64 = line[2..].trim().to_string(); }
-        }
-
-        if p_b64.is_empty() || r_b64.is_empty() || e_b64.is_empty() {
-            return Err(CryptoError::Parameter("Invalid TPM wrapped blob".to_string()));
-        }
-
-        let pub_blob = BASE64.decode(p_b64).map_err(|e| CryptoError::Parameter(e.to_string()))?;
-        let priv_blob = BASE64.decode(r_b64).map_err(|e| CryptoError::Parameter(e.to_string()))?;
-        let ciphertext = BASE64.decode(e_b64).map_err(|e| CryptoError::Parameter(e.to_string()))?;
-        let iv = BASE64.decode(i_b64).map_err(|e| CryptoError::Parameter(e.to_string()))?;
-        let tag = BASE64.decode(t_b64).map_err(|e| CryptoError::Parameter(e.to_string()))?;
+    fn unwrap_raw(&self, pem_str: &str, passphrase: Option<&str>) -> Result<Vec<u8>> {
+        let b64 = pem_str.lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<String>();
+        
+        use base64::{Engine as _, engine::general_purpose};
+        let combined = general_purpose::STANDARD.decode(b64).map_err(|_| CryptoError::Parameter("Invalid base64".to_string()))?;
+        
+        if combined.len() < 4 { return Err(CryptoError::Parameter("TPM blob too short".to_string())); }
+        let pub_len = u32::from_le_bytes(combined[0..4].try_into().map_err(|_| CryptoError::Parameter("Corrupted TPM blob".to_string()))?) as usize;
+        if combined.len() < 4 + pub_len { return Err(CryptoError::Parameter("TPM blob corrupted".to_string())); }
+        
+        let pub_blob = &combined[4..4+pub_len];
+        let priv_blob = &combined[4+pub_len..];
 
         let primary_ctx = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
         let pub_file = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
@@ -174,9 +142,8 @@ impl KeyProvider for TpmKeyProvider {
         fs::write(pub_file.path(), pub_blob).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
         fs::write(priv_file.path(), priv_blob).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
 
-        let sess_path = session_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid temp file path".to_string()))?;
-        let sess_arg = format!("session:{}", sess_path);
-        let pctx_path = primary_ctx.path().to_str().unwrap_or(""); // Still using unwrap_or for temporary string building but let's be strict
+        let sess_path = session_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
+        let pctx_path = primary_ctx.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
         let upath = pub_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
         let rpath = priv_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
         let kctx_path = key_ctx.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
@@ -189,29 +156,11 @@ impl KeyProvider for TpmKeyProvider {
             "tpm2_load", "-C", pctx_path,
             "-u", upath,
             "-r", rpath,
-            "-c", kctx_path,
-            "-P", &sess_arg,
-            "-Q"
+            "-c", kctx_path, "-Q"
         ], None)?;
 
-        let mut auth_arg = sess_arg;
-        let mut pass_bytes = None;
-
-        if let Some(pass) = passphrase {
-            if !pass.is_empty() {
-                auth_arg += "+-";
-                pass_bytes = Some(pass.as_bytes());
-            }
-        } else {
-            // Smart prompt: try without password first, but tpm2_unseal will fail if needed.
-            // Better approach: Since we don't know if the TPM key has a password, 
-            // we can either catch the error or ask if it fails.
-            // For now, let's follow the pattern of utils.rs and ask if it's missing.
-            // However, TPM blobs don't explicitly say "ENCRYPTED" in a standard way like PEM.
-            // We'll attempt unseal, and if it fails with an auth error, we could retry.
-            // But to keep it simple and consistent with the "smart prompt" goal:
-            // We'll check if we can get a hint, or just allow the user to provide it.
-        }
+        let pass_bytes = passphrase.map(|s| s.as_bytes());
+        let auth_arg = if passphrase.is_some() { format!("session:{}+-", sess_path) } else { "".to_string() };
 
         let res = self.run_tpm_cmd(&[
             "tpm2_unseal", "-c", kctx_path,
@@ -229,7 +178,7 @@ impl KeyProvider for TpmKeyProvider {
                     "-p", &retry_auth_arg, "-Q"
                 ], Some(pass.as_bytes()))?;
             } else {
-                return Err(res.err().unwrap());
+                res?;
             }
         } else {
             res?;
@@ -238,14 +187,6 @@ impl KeyProvider for TpmKeyProvider {
         Command::new("tpm2_flushcontext").arg(sess_path).env("TCTI", "device:/dev/tpmrm0").status().ok();
 
         let aes_key = fs::read(aes_path_str).map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        let mut ctx = backend::new_decrypt("AES-256-GCM", &aes_key, &iv)?;
-        ctx.set_tag(&tag)?;
-        
-        let mut decrypted = vec![0u8; ciphertext.len() + 16];
-        let n = ctx.update(&ciphertext, &mut decrypted)?;
-        let final_n = ctx.finalize(&mut decrypted[n..]).map_err(|_| CryptoError::SignatureVerification)?;
-        decrypted.truncate(n + final_n);
-
-        Ok(decrypted)
+        Ok(aes_key)
     }
 }
