@@ -44,11 +44,13 @@ impl NetworkProcessor {
             let (stream, peer) = listener.accept().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
             eprintln!("Connection accepted from {}", peer);
 
-            // #2 fix: Do not break on success, allow subsequent connections
-            if let Err(e) = Self::handle_server_connection(stream, config).await {
-                eprintln!("Connection error with {}: {}", peer, e);
-            }
-            eprintln!("Connection with {} closed. Waiting for next...", peer);
+            let config_clone = config.clone(); // Clone config for the task
+            tokio::spawn(async move {
+                if let Err(e) = Self::handle_server_connection(stream, &config_clone).await {
+                    eprintln!("Connection error with {}: {}", peer, e);
+                }
+                eprintln!("Connection with {} closed.", peer);
+            });
         }
     }
 
@@ -57,52 +59,51 @@ impl NetworkProcessor {
         let handshake_data = tokio::time::timeout(std::time::Duration::from_secs(15), async {
             // 1. Receive Client Hello
             let mut magic = [0u8; 4];
-            stream.read_exact(&mut magic).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            if &magic != MAGIC_CT { return Err(CryptoError::FileRead("Invalid protocol magic".to_string())); }
+            stream.read_exact(&mut magic).await.map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?; // #3 generic error
+            if &magic != MAGIC_CT { return Err(CryptoError::Parameter("Handshake failed".to_string())); }
             
             let mut version_bytes = [0u8; 2];
-            stream.read_exact(&mut version_bytes).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+            stream.read_exact(&mut version_bytes).await.map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?;
             let version = u16::from_le_bytes(version_bytes);
             if version != PROTOCOL_VERSION { 
-                return Err(CryptoError::Parameter(format!("Unsupported protocol version: {}. Expected: {}", version, PROTOCOL_VERSION))); 
+                return Err(CryptoError::Parameter("Handshake failed".to_string())); // #3 generic error
             }
 
             let mut transcript = Vec::new();
             transcript.extend_from_slice(MAGIC_CT);
             transcript.extend_from_slice(&version.to_le_bytes());
 
-            let aead_name = Self::read_string(&mut stream).await?;
+            let aead_name = Self::read_string(&mut stream).await.map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?;
             Self::validate_aead(&aead_name)?;
             Self::update_transcript(&mut transcript, aead_name.as_bytes());
 
-            let client_ecc_pub = Self::read_vec(&mut stream).await?;
+            let client_ecc_pub = Self::read_vec(&mut stream).await.map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?;
             Self::update_transcript(&mut transcript, &client_ecc_pub);
 
-            let client_kem_pub = Self::read_vec(&mut stream).await?;
+            let client_kem_pub = Self::read_vec(&mut stream).await.map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?;
             Self::update_transcript(&mut transcript, &client_kem_pub);
 
             // 1.5 Handle Client Authentication
             let mut client_auth_flag = [0u8; 1];
-            stream.read_exact(&mut client_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+            stream.read_exact(&mut client_auth_flag).await.map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?;
             transcript.extend_from_slice(&client_auth_flag); 
 
             if client_auth_flag[0] == 1 {
-                let client_sig = Self::read_vec(&mut stream).await?;
-                let pubkey_path = config.signing_pubkey.as_ref().ok_or(CryptoError::Parameter("Client authentication required but no peer public key provided".to_string()))?;
-                let pubkey_pem = std::fs::read_to_string(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                let client_sig = Self::read_vec(&mut stream).await.map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?;
+                let pubkey_path = config.signing_pubkey.as_ref().ok_or(CryptoError::Parameter("Handshake failed".to_string()))?; // #3 generic error
+                let pubkey_pem = std::fs::read_to_string(pubkey_path).map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?;
                 let pubkey_der = crate::utils::unwrap_from_pem(&pubkey_pem, "PUBLIC KEY")?;
                 
                 if !backend::pqc_verify(&config.pqc_dsa_algo, &pubkey_der, &transcript, &client_sig)? {
-                    return Err(CryptoError::SignatureVerification);
+                    return Err(CryptoError::Parameter("Handshake failed".to_string())); // #3 generic error
                 }
                 eprintln!("Client authenticated successfully.");
-            } else if config.signing_pubkey.is_some() {
-                return Err(CryptoError::Parameter("Server requires authentication but client did not provide signature".to_string()));
-            } else if !config.allow_unauth {
-                return Err(CryptoError::Parameter("Unauthenticated connections are disabled by default. Use --allow-unauth to enable.".to_string()));
+            } else if config.signing_pubkey.is_some() || !config.allow_unauth {
+                return Err(CryptoError::Parameter("Handshake failed".to_string())); // #3 generic error
             }
 
             // 2. Server Key Generation & Handshake
+            // #4: Executed only after basic protocol and auth (if applicable) checks
             let (server_ecc_priv, server_ecc_pub) = backend::generate_ecc_key_pair("prime256v1")?;
             let ss_ecc = backend::ecc_dh(&server_ecc_priv, &client_ecc_pub, None)?;
             let (kem_ss, kem_ct) = backend::pqc_encap(&config.pqc_kem_algo, &client_kem_pub)?;
@@ -127,6 +128,7 @@ impl NetworkProcessor {
             let mut s2c_iv = vec![0u8; 12];
             let mut c2s_key = vec![0u8; 32];
             let mut c2s_iv = vec![0u8; 12];
+            
             hk.expand(b"s2c-key", &mut s2c_key).map_err(|e| CryptoError::Parameter(e.to_string()))?;
             hk.expand(b"s2c-iv", &mut s2c_iv).map_err(|e| CryptoError::Parameter(e.to_string()))?;
             hk.expand(b"c2s-key", &mut c2s_key).map_err(|e| CryptoError::Parameter(e.to_string()))?;
@@ -152,7 +154,7 @@ impl NetworkProcessor {
         let (aead_name, s2c_key, _s2c_iv, c2s_key, c2s_iv) = match handshake_data {
             Ok(Ok(data)) => data,
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(CryptoError::OpenSSL("Handshake timeout".to_string())),
+            Err(_) => return Err(CryptoError::Parameter("Handshake failed".to_string())), // #3 generic error
         };
 
         eprintln!("Handshake completed. Using AEAD: {}", aead_name);
@@ -162,9 +164,14 @@ impl NetworkProcessor {
         } else {
             let mut aead = backend::new_decrypt(&aead_name, &c2s_key, &c2s_iv)?;
             let mut out_buffer = vec![0u8; BUF_SIZE + 32];
+            
+            // #1 fix: Buffer to a temporary file before verification
             use tempfile::NamedTempFile;
             let mut temp_file = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
             
+            let mut total_received: u64 = 0;
+            const MAX_TOTAL_SIZE: u64 = 4 * 1024 * 1024 * 1024; // #2: 4GB Limit
+
             loop {
                 let mut len_bytes = [0u8; 4];
                 match stream.read_exact(&mut len_bytes).await {
@@ -174,6 +181,11 @@ impl NetworkProcessor {
                 let chunk_len = u32::from_le_bytes(len_bytes) as usize;
                 if chunk_len == 0 { break; }
                 if chunk_len > MAX_CHUNK_SIZE { return Err(CryptoError::Parameter(format!("Chunk too large: {}", chunk_len))); }
+
+                total_received += chunk_len as u64;
+                if total_received > MAX_TOTAL_SIZE {
+                    return Err(CryptoError::Parameter("Total file size limit exceeded".to_string()));
+                }
 
                 let mut encrypted_chunk = vec![0u8; chunk_len];
                 stream.read_exact(&mut encrypted_chunk).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
