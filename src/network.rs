@@ -225,14 +225,20 @@ impl NetworkProcessor {
                 }
 
                 let mut encrypted_chunk = vec![0u8; chunk_len];
-                stream.read_exact(&mut encrypted_chunk).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut encrypted_chunk)).await
+                    .map_err(|_| CryptoError::Parameter("Idle timeout while reading chunk".to_string()))?
+                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+
                 let n = aead.update(&encrypted_chunk, &mut out_buffer)?;
                 use std::io::Write as _;
                 temp_file.write_all(&out_buffer[..n]).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
             }
             
             let mut tag = [0u8; 16];
-            stream.read_exact(&mut tag).await.map_err(|e| CryptoError::FileRead(format!("Failed to read GCM tag: {}", e)))?;
+            tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut tag)).await
+                .map_err(|_| CryptoError::Parameter("Idle timeout while reading tag".to_string()))?
+                .map_err(|e| CryptoError::FileRead(format!("Failed to read GCM tag: {}", e)))?;
+
             aead.set_tag(&tag)?;
 
             let final_n = aead.finalize(&mut out_buffer)?;
@@ -400,7 +406,9 @@ impl NetworkProcessor {
                 }
                 
                 let mut packet = vec![0u8; chunk_len];
-                stream_rx.read_exact(&mut packet).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                tokio::time::timeout(IDLE_TIMEOUT, stream_rx.read_exact(&mut packet)).await
+                    .map_err(|_| CryptoError::Parameter("Idle timeout while reading chat packet".to_string()))?
+                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
                 
                 let (nonce, rest) = packet.split_at(12);
                 let (ciphertext, tag) = rest.split_at(rest.len() - 16);
