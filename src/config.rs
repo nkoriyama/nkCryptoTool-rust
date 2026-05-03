@@ -51,6 +51,7 @@ impl Default for CryptoMode {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct CryptoConfig {
     pub operation: Operation,
     pub mode: CryptoMode,
