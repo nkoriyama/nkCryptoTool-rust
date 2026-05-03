@@ -88,6 +88,7 @@ pub struct CryptoConfig {
     pub listen_addr: Option<String>,
     pub connect_addr: Option<String>,
     pub chat_mode: bool,
+    pub allow_unauth: bool,
 
     // For regenerate-pubkey
     pub regenerate_privkey_path: Option<String>,
@@ -124,6 +125,7 @@ impl Default for CryptoConfig {
             listen_addr: None,
             connect_addr: None,
             chat_mode: false,
+            allow_unauth: false,
             regenerate_privkey_path: None,
             regenerate_pubkey_path: None,
         }
