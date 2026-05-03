@@ -10,7 +10,7 @@ use crate::strategy::{CryptoStrategy, StrategyType, ecc::EccStrategy, pqc::PqcSt
 use crate::backend::AeadBackend;
 use std::collections::HashMap;
 use std::path::Path;
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct HybridStrategy {
@@ -69,7 +69,7 @@ impl CryptoStrategy for HybridStrategy {
         self.pqc.generate_signing_key_pair(key_paths, passphrase)
     }
 
-    fn regenerate_public_key(&self, priv_path: &Path, pub_path: &Path, passphrase: &mut Option<String>) -> Result<()> {
+    fn regenerate_public_key(&self, priv_path: &Path, pub_path: &Path, passphrase: &mut Option<Zeroizing<String>>) -> Result<()> {
         // For hybrid, we typically only regenerate the PQC part for signing, 
         // or we don't have a clear single path. 
         // Here we delegate to PQC strategy as a default.
@@ -105,7 +105,7 @@ impl CryptoStrategy for HybridStrategy {
         Ok(())
     }
 
-    fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<String>) -> Result<()> {
+    fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<Zeroizing<String>>) -> Result<()> {
         let mut ecc_paths = key_paths.clone();
         let mut pqc_paths = key_paths.clone();
         if let Some(p) = key_paths.get("user-ecdh-privkey") { ecc_paths.insert("user-privkey".to_string(), p.clone()); }
@@ -166,7 +166,7 @@ impl CryptoStrategy for HybridStrategy {
         Ok(())
     }
 
-    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: &mut Option<String>, digest_algo: &str) -> Result<()> {
+    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: &mut Option<Zeroizing<String>>, digest_algo: &str) -> Result<()> {
         self.pqc.prepare_signing(priv_key_path, passphrase, digest_algo)
     }
 

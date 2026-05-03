@@ -14,7 +14,7 @@ use std::path::Path;
 use hkdf::Hkdf;
 use sha3::Sha3_256;
 use rand_core::{OsRng, RngCore};
-use zeroize::{Zeroize, ZeroizeOnDrop};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct PqcStrategy {
@@ -140,19 +140,22 @@ impl CryptoStrategy for PqcStrategy {
     }
 
 
-    fn regenerate_public_key(&self, priv_path: &Path, pub_path: &Path, passphrase: &mut Option<String>) -> Result<()> {
+    fn regenerate_public_key(&self, priv_path: &Path, pub_path: &Path, passphrase: &mut Option<Zeroizing<String>>) -> Result<()> {
         let priv_bytes = fs::read(priv_path)?;
         let pem_str = String::from_utf8_lossy(&priv_bytes);
         
         let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            provider.unwrap_raw(&pem_str, passphrase.as_deref())?
+            provider.unwrap_raw(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?
         } else {
-            *passphrase = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref())?;
+            let pass = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?;
+            if let Some(p) = pass {
+                *passphrase = Some(Zeroizing::new(p));
+            }
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
 
-        let pub_der = backend::extract_public_key(&priv_key_der, passphrase.as_deref())?;
+        let pub_der = backend::extract_public_key(&priv_key_der, passphrase.as_deref().map(|x| x.as_str()))?;
         fs::write(pub_path, crate::utils::wrap_to_pem(&pub_der, "PUBLIC KEY"))?;
         Ok(())
     }
@@ -183,7 +186,7 @@ impl CryptoStrategy for PqcStrategy {
         Ok(())
     }
 
-    fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<String>) -> Result<()> {
+    fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<Zeroizing<String>>) -> Result<()> {
         if let Some(algo) = key_paths.get("kem-algo") { self.kem_algo = algo.clone(); }
         if let Some(algo) = key_paths.get("dsa-algo") { self.dsa_algo = algo.clone(); }
 
@@ -196,13 +199,16 @@ impl CryptoStrategy for PqcStrategy {
         
         let wrapped_priv = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            provider.unwrap_raw(&pem_str, passphrase.as_deref())?
+            provider.unwrap_raw(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?
         } else {
-            *passphrase = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref())?;
+            let pass = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?;
+            if let Some(p) = pass {
+                *passphrase = Some(Zeroizing::new(p));
+            }
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
 
-        let ss_bytes = backend::pqc_decap(&self.kem_algo, &wrapped_priv, &self.kem_ct, passphrase.as_deref())?;
+        let ss_bytes = backend::pqc_decap(&self.kem_algo, &wrapped_priv, &self.kem_ct, passphrase.as_deref().map(|x| x.as_str()))?;
         
         self.shared_secret = ss_bytes;
         self.encryption_key = self.hkdf_derive(&self.shared_secret, 32, &self.salt, "pqc-encryption")?;
@@ -248,15 +254,18 @@ impl CryptoStrategy for PqcStrategy {
         Ok(())
     }
 
-    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: &mut Option<String>, digest_algo: &str) -> Result<()> {
+    fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: &mut Option<Zeroizing<String>>, digest_algo: &str) -> Result<()> {
         let priv_bytes = fs::read(priv_key_path)?;
         let pem_str = String::from_utf8_lossy(&priv_bytes);
 
         let wrapped_priv = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            provider.unwrap_raw(&pem_str, passphrase.as_deref())?
+            provider.unwrap_raw(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?
         } else {
-            *passphrase = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref())?;
+            let pass = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?;
+            if let Some(p) = pass {
+                *passphrase = Some(Zeroizing::new(p));
+            }
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
         
