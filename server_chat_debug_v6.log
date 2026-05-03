@@ -1,0 +1,17 @@
+   Compiling nk-crypto-tool v0.1.0 (/home/bazzite/ドキュメント/src/nkCryptoTool-rust)
+error: this file contains an unclosed delimiter
+   --> src/backend/rustcrypto_impl.rs:635:3
+    |
+559 | pub fn pqc_sign(algo: &str, priv_der: &[u8], message: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+    |                                                                                                           - unclosed delimiter
+...
+565 |         match algo {
+    |                    - this delimiter might not be properly closed...
+...
+596 |     }
+    |     - ...as it matches this but it has different indentation
+...
+635 | }
+    |  ^
+
+error: could not compile `nk-crypto-tool` (lib) due to 1 previous error

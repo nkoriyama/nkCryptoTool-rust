@@ -8,7 +8,7 @@ use crate::error::{CryptoError, Result};
 use crate::backend::{AeadBackend, HashBackend};
 
 #[cfg(feature = "backend-rustcrypto")]
-use fips203::traits::{KeyGen as _, SerDes as _, Decaps as _};
+use fips203::traits::{KeyGen as _, SerDes as _, Decaps as _, Encaps as _};
 #[cfg(feature = "backend-rustcrypto")]
 use fips204::traits::{KeyGen as _, SerDes as _, Signer as _, Verifier as _};
 
@@ -19,7 +19,6 @@ mod rc_internal {
     pub use sha3::{Digest, Sha3_256, Sha3_512};
     pub use rand_core::{OsRng};
     
-    // Low-level for streaming GCM
     pub use aes::{Aes256, cipher::{KeyInit as _, StreamCipher, BlockEncrypt, KeyIvInit}};
     pub use ctr::Ctr64BE;
     pub use ghash::{GHash, universal_hash::{UniversalHash, KeyInit as _}};
@@ -27,12 +26,9 @@ mod rc_internal {
     pub use generic_array::GenericArray;
     pub use aes_gcm::aead::consts;
 
-    // ChaCha20Poly1305 low-level
     pub use chacha20::ChaCha20;
     pub use poly1305::Poly1305;
-    pub use chacha20::cipher::StreamCipherSeek;
     
-    // ECDSA
     pub use p256::ecdsa::{SigningKey, VerifyingKey, Signature, signature::{hazmat::{PrehashSigner, PrehashVerifier}}};
 }
 
@@ -463,10 +459,9 @@ pub fn pqc_keygen_dsa(algo: &str) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)>
     { let _ = algo; Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
 }
 
-pub fn pqc_sign(algo: &str, priv_der: &[u8], message: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+pub fn pqc_sign(algo: &str, priv_der: &[u8], message: &[u8], _passphrase: Option<&str>) -> Result<Vec<u8>> {
     #[cfg(feature = "backend-rustcrypto")]
     {
-        let _ = passphrase; // In pure-Rust we assume it's already unwrapped or we don't support PKCS8-Encrypted yet here
         let raw_priv = unwrap_pqc_der_internal(priv_der, false);
         match algo {
             "ML-DSA-44" => {
@@ -488,7 +483,7 @@ pub fn pqc_sign(algo: &str, priv_der: &[u8], message: &[u8], passphrase: Option<
         }
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
-    { let _ = (algo, priv_der, message, passphrase); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
+    { let _ = (algo, priv_der, message, _passphrase); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
 }
 
 pub fn pqc_verify(algo: &str, pub_der: &[u8], message: &[u8], signature: &[u8]) -> Result<bool> {
@@ -524,11 +519,8 @@ pub fn pqc_verify(algo: &str, pub_der: &[u8], message: &[u8], signature: &[u8]) 
 pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     #[cfg(feature = "backend-rustcrypto")]
     {
-        use fips203::traits::{Encaps, SerDes};
         let raw_pub = unwrap_pqc_der_internal(peer_pub_der, true);
         let actual_len = raw_pub.len();
-        
-        // Match algorithm based on key size if the provided algo doesn't match
         if actual_len == 800 {
             use fips203::ml_kem_512::EncapsKey;
             let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?)
@@ -555,13 +547,11 @@ pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> 
     { let _ = (algo, peer_pub_der); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
 }
 
-pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], _passphrase: Option<&str>) -> Result<Vec<u8>> {
     #[cfg(feature = "backend-rustcrypto")]
     {
-        let _ = passphrase;
         let raw_priv = unwrap_pqc_der_internal(priv_der, false);
         let actual_len = raw_priv.len();
-
         if actual_len == 1632 {
             use fips203::ml_kem_512::{DecapsKey, CipherText};
             let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?)
@@ -591,7 +581,7 @@ pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option<
         }
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
-    { let _ = (algo, priv_der, kem_ct, passphrase); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
+    { let _ = (algo, priv_der, kem_ct, _passphrase); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
 }
 
 pub fn hkdf(ikm: &[u8], length: usize, salt: &[u8], info: &str, md_name: &str) -> Result<Vec<u8>> {
@@ -599,7 +589,6 @@ pub fn hkdf(ikm: &[u8], length: usize, salt: &[u8], info: &str, md_name: &str) -
     {
         use rc_internal::*;
         use hkdf::Hkdf;
-        
         let mut okm = vec![0u8; length];
         if md_name.contains("256") {
             let h = Hkdf::<Sha3_256>::new(Some(salt), ikm);

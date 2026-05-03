@@ -1,0 +1,53 @@
+   Compiling nk-crypto-tool v0.1.0 (/home/bazzite/ドキュメント/src/nkCryptoTool-rust)
+warning: unused import: `crate::backend`
+ --> src/key/tpm.rs:9:5
+  |
+9 | use crate::backend;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::backend::AeadBackend`
+  --> src/key/tpm.rs:10:5
+   |
+10 | use crate::backend::AeadBackend;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `chacha20::cipher::StreamCipherSeek`
+  --> src/backend/rustcrypto_impl.rs:33:13
+   |
+33 |     pub use chacha20::cipher::StreamCipherSeek;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `sha3::Sha3_256`
+  --> src/network.rs:15:5
+   |
+15 | use sha3::Sha3_256;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused variable: `algo`
+   --> src/backend/rustcrypto_impl.rs:525:18
+    |
+525 | pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Ve...
+    |                  ^^^^ help: if this is intentional, prefix it with an underscore: `_algo`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `algo`
+   --> src/backend/rustcrypto_impl.rs:559:18
+    |
+559 | pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], pa...
+    |                  ^^^^ help: if this is intentional, prefix it with an underscore: `_algo`
+
+warning: `nk-crypto-tool` (lib) generated 6 warnings (run `cargo fix --lib -p nk-crypto-tool` to apply 6 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.49s
+     Running `target/debug/nk-crypto-tool --mode pqc --listen '127.0.0.1:9989' --chat --signing-privkey server_keys/private_sign_pqc.key --signing-pubkey client_keys/public_sign_pqc.key`
+AES-NI is available!
+Listening on 127.0.0.1:9989...
+Connection accepted from 127.0.0.1:51318
+DEBUG: Server transcript (first 64 bytes): [4e, 4b, 43, 54, 04, 00, 0b, 00, 00, 00, 41, 45, 53, 2d, 32, 35, 36, 2d, 47, 43, 4d, 5b, 00, 00, 00, 30, 59, 30, 13, 06, 07, 2a, 86, 48, ce, 3d, 02, 01, 06, 08, 2a, 86, 48, ce, 3d, 03, 01, 07, 03, 42, 00, 04, f4, 8f, 40, 05, 15, 4d, 2a, c9, e7, 9e, 09, 90]
+DEBUG: Server transcript hash: 0abf72a0a36bfb65f3652c4c821e926bc1fe43976a6764de1289a6d72b04cb67
+DEBUG: Server auth_flag: 1, transcript len after auth: 1305, hash: 9fe1d93eb260bd69ef7374517a4748a0df129756d27b5d646f7b7703d46bbfcd
+DEBUG: Server received client_sig len: 3309
+DEBUG: pqc_verify raw_pub len: 1952, algo: ML-DSA-65
+Connection error with 127.0.0.1:51318: Signature verification failed

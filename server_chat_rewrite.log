@@ -1,0 +1,48 @@
+   Compiling nk-crypto-tool v0.1.0 (/home/bazzite/ドキュメント/src/nkCryptoTool-rust)
+warning: unused import: `crate::backend`
+ --> src/key/tpm.rs:9:5
+  |
+9 | use crate::backend;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::backend::AeadBackend`
+  --> src/key/tpm.rs:10:5
+   |
+10 | use crate::backend::AeadBackend;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `chacha20::cipher::StreamCipherSeek`
+  --> src/backend/rustcrypto_impl.rs:33:13
+   |
+33 |     pub use chacha20::cipher::StreamCipherSeek;
+   |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `sha3::Sha3_256`
+  --> src/network.rs:15:5
+   |
+15 | use sha3::Sha3_256;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused variable: `algo`
+   --> src/backend/rustcrypto_impl.rs:524:18
+    |
+524 | pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Ve...
+    |                  ^^^^ help: if this is intentional, prefix it with an underscore: `_algo`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `algo`
+   --> src/backend/rustcrypto_impl.rs:558:18
+    |
+558 | pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], pa...
+    |                  ^^^^ help: if this is intentional, prefix it with an underscore: `_algo`
+
+warning: `nk-crypto-tool` (lib) generated 6 warnings (run `cargo fix --lib -p nk-crypto-tool` to apply 6 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.81s
+     Running `target/debug/nk-crypto-tool --mode pqc --listen '127.0.0.1:9993' --chat --signing-privkey server_keys/private_sign_pqc.key --signing-pubkey client_keys/public_sign_pqc.key`
+AES-NI is available!
+Listening on 127.0.0.1:9993...
+Connection accepted from 127.0.0.1:39360
+Connection error with 127.0.0.1:39360: Signature verification failed

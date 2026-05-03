@@ -1,0 +1,45 @@
+warning: unused import: `crate::backend`
+ --> src/key/tpm.rs:9:5
+  |
+9 | use crate::backend;
+  |     ^^^^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::backend::AeadBackend`
+  --> src/key/tpm.rs:10:5
+   |
+10 | use crate::backend::AeadBackend;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `sha3::Sha3_256`
+  --> src/network.rs:15:5
+   |
+15 | use sha3::Sha3_256;
+   |     ^^^^^^^^^^^^^^
+
+warning: unused variable: `algo`
+   --> src/backend/rustcrypto_impl.rs:519:18
+    |
+519 | pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Ve...
+    |                  ^^^^ help: if this is intentional, prefix it with an underscore: `_algo`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `algo`
+   --> src/backend/rustcrypto_impl.rs:550:18
+    |
+550 | pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], _p...
+    |                  ^^^^ help: if this is intentional, prefix it with an underscore: `_algo`
+
+warning: `nk-crypto-tool` (lib) generated 5 warnings (run `cargo fix --lib -p nk-crypto-tool` to apply 5 suggestions)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running `target/debug/nk-crypto-tool --mode pqc --listen '127.0.0.1:9986' --chat --signing-privkey server_keys_final/private_sign_pqc.key --signing-pubkey client_keys_final/public_sign_pqc.key`
+AES-NI is available!
+Listening on 127.0.0.1:9986...
+Connection accepted from 127.0.0.1:56552
+DEBUG: Server transcript (first 64 bytes): [4e, 4b, 43, 54, 04, 00, 0b, 00, 00, 00, 41, 45, 53, 2d, 32, 35, 36, 2d, 47, 43, 4d, 5b, 00, 00, 00, 30, 59, 30, 13, 06, 07, 2a, 86, 48, ce, 3d, 02, 01, 06, 08, 2a, 86, 48, ce, 3d, 03, 01, 07, 03, 42, 00, 04, 28, 3b, 84, ce, 9e, cf, c0, be, d5, 3e, 19, 57]
+DEBUG: Server transcript hash: ba87235325fe2f253502e273dcb6b29c0eb3e9179f2e28b5e727e6eeb1e54d5b
+DEBUG: Server auth_flag: 1, transcript len after auth: 1305, hash: 49cecca12946b419ef71cadef15072e8211356ae01d80461edeb94dc231a6177
+DEBUG: Server received client_sig len: 3309
+Connection error with 127.0.0.1:56552: Signature verification failed
