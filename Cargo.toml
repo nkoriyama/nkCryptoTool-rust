@@ -41,6 +41,7 @@ generic-array = { version = "0.14", optional = true }
 chacha20poly1305 = "0.10.1"
 chacha20 = "0.9"
 poly1305 = "0.8"
+once_cell = "1.21.4"
 
 [features]
 default = ["backend-openssl"]

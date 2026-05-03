@@ -572,6 +572,7 @@ dependencies = [
  "ghash",
  "hkdf",
  "libc",
+ "once_cell",
  "openssl",
  "openssl-sys",
  "p256",

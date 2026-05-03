@@ -14,11 +14,16 @@ use std::io::Write;
 use hkdf::Hkdf;
 use sha3::Sha3_256;
 use zeroize::Zeroizing;
+use tokio::sync::{Semaphore, Mutex};
+use std::sync::Arc;
+use once_cell::sync::Lazy;
 
 const BUF_SIZE: usize = 1024 * 1024;
-const MAX_CHUNK_SIZE: usize = 64 * 1024 * 1024; // 64MB DoS protection
+const MAX_CHUNK_SIZE: usize = 1024 * 1024; // #1 Fix: limit chunk size to buffer size
 const MAGIC_CT: &[u8; 4] = b"NKCT";
 const PROTOCOL_VERSION: u16 = 4;
+
+static STDOUT_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
 pub struct NetworkProcessor;
 
@@ -40,11 +45,12 @@ impl NetworkProcessor {
         let listener = TcpListener::bind(addr).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
         eprintln!("Listening on {}...", addr);
 
-        use tokio::sync::Semaphore;
-        use std::sync::Arc;
         let semaphore = Arc::new(Semaphore::new(100)); // #1 Fix: limit to 100 concurrent connections
 
         loop {
+            // #2 Fix: Acquire semaphore permit BEFORE accept to avoid blocking next accepts
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+
             let accept_res = listener.accept().await;
             let (stream, peer) = match accept_res {
                 Ok(res) => res,
@@ -56,7 +62,6 @@ impl NetworkProcessor {
             };
             eprintln!("Connection accepted from {}", peer);
 
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
             let config_clone = config.clone(); // Clone config for the task
             tokio::spawn(async move {
                 let _permit = permit;
@@ -219,6 +224,9 @@ impl NetworkProcessor {
             }
 
             eprintln!("GCM verification successful. Releasing data...");
+            
+            // #4 Fix: Serialize stdout access for parallel file transfers
+            let _stdout_lock = STDOUT_MUTEX.lock().await;
             let mut stdout = tokio::io::stdout();
             let mut reader = tokio::fs::File::open(temp_file.path()).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
             tokio::io::copy(&mut reader, &mut stdout).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
@@ -264,7 +272,6 @@ impl NetworkProcessor {
             Self::write_vec(&mut stream, &sig).await?;
             eprintln!("Sent client signature for authentication.");
         } else {
-
             if !config.allow_unauth {
                 return Err(CryptoError::Parameter("Unauthenticated connections are disabled by default. Use --allow-unauth to enable.".to_string()));
             }
@@ -376,6 +383,11 @@ impl NetworkProcessor {
                 // #4 Fix: Prevent nonce replay
                 if !seen_nonces.insert(nonce.to_vec()) {
                     return Err(CryptoError::Parameter("Replayed nonce detected".to_string()));
+                }
+
+                // #3 Fix: Limit HashSet size to prevent memory exhaustion
+                if seen_nonces.len() > 10000 {
+                    return Err(CryptoError::Parameter("Nonce history limit exceeded".to_string()));
                 }
                 
                 let mut rx_aead = backend::new_decrypt(&aead_name_str, &rx_key, nonce)?;
