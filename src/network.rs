@@ -24,6 +24,7 @@ const MAX_CHUNK_SIZE: usize = 1024 * 1024; // #1 Fix: limit chunk size to buffer
 const MAGIC_CT: &[u8; 4] = b"NKCT";
 const PROTOCOL_VERSION: u16 = 4;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
+const CUMULATIVE_TIMEOUT: Duration = Duration::from_secs(7200); // 2 hours (#1: Slow Sender protection)
 
 static STDOUT_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -81,8 +82,7 @@ impl NetworkProcessor {
 
             let config_clone = config.clone();
             tokio::spawn(async move {
-                let mut permit_owned = Some(permit);
-                if let Err(e) = Self::handle_server_connection(stream, &config_clone, &mut permit_owned).await {
+                if let Err(e) = Self::handle_server_connection(stream, &config_clone, permit).await {
                     eprintln!("Connection error with {}: {}", peer, e);
                 }
                 eprintln!("Connection with {} closed.", peer);
@@ -90,7 +90,8 @@ impl NetworkProcessor {
         }
     }
 
-    async fn handle_server_connection(mut stream: TcpStream, config: &CryptoConfig, permit: &mut Option<OwnedSemaphorePermit>) -> Result<()> {
+    async fn handle_server_connection(mut stream: TcpStream, config: &CryptoConfig, permit: OwnedSemaphorePermit) -> Result<()> {
+        let _permit = permit; // #2 Revert: Keep permit until task finishes to limit disk usage
         // #1 fix: Limit timeout to handshake only
         let handshake_data = tokio::time::timeout(Duration::from_secs(15), async {
             // 1. Receive Client Hello
@@ -194,72 +195,77 @@ impl NetworkProcessor {
 
         eprintln!("Handshake completed. Using AEAD: {}", aead_name);
 
-        if config.chat_mode {
-            Self::chat_loop(stream, &aead_name, &s2c_key, &c2s_key, true).await?;
-        } else {
-            let mut aead = backend::new_decrypt(&aead_name, &c2s_key, &c2s_iv)?;
-            let mut out_buffer = vec![0u8; BUF_SIZE + 32];
-            
-            use tempfile::NamedTempFile;
-            let mut temp_file = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-            
-            let mut total_received: u64 = 0;
-            const MAX_TOTAL_SIZE: u64 = 4 * 1024 * 1024 * 1024; // #2: 4GB Limit
+        // #1: Apply cumulative timeout to the entire data transfer phase
+        tokio::time::timeout(CUMULATIVE_TIMEOUT, async {
+            if config.chat_mode {
+                Self::chat_loop(stream, &aead_name, &s2c_key, &c2s_key, true).await?;
+            } else {
+                let mut aead = backend::new_decrypt(&aead_name, &c2s_key, &c2s_iv)?;
+                let mut out_buffer = vec![0u8; BUF_SIZE + 32];
+                
+                use tempfile::NamedTempFile;
+                let mut temp_file = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+                
+                let mut total_received: u64 = 0;
+                const MAX_TOTAL_SIZE: u64 = 4 * 1024 * 1024 * 1024; // #2: 4GB Limit
 
-            loop {
-                let mut len_bytes = [0u8; 4];
-                // #1: Add idle timeout for data phase
-                let read_res = tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut len_bytes)).await;
-                match read_res {
-                    Ok(Ok(_)) => {},
-                    Ok(Err(_)) | Err(_) => break, // Error or Timeout
+                loop {
+                    let mut len_bytes = [0u8; 4];
+                    // #1: Add idle timeout for data phase
+                    let read_res = tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut len_bytes)).await;
+                    match read_res {
+                        Ok(Ok(_)) => {},
+                        Ok(Err(_)) | Err(_) => break, // Error or Timeout
+                    }
+                    
+                    let chunk_len = u32::from_le_bytes(len_bytes) as usize;
+                    if chunk_len == 0 { break; }
+                    if chunk_len > MAX_CHUNK_SIZE { return Err(CryptoError::Parameter(format!("Chunk too large: {}", chunk_len))); }
+
+                    total_received += chunk_len as u64;
+                    if total_received > MAX_TOTAL_SIZE {
+                        return Err(CryptoError::Parameter("Total file size limit exceeded".to_string()));
+                    }
+
+                    let mut encrypted_chunk = vec![0u8; chunk_len];
+                    tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut encrypted_chunk)).await
+                        .map_err(|_| CryptoError::Parameter("Idle timeout while reading chunk".to_string()))?
+                        .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+
+                    let n = aead.update(&encrypted_chunk, &mut out_buffer)?;
+                    use std::io::Write as _;
+                    temp_file.write_all(&out_buffer[..n]).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
                 }
                 
-                let chunk_len = u32::from_le_bytes(len_bytes) as usize;
-                if chunk_len == 0 { break; }
-                if chunk_len > MAX_CHUNK_SIZE { return Err(CryptoError::Parameter(format!("Chunk too large: {}", chunk_len))); }
+                let mut tag = [0u8; 16];
+                tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut tag)).await
+                    .map_err(|_| CryptoError::Parameter("Idle timeout while reading tag".to_string()))?
+                    .map_err(|e| CryptoError::FileRead(format!("Failed to read GCM tag: {}", e)))?;
 
-                total_received += chunk_len as u64;
-                if total_received > MAX_TOTAL_SIZE {
-                    return Err(CryptoError::Parameter("Total file size limit exceeded".to_string()));
+                aead.set_tag(&tag)?;
+
+                let final_n = aead.finalize(&mut out_buffer)?;
+                if final_n > 0 {
+                    use std::io::Write as _;
+                    temp_file.write_all(&out_buffer[..final_n]).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
                 }
 
-                let mut encrypted_chunk = vec![0u8; chunk_len];
-                tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut encrypted_chunk)).await
-                    .map_err(|_| CryptoError::Parameter("Idle timeout while reading chunk".to_string()))?
-                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                eprintln!("GCM verification successful. Releasing data...");
+                
+                // #2 Revert: Keep permit until stdout write is finished to limit disk usage
+                // (permit.take() is removed)
 
-                let n = aead.update(&encrypted_chunk, &mut out_buffer)?;
-                use std::io::Write as _;
-                temp_file.write_all(&out_buffer[..n]).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+                // #4 Fix: Serialize stdout access for parallel file transfers
+                let _stdout_lock = STDOUT_MUTEX.lock().await;
+                let mut stdout = tokio::io::stdout();
+                let mut reader = tokio::fs::File::open(temp_file.path()).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                tokio::io::copy(&mut reader, &mut stdout).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                stdout.flush().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                eprintln!("Data transfer complete and verified.");
             }
-            
-            let mut tag = [0u8; 16];
-            tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut tag)).await
-                .map_err(|_| CryptoError::Parameter("Idle timeout while reading tag".to_string()))?
-                .map_err(|e| CryptoError::FileRead(format!("Failed to read GCM tag: {}", e)))?;
-
-            aead.set_tag(&tag)?;
-
-            let final_n = aead.finalize(&mut out_buffer)?;
-            if final_n > 0 {
-                use std::io::Write as _;
-                temp_file.write_all(&out_buffer[..final_n]).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-            }
-
-            eprintln!("GCM verification successful. Releasing data...");
-            
-            // #2 Fix: Early permit drop to allow other handshakes while writing to stdout
-            permit.take(); 
-
-            // #4 Fix: Serialize stdout access for parallel file transfers
-            let _stdout_lock = STDOUT_MUTEX.lock().await;
-            let mut stdout = tokio::io::stdout();
-            let mut reader = tokio::fs::File::open(temp_file.path()).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            tokio::io::copy(&mut reader, &mut stdout).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            stdout.flush().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            eprintln!("Connection closed. Data transfer complete and verified.");
-        }
+            Ok::<(), CryptoError>(())
+        }).await.map_err(|_| CryptoError::Parameter("Cumulative session timeout exceeded".to_string()))??;
+        
         Ok(())
     }
 
@@ -483,8 +489,13 @@ impl NetworkProcessor {
                     packet.extend_from_slice(&encrypted[..n + final_n]);
                     packet.extend_from_slice(&tag);
 
-                    stream_tx.write_all(&(packet.len() as u32).to_le_bytes()).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                    stream_tx.write_all(&packet).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                    // #3 Fix: Add idle timeout to chat packet transmission
+                    tokio::time::timeout(IDLE_TIMEOUT, stream_tx.write_all(&(packet.len() as u32).to_le_bytes())).await
+                        .map_err(|_| CryptoError::Parameter("Idle timeout while sending chat header".to_string()))?
+                        .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                    tokio::time::timeout(IDLE_TIMEOUT, stream_tx.write_all(&packet)).await
+                        .map_err(|_| CryptoError::Parameter("Idle timeout while sending chat packet".to_string()))?
+                        .map_err(|e| CryptoError::FileRead(e.to_string()))?;
                     
                     print!("> ");
                     let _ = std::io::stdout().flush();
