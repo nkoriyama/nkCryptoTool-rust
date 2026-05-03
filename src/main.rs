@@ -9,6 +9,7 @@ use nk_crypto_tool::config::{CryptoConfig, CryptoMode, Operation};
 use nk_crypto_tool::processor::CryptoProcessor;
 use nk_crypto_tool::key::create_best_provider;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -120,7 +121,7 @@ async fn main() -> anyhow::Result<()> {
     // If it's a key generation operation, we should ask for one by default 
     // to protect the new private key.
     if operation == Operation::GenerateEncKey || operation == Operation::GenerateSignKey {
-        passphrase = Some(nk_crypto_tool::utils::get_and_verify_passphrase("Generate new key pair")?);
+        passphrase = Some(Zeroizing::new(nk_crypto_tool::utils::get_and_verify_passphrase("Generate new key pair")?));
     }
 
     let mut config = CryptoConfig::default();

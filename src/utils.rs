@@ -40,6 +40,7 @@ impl SecureBuffer {
 
 pub fn get_masked_passphrase() -> Result<String> {
     if let Ok(pass) = std::env::var("NK_PASSPHRASE") {
+        eprintln!("WARNING: Using passphrase from NK_PASSPHRASE environment variable. This is less secure than interactive entry.");
         return Ok(pass);
     }
     print!("Enter passphrase: ");

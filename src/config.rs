@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use clap::ValueEnum;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operation {
@@ -75,7 +76,7 @@ pub struct CryptoConfig {
     pub user_ecdh_privkey: Option<String>,
 
     // Options
-    pub passphrase: Option<String>,
+    pub passphrase: Option<Zeroizing<String>>,
     pub use_tpm: bool,
     pub digest_algo: String,
     pub aead_algo: String,

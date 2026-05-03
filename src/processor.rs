@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 pub type ProgressCallback = Arc<dyn Fn(f64) + Send + Sync>;
 
@@ -62,14 +63,14 @@ impl CryptoProcessor {
         }
     }
 
-    fn regenerate_pubkey(&self, config: &CryptoConfig, passphrase: &mut Option<String>) -> Result<()> {
+    fn regenerate_pubkey(&self, config: &CryptoConfig, passphrase: &mut Option<Zeroizing<String>>) -> Result<()> {
         let priv_path = config.regenerate_privkey_path.as_ref().ok_or(CryptoError::Parameter("No private key path".to_string()))?;
         let pub_path = config.regenerate_pubkey_path.as_ref().ok_or(CryptoError::Parameter("No public key path".to_string()))?;
         let strategy = self.strategy.as_ref().ok_or(CryptoError::Parameter("Strategy not initialized".to_string()))?;
         strategy.regenerate_public_key(Path::new(priv_path), Path::new(pub_path), passphrase)
     }
 
-    pub async fn sign_file(&mut self, config: &CryptoConfig, passphrase: &mut Option<String>, progress_callback: Option<ProgressCallback>) -> Result<()> {
+    pub async fn sign_file(&mut self, config: &CryptoConfig, passphrase: &mut Option<Zeroizing<String>>, progress_callback: Option<ProgressCallback>) -> Result<()> {
         let input_path = config.input_files.first().ok_or(CryptoError::Parameter("No input file".to_string()))?;
         let signature_path = config.signature_file.as_ref().ok_or(CryptoError::Parameter("No signature output path".to_string()))?;
         let priv_key_path = config.signing_privkey.as_ref().ok_or(CryptoError::Parameter("No signing private key".to_string()))?;
@@ -163,7 +164,7 @@ impl CryptoProcessor {
         }
     }
 
-    pub async fn decrypt_file(&mut self, config: &CryptoConfig, passphrase: &mut Option<String>, progress_callback: Option<ProgressCallback>) -> Result<()> {
+    pub async fn decrypt_file(&mut self, config: &CryptoConfig, passphrase: &mut Option<Zeroizing<String>>, progress_callback: Option<ProgressCallback>) -> Result<()> {
         let input_path = config.input_files.first().ok_or(CryptoError::Parameter("No input file".to_string()))?;
         let output_path = config.output_file.as_ref().ok_or(CryptoError::Parameter("No output file".to_string()))?;
 
@@ -383,7 +384,7 @@ impl CryptoProcessor {
 
         std::fs::create_dir_all(&config.key_dir)?;
         if let Some(ref s) = self.strategy {
-            s.generate_encryption_key_pair(&key_paths, config.passphrase.as_deref())
+            s.generate_encryption_key_pair(&key_paths, config.passphrase.as_deref().map(|x| x.as_str()))
         } else {
             Err(CryptoError::Parameter("Strategy not initialized".to_string()))
         }
@@ -399,7 +400,7 @@ impl CryptoProcessor {
 
         std::fs::create_dir_all(&config.key_dir)?;
         if let Some(ref s) = self.strategy {
-            s.generate_signing_key_pair(&key_paths, config.passphrase.as_deref())
+            s.generate_signing_key_pair(&key_paths, config.passphrase.as_deref().map(|x| x.as_str()))
         } else {
             Err(CryptoError::Parameter("Strategy not initialized".to_string()))
         }

@@ -93,12 +93,12 @@ impl KeyProvider for TpmKeyProvider {
 
         fs::write(aes_file.path(), &aes_key).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
 
-        let sess_path = session_file.path().to_str().unwrap();
+        let sess_path = session_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid temp file path".to_string()))?;
         let sess_arg = format!("session:{}", sess_path);
-        let pctx_path = primary_ctx.path().to_str().unwrap();
-        let aes_path_str = aes_file.path().to_str().unwrap();
-        let upath = pub_file.path().to_str().unwrap();
-        let rpath = priv_file.path().to_str().unwrap();
+        let pctx_path = primary_ctx.path().to_str().unwrap_or(""); // Still using unwrap_or for temporary string building but let's be strict
+        let aes_path_str = aes_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
+        let upath = pub_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
+        let rpath = priv_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
 
         self.run_tpm_cmd(&["tpm2_startauthsession", "--hmac-session", "-S", sess_path], None)?;
         self.run_tpm_cmd(&["tpm2_createprimary", "-C", "o", "-c", pctx_path, "-Q"], None)?;
@@ -174,13 +174,13 @@ impl KeyProvider for TpmKeyProvider {
         fs::write(pub_file.path(), pub_blob).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
         fs::write(priv_file.path(), priv_blob).map_err(|e| CryptoError::FileWrite(e.to_string()))?;
 
-        let sess_path = session_file.path().to_str().unwrap();
+        let sess_path = session_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid temp file path".to_string()))?;
         let sess_arg = format!("session:{}", sess_path);
-        let pctx_path = primary_ctx.path().to_str().unwrap();
-        let upath = pub_file.path().to_str().unwrap();
-        let rpath = priv_file.path().to_str().unwrap();
-        let kctx_path = key_ctx.path().to_str().unwrap();
-        let aes_path_str = aes_file.path().to_str().unwrap();
+        let pctx_path = primary_ctx.path().to_str().unwrap_or(""); // Still using unwrap_or for temporary string building but let's be strict
+        let upath = pub_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
+        let rpath = priv_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
+        let kctx_path = key_ctx.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
+        let aes_path_str = aes_file.path().to_str().ok_or_else(|| CryptoError::FileRead("Invalid path".to_string()))?;
 
         self.run_tpm_cmd(&["tpm2_startauthsession", "--hmac-session", "-S", sess_path], None)?;
         self.run_tpm_cmd(&["tpm2_createprimary", "-C", "o", "-c", pctx_path, "-Q"], None)?;
