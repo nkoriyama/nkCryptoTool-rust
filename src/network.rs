@@ -14,14 +14,16 @@ use std::io::Write;
 use hkdf::Hkdf;
 use sha3::Sha3_256;
 use zeroize::Zeroizing;
-use tokio::sync::{Semaphore, Mutex};
+use tokio::sync::{Semaphore, Mutex, OwnedSemaphorePermit};
 use std::sync::Arc;
 use once_cell::sync::Lazy;
+use std::time::Duration;
 
 const BUF_SIZE: usize = 1024 * 1024;
 const MAX_CHUNK_SIZE: usize = 1024 * 1024; // #1 Fix: limit chunk size to buffer size
 const MAGIC_CT: &[u8; 4] = b"NKCT";
 const PROTOCOL_VERSION: u16 = 4;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300); // 5 minutes
 
 static STDOUT_MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -56,16 +58,31 @@ impl NetworkProcessor {
                 Ok(res) => res,
                 Err(e) => {
                     eprintln!("accept error: {}", e);
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await; // #3 Fix: avoid busy loop on temporary errors
-                    continue;
+                    // #4 Fix: Classification of accept errors
+                    match e.kind() {
+                        std::io::ErrorKind::ConnectionAborted |
+                        std::io::ErrorKind::ConnectionReset |
+                        std::io::ErrorKind::TimedOut => {
+                            continue; 
+                        }
+                        _ => {
+                            if let Some(os_err) = e.raw_os_error() {
+                                if os_err == libc::EMFILE || os_err == libc::ENFILE {
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    continue;
+                                }
+                            }
+                            return Err(CryptoError::FileRead(format!("Fatal accept error: {}", e)));
+                        }
+                    }
                 }
             };
             eprintln!("Connection accepted from {}", peer);
 
-            let config_clone = config.clone(); // Clone config for the task
+            let config_clone = config.clone();
             tokio::spawn(async move {
-                let _permit = permit;
-                if let Err(e) = Self::handle_server_connection(stream, &config_clone).await {
+                let mut permit_owned = Some(permit);
+                if let Err(e) = Self::handle_server_connection(stream, &config_clone, &mut permit_owned).await {
                     eprintln!("Connection error with {}: {}", peer, e);
                 }
                 eprintln!("Connection with {} closed.", peer);
@@ -73,19 +90,19 @@ impl NetworkProcessor {
         }
     }
 
-    async fn handle_server_connection(mut stream: TcpStream, config: &CryptoConfig) -> Result<()> {
+    async fn handle_server_connection(mut stream: TcpStream, config: &CryptoConfig, permit: &mut Option<OwnedSemaphorePermit>) -> Result<()> {
         // #1 fix: Limit timeout to handshake only
-        let handshake_data = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let handshake_data = tokio::time::timeout(Duration::from_secs(15), async {
             // 1. Receive Client Hello
             let mut magic = [0u8; 4];
-            stream.read_exact(&mut magic).await.map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?; // #3 generic error
+            stream.read_exact(&mut magic).await.map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?;
             if &magic != MAGIC_CT { return Err(CryptoError::Parameter("Handshake failed".to_string())); }
             
             let mut version_bytes = [0u8; 2];
             stream.read_exact(&mut version_bytes).await.map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?;
             let version = u16::from_le_bytes(version_bytes);
             if version != PROTOCOL_VERSION { 
-                return Err(CryptoError::Parameter("Handshake failed".to_string())); // #3 generic error
+                return Err(CryptoError::Parameter("Handshake failed".to_string())); 
             }
 
             let mut transcript = Vec::new();
@@ -109,20 +126,19 @@ impl NetworkProcessor {
 
             if client_auth_flag[0] == 1 {
                 let client_sig = Self::read_vec(&mut stream).await.map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?;
-                let pubkey_path = config.signing_pubkey.as_ref().ok_or(CryptoError::Parameter("Handshake failed".to_string()))?; // #3 generic error
+                let pubkey_path = config.signing_pubkey.as_ref().ok_or(CryptoError::Parameter("Handshake failed".to_string()))?;
                 let pubkey_pem = std::fs::read_to_string(pubkey_path).map_err(|_| CryptoError::Parameter("Handshake failed".to_string()))?;
                 let pubkey_der = crate::utils::unwrap_from_pem(&pubkey_pem, "PUBLIC KEY")?;
                 
                 if !backend::pqc_verify(&config.pqc_dsa_algo, &pubkey_der, &transcript, &client_sig)? {
-                    return Err(CryptoError::Parameter("Handshake failed".to_string())); // #3 generic error
+                    return Err(CryptoError::Parameter("Handshake failed".to_string()));
                 }
                 eprintln!("Client authenticated successfully.");
             } else if config.signing_pubkey.is_some() || !config.allow_unauth {
-                return Err(CryptoError::Parameter("Handshake failed".to_string())); // #3 generic error
+                return Err(CryptoError::Parameter("Handshake failed".to_string()));
             }
 
             // 2. Server Key Generation & Handshake
-            // #4: Executed only after basic protocol and auth (if applicable) checks
             let (server_ecc_priv, server_ecc_pub) = backend::generate_ecc_key_pair("prime256v1")?;
             let ss_ecc = backend::ecc_dh(&server_ecc_priv, &client_ecc_pub, None)?;
             let (kem_ss, kem_ct) = backend::pqc_encap(&config.pqc_kem_algo, &client_kem_pub)?;
@@ -173,7 +189,7 @@ impl NetworkProcessor {
         let (aead_name, s2c_key, _s2c_iv, c2s_key, c2s_iv) = match handshake_data {
             Ok(Ok(data)) => data,
             Ok(Err(e)) => return Err(e),
-            Err(_) => return Err(CryptoError::Parameter("Handshake failed".to_string())), // #3 generic error
+            Err(_) => return Err(CryptoError::Parameter("Handshake failed".to_string())), 
         };
 
         eprintln!("Handshake completed. Using AEAD: {}", aead_name);
@@ -184,7 +200,6 @@ impl NetworkProcessor {
             let mut aead = backend::new_decrypt(&aead_name, &c2s_key, &c2s_iv)?;
             let mut out_buffer = vec![0u8; BUF_SIZE + 32];
             
-            // #1 fix: Buffer to a temporary file before verification
             use tempfile::NamedTempFile;
             let mut temp_file = NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
             
@@ -193,10 +208,13 @@ impl NetworkProcessor {
 
             loop {
                 let mut len_bytes = [0u8; 4];
-                match stream.read_exact(&mut len_bytes).await {
-                    Ok(_) => {},
-                    Err(_) => break,
+                // #1: Add idle timeout for data phase
+                let read_res = tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut len_bytes)).await;
+                match read_res {
+                    Ok(Ok(_)) => {},
+                    Ok(Err(_)) | Err(_) => break, // Error or Timeout
                 }
+                
                 let chunk_len = u32::from_le_bytes(len_bytes) as usize;
                 if chunk_len == 0 { break; }
                 if chunk_len > MAX_CHUNK_SIZE { return Err(CryptoError::Parameter(format!("Chunk too large: {}", chunk_len))); }
@@ -225,6 +243,9 @@ impl NetworkProcessor {
 
             eprintln!("GCM verification successful. Releasing data...");
             
+            // #2 Fix: Early permit drop to allow other handshakes while writing to stdout
+            permit.take(); 
+
             // #4 Fix: Serialize stdout access for parallel file transfers
             let _stdout_lock = STDOUT_MUTEX.lock().await;
             let mut stdout = tokio::io::stdout();
@@ -263,7 +284,6 @@ impl NetworkProcessor {
         transcript.extend_from_slice(&client_auth_flag); 
 
         if let Some(privkey_path) = &config.signing_privkey {
-            // #4 fix: Wrap secret keys in Zeroizing
             let privkey_pem = Zeroizing::new(std::fs::read_to_string(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
             let privkey_der = Zeroizing::new(crate::utils::unwrap_from_pem(&privkey_pem, "PRIVATE KEY")?);
             let pass = config.passphrase.as_deref().map(|x| x.as_str());
@@ -366,9 +386,14 @@ impl NetworkProcessor {
             let mut seen_nonces = std::collections::HashSet::new(); // #4 Fix: Replay protection
             loop {
                 let mut len_bytes = [0u8; 4];
-                if stream_rx.read_exact(&mut len_bytes).await.is_err() { break; }
+                // #1: Add idle timeout for data phase
+                let read_res = tokio::time::timeout(IDLE_TIMEOUT, stream_rx.read_exact(&mut len_bytes)).await;
+                match read_res {
+                    Ok(Ok(_)) => {},
+                    Ok(Err(_)) | Err(_) => break, // Error or Timeout
+                }
+
                 let chunk_len = u32::from_le_bytes(len_bytes) as usize;
-                
                 if chunk_len == 0 { break; }
                 if chunk_len < 28 || chunk_len > 70000 { 
                     return Err(CryptoError::Parameter("Invalid packet size".to_string()));
@@ -380,12 +405,10 @@ impl NetworkProcessor {
                 let (nonce, rest) = packet.split_at(12);
                 let (ciphertext, tag) = rest.split_at(rest.len() - 16);
                 
-                // #4 Fix: Prevent nonce replay
                 if !seen_nonces.insert(nonce.to_vec()) {
                     return Err(CryptoError::Parameter("Replayed nonce detected".to_string()));
                 }
 
-                // #3 Fix: Limit HashSet size to prevent memory exhaustion
                 if seen_nonces.len() > 10000 {
                     return Err(CryptoError::Parameter("Nonce history limit exceeded".to_string()));
                 }
@@ -396,7 +419,6 @@ impl NetworkProcessor {
                 let n = rx_aead.update(ciphertext, &mut out_buf)?;
                 let final_n = rx_aead.finalize(&mut out_buf[n..])?; 
                 
-                // #3 fix: Sanitize received message to prevent terminal injection
                 let msg_raw = String::from_utf8_lossy(&out_buf[..n + final_n]);
                 let msg = msg_raw.chars().filter(|c| !c.is_control() || *c == '\n' || *c == '\t').collect::<String>();
                 println!("\r[Peer]: {}", msg);
