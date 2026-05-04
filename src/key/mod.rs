@@ -9,6 +9,8 @@ pub mod tpm;
 use crate::error::Result;
 use std::sync::Arc;
 
+use zeroize::Zeroizing;
+
 pub trait KeyProvider: Send + Sync {
     /// Wrap raw key bytes using the provider's hardware protection (e.g. TPM).
     fn wrap_raw(&self, _data: &[u8], _passphrase: Option<&str>) -> Result<String> {
@@ -16,7 +18,7 @@ pub trait KeyProvider: Send + Sync {
     }
 
     /// Unwrap a provider-specific blob into raw key bytes.
-    fn unwrap_raw(&self, _wrapped_pem: &str, _passphrase: Option<&str>) -> Result<Vec<u8>> {
+    fn unwrap_raw(&self, _wrapped_pem: &str, _passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
         Err(crate::error::CryptoError::ProviderNotAvailable)
     }
 

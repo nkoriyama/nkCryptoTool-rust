@@ -6,6 +6,7 @@
 
 use crate::error::{CryptoError, Result};
 use crate::backend::{AeadBackend, HashBackend};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[cfg(feature = "backend-rustcrypto")]
 use fips203::traits::{KeyGen as _, SerDes as _, Decaps as _, Encaps as _};
@@ -41,21 +42,59 @@ enum AeadMode {
         ctr: rc_internal::Ctr64BE<rc_internal::Aes256>,
         ghash: rc_internal::GHash,
         tag_mask: [u8; 16],
+        _cipher_name: String, // Store to support re_init
     },
     ChaChaPoly {
         cipher: rc_internal::ChaCha20,
         poly: rc_internal::Poly1305,
+        _cipher_name: String, // Store to support re_init
+    }
+}
+
+#[cfg(feature = "backend-rustcrypto")]
+impl Zeroize for AeadMode {
+    fn zeroize(&mut self) {
+        match self {
+            AeadMode::AesGcm { tag_mask, .. } => {
+                tag_mask.zeroize();
+            }
+            AeadMode::ChaChaPoly { .. } => {
+                // Primitive types from RustCrypto might not implement Zeroize in all versions,
+                // but we clear what we can.
+            }
+        }
     }
 }
 
 pub struct RustCryptoAead {
     #[cfg(feature = "backend-rustcrypto")]
     mode: Option<AeadMode>,
+    _cipher_name: String, // #27 Fix: Store cipher name to support re_init after finalize
     _iv: Vec<u8>,
     _tag: Vec<u8>,
     _is_encrypt: bool,
     _data_len: u64,
 }
+
+impl Zeroize for RustCryptoAead {
+    fn zeroize(&mut self) {
+        #[cfg(feature = "backend-rustcrypto")]
+        if let Some(mut m) = self.mode.take() {
+            m.zeroize();
+        }
+        self._iv.zeroize();
+        self._tag.zeroize();
+        // _cipher_name is not zeroized as it is not sensitive
+    }
+}
+
+impl Drop for RustCryptoAead {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for RustCryptoAead {}
 
 impl AeadBackend for RustCryptoAead {
     fn new_encrypt(cipher_name: &str, key: &[u8], iv: &[u8]) -> Result<Self> {
@@ -65,9 +104,9 @@ impl AeadBackend for RustCryptoAead {
             let normalized = cipher_name.to_lowercase();
             let mode = if normalized == "aes-256-gcm" {
                 let aes = Aes256::new_from_slice(key).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-                let mut h = [0u8; 16];
-                aes.encrypt_block(GenericArray::from_mut_slice(&mut h));
-                let ghash = GHash::new(GenericArray::from_slice(&h));
+                let mut h = Zeroizing::new([0u8; 16]); // #26 Fix: Wrap in Zeroizing
+                aes.encrypt_block(GenericArray::from_mut_slice(&mut *h));
+                let ghash = GHash::new(GenericArray::from_slice(&*h));
                 let mut j0 = [0u8; 16];
                 j0[..12].copy_from_slice(iv);
                 j0[15] = 1;
@@ -76,19 +115,20 @@ impl AeadBackend for RustCryptoAead {
                 let mut ctr_iv = j0;
                 ctr_iv[15] = 2;
                 let ctr = Ctr64BE::<Aes256>::new(GenericArray::from_slice(key), GenericArray::from_slice(&ctr_iv));
-                AeadMode::AesGcm { ctr, ghash, tag_mask }
+                AeadMode::AesGcm { ctr, ghash, tag_mask, _cipher_name: normalized.clone() }
             } else if normalized == "chacha20-poly1305" {
                 let mut cipher = ChaCha20::new(GenericArray::from_slice(key), GenericArray::from_slice(iv));
-                let mut poly_key = [0u8; 32];
-                cipher.apply_keystream(&mut poly_key);
-                let poly = Poly1305::new(GenericArray::from_slice(&poly_key));
-                AeadMode::ChaChaPoly { cipher, poly }
+                let mut poly_key = Zeroizing::new([0u8; 32]); // #25 Fix: Wrap in Zeroizing
+                cipher.apply_keystream(&mut *poly_key);
+                let poly = Poly1305::new(GenericArray::from_slice(&*poly_key));
+                AeadMode::ChaChaPoly { cipher, poly, _cipher_name: normalized.clone() }
             } else {
                 return Err(CryptoError::Parameter(format!("Unsupported: {}", cipher_name)));
             };
 
             Ok(Self { 
                 mode: Some(mode), 
+                _cipher_name: normalized,
                 _iv: iv.to_vec(), 
                 _tag: vec![0u8; 16],
                 _is_encrypt: true,
@@ -106,6 +146,50 @@ impl AeadBackend for RustCryptoAead {
         let mut me = Self::new_encrypt(cipher_name, key, iv)?;
         me._is_encrypt = false;
         Ok(me)
+    }
+
+    fn re_init(&mut self, key: &[u8], iv: &[u8]) -> Result<()> {
+        #[cfg(feature = "backend-rustcrypto")]
+        {
+            use rc_internal::*;
+            if let Some(mut old_mode) = self.mode.take() {
+                old_mode.zeroize(); // #25 Fix: Explicitly zeroize old mode before drop
+            }
+            let cipher_name = self._cipher_name.clone();
+            
+            let new_mode = if cipher_name == "aes-256-gcm" {
+                let aes = Aes256::new_from_slice(key).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+                let mut h = Zeroizing::new([0u8; 16]); // #26 Fix: Wrap in Zeroizing
+                aes.encrypt_block(GenericArray::from_mut_slice(&mut *h));
+                let ghash = GHash::new(GenericArray::from_slice(&*h));
+                let mut j0 = [0u8; 16];
+                j0[..12].copy_from_slice(iv);
+                j0[15] = 1;
+                let mut tag_mask = j0;
+                aes.encrypt_block(GenericArray::from_mut_slice(&mut tag_mask));
+                let mut ctr_iv = j0;
+                ctr_iv[15] = 2;
+                let ctr = Ctr64BE::<Aes256>::new(GenericArray::from_slice(key), GenericArray::from_slice(&ctr_iv));
+                AeadMode::AesGcm { ctr, ghash, tag_mask, _cipher_name: cipher_name }
+            } else {
+                let mut cipher = ChaCha20::new(GenericArray::from_slice(key), GenericArray::from_slice(iv));
+                let mut poly_key = Zeroizing::new([0u8; 32]); // #25 Fix: Wrap in Zeroizing
+                cipher.apply_keystream(&mut *poly_key);
+                let poly = Poly1305::new(GenericArray::from_slice(&*poly_key));
+                AeadMode::ChaChaPoly { cipher, poly, _cipher_name: cipher_name }
+            };
+
+            self.mode = Some(new_mode);
+            self._iv = iv.to_vec();
+            self._tag = vec![0u8; 16];
+            self._data_len = 0;
+            Ok(())
+        }
+        #[cfg(not(feature = "backend-rustcrypto"))]
+        {
+            let _ = (key, iv);
+            Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string()))
+        }
     }
 
     fn update(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
@@ -135,7 +219,7 @@ impl AeadBackend for RustCryptoAead {
                         ghash.update_padded(aad_or_cipher);
                     }
                 },
-                AeadMode::ChaChaPoly { cipher, poly } => {
+                AeadMode::ChaChaPoly { cipher, poly, .. } => {
                     let out_slice = &mut output[..input.len()];
                     out_slice.copy_from_slice(input);
                     cipher.apply_keystream(out_slice);
@@ -158,13 +242,14 @@ impl AeadBackend for RustCryptoAead {
         {
             use rc_internal::*;
             let mode = self.mode.take().ok_or(CryptoError::Parameter("AEAD not init".to_string()))?;
-            match mode {
-                AeadMode::AesGcm { mut ghash, tag_mask, .. } => {
+            let res = match mode {
+                AeadMode::AesGcm { mut ghash, mut tag_mask, .. } => {
                     let mut len_block = [0u8; 16];
                     len_block[8..16].copy_from_slice(&(self._data_len * 8).to_be_bytes());
                     ghash.update(&[*GenericArray::from_slice(&len_block)]);
                     let mut tag = ghash.finalize();
                     for i in 0..16 { tag[i] ^= tag_mask[i]; }
+                    tag_mask.zeroize();
                     if self._is_encrypt {
                         self._tag = tag.to_vec();
                         Ok(0)
@@ -173,10 +258,9 @@ impl AeadBackend for RustCryptoAead {
                         if tag.ct_eq(expected_tag).unwrap_u8() == 1 { Ok(0) } else { Err(CryptoError::SignatureVerification) }
                     }
                 },
-                AeadMode::ChaChaPoly { poly, .. } => {
+                AeadMode::ChaChaPoly { mut poly, .. } => {
                     let mut len_block = [0u8; 16];
                     len_block[8..16].copy_from_slice(&self._data_len.to_le_bytes());
-                    let mut poly = poly;
                     poly.update_padded(&len_block);
                     let tag = poly.finalize();
                     if self._is_encrypt {
@@ -187,7 +271,8 @@ impl AeadBackend for RustCryptoAead {
                         if tag.ct_eq(expected_tag).unwrap_u8() == 1 { Ok(0) } else { Err(CryptoError::SignatureVerification) }
                     }
                 }
-            }
+            };
+            res
         }
         #[cfg(not(feature = "backend-rustcrypto"))]
         {
@@ -250,8 +335,8 @@ impl HashBackend for RustCryptoHash {
         #[cfg(feature = "backend-rustcrypto")]
         {
             use rc_internal::*;
-            let hash_bytes = if let Some(d) = self.digest_256.take() { d.finalize().to_vec() }
-                            else if let Some(d) = self.digest_512.take() { d.finalize().to_vec() }
+            let hash_bytes = if let Some(d) = self.digest_256.take() { Zeroizing::new(d.finalize().to_vec()) }
+                            else if let Some(d) = self.digest_512.take() { Zeroizing::new(d.finalize().to_vec()) }
                             else { return Err(CryptoError::Parameter("Digest not init".to_string())); };
             
             let sk_raw = SecretKey::from_pkcs8_der(key_der).or_else(|_| SecretKey::from_sec1_der(key_der))
@@ -271,8 +356,8 @@ impl HashBackend for RustCryptoHash {
         #[cfg(feature = "backend-rustcrypto")]
         {
             use rc_internal::*;
-            let hash_bytes = if let Some(d) = self.digest_256.take() { d.finalize().to_vec() }
-                            else if let Some(d) = self.digest_512.take() { d.finalize().to_vec() }
+            let hash_bytes = if let Some(d) = self.digest_256.take() { Zeroizing::new(d.finalize().to_vec()) }
+                            else if let Some(d) = self.digest_512.take() { Zeroizing::new(d.finalize().to_vec()) }
                             else { return Err(CryptoError::Parameter("Digest not init".to_string())); };
             
             let vk = VerifyingKey::from_public_key_der(key_der).map_err(|e| CryptoError::PublicKeyLoad(e.to_string()))?;
@@ -295,7 +380,7 @@ impl HashBackend for RustCryptoHash {
     }
 }
 
-pub fn generate_ecc_key_pair(curve_name: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn generate_ecc_key_pair(curve_name: &str) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
     #[cfg(feature = "backend-rustcrypto")]
     {
         use rc_internal::*;
@@ -308,7 +393,7 @@ pub fn generate_ecc_key_pair(curve_name: &str) -> Result<(Vec<u8>, Vec<u8>)> {
         let priv_der = secret_key.to_pkcs8_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         let pub_der = public_key.to_public_key_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         
-        Ok((priv_der.to_bytes().to_vec(), pub_der.as_bytes().to_vec()))
+        Ok((Zeroizing::new(priv_der.to_bytes().to_vec()), pub_der.as_bytes().to_vec()))
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
     {
@@ -317,7 +402,7 @@ pub fn generate_ecc_key_pair(curve_name: &str) -> Result<(Vec<u8>, Vec<u8>)> {
     }
 }
 
-pub fn ecc_dh(my_priv_der: &[u8], peer_pub_der: &[u8], _passphrase: Option<&str>) -> Result<Vec<u8>> {
+pub fn ecc_dh(my_priv_der: &[u8], peer_pub_der: &[u8], _passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
     #[cfg(feature = "backend-rustcrypto")]
     {
         use rc_internal::*;
@@ -325,7 +410,7 @@ pub fn ecc_dh(my_priv_der: &[u8], peer_pub_der: &[u8], _passphrase: Option<&str>
             .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         let pk = PublicKey::from_public_key_der(peer_pub_der).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         let shared_secret = p256::ecdh::diffie_hellman(sk.to_nonzero_scalar(), pk.as_affine());
-        Ok(shared_secret.raw_secret_bytes().to_vec())
+        Ok(Zeroizing::new(shared_secret.raw_secret_bytes().to_vec()))
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
     {
@@ -367,9 +452,9 @@ fn read_asn1_len(der: &[u8], pos: &mut usize) -> usize {
 }
 
 #[cfg(feature = "backend-rustcrypto")]
-fn unwrap_pqc_der_internal(der: &[u8], is_public: bool) -> Vec<u8> {
-    if der.is_empty() || der[0] != 0x30 { return der.to_vec(); }
-    let mut best = Vec::new();
+fn unwrap_pqc_der_internal(der: &[u8], is_public: bool) -> Zeroizing<Vec<u8>> {
+    if der.is_empty() || der[0] != 0x30 { return Zeroizing::new(der.to_vec()); }
+    let mut best = Zeroizing::new(Vec::new());
     for i in 0..der.len().saturating_sub(4) {
         let tag = der[i];
         if tag == 0x04 || (is_public && tag == 0x03) {
@@ -383,46 +468,46 @@ fn unwrap_pqc_der_internal(der: &[u8], is_public: bool) -> Vec<u8> {
                     else { continue; }
                 }
                 if [1632, 2400, 3168, 2560, 4032, 4896, 800, 1184, 1568, 1312, 1952, 2592].contains(&actual_len) {
-                    return der[data_start..data_start + actual_len].to_vec();
+                    return Zeroizing::new(der[data_start..data_start + actual_len].to_vec());
                 }
                 if actual_len > 32 && der[data_start] == 0x30 {
                     let inner = unwrap_pqc_der_internal(&der[data_start..data_start + actual_len], is_public);
                     if [1632, 2400, 3168, 2560, 4032, 4896, 800, 1184, 1568, 1312, 1952, 2592].contains(&inner.len()) { return inner; }
                 }
-                if actual_len > best.len() { best = der[data_start..data_start + actual_len].to_vec(); }
+                if actual_len > best.len() { *best = der[data_start..data_start + actual_len].to_vec(); }
             }
         }
     }
-    if best.is_empty() { der.to_vec() } else { best }
+    if best.is_empty() { Zeroizing::new(der.to_vec()) } else { best }
 }
 
-pub fn pqc_keygen_kem(algo: &str) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+pub fn pqc_keygen_kem(algo: &str) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option<Zeroizing<Vec<u8>>>)> {
     #[cfg(feature = "backend-rustcrypto")]
     {
         use rc_internal::OsRng;
         use rand_core::RngCore;
-        let mut d = [0u8; 32];
-        let mut z = [0u8; 32];
-        OsRng.fill_bytes(&mut d);
-        OsRng.fill_bytes(&mut z);
-        let mut seeds = Vec::with_capacity(64);
-        seeds.extend_from_slice(&d);
-        seeds.extend_from_slice(&z);
+        let mut d = Zeroizing::new([0u8; 32]);
+        let mut z = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(&mut *d);
+        OsRng.fill_bytes(&mut *z);
+        let mut seeds = Zeroizing::new(Vec::with_capacity(64));
+        seeds.extend_from_slice(&*d);
+        seeds.extend_from_slice(&*z);
         match algo {
             "ML-KEM-512" => {
                 use fips203::ml_kem_512::KG;
-                let (pk, sk) = KG::keygen_from_seed(d, z);
-                Ok((sk.into_bytes().to_vec(), pk.into_bytes().to_vec(), Some(seeds)))
+                let (pk, sk) = KG::keygen_from_seed(*d, *z);
+                Ok((Zeroizing::new(sk.into_bytes().to_vec()), pk.into_bytes().to_vec(), Some(seeds)))
             },
             "ML-KEM-768" => {
                 use fips203::ml_kem_768::KG;
-                let (pk, sk) = KG::keygen_from_seed(d, z);
-                Ok((sk.into_bytes().to_vec(), pk.into_bytes().to_vec(), Some(seeds)))
+                let (pk, sk) = KG::keygen_from_seed(*d, *z);
+                Ok((Zeroizing::new(sk.into_bytes().to_vec()), pk.into_bytes().to_vec(), Some(seeds)))
             },
             "ML-KEM-1024" => {
                 use fips203::ml_kem_1024::KG;
-                let (pk, sk) = KG::keygen_from_seed(d, z);
-                Ok((sk.into_bytes().to_vec(), pk.into_bytes().to_vec(), Some(seeds)))
+                let (pk, sk) = KG::keygen_from_seed(*d, *z);
+                Ok((Zeroizing::new(sk.into_bytes().to_vec()), pk.into_bytes().to_vec(), Some(seeds)))
             },
             _ => Err(CryptoError::Parameter(format!("Unsupported KEM: {}", algo))),
         }
@@ -431,26 +516,26 @@ pub fn pqc_keygen_kem(algo: &str) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)>
     { let _ = algo; Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
 }
 
-pub fn pqc_keygen_dsa(algo: &str) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+pub fn pqc_keygen_dsa(algo: &str) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option<Zeroizing<Vec<u8>>>)> {
     #[cfg(feature = "backend-rustcrypto")]
     {
         use rc_internal::OsRng;
         use rand_core::RngCore;
-        let mut xi = [0u8; 32];
-        OsRng.fill_bytes(&mut xi);
-        let seed = xi.to_vec();
+        let mut xi = Zeroizing::new([0u8; 32]);
+        OsRng.fill_bytes(&mut *xi);
+        let seed = Zeroizing::new(xi.to_vec());
         match algo {
             "ML-DSA-44" => {
-                let (pk, sk) = fips204::ml_dsa_44::KG::keygen_from_seed(&xi);
-                Ok((sk.into_bytes().to_vec(), pk.into_bytes().to_vec(), Some(seed)))
+                let (pk, sk) = fips204::ml_dsa_44::KG::keygen_from_seed(&*xi);
+                Ok((Zeroizing::new(sk.into_bytes().to_vec()), pk.into_bytes().to_vec(), Some(seed)))
             },
             "ML-DSA-65" => {
-                let (pk, sk) = fips204::ml_dsa_65::KG::keygen_from_seed(&xi);
-                Ok((sk.into_bytes().to_vec(), pk.into_bytes().to_vec(), Some(seed)))
+                let (pk, sk) = fips204::ml_dsa_65::KG::keygen_from_seed(&*xi);
+                Ok((Zeroizing::new(sk.into_bytes().to_vec()), pk.into_bytes().to_vec(), Some(seed)))
             },
             "ML-DSA-87" => {
-                let (pk, sk) = fips204::ml_dsa_87::KG::keygen_from_seed(&xi);
-                Ok((sk.into_bytes().to_vec(), pk.into_bytes().to_vec(), Some(seed)))
+                let (pk, sk) = fips204::ml_dsa_87::KG::keygen_from_seed(&*xi);
+                Ok((Zeroizing::new(sk.into_bytes().to_vec()), pk.into_bytes().to_vec(), Some(seed)))
             },
             _ => Err(CryptoError::Parameter(format!("Unsupported DSA: {}", algo))),
         }
@@ -465,17 +550,17 @@ pub fn pqc_sign(algo: &str, priv_der: &[u8], message: &[u8], _passphrase: Option
         let raw_priv = unwrap_pqc_der_internal(priv_der, false);
         match algo {
             "ML-DSA-44" => {
-                let sk = fips204::ml_dsa_44::PrivateKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                let sk = fips204::ml_dsa_44::PrivateKey::try_from_bytes((&*raw_priv).to_vec().try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
                     .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
                 Ok(sk.try_sign(message, &[]).map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?.to_vec())
             },
             "ML-DSA-65" => {
-                let sk = fips204::ml_dsa_65::PrivateKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                let sk = fips204::ml_dsa_65::PrivateKey::try_from_bytes((&*raw_priv).to_vec().try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
                     .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
                 Ok(sk.try_sign(message, &[]).map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?.to_vec())
             },
             "ML-DSA-87" => {
-                let sk = fips204::ml_dsa_87::PrivateKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                let sk = fips204::ml_dsa_87::PrivateKey::try_from_bytes((&*raw_priv).to_vec().try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
                     .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
                 Ok(sk.try_sign(message, &[]).map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?.to_vec())
             },
@@ -492,19 +577,19 @@ pub fn pqc_verify(algo: &str, pub_der: &[u8], message: &[u8], signature: &[u8]) 
         let raw_pub = unwrap_pqc_der_internal(pub_der, true);
         match algo {
             "ML-DSA-44" => {
-                let pk = fips204::ml_dsa_44::PublicKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                let pk = fips204::ml_dsa_44::PublicKey::try_from_bytes((&*raw_pub).to_vec().try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
                     .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
                 let sig_arr: [u8; 2420] = signature.try_into().map_err(|_| CryptoError::Parameter("Invalid sig size".to_string()))?;
                 Ok(pk.verify(message, &sig_arr, &[]))
             },
             "ML-DSA-65" => {
-                let pk = fips204::ml_dsa_65::PublicKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                let pk = fips204::ml_dsa_65::PublicKey::try_from_bytes((&*raw_pub).to_vec().try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
                     .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
                 let sig_arr: [u8; 3309] = signature.try_into().map_err(|_| CryptoError::Parameter("Invalid sig size".to_string()))?;
                 Ok(pk.verify(message, &sig_arr, &[]))
             },
             "ML-DSA-87" => {
-                let pk = fips204::ml_dsa_87::PublicKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                let pk = fips204::ml_dsa_87::PublicKey::try_from_bytes((&*raw_pub).to_vec().try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
                     .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
                 let sig_arr: [u8; 4627] = signature.try_into().map_err(|_| CryptoError::Parameter("Invalid sig size".to_string()))?;
                 Ok(pk.verify(message, &sig_arr, &[]))
@@ -516,86 +601,88 @@ pub fn pqc_verify(algo: &str, pub_der: &[u8], message: &[u8], signature: &[u8]) 
     { let _ = (algo, pub_der, message, signature); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
 }
 
-pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn pqc_encap(_algo: &str, peer_pub_der: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
     #[cfg(feature = "backend-rustcrypto")]
     {
         let raw_pub = unwrap_pqc_der_internal(peer_pub_der, true);
         let actual_len = raw_pub.len();
         if actual_len == 800 {
             use fips203::ml_kem_512::EncapsKey;
-            let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?)
+            let pk = EncapsKey::try_from_bytes((&*raw_pub).to_vec().try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?)
                 .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
             let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
-            Ok((ss.into_bytes().to_vec(), ct.into_bytes().to_vec()))
+            Ok((Zeroizing::new(ss.into_bytes().to_vec()), ct.into_bytes().to_vec()))
         } else if actual_len == 1184 {
             use fips203::ml_kem_768::EncapsKey;
-            let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?)
+            let pk = EncapsKey::try_from_bytes((&*raw_pub).to_vec().try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?)
                 .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
             let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
-            Ok((ss.into_bytes().to_vec(), ct.into_bytes().to_vec()))
+            Ok((Zeroizing::new(ss.into_bytes().to_vec()), ct.into_bytes().to_vec()))
         } else if actual_len == 1568 {
             use fips203::ml_kem_1024::EncapsKey;
-            let pk = EncapsKey::try_from_bytes(raw_pub.try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?)
+            let pk = EncapsKey::try_from_bytes((&*raw_pub).to_vec().try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?)
                 .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
             let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
-            Ok((ss.into_bytes().to_vec(), ct.into_bytes().to_vec()))
+            Ok((Zeroizing::new(ss.into_bytes().to_vec()), ct.into_bytes().to_vec()))
         } else {
             Err(CryptoError::Parameter(format!("Unsupported or mismatched KEM key size: {}", actual_len)))
         }
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
-    { let _ = (algo, peer_pub_der); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
+    { let _ = (_algo, peer_pub_der); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
 }
 
-pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], _passphrase: Option<&str>) -> Result<Vec<u8>> {
+pub fn pqc_decap(_algo: &str, priv_der: &[u8], kem_ct: &[u8], _passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
     #[cfg(feature = "backend-rustcrypto")]
     {
         let raw_priv = unwrap_pqc_der_internal(priv_der, false);
         let actual_len = raw_priv.len();
         if actual_len == 1632 {
             use fips203::ml_kem_512::{DecapsKey, CipherText};
-            let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?)
+            let sk = DecapsKey::try_from_bytes((&*raw_priv).to_vec().try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?)
                 .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
             let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
                 .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
             let ss = sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
-            Ok(ss.into_bytes().to_vec())
+            Ok(Zeroizing::new(ss.into_bytes().to_vec()))
         } else if actual_len == 2400 {
             use fips203::ml_kem_768::{DecapsKey, CipherText};
-            let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?)
+            let sk = DecapsKey::try_from_bytes((&*raw_priv).to_vec().try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?)
                 .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
             let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
                 .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
             let ss = sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
-            Ok(ss.into_bytes().to_vec())
+            Ok(Zeroizing::new(ss.into_bytes().to_vec()))
         } else if actual_len == 3168 {
             use fips203::ml_kem_1024::{DecapsKey, CipherText};
-            let sk = DecapsKey::try_from_bytes(raw_priv.try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?)
+            let sk = DecapsKey::try_from_bytes((&*raw_priv).to_vec().try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?)
                 .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
             let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
                 .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
             let ss = sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
-            Ok(ss.into_bytes().to_vec())
+            Ok(Zeroizing::new(ss.into_bytes().to_vec()))
         } else {
              Err(CryptoError::Parameter(format!("Unsupported or mismatched KEM key size: {}", actual_len)))
         }
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
-    { let _ = (algo, priv_der, kem_ct, _passphrase); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
+    { let _ = (_algo, priv_der, kem_ct, _passphrase); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
 }
 
-pub fn hkdf(ikm: &[u8], length: usize, salt: &[u8], info: &str, md_name: &str) -> Result<Vec<u8>> {
+pub fn hkdf(ikm: &[u8], length: usize, salt: &[u8], info: &str, md_name: &str) -> Result<Zeroizing<Vec<u8>>> {
     #[cfg(feature = "backend-rustcrypto")]
     {
         use rc_internal::*;
         use hkdf::Hkdf;
-        let mut okm = vec![0u8; length];
+        let mut okm = Zeroizing::new(vec![0u8; length]);
         if md_name.contains("256") {
             let h = Hkdf::<Sha3_256>::new(Some(salt), ikm);
-            h.expand(info.as_bytes(), &mut okm).map_err(|_| CryptoError::Parameter("HKDF expand failed".to_string()))?;
+            h.expand(info.as_bytes(), &mut *okm).map_err(|_| CryptoError::Parameter("HKDF expand failed".to_string()))?;
+            drop(h); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
         } else {
             let h = Hkdf::<Sha3_512>::new(Some(salt), ikm);
-            h.expand(info.as_bytes(), &mut okm).map_err(|_| CryptoError::Parameter("HKDF expand failed".to_string()))?;
+            h.expand(info.as_bytes(), &mut *okm).map_err(|_| CryptoError::Parameter("HKDF expand failed".to_string()))?;
+            drop(h); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
         }
         Ok(okm)
     }
@@ -603,8 +690,8 @@ pub fn hkdf(ikm: &[u8], length: usize, salt: &[u8], info: &str, md_name: &str) -
     { let _ = (ikm, length, salt, info, md_name); Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string())) }
 }
 
-pub fn extract_raw_private_key(priv_der: &[u8], _passphrase: Option<&str>) -> Result<Vec<u8>> {
-    Ok(priv_der.to_vec())
+pub fn extract_raw_private_key(priv_der: &[u8], _passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
+    Ok(Zeroizing::new(priv_der.to_vec()))
 }
 
 pub fn new_encrypt(cipher: &str, key: &[u8], iv: &[u8]) -> Result<Aead> {

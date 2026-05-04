@@ -16,7 +16,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 pub struct HybridStrategy {
     ecc: EccStrategy,
     pqc: PqcStrategy,
-    encryption_key: Vec<u8>,
+    encryption_key: Zeroizing<Vec<u8>>,
     iv: Vec<u8>,
     salt: Vec<u8>,
     #[zeroize(skip)]
@@ -28,7 +28,7 @@ impl HybridStrategy {
         Self {
             ecc: EccStrategy::new(),
             pqc: PqcStrategy::new(),
-            encryption_key: Vec::new(),
+            encryption_key: Zeroizing::new(Vec::new()),
             iv: Vec::new(),
             salt: Vec::new(),
             aead_ctx: None,
@@ -87,17 +87,19 @@ impl CryptoStrategy for HybridStrategy {
         
         let ss_ecc = self.ecc.get_shared_secret();
         let ss_pqc = self.pqc.get_shared_secret();
-        let mut combined_ss = ss_ecc;
-        combined_ss.extend_from_slice(&ss_pqc);
+        let mut combined_ss = crate::utils::SecureBuffer::new(ss_ecc.len() + ss_pqc.len())?;
+        combined_ss[..ss_ecc.len()].copy_from_slice(&ss_ecc);
+        combined_ss[ss_ecc.len()..].copy_from_slice(&ss_pqc);
         
         self.salt = self.ecc.get_salt();
         self.iv = self.ecc.get_iv();
         
         use hkdf::Hkdf;
         use sha3::Sha3_256;
-        let mut okm = vec![0u8; 32];
+        let mut okm = Zeroizing::new(vec![0u8; 32]);
         let hk = Hkdf::<Sha3_256>::new(Some(&self.salt), &combined_ss);
-        hk.expand(b"hybrid-encryption", &mut okm).map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
+        hk.expand(b"hybrid-encryption", &mut *okm).map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
+        drop(hk); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
         self.encryption_key = okm;
         
         let ctx = crate::backend::new_encrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
@@ -116,14 +118,16 @@ impl CryptoStrategy for HybridStrategy {
         
         let ss_ecc = self.ecc.get_shared_secret();
         let ss_pqc = self.pqc.get_shared_secret();
-        let mut combined_ss = ss_ecc;
-        combined_ss.extend_from_slice(&ss_pqc);
+        let mut combined_ss = crate::utils::SecureBuffer::new(ss_ecc.len() + ss_pqc.len())?;
+        combined_ss[..ss_ecc.len()].copy_from_slice(&ss_ecc);
+        combined_ss[ss_ecc.len()..].copy_from_slice(&ss_pqc);
         
         use hkdf::Hkdf;
         use sha3::Sha3_256;
-        let mut okm = vec![0u8; 32];
+        let mut okm = Zeroizing::new(vec![0u8; 32]);
         let hk = Hkdf::<Sha3_256>::new(Some(&self.salt), &combined_ss);
-        hk.expand(b"hybrid-encryption", &mut okm).map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
+        hk.expand(b"hybrid-encryption", &mut *okm).map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
+        drop(hk); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
         self.encryption_key = okm;
         
         let ctx = crate::backend::new_decrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
@@ -131,17 +135,17 @@ impl CryptoStrategy for HybridStrategy {
         Ok(())
     }
 
-    fn encrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    fn encrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        let mut out = vec![0u8; data.len()];
+        let mut out = Zeroizing::new(vec![0u8; data.len()]);
         let n = ctx.update(data, &mut out)?;
         out.truncate(n);
         Ok(out)
     }
 
-    fn decrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        let mut out = vec![0u8; data.len()];
+        let mut out = Zeroizing::new(vec![0u8; data.len()]);
         let n = ctx.update(data, &mut out)?;
         out.truncate(n);
         Ok(out)
@@ -234,7 +238,7 @@ impl CryptoStrategy for HybridStrategy {
     }
 
     fn get_tag_size(&self) -> usize { 16 }
-    fn get_shared_secret(&self) -> Vec<u8> { Vec::new() }
+    fn get_shared_secret(&self) -> Zeroizing<Vec<u8>> { Zeroizing::new(Vec::new()) }
     fn get_salt(&self) -> Vec<u8> { self.salt.clone() }
     fn get_iv(&self) -> Vec<u8> { self.iv.clone() }
 }

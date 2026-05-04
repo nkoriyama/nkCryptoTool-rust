@@ -32,15 +32,15 @@ pub struct EccStrategy {
     hash_ctx: Option<backend::Hash>,
     
     // Key states
-    encryption_key: Vec<u8>,
+    encryption_key: Zeroizing<Vec<u8>>,
     iv: Vec<u8>,
     salt: Vec<u8>,
-    shared_secret: Vec<u8>,
+    shared_secret: Zeroizing<Vec<u8>>,
     ephemeral_pubkey: Vec<u8>,
     
     // Signing keys (stored as DER to be backend-agnostic)
-    sign_key_der: Option<Vec<u8>>,
-    verify_key_der: Option<Vec<u8>>,
+    sign_key_der: Option<Zeroizing<Vec<u8>>>,
+    verify_key_der: Option<Zeroizing<Vec<u8>>>,
 }
 
 impl EccStrategy {
@@ -52,21 +52,22 @@ impl EccStrategy {
             aead_algo: "AES-256-GCM".to_string(),
             aead_ctx: None,
             hash_ctx: None,
-            encryption_key: Vec::new(),
+            encryption_key: Zeroizing::new(Vec::new()),
             iv: Vec::new(),
             salt: Vec::new(),
-            shared_secret: Vec::new(),
+            shared_secret: Zeroizing::new(Vec::new()),
             ephemeral_pubkey: Vec::new(),
             sign_key_der: None,
             verify_key_der: None,
         }
     }
 
-    fn hkdf_derive(&self, secret: &[u8], out_len: usize, salt: &[u8], info: &str) -> Result<Vec<u8>> {
-        let mut okm = vec![0u8; out_len];
+    fn hkdf_derive(&self, secret: &[u8], out_len: usize, salt: &[u8], info: &str) -> Result<Zeroizing<Vec<u8>>> {
+        let mut okm = Zeroizing::new(vec![0u8; out_len]);
         use sha3::Sha3_256;
         let hk = Hkdf::<Sha3_256>::new(Some(salt), secret);
-        hk.expand(info.as_bytes(), &mut okm).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        hk.expand(info.as_bytes(), &mut *okm).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        drop(hk); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
         Ok(okm)
     }
 }
@@ -97,11 +98,12 @@ impl CryptoStrategy for EccStrategy {
             let wrapped = provider.wrap_raw(&priv_der, passphrase)?;
             fs::write(priv_path, wrapped)?;
         } else {
-            let priv_pem = crate::utils::wrap_to_pem(&priv_der, "PRIVATE KEY").into_bytes();
-            fs::write(priv_path, priv_pem)?;
+            let priv_pem = crate::utils::wrap_to_pem_zeroizing(&priv_der, "PRIVATE KEY");
+            fs::write(priv_path, priv_pem.as_bytes())?;
         }
 
-        fs::write(pub_path, crate::utils::wrap_to_pem(&pub_der, "PUBLIC KEY"))?;
+        let pub_pem = crate::utils::wrap_to_pem_zeroizing(&pub_der, "PUBLIC KEY");
+        fs::write(pub_path, pub_pem.as_bytes())?;
         Ok(())
     }
 
@@ -110,8 +112,8 @@ impl CryptoStrategy for EccStrategy {
     }
 
     fn regenerate_public_key(&self, priv_path: &Path, pub_path: &Path, passphrase: &mut Option<Zeroizing<String>>) -> Result<()> {
-        let priv_bytes = fs::read(priv_path)?;
-        let pem_str = String::from_utf8_lossy(&priv_bytes);
+        let priv_bytes = Zeroizing::new(fs::read(priv_path)?);
+        let pem_str = Zeroizing::new(String::from_utf8(priv_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
         
         let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
@@ -119,7 +121,7 @@ impl CryptoStrategy for EccStrategy {
         } else {
             let pass = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?;
             if let Some(p) = pass {
-                *passphrase = Some(Zeroizing::new(p));
+                *passphrase = Some(p);
             }
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
@@ -181,8 +183,8 @@ impl CryptoStrategy for EccStrategy {
             .or_else(|| key_paths.get("recipient-ecdh-privkey"))
             .ok_or(CryptoError::PrivateKeyLoad("Missing private key path".to_string()))?;
 
-        let priv_bytes = fs::read(privkey_path)?;
-        let pem_str = String::from_utf8_lossy(&priv_bytes);
+        let priv_bytes = Zeroizing::new(fs::read(privkey_path)?);
+        let pem_str = Zeroizing::new(String::from_utf8(priv_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
 
         let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
@@ -190,7 +192,7 @@ impl CryptoStrategy for EccStrategy {
         } else {
             let pass = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?;
             if let Some(p) = pass {
-                *passphrase = Some(Zeroizing::new(p));
+                *passphrase = Some(p);
             }
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
@@ -210,17 +212,17 @@ impl CryptoStrategy for EccStrategy {
         Ok(())
     }
 
-    fn encrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    fn encrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        let mut out = vec![0u8; data.len()];
+        let mut out = Zeroizing::new(vec![0u8; data.len()]);
         let n = ctx.update(data, &mut out)?;
         out.truncate(n);
         Ok(out)
     }
 
-    fn decrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>> {
+    fn decrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        let mut out = vec![0u8; data.len()];
+        let mut out = Zeroizing::new(vec![0u8; data.len()]);
         let n = ctx.update(data, &mut out)?;
         out.truncate(n);
         Ok(out)
@@ -248,8 +250,8 @@ impl CryptoStrategy for EccStrategy {
     }
 
     fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: &mut Option<Zeroizing<String>>, digest_algo: &str) -> Result<()> {
-        let priv_bytes = fs::read(priv_key_path)?;
-        let pem_str = String::from_utf8_lossy(&priv_bytes);
+        let priv_bytes = Zeroizing::new(fs::read(priv_key_path)?);
+        let pem_str = Zeroizing::new(String::from_utf8(priv_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
 
         let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
@@ -257,7 +259,7 @@ impl CryptoStrategy for EccStrategy {
         } else {
             let pass = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?;
             if let Some(p) = pass {
-                *passphrase = Some(Zeroizing::new(p));
+                *passphrase = Some(p);
             }
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
@@ -442,7 +444,7 @@ impl CryptoStrategy for EccStrategy {
         16
     }
 
-    fn get_shared_secret(&self) -> Vec<u8> {
+    fn get_shared_secret(&self) -> Zeroizing<Vec<u8>> {
         self.shared_secret.clone()
     }
 

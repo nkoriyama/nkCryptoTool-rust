@@ -6,12 +6,11 @@
 
 use crate::error::{CryptoError, Result};
 use crate::key::KeyProvider;
-use crate::backend;
-use crate::backend::AeadBackend;
 use std::process::{Command, Stdio};
 use std::io::{Write};
 use std::fs;
 use tempfile::NamedTempFile;
+use zeroize::Zeroizing;
 
 pub struct TpmKeyProvider;
 
@@ -99,13 +98,13 @@ impl KeyProvider for TpmKeyProvider {
         let pub_blob = fs::read(pub_file.path()).map_err(|e| CryptoError::FileRead(e.to_string()))?;
         let priv_blob = fs::read(priv_file.path()).map_err(|e| CryptoError::FileRead(e.to_string()))?;
         
-        let mut combined = Vec::new();
+        let mut combined = Zeroizing::new(Vec::new());
         combined.extend_from_slice(&(pub_blob.len() as u32).to_le_bytes());
         combined.extend_from_slice(&pub_blob);
         combined.extend_from_slice(&priv_blob);
         
         use base64::{Engine as _, engine::general_purpose};
-        let b64 = general_purpose::STANDARD.encode(&combined);
+        let b64 = general_purpose::STANDARD.encode(&*combined);
         for chunk in b64.as_bytes().chunks(64) {
             out_data.extend_from_slice(chunk);
             out_data.push(b'\n');
@@ -117,13 +116,13 @@ impl KeyProvider for TpmKeyProvider {
         Ok(String::from_utf8_lossy(&out_data).to_string())
     }
 
-    fn unwrap_raw(&self, pem_str: &str, passphrase: Option<&str>) -> Result<Vec<u8>> {
+    fn unwrap_raw(&self, pem_str: &str, passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
         let b64 = pem_str.lines()
             .filter(|line| !line.starts_with("-----"))
             .collect::<String>();
         
         use base64::{Engine as _, engine::general_purpose};
-        let combined = general_purpose::STANDARD.decode(b64).map_err(|_| CryptoError::Parameter("Invalid base64".to_string()))?;
+        let combined = Zeroizing::new(general_purpose::STANDARD.decode(b64).map_err(|_| CryptoError::Parameter("Invalid base64".to_string()))?);
         
         if combined.len() < 4 { return Err(CryptoError::Parameter("TPM blob too short".to_string())); }
         let pub_len = u32::from_le_bytes(combined[0..4].try_into().map_err(|_| CryptoError::Parameter("Corrupted TPM blob".to_string()))?) as usize;
@@ -187,6 +186,6 @@ impl KeyProvider for TpmKeyProvider {
         Command::new("tpm2_flushcontext").arg(sess_path).env("TCTI", "device:/dev/tpmrm0").status().ok();
 
         let aes_key = fs::read(aes_path_str).map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        Ok(aes_key)
+        Ok(Zeroizing::new(aes_key))
     }
 }

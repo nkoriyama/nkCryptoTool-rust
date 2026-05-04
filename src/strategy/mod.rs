@@ -38,8 +38,8 @@ pub trait CryptoStrategy: Send + Sync {
     fn prepare_encryption(&mut self, key_paths: &HashMap<String, String>) -> Result<()>;
     fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<Zeroizing<String>>) -> Result<()>;
     
-    fn encrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>>;
-    fn decrypt_transform(&mut self, data: &[u8]) -> Result<Vec<u8>>;
+    fn encrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>>;
+    fn decrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>>;
     
     fn finalize_encryption(&mut self) -> Result<Vec<u8>>;
     fn finalize_decryption(&mut self, tag: &[u8]) -> Result<()>;
@@ -72,7 +72,7 @@ pub trait CryptoStrategy: Send + Sync {
     fn get_tag_size(&self) -> usize;
 
     // Internal state access for hybrid
-    fn get_shared_secret(&self) -> Vec<u8>;
+    fn get_shared_secret(&self) -> Zeroizing<Vec<u8>>;
     fn get_salt(&self) -> Vec<u8>;
     fn get_iv(&self) -> Vec<u8>;
 }

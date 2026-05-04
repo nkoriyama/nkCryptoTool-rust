@@ -5,9 +5,11 @@
  */
 
 use crate::error::{CryptoError, Result};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 use std::io::{self, Write};
 use rpassword::read_password;
+
+use std::ops::{Deref, DerefMut};
 
 #[derive(Zeroize)]
 #[zeroize(drop)]
@@ -29,6 +31,36 @@ impl SecureBuffer {
         Ok(SecureBuffer(buf))
     }
 
+    pub fn from_slice(data: &[u8]) -> Result<Self> {
+        let mut me = Self::new(data.len())?;
+        me.copy_from_slice(data);
+        Ok(me)
+    }
+
+    pub fn with_capacity(capacity: usize) -> Result<Self> {
+        let buf = Vec::with_capacity(capacity);
+        if buf.capacity() > 0 {
+            unsafe {
+                let _ = libc::mlock(buf.as_ptr() as *const libc::c_void, buf.capacity());
+            }
+        }
+        Ok(SecureBuffer(buf))
+    }
+
+    pub fn extend_from_slice(&mut self, data: &[u8]) {
+        let old_ptr = self.0.as_ptr();
+        let old_cap = self.0.capacity();
+        self.0.extend_from_slice(data);
+        let new_ptr = self.0.as_ptr();
+        let new_cap = self.0.capacity();
+        
+        if new_ptr != old_ptr || new_cap != old_cap {
+            unsafe {
+                let _ = libc::mlock(new_ptr as *const libc::c_void, new_cap);
+            }
+        }
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         &self.0
     }
@@ -38,37 +70,51 @@ impl SecureBuffer {
     }
 }
 
-pub fn get_masked_passphrase() -> Result<String> {
+impl Deref for SecureBuffer {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for SecureBuffer {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+pub fn get_masked_passphrase() -> Result<Zeroizing<String>> {
     if let Ok(pass) = std::env::var("NK_PASSPHRASE") {
         eprintln!("WARNING: Using passphrase from NK_PASSPHRASE environment variable. This is less secure than interactive entry.");
-        return Ok(pass);
+        return Ok(Zeroizing::new(pass));
     }
     print!("Enter passphrase: ");
     io::stdout().flush()?;
     let password = read_password()?;
-    Ok(password)
+    Ok(Zeroizing::new(password))
 }
 
-pub fn get_and_verify_passphrase(prompt: &str) -> Result<String> {
+pub fn get_and_verify_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
     if let Ok(pass) = std::env::var("NK_PASSPHRASE") {
         eprintln!("WARNING: Using passphrase from NK_PASSPHRASE environment variable. This is less secure than interactive entry.");
-        return Ok(pass);
+        return Ok(Zeroizing::new(pass));
     }
     println!("{}", prompt);
     print!("Enter passphrase: ");
     io::stdout().flush()?;
-    let p1 = read_password()?;
+    let p1 = Zeroizing::new(read_password()?);
     
     print!("Verify passphrase: ");
     io::stdout().flush()?;
-    let p2 = read_password()?;
+    let p2 = Zeroizing::new(read_password()?);
     
-    if p1 != p2 {
+    if *p1 != *p2 {
         return Err(CryptoError::Parameter("Passphrases do not match".to_string()));
     }
     
     Ok(p1)
 }
+
 
 pub fn disable_core_dumps() {
     unsafe {
@@ -144,7 +190,7 @@ pub fn wrap_to_pem(data: &[u8], label: &str) -> String {
     pem
 }
 
-pub fn unwrap_from_pem(pem: &str, label: &str) -> Result<Vec<u8>> {
+pub fn unwrap_from_pem(pem: &str, label: &str) -> Result<Zeroizing<Vec<u8>>> {
     let begin = format!("-----BEGIN {}-----", label);
     let begin_enc = format!("-----BEGIN ENCRYPTED {}-----", label);
     let end = format!("-----END {}-----", label);
@@ -165,7 +211,7 @@ pub fn unwrap_from_pem(pem: &str, label: &str) -> Result<Vec<u8>> {
         .replace('\r', "")
         .replace(' ', "");
 
-    BASE64.decode(b64).map_err(|e| CryptoError::Parameter(format!("Base64 decode error: {}", e)))
+    Ok(Zeroizing::new(BASE64.decode(b64).map_err(|e| CryptoError::Parameter(format!("Base64 decode error: {}", e)))?))
 }
 
 pub fn is_encrypted_pem(pem: &str) -> bool {
@@ -200,8 +246,14 @@ fn wrap_der_sequence(data: &[u8]) -> Vec<u8> {
     res
 }
 
-fn encode_der_octet_string(data: &[u8]) -> Vec<u8> {
-    let mut res = encode_der_header(0x04, data.len());
+fn wrap_der_sequence_zeroizing(data: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut res = Zeroizing::new(encode_der_header(0x30, data.len()));
+    res.extend_from_slice(data);
+    res
+}
+
+fn encode_der_octet_string_zeroizing(data: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut res = Zeroizing::new(encode_der_header(0x04, data.len()));
     res.extend_from_slice(data);
     res
 }
@@ -229,27 +281,51 @@ fn get_pqc_oid(algo: &str) -> Result<Vec<u8>> {
     Ok(res)
 }
 
-pub fn wrap_pqc_priv_to_pkcs8(raw_priv: &[u8], algo: &str, seed: Option<&[u8]>) -> Result<Vec<u8>> {
+pub fn wrap_pqc_priv_to_pkcs8(raw_priv: &[u8], algo: &str, seed: Option<&[u8]>) -> Result<Zeroizing<Vec<u8>>> {
     // 1. Create the algorithm-specific PrivateKey structure
     // OpenSSL's observed structure: SEQUENCE { seeds OCTET STRING OPTIONAL, privateKey OCTET STRING }
-    // Note: It seems version field is omitted in OpenSSL's current implementation for PQC.
-    let mut inner = Vec::new();
+    let mut inner = SecureBuffer::with_capacity(raw_priv.len() + 128)?;
     if let Some(s) = seed {
-        inner.extend(encode_der_octet_string(s));
+        inner.extend_from_slice(&encode_der_octet_string_zeroizing(s));
     }
-    inner.extend(encode_der_octet_string(raw_priv));
-    let inner_seq = wrap_der_sequence(&inner);
+    inner.extend_from_slice(&encode_der_octet_string_zeroizing(raw_priv));
+    let inner_seq = wrap_der_sequence_zeroizing(&inner);
 
     // 2. Create the PKCS#8 structure
-    // OneAsymmetricKey ::= SEQUENCE { version INTEGER(0), privateKeyAlgorithm AlgorithmIdentifier, privateKey OCTET STRING }
     let oid = get_pqc_oid(algo)?;
     let alg_id = wrap_der_sequence(&oid);
     
-    let mut pkcs8 = vec![0x02, 0x01, 0x00]; // PKCS#8 version 0
-    pkcs8.extend(alg_id);
-    pkcs8.extend(encode_der_octet_string(&inner_seq));
+    let mut pkcs8 = SecureBuffer::with_capacity(inner_seq.len() + 64)?;
+    pkcs8.extend_from_slice(&[0x02, 0x01, 0x00]); // PKCS#8 version 0
+    pkcs8.extend_from_slice(&alg_id);
+    pkcs8.extend_from_slice(&encode_der_octet_string_zeroizing(&inner_seq));
+
+    Ok(wrap_der_sequence_zeroizing(&pkcs8))
+    }
+
+
+pub fn wrap_to_pem_zeroizing(data: &[u8], label: &str) -> Zeroizing<String> {
+    let mut b64_buf = Zeroizing::new(vec![0u8; (data.len() + 2) / 3 * 4]);
+    let n = BASE64.encode_slice(data, &mut *b64_buf).map_err(|e| CryptoError::Parameter(format!("Base64 encode error: {}", e))).unwrap();
     
-    Ok(wrap_der_sequence(&pkcs8))
+    // Pre-calculate capacity to avoid reallocations
+    let estimated_size = label.len() * 2 + n + (n / 64) + 40;
+    let mut pem = String::with_capacity(estimated_size);
+    
+    pem.push_str("-----BEGIN ");
+    pem.push_str(label);
+    pem.push_str("-----\n");
+    
+    for chunk in b64_buf[..n].chunks(64) {
+        pem.push_str(std::str::from_utf8(chunk).unwrap());
+        pem.push('\n');
+    }
+    
+    pem.push_str("-----END ");
+    pem.push_str(label);
+    pem.push_str("-----\n");
+    
+    Zeroizing::new(pem)
 }
 
 pub fn wrap_pqc_pub_to_spki(raw_pub: &[u8], algo: &str) -> Result<Vec<u8>> {
@@ -265,9 +341,59 @@ pub fn wrap_pqc_pub_to_spki(raw_pub: &[u8], algo: &str) -> Result<Vec<u8>> {
     Ok(wrap_der_sequence(&spki))
 }
 
-pub fn get_passphrase_if_needed(content: &str, provided_passphrase: Option<&str>) -> Result<Option<String>> {
+pub fn unwrap_pqc_priv_from_pkcs8(der: &[u8], _algo: &str) -> Result<(Zeroizing<Vec<u8>>, Option<Zeroizing<Vec<u8>>>)> {
+    if der.is_empty() || der[0] != 0x30 { return Ok((Zeroizing::new(der.to_vec()), None)); }
+    
+    // Simple heuristic-based PQC PKCS#8 unwrap
+    // Look for nested OCTET STRINGs that match expected sizes
+    let mut best_sk = Zeroizing::new(Vec::new());
+    let mut best_seed = None;
+    
+    for i in 0..der.len().saturating_sub(4) {
+        if der[i] == 0x04 { // OCTET STRING
+            let mut pos = i + 1;
+            let len = read_asn1_len_internal(der, &mut pos);
+            if len > 0 && pos + len <= der.len() {
+                let chunk = &der[pos..pos + len];
+                if [1632, 2400, 3168, 2560, 4032, 4896, 800, 1184, 1568, 1312, 1952, 2592].contains(&len) {
+                    *best_sk = chunk.to_vec();
+                } else if len == 32 || len == 64 {
+                    best_seed = Some(Zeroizing::new(chunk.to_vec()));
+                } else if chunk.starts_with(&[0x30]) {
+                    // Try inner sequence
+                    if let Ok((sk, s)) = unwrap_pqc_priv_from_pkcs8(chunk, _algo) {
+                        if !sk.is_empty() { return Ok((sk, s)); }
+                    }
+                }
+            }
+        }
+    }
+    
+    if !best_sk.is_empty() {
+        Ok((best_sk, best_seed))
+    } else {
+        Ok((Zeroizing::new(der.to_vec()), None))
+    }
+}
+
+fn read_asn1_len_internal(der: &[u8], pos: &mut usize) -> usize {
+    if *pos >= der.len() { return 0; }
+    let b = der[*pos];
+    *pos += 1;
+    if b < 128 { return b as usize; }
+    let n = (b & 0x7F) as usize;
+    if *pos + n > der.len() || n > 4 { return 0; }
+    let mut res = 0usize;
+    for _ in 0..n {
+        res = (res << 8) | (der[*pos] as usize);
+        *pos += 1;
+    }
+    res
+}
+
+pub fn get_passphrase_if_needed(content: &str, provided_passphrase: Option<&str>) -> Result<Option<Zeroizing<String>>> {
     if let Some(pass) = provided_passphrase {
-        return Ok(Some(pass.to_string()));
+        return Ok(Some(Zeroizing::new(pass.to_string())));
     }
     if is_encrypted_pem(content) {
         let pass = get_masked_passphrase()?;
@@ -275,6 +401,7 @@ pub fn get_passphrase_if_needed(content: &str, provided_passphrase: Option<&str>
     }
     Ok(None)
 }
+
 
 
 #[cfg(test)]
@@ -290,7 +417,7 @@ mod tests {
         assert!(pem.trim().ends_with("-----END TEST LABEL-----"));
         
         let unwrapped = unwrap_from_pem(&pem, label).unwrap();
-        assert_eq!(unwrapped, data);
+        assert_eq!(&*unwrapped, data);
     }
 
     #[test]

@@ -227,8 +227,8 @@ impl CryptoProcessor {
         total_input_size: u64,
         progress_callback: Option<ProgressCallback>
     ) -> Result<Box<dyn CryptoStrategy>> {
-        let (tx_crypto, mut rx_crypto) = mpsc::channel::<(u64, Vec<u8>)>(32);
-        let (tx_writer, mut rx_writer) = mpsc::channel::<(u64, Vec<u8>)>(32);
+        let (tx_crypto, mut rx_crypto) = mpsc::channel::<(u64, Zeroizing<Vec<u8>>)>(32);
+        let (tx_writer, mut rx_writer) = mpsc::channel::<(u64, Zeroizing<Vec<u8>>)>(32);
 
         let reader_handle = tokio::spawn(async move {
             let file = File::open(&input_path).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
@@ -237,10 +237,12 @@ impl CryptoProcessor {
             let mut chunk_idx = 0u64;
             
             loop {
-                let mut buffer = vec![0u8; BUF_SIZE];
+                let mut buffer = Zeroizing::new(vec![0u8; BUF_SIZE]);
                 let n = reader.read(&mut buffer).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
                 if n == 0 { break; }
-                buffer.truncate(n);
+                if n < BUF_SIZE {
+                    buffer.truncate(n);
+                }
                 if tx_crypto.send((chunk_idx, buffer)).await.is_err() { break; }
                 total_read += n as u64;
                 chunk_idx += 1;
@@ -256,7 +258,7 @@ impl CryptoProcessor {
             }
             let final_block = strategy.finalize_encryption()?;
             if !final_block.is_empty() {
-                tx_writer.send((u64::MAX, final_block)).await.ok();
+                tx_writer.send((u64::MAX, Zeroizing::new(final_block))).await.ok();
             }
             Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
         });
@@ -305,8 +307,8 @@ impl CryptoProcessor {
         tag: Vec<u8>,
         progress_callback: Option<ProgressCallback>
     ) -> Result<Box<dyn CryptoStrategy>> {
-        let (tx_crypto, mut rx_crypto) = mpsc::channel::<(u64, Vec<u8>)>(32);
-        let (tx_writer, mut rx_writer) = mpsc::channel::<(u64, Vec<u8>)>(32);
+        let (tx_crypto, mut rx_crypto) = mpsc::channel::<(u64, Zeroizing<Vec<u8>>)>(32);
+        let (tx_writer, mut rx_writer) = mpsc::channel::<(u64, Zeroizing<Vec<u8>>)>(32);
 
         let reader_handle = tokio::spawn(async move {
             let mut file = File::open(&input_path).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
@@ -317,7 +319,7 @@ impl CryptoProcessor {
             
             while total_read < ciphertext_size {
                 let to_read = std::cmp::min(BUF_SIZE as u64, ciphertext_size - total_read) as usize;
-                let mut buffer = vec![0u8; to_read];
+                let mut buffer = Zeroizing::new(vec![0u8; to_read]);
                 let n = reader.read_exact(&mut buffer).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
                 if tx_crypto.send((chunk_idx, buffer)).await.is_err() { break; }
                 total_read += n as u64;

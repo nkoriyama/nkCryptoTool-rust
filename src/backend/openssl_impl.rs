@@ -6,6 +6,7 @@
 
 use crate::error::{CryptoError, Result};
 use crate::backend::{AeadBackend, HashBackend};
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 #[cfg(feature = "backend-openssl")]
 use openssl::cipher::Cipher;
@@ -33,7 +34,17 @@ use foreign_types::ForeignType;
 pub struct OpenSslAead {
     #[cfg(feature = "backend-openssl")]
     ctx: CipherCtx,
+    _is_encrypt: bool,
 }
+
+impl Zeroize for OpenSslAead {
+    fn zeroize(&mut self) {
+        // OpenSSL CipherCtx is automatically cleared on drop (EVP_CIPHER_CTX_free).
+        // No explicit zeroize method is provided by the openssl crate for CipherCtx.
+    }
+}
+
+impl ZeroizeOnDrop for OpenSslAead {}
 
 #[cfg(feature = "backend-openssl")]
 fn read_asn1_len(der: &[u8], pos: &mut usize) -> usize {
@@ -52,9 +63,9 @@ fn read_asn1_len(der: &[u8], pos: &mut usize) -> usize {
 }
 
 #[cfg(feature = "backend-openssl")]
-fn unwrap_pqc_der_internal(der: &[u8], is_public: bool) -> Vec<u8> {
-    if der.is_empty() || der[0] != 0x30 { return der.to_vec(); }
-    let mut best = Vec::new();
+fn unwrap_pqc_der_internal(der: &[u8], is_public: bool) -> Zeroizing<Vec<u8>> {
+    if der.is_empty() || der[0] != 0x30 { return Zeroizing::new(der.to_vec()); }
+    let mut best = Zeroizing::new(Vec::new());
     for i in 0..der.len().saturating_sub(4) {
         let tag = der[i];
         if tag == 0x04 || (is_public && tag == 0x03) {
@@ -68,17 +79,17 @@ fn unwrap_pqc_der_internal(der: &[u8], is_public: bool) -> Vec<u8> {
                     else { continue; }
                 }
                 if [1632, 2400, 3168, 2560, 4032, 4896, 800, 1184, 1568, 1312, 1952, 2592].contains(&actual_len) {
-                    return der[data_start..data_start + actual_len].to_vec();
+                    return Zeroizing::new(der[data_start..data_start + actual_len].to_vec());
                 }
                 if actual_len > 32 && der[data_start] == 0x30 {
                     let inner = unwrap_pqc_der_internal(&der[data_start..data_start + actual_len], is_public);
                     if [1632, 2400, 3168, 2560, 4032, 4896, 800, 1184, 1568, 1312, 1952, 2592].contains(&inner.len()) { return inner; }
                 }
-                if actual_len > best.len() { best = der[data_start..data_start + actual_len].to_vec(); }
+                if actual_len > best.len() { *best = der[data_start..data_start + actual_len].to_vec(); }
             }
         }
     }
-    if best.is_empty() { der.to_vec() } else { best }
+    if best.is_empty() { Zeroizing::new(der.to_vec()) } else { best }
 }
 
 #[cfg(feature = "backend-openssl")]
@@ -125,7 +136,7 @@ impl AeadBackend for OpenSslAead {
             ctx.encrypt_init(Some(cipher), None, None).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
             ctx.set_iv_length(iv.len()).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
             ctx.encrypt_init(None, Some(key), Some(iv)).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            Ok(Self { ctx })
+            Ok(Self { ctx, _is_encrypt: true })
         }
         #[cfg(not(feature = "backend-openssl"))]
         {
@@ -147,11 +158,27 @@ impl AeadBackend for OpenSslAead {
             ctx.decrypt_init(Some(cipher), None, None).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
             ctx.set_iv_length(iv.len()).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
             ctx.decrypt_init(None, Some(key), Some(iv)).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            Ok(Self { ctx })
+            Ok(Self { ctx, _is_encrypt: false })
         }
         #[cfg(not(feature = "backend-openssl"))]
         {
             let _ = (cipher_name, key, iv);
+            Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string()))
+        }
+    }
+
+    fn re_init(&mut self, key: &[u8], iv: &[u8]) -> Result<()> {
+        #[cfg(feature = "backend-openssl")]
+        {
+            if self._is_encrypt {
+                self.ctx.encrypt_init(None, Some(key), Some(iv)).map_err(|e| CryptoError::OpenSSL(e.to_string()))
+            } else {
+                self.ctx.decrypt_init(None, Some(key), Some(iv)).map_err(|e| CryptoError::OpenSSL(e.to_string()))
+            }
+        }
+        #[cfg(not(feature = "backend-openssl"))]
+        {
+            let _ = (key, iv);
             Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string()))
         }
     }
@@ -277,14 +304,14 @@ impl HashBackend for OpenSslHash {
     }
 }
 
-pub fn ecc_dh(my_priv_der: &[u8], peer_pub_der: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+pub fn ecc_dh(my_priv_der: &[u8], peer_pub_der: &[u8], passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
     #[cfg(feature = "backend-openssl")]
     {
         let my_priv = load_private_key_robust(my_priv_der, passphrase)?;
         let peer_pub = load_public_key_robust(peer_pub_der)?;
         let mut deriver = Deriver::new(&my_priv).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         deriver.set_peer(&peer_pub).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        deriver.derive_to_vec().map_err(|e| CryptoError::OpenSSL(e.to_string()))
+        deriver.derive_to_vec().map_err(|e| CryptoError::OpenSSL(e.to_string())).map(Zeroizing::new)
     }
     #[cfg(not(feature = "backend-openssl"))]
     { let _ = (my_priv_der, peer_pub_der, passphrase); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
@@ -300,11 +327,11 @@ pub fn extract_public_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<V
     { let _ = (priv_der, passphrase); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
 }
 
-pub fn pqc_keygen_kem(_algo: &str) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+pub fn pqc_keygen_kem(_algo: &str) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option<Zeroizing<Vec<u8>>>)> {
     Err(CryptoError::Parameter("PQC keygen not supported in this OpenSSL version".to_string()))
 }
 
-pub fn pqc_keygen_dsa(_algo: &str) -> Result<(Vec<u8>, Vec<u8>, Option<Vec<u8>>)> {
+pub fn pqc_keygen_dsa(_algo: &str) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option<Zeroizing<Vec<u8>>>)> {
     Err(CryptoError::Parameter("PQC keygen not supported in this OpenSSL version".to_string()))
 }
 
@@ -357,7 +384,7 @@ pub fn pqc_verify(_algo: &str, pub_der: &[u8], message: &[u8], signature: &[u8])
     { let _ = (pub_der, message, signature, _algo); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
 }
 
-pub fn pqc_encap(_algo: &str, peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn pqc_encap(_algo: &str, peer_pub_der: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
     #[cfg(feature = "backend-openssl")]
     {
         let pkey = load_public_key_robust(peer_pub_der)?;
@@ -374,7 +401,7 @@ pub fn pqc_encap(_algo: &str, peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)>
                 ffi::EVP_PKEY_CTX_free(ctx);
                 return Err(CryptoError::OpenSSL("EVP_PKEY_encapsulate (length) failed".to_string()));
             }
-            let mut ss = vec![0u8; ss_len as usize];
+            let mut ss = Zeroizing::new(vec![0u8; ss_len as usize]);
             let mut ct = vec![0u8; ct_len as usize];
             if ffi::EVP_PKEY_encapsulate(ctx, ct.as_mut_ptr(), &mut ct_len, ss.as_mut_ptr(), &mut ss_len) <= 0 {
                 ffi::EVP_PKEY_CTX_free(ctx);
@@ -390,7 +417,7 @@ pub fn pqc_encap(_algo: &str, peer_pub_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>)>
     { let _ = (peer_pub_der, _algo); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
 }
 
-pub fn pqc_decap(_algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+pub fn pqc_decap(_algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
     #[cfg(feature = "backend-openssl")]
     {
         let pkey = load_private_key_robust(priv_der, passphrase)?;
@@ -406,7 +433,7 @@ pub fn pqc_decap(_algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option
                 ffi::EVP_PKEY_CTX_free(ctx);
                 return Err(CryptoError::OpenSSL("EVP_PKEY_decapsulate (length) failed".to_string()));
             }
-            let mut ss = vec![0u8; ss_len as usize];
+            let mut ss = Zeroizing::new(vec![0u8; ss_len as usize]);
             if ffi::EVP_PKEY_decapsulate(ctx, ss.as_mut_ptr(), &mut ss_len, kem_ct.as_ptr(), kem_ct.len()) <= 0 {
                 ffi::EVP_PKEY_CTX_free(ctx);
                 return Err(CryptoError::OpenSSL("EVP_PKEY_decapsulate (execution) failed".to_string()));
@@ -420,30 +447,31 @@ pub fn pqc_decap(_algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option
     { let _ = (priv_der, kem_ct, passphrase, _algo); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
 }
 
-pub fn extract_raw_private_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+pub fn extract_raw_private_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
     #[cfg(feature = "backend-openssl")]
     {
         let pkey = load_private_key_robust(priv_der, passphrase)?;
-        pkey.private_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))
+        pkey.private_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string())).map(Zeroizing::new)
     }
     #[cfg(not(feature = "backend-openssl"))]
     { let _ = (priv_der, passphrase); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
 }
 
-pub fn hkdf(ikm: &[u8], length: usize, salt: &[u8], info: &str, md_name: &str) -> Result<Vec<u8>> {
+pub fn hkdf(ikm: &[u8], length: usize, salt: &[u8], info: &str, md_name: &str) -> Result<Zeroizing<Vec<u8>>> {
     #[cfg(feature = "backend-openssl")]
     {
         use hkdf::Hkdf;
         use sha3::{Sha3_256, Sha3_512};
-        use openssl::hash::MessageDigest; // Keep for consistency if needed, but we use sha3 crate here
         
-        let mut okm = vec![0u8; length];
+        let mut okm = Zeroizing::new(vec![0u8; length]);
         if md_name.contains("256") {
             let h = Hkdf::<Sha3_256>::new(Some(salt), ikm);
-            h.expand(info.as_bytes(), &mut okm).map_err(|_| CryptoError::Parameter("HKDF expand failed".to_string()))?;
+            h.expand(info.as_bytes(), &mut *okm).map_err(|_| CryptoError::Parameter("HKDF expand failed".to_string()))?;
+            drop(h); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
         } else {
             let h = Hkdf::<Sha3_512>::new(Some(salt), ikm);
-            h.expand(info.as_bytes(), &mut okm).map_err(|_| CryptoError::Parameter("HKDF expand failed".to_string()))?;
+            h.expand(info.as_bytes(), &mut *okm).map_err(|_| CryptoError::Parameter("HKDF expand failed".to_string()))?;
+            drop(h); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
         }
         Ok(okm)
     }
@@ -451,7 +479,7 @@ pub fn hkdf(ikm: &[u8], length: usize, salt: &[u8], info: &str, md_name: &str) -
     { let _ = (ikm, length, salt, info, md_name); Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
 }
 
-pub fn generate_ecc_key_pair(curve_name: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+pub fn generate_ecc_key_pair(curve_name: &str) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
     #[cfg(feature = "backend-openssl")]
     {
         let nid = match curve_name {
@@ -463,7 +491,7 @@ pub fn generate_ecc_key_pair(curve_name: &str) -> Result<(Vec<u8>, Vec<u8>)> {
         let pkey = PKey::from_ec_key(ec_key).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         let priv_der = pkey.private_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         let pub_der = pkey.public_key_to_der().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        Ok((priv_der, pub_der))
+        Ok((Zeroizing::new(priv_der), pub_der))
     }
     #[cfg(not(feature = "backend-openssl"))]
     { let _ = curve_name; Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string())) }
