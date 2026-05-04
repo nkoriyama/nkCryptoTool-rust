@@ -14,6 +14,7 @@ use crate::key::SharedKeyProvider;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncSeekExt, BufReader};
 use tokio::sync::mpsc;
+use rand_core::RngCore;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -197,7 +198,12 @@ impl CryptoProcessor {
 
         let input_path_str = input_path.to_string();
         let output_path_str = output_path.to_string();
-        let ciphertext_size = total_size - header_size - tag_size;
+        let ciphertext_size = total_size
+            .checked_sub(header_size)
+            .and_then(|s| s.checked_sub(tag_size))
+            .ok_or_else(|| CryptoError::FileRead(
+                "File too small for header and tag".to_string()
+            ))?;
 
         let result = self.run_pipelined_decrypt(
             strategy,
@@ -337,9 +343,10 @@ impl CryptoProcessor {
             Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
         });
 
-        let output_path_clone = output_path.clone();
+        let temp_output_path = format!("{}.tmp.{}", output_path, rand_core::OsRng.next_u32());
+        let temp_output_path_clone = temp_output_path.clone();
         let writer_handle = tokio::spawn(async move {
-            let mut file = File::create(&output_path_clone).await.map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+            let mut file = File::create(&temp_output_path_clone).await.map_err(|e| CryptoError::FileWrite(e.to_string()))?;
             let mut total_written = 0u64;
             while let Some((_, data)) = rx_writer.recv().await {
                 file.write_all(&data).await.map_err(|e| CryptoError::FileWrite(e.to_string()))?;
@@ -353,17 +360,23 @@ impl CryptoProcessor {
         });
 
         let (r1, r2, r3) = tokio::try_join!(reader_handle, crypto_task, writer_handle)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&temp_output_path);
+                CryptoError::OpenSSL(e.to_string())
+            })?;
 
         if let Err(e) = r1.and(r3) {
-            tokio::fs::remove_file(&output_path).await.ok();
+            let _ = std::fs::remove_file(&temp_output_path);
             return Err(e);
         }
         
         match r2 {
-            Ok(s) => Ok(s),
+            Ok(s) => {
+                tokio::fs::rename(&temp_output_path, &output_path).await.map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+                Ok(s)
+            },
             Err(e) => {
-                tokio::fs::remove_file(&output_path).await.ok();
+                let _ = std::fs::remove_file(&temp_output_path);
                 Err(e)
             }
         }

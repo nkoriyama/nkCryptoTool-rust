@@ -37,7 +37,21 @@ pub type Aead = RustCryptoAead;
 pub type Hash = RustCryptoHash;
 
 #[cfg(feature = "backend-rustcrypto")]
+fn zeroize_bytes<T>(val: &mut T) {
+    let len = std::mem::size_of::<T>();
+    if len > 0 {
+        // Use the zeroize crate's implementation on a raw byte slice
+        // to ensure it's not optimized away.
+        let slice = unsafe { std::slice::from_raw_parts_mut(val as *mut T as *mut u8, len) };
+        slice.zeroize();
+    }
+}
+
+#[cfg(feature = "backend-rustcrypto")]
 enum AeadMode {
+    /// Internal placeholder for a moved-out state.
+    /// Used as a safety guard in zeroize() and error handling.
+    Empty,
     AesGcm {
         ctr: rc_internal::Ctr64BE<rc_internal::Aes256>,
         ghash: rc_internal::GHash,
@@ -55,13 +69,16 @@ enum AeadMode {
 impl Zeroize for AeadMode {
     fn zeroize(&mut self) {
         match self {
-            AeadMode::AesGcm { tag_mask, .. } => {
+            AeadMode::AesGcm { ctr, ghash, tag_mask, .. } => {
+                zeroize_bytes(ctr);
+                zeroize_bytes(ghash);
                 tag_mask.zeroize();
             }
-            AeadMode::ChaChaPoly { .. } => {
-                // Primitive types from RustCrypto might not implement Zeroize in all versions,
-                // but we clear what we can.
+            AeadMode::ChaChaPoly { cipher, poly, .. } => {
+                zeroize_bytes(cipher);
+                zeroize_bytes(poly);
             }
+            AeadMode::Empty => {}
         }
     }
 }
@@ -225,7 +242,8 @@ impl AeadBackend for RustCryptoAead {
                     cipher.apply_keystream(out_slice);
                     let aad_or_cipher = if self._is_encrypt { out_slice } else { input };
                     poly.update_padded(aad_or_cipher);
-                }
+                },
+                AeadMode::Empty => return Err(CryptoError::Parameter("AEAD mode is empty".to_string())),
             }
             self._data_len += input.len() as u64;
             Ok(input.len())
@@ -270,7 +288,8 @@ impl AeadBackend for RustCryptoAead {
                         let expected_tag = GenericArray::<u8, consts::U16>::from_slice(&self._tag);
                         if tag.ct_eq(expected_tag).unwrap_u8() == 1 { Ok(0) } else { Err(CryptoError::SignatureVerification) }
                     }
-                }
+                },
+                AeadMode::Empty => Err(CryptoError::Parameter("AEAD mode is empty".to_string())),
             };
             res
         }
@@ -496,17 +515,29 @@ pub fn pqc_keygen_kem(algo: &str) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option
         match algo {
             "ML-KEM-512" => {
                 use fips203::ml_kem_512::KG;
-                let (pk, sk) = KG::keygen_from_seed(*d, *z);
+                let mut d_tmp = *d;
+                let mut z_tmp = *z;
+                let (pk, sk) = KG::keygen_from_seed(d_tmp, z_tmp);
+                d_tmp.zeroize();
+                z_tmp.zeroize();
                 Ok((Zeroizing::new(sk.into_bytes().to_vec()), pk.into_bytes().to_vec(), Some(seeds)))
             },
             "ML-KEM-768" => {
                 use fips203::ml_kem_768::KG;
-                let (pk, sk) = KG::keygen_from_seed(*d, *z);
+                let mut d_tmp = *d;
+                let mut z_tmp = *z;
+                let (pk, sk) = KG::keygen_from_seed(d_tmp, z_tmp);
+                d_tmp.zeroize();
+                z_tmp.zeroize();
                 Ok((Zeroizing::new(sk.into_bytes().to_vec()), pk.into_bytes().to_vec(), Some(seeds)))
             },
             "ML-KEM-1024" => {
                 use fips203::ml_kem_1024::KG;
-                let (pk, sk) = KG::keygen_from_seed(*d, *z);
+                let mut d_tmp = *d;
+                let mut z_tmp = *z;
+                let (pk, sk) = KG::keygen_from_seed(d_tmp, z_tmp);
+                d_tmp.zeroize();
+                z_tmp.zeroize();
                 Ok((Zeroizing::new(sk.into_bytes().to_vec()), pk.into_bytes().to_vec(), Some(seeds)))
             },
             _ => Err(CryptoError::Parameter(format!("Unsupported KEM: {}", algo))),
@@ -550,19 +581,28 @@ pub fn pqc_sign(algo: &str, priv_der: &[u8], message: &[u8], _passphrase: Option
         let raw_priv = unwrap_pqc_der_internal(priv_der, false);
         match algo {
             "ML-DSA-44" => {
-                let sk = fips204::ml_dsa_44::PrivateKey::try_from_bytes((&*raw_priv).to_vec().try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                let sk_bytes: [u8; 2560] = (&**raw_priv).try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?;
+                let mut sk = fips204::ml_dsa_44::PrivateKey::try_from_bytes(sk_bytes)
                     .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
-                Ok(sk.try_sign(message, &[]).map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?.to_vec())
+                let res = sk.try_sign(message, &[]).map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?.to_vec();
+                zeroize_bytes(&mut sk);
+                Ok(res)
             },
             "ML-DSA-65" => {
-                let sk = fips204::ml_dsa_65::PrivateKey::try_from_bytes((&*raw_priv).to_vec().try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                let sk_bytes: [u8; 4032] = (&**raw_priv).try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?;
+                let mut sk = fips204::ml_dsa_65::PrivateKey::try_from_bytes(sk_bytes)
                     .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
-                Ok(sk.try_sign(message, &[]).map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?.to_vec())
+                let res = sk.try_sign(message, &[]).map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?.to_vec();
+                zeroize_bytes(&mut sk);
+                Ok(res)
             },
             "ML-DSA-87" => {
-                let sk = fips204::ml_dsa_87::PrivateKey::try_from_bytes((&*raw_priv).to_vec().try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                let sk_bytes: [u8; 4896] = (&**raw_priv).try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?;
+                let mut sk = fips204::ml_dsa_87::PrivateKey::try_from_bytes(sk_bytes)
                     .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
-                Ok(sk.try_sign(message, &[]).map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?.to_vec())
+                let res = sk.try_sign(message, &[]).map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?.to_vec();
+                zeroize_bytes(&mut sk);
+                Ok(res)
             },
             _ => Err(CryptoError::Parameter(format!("Unsupported DSA: {}", algo))),
         }
@@ -577,19 +617,22 @@ pub fn pqc_verify(algo: &str, pub_der: &[u8], message: &[u8], signature: &[u8]) 
         let raw_pub = unwrap_pqc_der_internal(pub_der, true);
         match algo {
             "ML-DSA-44" => {
-                let pk = fips204::ml_dsa_44::PublicKey::try_from_bytes((&*raw_pub).to_vec().try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                let pk_bytes: [u8; 1312] = (&**raw_pub).try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?;
+                let pk = fips204::ml_dsa_44::PublicKey::try_from_bytes(pk_bytes)
                     .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
                 let sig_arr: [u8; 2420] = signature.try_into().map_err(|_| CryptoError::Parameter("Invalid sig size".to_string()))?;
                 Ok(pk.verify(message, &sig_arr, &[]))
             },
             "ML-DSA-65" => {
-                let pk = fips204::ml_dsa_65::PublicKey::try_from_bytes((&*raw_pub).to_vec().try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                let pk_bytes: [u8; 1952] = (&**raw_pub).try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?;
+                let pk = fips204::ml_dsa_65::PublicKey::try_from_bytes(pk_bytes)
                     .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
                 let sig_arr: [u8; 3309] = signature.try_into().map_err(|_| CryptoError::Parameter("Invalid sig size".to_string()))?;
                 Ok(pk.verify(message, &sig_arr, &[]))
             },
             "ML-DSA-87" => {
-                let pk = fips204::ml_dsa_87::PublicKey::try_from_bytes((&*raw_pub).to_vec().try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?)
+                let pk_bytes: [u8; 2592] = (&**raw_pub).try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?;
+                let pk = fips204::ml_dsa_87::PublicKey::try_from_bytes(pk_bytes)
                     .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
                 let sig_arr: [u8; 4627] = signature.try_into().map_err(|_| CryptoError::Parameter("Invalid sig size".to_string()))?;
                 Ok(pk.verify(message, &sig_arr, &[]))
@@ -608,19 +651,22 @@ pub fn pqc_encap(_algo: &str, peer_pub_der: &[u8]) -> Result<(Zeroizing<Vec<u8>>
         let actual_len = raw_pub.len();
         if actual_len == 800 {
             use fips203::ml_kem_512::EncapsKey;
-            let pk = EncapsKey::try_from_bytes((&*raw_pub).to_vec().try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?)
+            let pk_bytes: [u8; 800] = (&**raw_pub).try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?;
+            let pk = EncapsKey::try_from_bytes(pk_bytes)
                 .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
             let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
             Ok((Zeroizing::new(ss.into_bytes().to_vec()), ct.into_bytes().to_vec()))
         } else if actual_len == 1184 {
             use fips203::ml_kem_768::EncapsKey;
-            let pk = EncapsKey::try_from_bytes((&*raw_pub).to_vec().try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?)
+            let pk_bytes: [u8; 1184] = (&**raw_pub).try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?;
+            let pk = EncapsKey::try_from_bytes(pk_bytes)
                 .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
             let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
             Ok((Zeroizing::new(ss.into_bytes().to_vec()), ct.into_bytes().to_vec()))
         } else if actual_len == 1568 {
             use fips203::ml_kem_1024::EncapsKey;
-            let pk = EncapsKey::try_from_bytes((&*raw_pub).to_vec().try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?)
+            let pk_bytes: [u8; 1568] = (&**raw_pub).try_into().map_err(|_| CryptoError::PublicKeyLoad("Invalid key size".to_string()))?;
+            let pk = EncapsKey::try_from_bytes(pk_bytes)
                 .map_err(|_| CryptoError::PublicKeyLoad("Invalid key".to_string()))?;
             let (ss, ct) = pk.try_encaps().map_err(|_| CryptoError::OpenSSL("Encap failed".to_string()))?;
             Ok((Zeroizing::new(ss.into_bytes().to_vec()), ct.into_bytes().to_vec()))
@@ -639,27 +685,33 @@ pub fn pqc_decap(_algo: &str, priv_der: &[u8], kem_ct: &[u8], _passphrase: Optio
         let actual_len = raw_priv.len();
         if actual_len == 1632 {
             use fips203::ml_kem_512::{DecapsKey, CipherText};
-            let sk = DecapsKey::try_from_bytes((&*raw_priv).to_vec().try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?)
+            let sk_bytes: [u8; 1632] = (&**raw_priv).try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?;
+            let mut sk = DecapsKey::try_from_bytes(sk_bytes)
                 .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
             let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
                 .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
             let ss = sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
+            zeroize_bytes(&mut sk);
             Ok(Zeroizing::new(ss.into_bytes().to_vec()))
         } else if actual_len == 2400 {
             use fips203::ml_kem_768::{DecapsKey, CipherText};
-            let sk = DecapsKey::try_from_bytes((&*raw_priv).to_vec().try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?)
+            let sk_bytes: [u8; 2400] = (&**raw_priv).try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?;
+            let mut sk = DecapsKey::try_from_bytes(sk_bytes)
                 .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
             let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
                 .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
             let ss = sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
+            zeroize_bytes(&mut sk);
             Ok(Zeroizing::new(ss.into_bytes().to_vec()))
         } else if actual_len == 3168 {
             use fips203::ml_kem_1024::{DecapsKey, CipherText};
-            let sk = DecapsKey::try_from_bytes((&*raw_priv).to_vec().try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?)
+            let sk_bytes: [u8; 3168] = (&**raw_priv).try_into().map_err(|_| CryptoError::PrivateKeyLoad("Invalid key size".to_string()))?;
+            let mut sk = DecapsKey::try_from_bytes(sk_bytes)
                 .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
             let ct = CipherText::try_from_bytes(kem_ct.try_into().map_err(|_| CryptoError::Parameter("Invalid CT size".to_string()))?)
                 .map_err(|_| CryptoError::Parameter("Invalid CT".to_string()))?;
             let ss = sk.try_decaps(&ct).map_err(|_| CryptoError::OpenSSL("Decap failed".to_string()))?;
+            zeroize_bytes(&mut sk);
             Ok(Zeroizing::new(ss.into_bytes().to_vec()))
         } else {
              Err(CryptoError::Parameter(format!("Unsupported or mismatched KEM key size: {}", actual_len)))

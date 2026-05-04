@@ -70,6 +70,72 @@ impl EccStrategy {
         drop(hk); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
         Ok(okm)
     }
+    pub fn take_shared_secret(&mut self) -> Zeroizing<Vec<u8>> {
+        std::mem::take(&mut self.shared_secret)
+    }
+
+    pub fn prepare_shared_secret_encryption(&mut self, key_paths: &HashMap<String, String>) -> Result<()> {
+        if let Some(algo) = key_paths.get("digest-algo") {
+            self.digest_algo = algo.clone();
+        }
+        if let Some(algo) = key_paths.get("aead-algo") {
+            self.aead_algo = algo.clone();
+        }
+
+        let pubkey_path = key_paths.get("recipient-pubkey")
+            .or_else(|| key_paths.get("recipient-ecdh-pubkey"))
+            .ok_or(CryptoError::PublicKeyLoad("Missing recipient public key".to_string()))?;
+
+        let pubkey_pem = fs::read_to_string(pubkey_path)?;
+        let recipient_pub_der = crate::utils::unwrap_from_pem(&pubkey_pem, "PUBLIC KEY")?;
+
+        let (ephem_priv, ephem_pub) = backend::generate_ecc_key_pair(&self.curve_name)?;
+        self.shared_secret = backend::ecc_dh(&ephem_priv, &recipient_pub_der, None)?;
+        self.ephemeral_pubkey = ephem_pub;
+
+        self.salt = vec![0u8; 16];
+        self.iv = vec![0u8; 12];
+        
+        #[cfg(feature = "backend-openssl")]
+        openssl::rand::rand_bytes(&mut self.salt).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        #[cfg(feature = "backend-openssl")]
+        openssl::rand::rand_bytes(&mut self.iv).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        
+        #[cfg(feature = "backend-rustcrypto")]
+        {
+            use rand_core::{RngCore, OsRng};
+            OsRng.fill_bytes(&mut self.salt);
+            OsRng.fill_bytes(&mut self.iv);
+        }
+        Ok(())
+    }
+
+    pub fn prepare_shared_secret_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<Zeroizing<String>>) -> Result<()> {
+        let privkey_path = key_paths.get("user-privkey")
+            .or_else(|| key_paths.get("recipient-ecdh-privkey"))
+            .ok_or(CryptoError::PrivateKeyLoad("Missing private key path".to_string()))?;
+
+        let priv_bytes = Zeroizing::new(fs::read(privkey_path)?);
+        let pem_str = Zeroizing::new(
+            std::str::from_utf8(&*priv_bytes)
+                .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                .to_string()
+        );
+
+        let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
+            let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
+            provider.unwrap_raw(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?
+        } else {
+            let pass = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?;
+            if let Some(p) = pass {
+                *passphrase = Some(p);
+            }
+            crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
+        };
+
+        self.shared_secret = backend::ecc_dh(&priv_key_der, &self.ephemeral_pubkey, passphrase.as_deref().map(|x| x.as_str()))?;
+        Ok(())
+    }
 }
 
 impl CryptoStrategy for EccStrategy {
@@ -113,7 +179,11 @@ impl CryptoStrategy for EccStrategy {
 
     fn regenerate_public_key(&self, priv_path: &Path, pub_path: &Path, passphrase: &mut Option<Zeroizing<String>>) -> Result<()> {
         let priv_bytes = Zeroizing::new(fs::read(priv_path)?);
-        let pem_str = Zeroizing::new(String::from_utf8(priv_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
+        let pem_str = Zeroizing::new(
+            std::str::from_utf8(&*priv_bytes)
+                .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                .to_string()
+        );
         
         let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
@@ -132,38 +202,7 @@ impl CryptoStrategy for EccStrategy {
     }
 
     fn prepare_encryption(&mut self, key_paths: &HashMap<String, String>) -> Result<()> {
-        if let Some(algo) = key_paths.get("digest-algo") {
-            self.digest_algo = algo.clone();
-        }
-        if let Some(algo) = key_paths.get("aead-algo") {
-            self.aead_algo = algo.clone();
-        }
-
-        let pubkey_path = key_paths.get("recipient-pubkey")
-            .or_else(|| key_paths.get("recipient-ecdh-pubkey"))
-            .ok_or(CryptoError::PublicKeyLoad("Missing recipient public key".to_string()))?;
-
-        let pubkey_pem = fs::read_to_string(pubkey_path)?;
-        let recipient_pub_der = crate::utils::unwrap_from_pem(&pubkey_pem, "PUBLIC KEY")?;
-
-        let (ephem_priv, ephem_pub) = backend::generate_ecc_key_pair(&self.curve_name)?;
-        self.shared_secret = backend::ecc_dh(&ephem_priv, &recipient_pub_der, None)?;
-        self.ephemeral_pubkey = ephem_pub;
-
-        self.salt = vec![0u8; 16];
-        self.iv = vec![0u8; 12];
-        
-        #[cfg(feature = "backend-openssl")]
-        openssl::rand::rand_bytes(&mut self.salt).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        #[cfg(feature = "backend-openssl")]
-        openssl::rand::rand_bytes(&mut self.iv).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        
-        #[cfg(feature = "backend-rustcrypto")]
-        {
-            use rand_core::{RngCore, OsRng};
-            OsRng.fill_bytes(&mut self.salt);
-            OsRng.fill_bytes(&mut self.iv);
-        }
+        self.prepare_shared_secret_encryption(key_paths)?;
 
         self.encryption_key = self.hkdf_derive(
             &self.shared_secret, 
@@ -179,25 +218,7 @@ impl CryptoStrategy for EccStrategy {
     }
 
     fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<Zeroizing<String>>) -> Result<()> {
-        let privkey_path = key_paths.get("user-privkey")
-            .or_else(|| key_paths.get("recipient-ecdh-privkey"))
-            .ok_or(CryptoError::PrivateKeyLoad("Missing private key path".to_string()))?;
-
-        let priv_bytes = Zeroizing::new(fs::read(privkey_path)?);
-        let pem_str = Zeroizing::new(String::from_utf8(priv_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
-
-        let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
-            let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;
-            provider.unwrap_raw(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?
-        } else {
-            let pass = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?;
-            if let Some(p) = pass {
-                *passphrase = Some(p);
-            }
-            crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
-        };
-
-        self.shared_secret = backend::ecc_dh(&priv_key_der, &self.ephemeral_pubkey, passphrase.as_deref().map(|x| x.as_str()))?;
+        self.prepare_shared_secret_decryption(key_paths, passphrase)?;
 
         self.encryption_key = self.hkdf_derive(
             &self.shared_secret, 
@@ -251,7 +272,11 @@ impl CryptoStrategy for EccStrategy {
 
     fn prepare_signing(&mut self, priv_key_path: &Path, passphrase: &mut Option<Zeroizing<String>>, digest_algo: &str) -> Result<()> {
         let priv_bytes = Zeroizing::new(fs::read(priv_key_path)?);
-        let pem_str = Zeroizing::new(String::from_utf8(priv_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
+        let pem_str = Zeroizing::new(
+            std::str::from_utf8(&*priv_bytes)
+                .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                .to_string()
+        );
 
         let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self.key_provider.as_ref().ok_or(CryptoError::ProviderNotAvailable)?;

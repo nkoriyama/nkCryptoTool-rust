@@ -101,7 +101,11 @@ impl NetworkProcessor {
                 let sig = Self::read_vec(&mut stream).await?;
                 if let Some(ref pubkey_path) = config.signing_pubkey {
                     let pubkey_bytes = Zeroizing::new(std::fs::read(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
-                    let pubkey_pem = Zeroizing::new(String::from_utf8(pubkey_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
+                    let pubkey_pem = Zeroizing::new(
+                        std::str::from_utf8(&*pubkey_bytes)
+                            .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                            .to_string()
+                    );
                     let pubkey_der = crate::utils::unwrap_from_pem(&pubkey_pem, "PUBLIC KEY")?;
                     
                     let algo = config.pqc_dsa_algo.clone();
@@ -144,7 +148,11 @@ impl NetworkProcessor {
             if server_auth_flag[0] == 1 {
                 let privkey_path = config.signing_privkey.as_ref().unwrap();
                 let privkey_bytes = Zeroizing::new(std::fs::read(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
-                let privkey_pem = Zeroizing::new(String::from_utf8(privkey_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
+                let privkey_pem = Zeroizing::new(
+                    std::str::from_utf8(&*privkey_bytes)
+                        .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                        .to_string()
+                );
                 let passphrase = config.passphrase.as_deref().map(|x| x.as_str());
                 
                 let (raw_priv, _seed) = if privkey_pem.contains("-----BEGIN TPM WRAPPED BLOB-----") {
@@ -269,7 +277,11 @@ impl NetworkProcessor {
             if client_auth_flag[0] == 1 {
                 let privkey_path = self.config.signing_privkey.as_ref().unwrap();
                 let privkey_bytes = Zeroizing::new(std::fs::read(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
-                let privkey_pem = Zeroizing::new(String::from_utf8(privkey_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
+                let privkey_pem = Zeroizing::new(
+                    std::str::from_utf8(&*privkey_bytes)
+                        .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                        .to_string()
+                );
                 let passphrase = self.config.passphrase.as_deref().map(|x| x.as_str());
 
                 let (raw_priv, _seed) = if privkey_pem.contains("-----BEGIN TPM WRAPPED BLOB-----") {
@@ -300,7 +312,11 @@ impl NetworkProcessor {
                 let sig = Self::read_vec(&mut stream).await?;
                 if let Some(ref pubkey_path) = self.config.signing_pubkey {
                     let pubkey_bytes = Zeroizing::new(std::fs::read(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
-                    let pubkey_pem = Zeroizing::new(String::from_utf8(pubkey_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
+                    let pubkey_pem = Zeroizing::new(
+                        std::str::from_utf8(&*pubkey_bytes)
+                            .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                            .to_string()
+                    );
                     let pubkey_der = crate::utils::unwrap_from_pem(&pubkey_pem, "PUBLIC KEY")?;
                     
                     let algo = self.config.pqc_dsa_algo.clone();

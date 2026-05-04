@@ -206,12 +206,14 @@ pub fn unwrap_from_pem(pem: &str, label: &str) -> Result<Zeroizing<Vec<u8>>> {
 
     let end_idx = pem.find(&actual_end).ok_or(CryptoError::Parameter(format!("Missing PEM footer for {}", label)))?;
 
-    let b64 = pem[start_idx..end_idx]
-        .replace('\n', "")
-        .replace('\r', "")
-        .replace(' ', "");
+    let b64_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
+        pem[start_idx..end_idx]
+            .bytes()
+            .filter(|&b| !b.is_ascii_whitespace())
+            .collect()
+    );
 
-    Ok(Zeroizing::new(BASE64.decode(b64).map_err(|e| CryptoError::Parameter(format!("Base64 decode error: {}", e)))?))
+    Ok(Zeroizing::new(BASE64.decode(&*b64_bytes).map_err(|e| CryptoError::Parameter(format!("Base64 decode error: {}", e)))?))
 }
 
 pub fn is_encrypted_pem(pem: &str) -> bool {
@@ -281,27 +283,18 @@ fn get_pqc_oid(algo: &str) -> Result<Vec<u8>> {
     Ok(res)
 }
 
-pub fn wrap_pqc_priv_to_pkcs8(raw_priv: &[u8], algo: &str, seed: Option<&[u8]>) -> Result<Zeroizing<Vec<u8>>> {
-    // 1. Create the algorithm-specific PrivateKey structure
-    // OpenSSL's observed structure: SEQUENCE { seeds OCTET STRING OPTIONAL, privateKey OCTET STRING }
-    let mut inner = SecureBuffer::with_capacity(raw_priv.len() + 128)?;
-    if let Some(s) = seed {
-        inner.extend_from_slice(&encode_der_octet_string_zeroizing(s));
-    }
-    inner.extend_from_slice(&encode_der_octet_string_zeroizing(raw_priv));
-    let inner_seq = wrap_der_sequence_zeroizing(&inner);
-
-    // 2. Create the PKCS#8 structure
+pub fn wrap_pqc_priv_to_pkcs8(raw_priv: &[u8], algo: &str, _seed: Option<&[u8]>) -> Result<Zeroizing<Vec<u8>>> {
     let oid = get_pqc_oid(algo)?;
+    // AlgorithmIdentifier ::= SEQUENCE { algorithm OBJECT IDENTIFIER, parameters ANY OPTIONAL }
     let alg_id = wrap_der_sequence(&oid);
     
-    let mut pkcs8 = SecureBuffer::with_capacity(inner_seq.len() + 64)?;
-    pkcs8.extend_from_slice(&[0x02, 0x01, 0x00]); // PKCS#8 version 0
+    let mut pkcs8 = SecureBuffer::with_capacity(raw_priv.len() + 64)?;
+    pkcs8.extend_from_slice(&[0x02, 0x01, 0x00]); // version 0
     pkcs8.extend_from_slice(&alg_id);
-    pkcs8.extend_from_slice(&encode_der_octet_string_zeroizing(&inner_seq));
+    pkcs8.extend_from_slice(&encode_der_octet_string_zeroizing(raw_priv));
 
     Ok(wrap_der_sequence_zeroizing(&pkcs8))
-    }
+}
 
 
 pub fn wrap_to_pem_zeroizing(data: &[u8], label: &str) -> Zeroizing<String> {

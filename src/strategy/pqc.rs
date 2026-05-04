@@ -63,6 +63,55 @@ impl PqcStrategy {
     fn hkdf_derive(&self, secret: &[u8], out_len: usize, salt: &[u8], info: &str) -> Result<Zeroizing<Vec<u8>>> {
         backend::hkdf(secret, out_len, salt, info, "SHA3-256")
     }
+    pub fn take_shared_secret(&mut self) -> Zeroizing<Vec<u8>> {
+        std::mem::take(&mut self.kem_shared_secret)
+    }
+
+    pub fn prepare_shared_secret_encryption(&mut self, key_paths: &HashMap<String, String>) -> Result<()> {
+        if let Some(algo) = key_paths.get("kem-algo") { self.kem_algo = algo.clone(); }
+        let pubkey_path = key_paths.get("recipient-pubkey")
+            .or_else(|| key_paths.get("recipient-mlkem-pubkey"))
+            .ok_or(CryptoError::PublicKeyLoad("Missing recipient public key".to_string()))?;
+
+        let pem = Zeroizing::new(fs::read_to_string(pubkey_path)?);
+        let der = crate::utils::unwrap_from_pem(&pem, "PUBLIC KEY")?;
+        
+        let (ss_bytes, ct_bytes) = backend::pqc_encap(&self.kem_algo, &der)?;
+        self.kem_shared_secret = ss_bytes;
+        self.kem_ciphertext = Zeroizing::new(ct_bytes);
+        
+        self.salt = vec![0u8; 16];
+        self.iv = vec![0u8; 12];
+        OsRng.fill_bytes(&mut self.salt);
+        OsRng.fill_bytes(&mut self.iv);
+        Ok(())
+    }
+
+    pub fn prepare_shared_secret_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<Zeroizing<String>>) -> Result<()> {
+        if let Some(algo) = key_paths.get("kem-algo") { self.kem_algo = algo.clone(); }
+        let privkey_path = key_paths.get("user-privkey")
+            .or_else(|| key_paths.get("recipient-mlkem-privkey"))
+            .ok_or(CryptoError::PrivateKeyLoad("Missing private key path".to_string()))?;
+
+        let priv_bytes = Zeroizing::new(fs::read(privkey_path)?);
+        let pem_str = Zeroizing::new(
+            std::str::from_utf8(&*priv_bytes)
+                .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                .to_string()
+        );
+
+        let der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
+            return Err(CryptoError::Parameter("TPM not supported for PQC yet".to_string()));
+        } else {
+            let pass = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?;
+            if let Some(p) = pass { *passphrase = Some(p); }
+            crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
+        };
+
+        let (raw_priv, _) = crate::utils::unwrap_pqc_priv_from_pkcs8(&der, &self.kem_algo)?;
+        self.kem_shared_secret = backend::pqc_decap(&self.kem_algo, &raw_priv, &self.kem_ciphertext, passphrase.as_deref().map(|x| x.as_str()))?;
+        Ok(())
+    }
 }
 
 impl CryptoStrategy for PqcStrategy {
@@ -107,23 +156,7 @@ impl CryptoStrategy for PqcStrategy {
     }
 
     fn prepare_encryption(&mut self, key_paths: &HashMap<String, String>) -> Result<()> {
-        if let Some(algo) = key_paths.get("kem-algo") { self.kem_algo = algo.clone(); }
-        let pubkey_path = key_paths.get("recipient-pubkey")
-            .or_else(|| key_paths.get("recipient-mlkem-pubkey"))
-            .ok_or(CryptoError::PublicKeyLoad("Missing recipient public key".to_string()))?;
-
-        let pem = Zeroizing::new(fs::read_to_string(pubkey_path)?);
-        let der = crate::utils::unwrap_from_pem(&pem, "PUBLIC KEY")?;
-        
-        let (ss_bytes, ct_bytes) = backend::pqc_encap(&self.kem_algo, &der)?;
-        self.kem_shared_secret = ss_bytes;
-        self.kem_ciphertext = Zeroizing::new(ct_bytes);
-        
-        self.salt = vec![0u8; 16];
-        self.iv = vec![0u8; 12];
-        OsRng.fill_bytes(&mut self.salt);
-        OsRng.fill_bytes(&mut self.iv);
-
+        self.prepare_shared_secret_encryption(key_paths)?;
         self.encryption_key = self.hkdf_derive(&self.kem_shared_secret, 32, &self.salt, "pqc-encryption")?;
         let ctx = backend::new_encrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
         self.aead_ctx = Some(ctx);
@@ -131,26 +164,7 @@ impl CryptoStrategy for PqcStrategy {
     }
 
     fn prepare_decryption(&mut self, key_paths: &HashMap<String, String>, passphrase: &mut Option<Zeroizing<String>>) -> Result<()> {
-        if let Some(algo) = key_paths.get("kem-algo") { self.kem_algo = algo.clone(); }
-        let privkey_path = key_paths.get("user-privkey")
-            .or_else(|| key_paths.get("recipient-mlkem-privkey"))
-            .ok_or(CryptoError::PrivateKeyLoad("Missing private key path".to_string()))?;
-
-        let priv_bytes = Zeroizing::new(fs::read(privkey_path)?);
-        let pem_str = Zeroizing::new(String::from_utf8(priv_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
-        
-        let der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
-            return Err(CryptoError::Parameter("TPM not supported for PQC yet".to_string()));
-        } else {
-            let pass = crate::utils::get_passphrase_if_needed(&pem_str, passphrase.as_deref().map(|x| x.as_str()))?;
-            if let Some(p) = pass { *passphrase = Some(p); }
-            crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
-        };
-
-        let (raw_priv, _) = crate::utils::unwrap_pqc_priv_from_pkcs8(&der, &self.kem_algo)?;
-        let ss_bytes = backend::pqc_decap(&self.kem_algo, &raw_priv, &self.kem_ciphertext, passphrase.as_deref().map(|x| x.as_str()))?;
-        self.kem_shared_secret = ss_bytes;
-
+        self.prepare_shared_secret_decryption(key_paths, passphrase)?;
         self.encryption_key = self.hkdf_derive(&self.kem_shared_secret, 32, &self.salt, "pqc-encryption")?;
         let ctx = backend::new_decrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
         self.aead_ctx = Some(ctx);
@@ -190,7 +204,11 @@ impl CryptoStrategy for PqcStrategy {
 
     fn prepare_signing(&mut self, priv_key_path: &Path, _passphrase: &mut Option<Zeroizing<String>>, _digest_algo: &str) -> Result<()> {
         let priv_bytes = Zeroizing::new(fs::read(priv_key_path)?);
-        let pem_str = Zeroizing::new(String::from_utf8(priv_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
+        let pem_str = Zeroizing::new(
+            std::str::from_utf8(&*priv_bytes)
+                .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                .to_string()
+        );
         let der = crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?;
         let (raw_priv, _) = crate::utils::unwrap_pqc_priv_from_pkcs8(&der, &self.dsa_algo)?;
         self.dsa_privkey = raw_priv;
@@ -200,7 +218,11 @@ impl CryptoStrategy for PqcStrategy {
 
     fn prepare_verification(&mut self, pub_key_path: &Path, _digest_algo: &str) -> Result<()> {
         let pub_bytes = Zeroizing::new(fs::read(pub_key_path)?);
-        let pem_str = Zeroizing::new(String::from_utf8(pub_bytes.to_vec()).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?);
+        let pem_str = Zeroizing::new(
+            std::str::from_utf8(&*pub_bytes)
+                .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                .to_string()
+        );
         let der = crate::utils::unwrap_from_pem(&pem_str, "PUBLIC KEY")?;
         self.peer_public_key = Some(der);
         self.sign_buffer = Zeroizing::new(Vec::new());

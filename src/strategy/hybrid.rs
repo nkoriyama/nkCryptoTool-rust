@@ -82,11 +82,11 @@ impl CryptoStrategy for HybridStrategy {
         if let Some(p) = key_paths.get("recipient-ecdh-pubkey") { ecc_paths.insert("recipient-pubkey".to_string(), p.clone()); }
         if let Some(p) = key_paths.get("recipient-mlkem-pubkey") { pqc_paths.insert("recipient-pubkey".to_string(), p.clone()); }
         
-        self.ecc.prepare_encryption(&ecc_paths)?;
-        self.pqc.prepare_encryption(&pqc_paths)?;
+        self.ecc.prepare_shared_secret_encryption(&ecc_paths)?;
+        self.pqc.prepare_shared_secret_encryption(&pqc_paths)?;
         
-        let ss_ecc = self.ecc.get_shared_secret();
-        let ss_pqc = self.pqc.get_shared_secret();
+        let ss_ecc = self.ecc.take_shared_secret();
+        let ss_pqc = self.pqc.take_shared_secret();
         let mut combined_ss = crate::utils::SecureBuffer::new(ss_ecc.len() + ss_pqc.len())?;
         combined_ss[..ss_ecc.len()].copy_from_slice(&ss_ecc);
         combined_ss[ss_ecc.len()..].copy_from_slice(&ss_pqc);
@@ -113,11 +113,11 @@ impl CryptoStrategy for HybridStrategy {
         if let Some(p) = key_paths.get("user-ecdh-privkey") { ecc_paths.insert("user-privkey".to_string(), p.clone()); }
         if let Some(p) = key_paths.get("user-mlkem-privkey") { pqc_paths.insert("user-privkey".to_string(), p.clone()); }
         
-        self.ecc.prepare_decryption(&ecc_paths, passphrase)?;
-        self.pqc.prepare_decryption(&pqc_paths, passphrase)?;
+        self.ecc.prepare_shared_secret_decryption(&ecc_paths, passphrase)?;
+        self.pqc.prepare_shared_secret_decryption(&pqc_paths, passphrase)?;
         
-        let ss_ecc = self.ecc.get_shared_secret();
-        let ss_pqc = self.pqc.get_shared_secret();
+        let ss_ecc = self.ecc.take_shared_secret();
+        let ss_pqc = self.pqc.take_shared_secret();
         let mut combined_ss = crate::utils::SecureBuffer::new(ss_ecc.len() + ss_pqc.len())?;
         combined_ss[..ss_ecc.len()].copy_from_slice(&ss_ecc);
         combined_ss[ss_ecc.len()..].copy_from_slice(&ss_pqc);
@@ -222,13 +222,19 @@ impl CryptoStrategy for HybridStrategy {
         if &data[0..4] != b"NKCT" { return Err(CryptoError::FileRead("Invalid magic".to_string())); }
         
         let mut pos = 7;
+        if data.len() < pos + 4 { return Err(CryptoError::FileRead("Header too short for ECC length".to_string())); }
         let ecc_len = u32::from_le_bytes(data[pos..pos+4].try_into().map_err(|_| CryptoError::FileRead("Invalid length".to_string()))?) as usize;
         pos += 4;
+        
+        if data.len() < pos + ecc_len { return Err(CryptoError::FileRead("Header too short for ECC data".to_string())); }
         self.ecc.deserialize_header(&data[pos..pos+ecc_len])?;
         pos += ecc_len;
         
+        if data.len() < pos + 4 { return Err(CryptoError::FileRead("Header too short for PQC length".to_string())); }
         let pqc_len = u32::from_le_bytes(data[pos..pos+4].try_into().map_err(|_| CryptoError::FileRead("Invalid length".to_string()))?) as usize;
         pos += 4;
+        
+        if data.len() < pos + pqc_len { return Err(CryptoError::FileRead("Header too short for PQC data".to_string())); }
         self.pqc.deserialize_header(&data[pos..pos+pqc_len])?;
         pos += pqc_len;
         
@@ -241,4 +247,27 @@ impl CryptoStrategy for HybridStrategy {
     fn get_shared_secret(&self) -> Zeroizing<Vec<u8>> { Zeroizing::new(Vec::new()) }
     fn get_salt(&self) -> Vec<u8> { self.salt.clone() }
     fn get_iv(&self) -> Vec<u8> { self.iv.clone() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategy::CryptoStrategy;
+
+    #[test]
+    fn test_hybrid_deserialize_header_short() {
+        let mut strategy = HybridStrategy::new();
+        // 8 bytes header (too short, should be at least 11)
+        let data = b"NKCT\x01\x00\x02";
+        let res = strategy.deserialize_header(data);
+        assert!(res.is_err());
+        if let Err(e) = res {
+            assert!(e.to_string().contains("Header too short"));
+        }
+
+        // 11 bytes header (enough for magic and version, but not enough for ECC/PQC lengths)
+        let data = b"NKCT\x01\x00\x02\x00\x00\x00\x00"; 
+        let res = strategy.deserialize_header(data);
+        assert!(res.is_err());
+    }
 }
