@@ -149,8 +149,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Initial passphrase from CLI args is now removed for security.
     let mut passphrase = if let Ok(p) = std::env::var("NK_PASSPHRASE") {
-        eprintln!("WARNING: Using passphrase from NK_PASSPHRASE environment variable. This is less secure than interactive entry.");
-        Some(Zeroizing::new(p))
+        if p.is_empty() {
+            None
+        } else {
+            eprintln!("WARNING: Using passphrase from NK_PASSPHRASE environment variable. This is less secure than interactive entry.");
+            Some(Zeroizing::new(p))
+        }
     } else {
         None
     };
@@ -160,9 +164,9 @@ async fn main() -> anyhow::Result<()> {
     if (operation == Operation::GenerateEncKey || operation == Operation::GenerateSignKey)
         && passphrase.is_none()
     {
-        passphrase = Some(nk_crypto_tool::utils::get_and_verify_passphrase(
+        passphrase = nk_crypto_tool::utils::get_and_verify_passphrase(
             "Generate new key pair",
-        )?);
+        )?;
     }
 
     let mut config = CryptoConfig::default();

@@ -196,15 +196,23 @@ pub fn get_masked_passphrase() -> Result<Zeroizing<String>> {
     Ok(Zeroizing::new(password))
 }
 
-pub fn get_and_verify_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
+pub fn get_and_verify_passphrase(prompt: &str) -> Result<Option<Zeroizing<String>>> {
     if let Ok(pass) = std::env::var("NK_PASSPHRASE") {
+        if pass.is_empty() {
+            return Ok(None);
+        }
         eprintln!("WARNING: Using passphrase from NK_PASSPHRASE environment variable. This is less secure than interactive entry.");
-        return Ok(Zeroizing::new(pass));
+        return Ok(Some(Zeroizing::new(pass)));
     }
     println!("{}", prompt);
+    println!("(Enter nothing to skip encryption and save key in plaintext)");
     print!("Enter passphrase: ");
     io::stdout().flush()?;
     let p1 = Zeroizing::new(read_password()?);
+
+    if p1.is_empty() {
+        return Ok(None);
+    }
 
     print!("Verify passphrase: ");
     io::stdout().flush()?;
@@ -216,7 +224,7 @@ pub fn get_and_verify_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
         ));
     }
 
-    Ok(p1)
+    Ok(Some(p1))
 }
 
 pub fn disable_core_dumps() {
@@ -385,8 +393,29 @@ pub fn wrap_pqc_priv_to_pkcs8_encrypted(
     use rand_core::OsRng;
     let pki = PrivateKeyInfo::from_der(&pkcs8_der)
         .map_err(|e| CryptoError::PrivateKeyLoad(format!("PKCS#8 parse failed: {}", e)))?;
+    
+    // F-57: Use PBKDF2-SHA256 + AES-256-CBC for maximum interoperability.
+    // Scrypt defaults can hit memory limits in some OpenSSL versions.
+    use pkcs8::pkcs5::pbes2;
+    let mut salt = [0u8; 16];
+    use rand_core::RngCore;
+    OsRng.fill_bytes(&mut salt);
+    
+    let mut iv = [0u8; 16];
+    OsRng.fill_bytes(&mut iv);
+
+    let params = pbes2::Parameters {
+        kdf: pbes2::Kdf::Pbkdf2(pbes2::Pbkdf2Params {
+            salt: &salt,
+            iteration_count: 2048,
+            key_length: Some(32),
+            prf: pbes2::Pbkdf2Prf::HmacWithSha256,
+        }),
+        encryption: pbes2::EncryptionScheme::Aes256Cbc { iv: &iv },
+    };
+
     let encrypted = pki
-        .encrypt(OsRng, passphrase)
+        .encrypt_with_params(params, passphrase)
         .map_err(|e| CryptoError::PrivateKeyLoad(format!("Encryption failed: {}", e)))?;
 
     Ok(encrypted.as_bytes().to_vec())
@@ -473,7 +502,71 @@ pub fn unwrap_pqc_priv_from_pkcs8(der: &[u8], algo: &str) -> Result<Zeroizing<Ve
         }
     }
 
-    Ok(Zeroizing::new(pki.private_key.to_vec()))
+    // F-57 Fix: OpenSSL uses a SEQUENCE { seed, expandedKey } inside the privateKey OCTET STRING.
+    // We need to extract the expanded key.
+    let priv_key_bytes = pki.private_key;
+    
+    // If it's a SEQUENCE, it might be the "both" format
+    if !priv_key_bytes.is_empty() && priv_key_bytes[0] == 0x30 {
+        let expected_sizes = match algo {
+            "ML-KEM-512" => vec![1632],
+            "ML-KEM-768" => vec![2400],
+            "ML-KEM-1024" => vec![3168],
+            "ML-DSA-44" => vec![2560],
+            "ML-DSA-65" => vec![4032],
+            "ML-DSA-87" => vec![4896],
+            _ => vec![1632, 2400, 3168, 2560, 4032, 4896],
+        };
+        
+        // Use a simple scanner to find the expanded key in the sequence
+        let mut best_sk = Vec::new();
+        // Skip SEQUENCE header
+        if let Ok(len_info) = read_asn1_len_safe(priv_key_bytes, 1) {
+            let mut i = len_info.1;
+            while i < priv_key_bytes.len() {
+                let tag = priv_key_bytes[i];
+                i += 1;
+                if let Ok((len, next_pos)) = read_asn1_len_safe(priv_key_bytes, i) {
+                    if tag == 0x04 { // OCTET STRING
+                        let chunk = &priv_key_bytes[next_pos..std::cmp::min(next_pos + len, priv_key_bytes.len())];
+                        if expected_sizes.contains(&chunk.len()) {
+                            return Ok(Zeroizing::new(chunk.to_vec()));
+                        }
+                        if chunk.len() > best_sk.len() {
+                            best_sk = chunk.to_vec();
+                        }
+                    }
+                    i = next_pos + len;
+                } else {
+                    break;
+                }
+            }
+        }
+        if !best_sk.is_empty() {
+            return Ok(Zeroizing::new(best_sk));
+        }
+    }
+
+    Ok(Zeroizing::new(priv_key_bytes.to_vec()))
+}
+
+fn read_asn1_len_safe(der: &[u8], pos: usize) -> std::result::Result<(usize, usize), ()> {
+    if pos >= der.len() {
+        return Err(());
+    }
+    let b = der[pos];
+    if b < 128 {
+        return Ok((b as usize, pos + 1));
+    }
+    let n = (b & 0x7F) as usize;
+    if n == 0 || n > 4 || pos + 1 + n > der.len() {
+        return Err(());
+    }
+    let mut res = 0usize;
+    for i in 0..n {
+        res = (res << 8) | (der[pos + 1 + i] as usize);
+    }
+    Ok((res, pos + 1 + n))
 }
 
 fn get_pqc_oid_str(algo: &str) -> Result<&'static str> {
@@ -580,5 +673,31 @@ mod tests {
         assert_eq!(buf.as_slice().len(), 32);
         // We can't easily test mlock/zeroize in unit tests without more complex mocks,
         // but we ensure it doesn't crash.
+    }
+
+    #[test]
+    fn test_unwrap_pqc_priv_structured() {
+        let algo = "ML-KEM-768";
+        let seed = vec![0x42u8; 64];
+        let expanded = vec![0x43u8; 2400];
+
+        // Construct the inner SEQUENCE { OCTET STRING (seed), OCTET STRING (expanded) }
+        let mut inner = encode_der_header(0x04, seed.len());
+        inner.extend_from_slice(&seed);
+        inner.extend_from_slice(&encode_der_header(0x04, expanded.len()));
+        inner.extend_from_slice(&expanded);
+        let structured_priv = wrap_der_sequence(&inner);
+
+        // Wrap in PKCS#8
+        let oid = get_pqc_oid(algo).unwrap();
+        let alg_id = wrap_der_sequence(&oid);
+        let mut pkcs8_content = vec![0x02, 0x01, 0x00]; // version 0
+        pkcs8_content.extend_from_slice(&alg_id);
+        pkcs8_content.extend_from_slice(&encode_der_header(0x04, structured_priv.len()));
+        pkcs8_content.extend_from_slice(&structured_priv);
+        let pkcs8 = wrap_der_sequence(&pkcs8_content);
+
+        let unwrapped = unwrap_pqc_priv_from_pkcs8(&pkcs8, algo).unwrap();
+        assert_eq!(&*unwrapped, &expanded, "Should have extracted expanded key");
     }
 }
