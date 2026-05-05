@@ -13,16 +13,17 @@ use crate::strategy::pqc::PqcStrategy;
 use crate::strategy::CryptoStrategy;
 use rand_core::RngCore;
 use std::collections::HashMap;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use zeroize::Zeroizing;
 
 pub type ProgressCallback = Arc<dyn Fn(f64) + Send + Sync>;
 
 const BUF_SIZE: usize = 1024 * 1024;
+const AEAD_OVERHEAD: usize = 32;
 
 pub struct CryptoProcessor {
     strategy: Option<Box<dyn CryptoStrategy>>,
@@ -137,50 +138,56 @@ impl CryptoProcessor {
         let input_path = config
             .input_files
             .first()
-            .ok_or(CryptoError::Parameter("No input file".to_string()))?;
+            .ok_or(CryptoError::Parameter("No input file".to_string()))?
+            .clone();
         let signature_path = config
             .signature_file
             .as_ref()
             .ok_or(CryptoError::Parameter(
                 "No signature output path".to_string(),
-            ))?;
+            ))?
+            .clone();
         let priv_key_path = config
             .signing_privkey
             .as_ref()
-            .ok_or(CryptoError::Parameter("No signing private key".to_string()))?;
+            .ok_or(CryptoError::Parameter("No signing private key".to_string()))?
+            .clone();
 
         let mut strategy = self.strategy.take().ok_or(CryptoError::Parameter(
             "Strategy not initialized".to_string(),
         ))?;
-        strategy.prepare_signing(Path::new(priv_key_path), passphrase, &config.digest_algo)?;
+        strategy.prepare_signing(Path::new(&priv_key_path), passphrase, &config.digest_algo)?;
 
-        let mut file = tokio::fs::File::open(input_path)
-            .await
-            .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        let metadata = file
-            .metadata()
-            .await
-            .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        let total_size = metadata.len();
-        let mut buffer = vec![0u8; BUF_SIZE];
-        let mut current_size = 0u64;
-
-        loop {
-            let n = file
-                .read(&mut buffer)
-                .await
+        let cb_clone = progress_callback.clone();
+        strategy = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut file = std::fs::File::open(&input_path)
                 .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            if n == 0 {
-                break;
-            }
-            strategy.update_hash(&buffer[..n])?;
-            current_size += n as u64;
-            if let Some(ref cb) = progress_callback {
-                if total_size > 0 {
-                    cb(current_size as f64 / total_size as f64 * 0.9);
+            let total_size = file.metadata()
+                .map_err(|e| CryptoError::FileRead(e.to_string()))?
+                .len();
+            let mut buffer = vec![0u8; BUF_SIZE];
+            let mut current_size = 0u64;
+
+            loop {
+                let n = file
+                    .read(&mut buffer)
+                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                strategy.update_hash(&buffer[..n])?;
+                current_size += n as u64;
+                if let Some(ref cb) = cb_clone {
+                    if total_size > 0 {
+                        cb(current_size as f64 / total_size as f64 * 0.9);
+                    }
                 }
             }
-        }
+            Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
+        })
+        .await
+        .map_err(|e| CryptoError::Parameter(format!("Blocking task failed: {}", e)))??;
 
         let signature = strategy.sign_hash()?;
         if let Some(ref cb) = progress_callback {
@@ -190,7 +197,7 @@ impl CryptoProcessor {
         let header = strategy.serialize_signature_header();
         self.strategy = Some(strategy);
 
-        crate::utils::secure_write(signature_path, {
+        crate::utils::secure_write(&signature_path, {
             let mut output = Vec::with_capacity(header.len() + signature.len());
             output.extend_from_slice(&header);
             output.extend_from_slice(&signature);
@@ -208,52 +215,58 @@ impl CryptoProcessor {
         let input_path = config
             .input_files
             .first()
-            .ok_or(CryptoError::Parameter("No input file".to_string()))?;
+            .ok_or(CryptoError::Parameter("No input file".to_string()))?
+            .clone();
         let signature_path = config
             .signature_file
             .as_ref()
-            .ok_or(CryptoError::Parameter("No signature file".to_string()))?;
+            .ok_or(CryptoError::Parameter("No signature file".to_string()))?
+            .clone();
         let pub_key_path = config
             .signing_pubkey
             .as_ref()
-            .ok_or(CryptoError::Parameter("No signing public key".to_string()))?;
+            .ok_or(CryptoError::Parameter("No signing public key".to_string()))?
+            .clone();
 
-        let sig_data = std::fs::read(signature_path)?;
+        let sig_data = std::fs::read(&signature_path)?;
         let mut strategy = self.strategy.take().ok_or(CryptoError::Parameter(
             "Strategy not initialized".to_string(),
         ))?;
         let header_size = strategy.deserialize_signature_header(&sig_data)?;
         let signature = sig_data[header_size..].to_vec();
 
-        strategy.prepare_verification(Path::new(pub_key_path), &config.digest_algo)?;
+        strategy.prepare_verification(Path::new(&pub_key_path), &config.digest_algo)?;
 
-        let mut file = tokio::fs::File::open(input_path)
-            .await
-            .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        let metadata = file
-            .metadata()
-            .await
-            .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        let total_size = metadata.len();
-        let mut buffer = vec![0u8; BUF_SIZE];
-        let mut current_size = 0u64;
-
-        loop {
-            let n = file
-                .read(&mut buffer)
-                .await
+        let cb_clone = progress_callback.clone();
+        strategy = tokio::task::spawn_blocking(move || {
+            use std::io::Read;
+            let mut file = std::fs::File::open(&input_path)
                 .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            if n == 0 {
-                break;
-            }
-            strategy.update_hash(&buffer[..n])?;
-            current_size += n as u64;
-            if let Some(ref cb) = progress_callback {
-                if total_size > 0 {
-                    cb(current_size as f64 / total_size as f64 * 0.9);
+            let total_size = file.metadata()
+                .map_err(|e| CryptoError::FileRead(e.to_string()))?
+                .len();
+            let mut buffer = vec![0u8; BUF_SIZE];
+            let mut current_size = 0u64;
+
+            loop {
+                let n = file
+                    .read(&mut buffer)
+                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+                strategy.update_hash(&buffer[..n])?;
+                current_size += n as u64;
+                if let Some(ref cb) = cb_clone {
+                    if total_size > 0 {
+                        cb(current_size as f64 / total_size as f64 * 0.9);
+                    }
                 }
             }
-        }
+            Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
+        })
+        .await
+        .map_err(|e| CryptoError::Parameter(format!("Blocking task failed: {}", e)))??;
 
         let success = strategy.verify_hash(&signature)?;
         if let Some(ref cb) = progress_callback {
@@ -310,7 +323,7 @@ impl CryptoProcessor {
         let output_path_str = output_path.to_string();
 
         let result = self
-            .run_pipelined_encrypt(
+            .run_streaming_encrypt(
                 strategy,
                 input_path_str,
                 output_path_str,
@@ -391,7 +404,7 @@ impl CryptoProcessor {
             })?;
 
         let result = self
-            .run_pipelined_decrypt(
+            .run_streaming_decrypt(
                 strategy,
                 input_path_str,
                 output_path_str,
@@ -411,7 +424,7 @@ impl CryptoProcessor {
         }
     }
 
-    async fn run_pipelined_encrypt(
+    async fn run_streaming_encrypt(
         &self,
         mut strategy: Box<dyn CryptoStrategy>,
         input_path: String,
@@ -420,106 +433,70 @@ impl CryptoProcessor {
         total_input_size: u64,
         progress_callback: Option<ProgressCallback>,
     ) -> Result<Box<dyn CryptoStrategy>> {
-        let (tx_crypto, mut rx_crypto) = mpsc::channel::<(u64, Zeroizing<Vec<u8>>)>(32);
-        let (tx_writer, mut rx_writer) = mpsc::channel::<(u64, Zeroizing<Vec<u8>>)>(32);
+        let cb_clone = progress_callback.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::fs::OpenOptions;
+            use std::io::{BufReader, BufWriter, Read, Write};
 
-        let reader_handle = tokio::spawn(async move {
-            let file = File::open(&input_path)
-                .await
-                .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let mut reader = BufReader::with_capacity(BUF_SIZE, file);
-            let mut total_read = 0u64;
-            let mut chunk_idx = 0u64;
+            let in_file =
+                std::fs::File::open(&input_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
+            let mut reader = BufReader::with_capacity(BUF_SIZE * 4, in_file);
 
-            loop {
-                let mut buffer = Zeroizing::new(vec![0u8; BUF_SIZE]);
-                let n = reader
-                    .read(&mut buffer)
-                    .await
-                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                if n == 0 {
-                    break;
-                }
-                if n < BUF_SIZE {
-                    buffer.truncate(n);
-                }
-                if tx_crypto.send((chunk_idx, buffer)).await.is_err() {
-                    break;
-                }
-                total_read += n as u64;
-                chunk_idx += 1;
-                if total_read >= total_input_size {
-                    break;
-                }
-            }
-            Ok::<(), CryptoError>(())
-        });
-
-        let crypto_task = tokio::spawn(async move {
-            while let Some((idx, data)) = rx_crypto.recv().await {
-                let out = strategy.encrypt_transform(&data)?;
-                if tx_writer.send((idx, out)).await.is_err() {
-                    break;
-                }
-            }
-            let final_block = strategy.finalize_encryption()?;
-            if !final_block.is_empty() {
-                tx_writer
-                    .send((u64::MAX, Zeroizing::new(final_block)))
-                    .await
-                    .ok();
-            }
-            Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
-        });
-
-        let output_path_clone = output_path.clone();
-        let writer_handle = tokio::spawn(async move {
-            let mut file = tokio::fs::OpenOptions::new()
+            let out_file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW)
-                .open(&output_path_clone)
-                .await
+                .open(&output_path)
                 .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-            file.write_all(&header)
-                .await
+            let mut writer = BufWriter::with_capacity(BUF_SIZE * 4, out_file);
+
+            writer
+                .write_all(&header)
                 .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
 
-            let mut total_written = 0u64;
-            while let Some((_, data)) = rx_writer.recv().await {
-                file.write_all(&data)
-                    .await
+            let mut in_buf = Zeroizing::new(vec![0u8; BUF_SIZE]);
+            let mut out_buf = vec![0u8; BUF_SIZE + AEAD_OVERHEAD];
+            let mut total_processed = 0u64;
+
+            loop {
+                let n = reader
+                    .read(&mut in_buf)
+                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                if n == 0 {
+                    break;
+                }
+
+                let m = strategy.encrypt_into(&in_buf[..n], &mut out_buf)?;
+                writer
+                    .write_all(&out_buf[..m])
                     .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-                total_written += data.len() as u64;
-                if let Some(ref cb) = progress_callback {
-                    cb(total_written as f64 / total_input_size as f64);
+
+                total_processed += n as u64;
+                if let Some(ref cb) = cb_clone {
+                    if total_input_size > 0 {
+                        cb(total_processed as f64 / total_input_size as f64);
+                    }
                 }
             }
-            file.flush()
-                .await
-                .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-            Ok::<(), CryptoError>(())
-        });
 
-        let (r1, r2, r3) = tokio::try_join!(reader_handle, crypto_task, writer_handle)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-
-        if let Err(e) = r1.and(r3) {
-            tokio::fs::remove_file(&output_path).await.ok();
-            return Err(e);
-        }
-
-        match r2 {
-            Ok(s) => Ok(s),
-            Err(e) => {
-                tokio::fs::remove_file(&output_path).await.ok();
-                Err(e)
+            let final_block = strategy.finalize_encryption()?;
+            if !final_block.is_empty() {
+                writer
+                    .write_all(&final_block)
+                    .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
             }
-        }
+            writer
+                .flush()
+                .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+
+            Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
+        })
+        .await
+        .map_err(|e| CryptoError::OpenSSL(format!("Blocking task failed: {}", e)))?
     }
 
-    async fn run_pipelined_decrypt(
+    async fn run_streaming_decrypt(
         &self,
         mut strategy: Box<dyn CryptoStrategy>,
         input_path: String,
@@ -529,89 +506,69 @@ impl CryptoProcessor {
         tag: Vec<u8>,
         progress_callback: Option<ProgressCallback>,
     ) -> Result<Box<dyn CryptoStrategy>> {
-        let (tx_crypto, mut rx_crypto) = mpsc::channel::<(u64, Zeroizing<Vec<u8>>)>(32);
-        let (tx_writer, mut rx_writer) = mpsc::channel::<(u64, Zeroizing<Vec<u8>>)>(32);
-
-        let reader_handle = tokio::spawn(async move {
-            let mut file = File::open(&input_path)
-                .await
-                .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            file.seek(std::io::SeekFrom::Start(header_size))
-                .await
-                .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let mut reader = BufReader::with_capacity(BUF_SIZE, file);
-            let mut total_read = 0u64;
-            let mut chunk_idx = 0u64;
-
-            while total_read < ciphertext_size {
-                let to_read = std::cmp::min(BUF_SIZE as u64, ciphertext_size - total_read) as usize;
-                let mut buffer = Zeroizing::new(vec![0u8; to_read]);
-                let n = reader
-                    .read_exact(&mut buffer)
-                    .await
-                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                if tx_crypto.send((chunk_idx, buffer)).await.is_err() {
-                    break;
-                }
-                total_read += n as u64;
-                chunk_idx += 1;
-            }
-            Ok::<(), CryptoError>(())
-        });
-
-        let crypto_task = tokio::spawn(async move {
-            while let Some((idx, data)) = rx_crypto.recv().await {
-                let out = strategy.decrypt_transform(&data)?;
-                if tx_writer.send((idx, out)).await.is_err() {
-                    break;
-                }
-            }
-            strategy.finalize_decryption(&tag)?;
-            Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
-        });
-
         let temp_output_path = format!("{}.tmp.{}", output_path, rand_core::OsRng.next_u64());
         let temp_output_path_clone = temp_output_path.clone();
-        let writer_handle = tokio::spawn(async move {
-            let mut file = tokio::fs::OpenOptions::new()
+
+        let cb_clone = progress_callback.clone();
+        let res = tokio::task::spawn_blocking(move || {
+            use std::fs::OpenOptions;
+            use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+
+            let mut in_file =
+                std::fs::File::open(&input_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
+            in_file
+                .seek(SeekFrom::Start(header_size))
+                .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+            let mut reader = BufReader::with_capacity(BUF_SIZE * 4, in_file);
+
+            let out_file = OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&temp_output_path_clone)
-                .await
                 .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-            let mut total_written = 0u64;
-            while let Some((_, data)) = rx_writer.recv().await {
-                file.write_all(&data)
-                    .await
+            let mut writer = BufWriter::with_capacity(BUF_SIZE * 4, out_file);
+
+            let mut in_buf = vec![0u8; BUF_SIZE];
+            let mut out_buf = vec![0u8; BUF_SIZE + AEAD_OVERHEAD];
+            let mut total_read = 0u64;
+
+            while total_read < ciphertext_size {
+                let to_read = std::cmp::min(BUF_SIZE as u64, ciphertext_size - total_read) as usize;
+                reader
+                    .read_exact(&mut in_buf[..to_read])
+                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+
+                let m = strategy.decrypt_into(&in_buf[..to_read], &mut out_buf)?;
+                writer
+                    .write_all(&out_buf[..m])
                     .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-                total_written += data.len() as u64;
-                if let Some(ref cb) = progress_callback {
-                    cb(total_written as f64 / ciphertext_size as f64);
+
+                total_read += to_read as u64;
+                if let Some(ref cb) = cb_clone {
+                    if ciphertext_size > 0 {
+                        cb(total_read as f64 / ciphertext_size as f64);
+                    }
                 }
             }
-            file.flush()
-                .await
+
+            strategy.finalize_decryption(&tag)?;
+            writer
+                .flush()
                 .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-            Ok::<(), CryptoError>(())
-        });
 
-        let (r1, r2, r3) =
-            tokio::try_join!(reader_handle, crypto_task, writer_handle).map_err(|e| {
-                let _ = std::fs::remove_file(&temp_output_path);
-                CryptoError::OpenSSL(e.to_string())
-            })?;
-
-        if let Err(e) = r1.and(r3) {
+            Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
+        })
+        .await
+        .map_err(|e| {
             let _ = std::fs::remove_file(&temp_output_path);
-            return Err(e);
-        }
+            CryptoError::OpenSSL(format!("Blocking task failed: {}", e))
+        })?;
 
-        match r2 {
+        match res {
             Ok(s) => {
-                tokio::fs::rename(&temp_output_path, &output_path)
-                    .await
+                std::fs::rename(&temp_output_path, &output_path)
                     .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
                 Ok(s)
             }

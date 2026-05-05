@@ -63,6 +63,9 @@ pub trait CryptoStrategy: Send + Sync {
     fn encrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>>;
     fn decrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>>;
 
+    fn encrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize>;
+    fn decrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize>;
+
     fn finalize_encryption(&mut self) -> Result<Vec<u8>>;
     fn finalize_decryption(&mut self, tag: &[u8]) -> Result<()>;
 

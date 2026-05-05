@@ -118,23 +118,22 @@ cargo build --release --no-default-features --features backend-rustcrypto
 
 ## **パフォーマンス**
 
-2.0 GiB のランダムデータを用いた v56 時点のベンチマーク結果（x86_64 / Linux / tmpfs 上で計測）。
-Tokio による非同期 I/O パイプラインにより、ディスク I/O や暗号エンジンの限界に近い性能を発揮します。
+10.0 GiB のランダムデータを用いた v57 時点のベンチマーク結果（x86_64 / Linux / tmpfs 上で計測）。
+事前確保されたバッファの再利用と同期 I/O パイプラインの最適化により、大規模ファイルでも安定した高スループットを実現しています。
 
 | バックエンド | モード | 暗号化 | 復号 |
 | :--- | :--- | :--- | :--- |
-| **OpenSSL (Rust)** | ECC (P-256) | ~3.3 GiB/s | ~3.3 GiB/s |
-| **OpenSSL (Rust)** | PQC (ML-KEM-1024) | **~3.2 GiB/s** | **~2.5 GiB/s** |
-| **OpenSSL (Rust)** | Hybrid (ML-KEM-1024 + P-256) | **~3.4 GiB/s** | **~2.7 GiB/s** |
-| **RustCrypto (Rust)** | ECC (P-256) | ~1.2 GiB/s | ~1.2 GiB/s |
-| **RustCrypto (Rust)** | PQC (ML-KEM-1024) | ~1.1 GiB/s | ~1.2 GiB/s |
+| **OpenSSL (Rust)** | ECC (P-256) | ~3.4 GiB/s | ~3.4 GiB/s |
+| **OpenSSL (Rust)** | PQC (ML-KEM-1024) | ~2.7 GiB/s | ~2.7 GiB/s |
+| **OpenSSL (Rust)** | Hybrid (ML-KEM-1024 + P-256) | ~3.1 GiB/s | ~3.1 GiB/s |
+| **RustCrypto (Rust)** | ECC (P-256) | ~1.3 GiB/s | ~1.3 GiB/s |
+| **RustCrypto (Rust)** | PQC (ML-KEM-1024) | ~1.2 GiB/s | ~1.3 GiB/s |
 | **RustCrypto (Rust)** | Hybrid (ML-KEM-1024 + P-256) | ~1.2 GiB/s | ~1.2 GiB/s |
 
-*   **OpenSSL バックエンド (Rust)**: 暗号化エンジンに OpenSSL の高度なアセンブリ最適化を使用しつつ、Rust の非同期 I/O パイプラインで並列化。
-    *   **PQC / Hybrid モードの native サポートには OpenSSL 3.5 以降が必要です。** それ以前のバージョンでは PQC 鍵生成・暗号化に対応しません。
-*   **RustCrypto バックエンド**: 外部 C ライブラリ非依存で、ECC・PQC・Hybrid のすべてに単独で対応。
-*   **相互運用性**: いかなる組み合わせで暗号化されたデータも、全てのバックエンドで相互に復号可能です。
-*   ベンチ値はビルドフラグ・CPU 機能（AES-NI 等）・ファイルシステム・ストレージにより変動します。再現するには `target/release/nk-crypto-tool` をビルド後、2 GiB のテストデータで計測してください。
+*   **大規模ファイル対応**: v57 以降、10 GiB 以上の巨大ファイルでも性能低下が発生しないストリーミング設計へ刷新されました。
+*   **低メモリ消費**: ファイルサイズに関わらず、常時 10 MiB 以下のメモリ（RSS）で動作します。
+*   **アセット保護**: 平文バッファには引き続き `Zeroizing` による自動消去が適用され、暗号文バッファのみを最適化対象としています。
+*   ベンチ値はビルドフラグ・CPU 機能（AES-NI 等）・ファイルシステム・ストレージにより変動します。再現するには `target/release/nk-crypto-tool` をビルド後、10 GiB のテストデータで計測してください。
 
 ## **統一ヘッダーフォーマット (Unified Header Format)**
 

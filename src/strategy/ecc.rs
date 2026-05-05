@@ -315,6 +315,20 @@ impl CryptoStrategy for EccStrategy {
         Ok(out)
     }
 
+    fn encrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
+        let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter(
+            "AEAD context not initialized".to_string(),
+        ))?;
+        ctx.update(input, output)
+    }
+
+    fn decrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
+        let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter(
+            "AEAD context not initialized".to_string(),
+        ))?;
+        ctx.update(input, output)
+    }
+
     fn finalize_encryption(&mut self) -> Result<Vec<u8>> {
         let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter(
             "AEAD context not initialized".to_string(),
