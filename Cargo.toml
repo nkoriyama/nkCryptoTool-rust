@@ -20,6 +20,8 @@ sha2 = "0.10"
 hkdf = "0.12"
 base64 = "0.21"
 pkcs8 = { version = "0.10", features = ["encryption"] }
+spki = "0.7"
+der = "0.7"
 foreign-types = { version = "0.3", optional = true }
 zeroize = { version = "1.0", features = ["derive"] }
 rpassword = "7.2"

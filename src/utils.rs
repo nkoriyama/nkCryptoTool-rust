@@ -432,171 +432,63 @@ pub fn wrap_pqc_pub_to_spki(raw_pub: &[u8], algo: &str) -> Result<Vec<u8>> {
     Ok(wrap_der_sequence(&spki))
 }
 
-pub fn unwrap_pqc_pub_from_spki(
-    der: &[u8],
-    algo: &str,
-) -> Result<Vec<u8>> {
-    unwrap_pqc_pub_from_spki_inner(der, algo, 0)
-}
-
-fn unwrap_pqc_pub_from_spki_inner(
-    der: &[u8],
-    algo: &str,
-    depth: usize,
-) -> Result<Vec<u8>> {
-    if depth > MAX_PKCS8_RECURSION_DEPTH {
-        return Err(CryptoError::Parameter(
-            "SPKI nesting too deep".to_string(),
-        ));
-    }
+pub fn unwrap_pqc_pub_from_spki(der: &[u8], algo: &str) -> Result<Vec<u8>> {
     if der.is_empty() || der[0] != 0x30 {
         return Ok(der.to_vec());
     }
 
-    let expected_sizes = match algo {
-        "ML-KEM-512" => vec![800],
-        "ML-KEM-768" => vec![1184],
-        "ML-KEM-1024" => vec![1568],
-        "ML-DSA-44" => vec![1312],
-        "ML-DSA-65" => vec![1952],
-        "ML-DSA-87" => vec![2592],
-        _ => vec![800, 1184, 1568, 1312, 1952, 2592],
-    };
+    use spki::SubjectPublicKeyInfoRef;
+    let spki = SubjectPublicKeyInfoRef::try_from(der)
+        .map_err(|e| CryptoError::Parameter(format!("Invalid SPKI: {}", e)))?;
 
-    let mut best_pk = Vec::new();
-
-    for i in 0..der.len().saturating_sub(4) {
-        if der[i] == 0x03 {
-            // BIT STRING
-            let mut pos = i + 1;
-            let len = read_asn1_len_internal(der, &mut pos);
-            if len > 1 && pos + len <= der.len() && der[pos] == 0x00 {
-                let chunk = &der[pos + 1..pos + len];
-                let actual_len = chunk.len();
-                if expected_sizes.contains(&actual_len) {
-                    return Ok(chunk.to_vec());
-                }
-                if actual_len > best_pk.len() {
-                    best_pk = chunk.to_vec();
-                }
-            }
-        } else if der[i] == 0x30 {
-            // Try inner sequence
-            let mut pos = i + 1;
-            let len = read_asn1_len_internal(der, &mut pos);
-            if len > 0 && pos + len <= der.len() {
-                if let Ok(pk) = unwrap_pqc_pub_from_spki_inner(&der[pos..pos+len], algo, depth + 1) {
-                    if !pk.is_empty() && expected_sizes.contains(&pk.len()) {
-                        return Ok(pk);
-                    }
-                }
-            }
+    if algo != "any" {
+        let expected_oid = get_pqc_oid_str(algo)?;
+        if spki.algorithm.oid.to_string() != expected_oid {
+            return Err(CryptoError::Parameter(format!(
+                "OID mismatch: expected {}, got {}",
+                expected_oid, spki.algorithm.oid
+            )));
         }
     }
 
-    if !best_pk.is_empty() {
-        Ok(best_pk)
-    } else {
-        Ok(der.to_vec())
-    }
+    Ok(spki.subject_public_key.raw_bytes().to_vec())
 }
 
-const MAX_PKCS8_RECURSION_DEPTH: usize = 5;
-
-pub fn unwrap_pqc_priv_from_pkcs8(
-    der: &[u8],
-    algo: &str,
-) -> Result<Zeroizing<Vec<u8>>> {
-    use pkcs8::der::Decode;
-    if pkcs8::EncryptedPrivateKeyInfo::from_der(der).is_ok() {
-        return Err(crate::error::CryptoError::Parameter(
-            "Encrypted private key detected. Decryption required.".to_string(),
-        ));
-    }
-    unwrap_pqc_priv_from_pkcs8_inner(der, algo, 0)
-}
-
-fn unwrap_pqc_priv_from_pkcs8_inner(
-    der: &[u8],
-    algo: &str,
-    depth: usize,
-) -> Result<Zeroizing<Vec<u8>>> {
-    if depth > MAX_PKCS8_RECURSION_DEPTH {
-        return Err(CryptoError::Parameter(
-            "PKCS#8 nesting too deep".to_string(),
-        ));
-    }
+pub fn unwrap_pqc_priv_from_pkcs8(der: &[u8], algo: &str) -> Result<Zeroizing<Vec<u8>>> {
     if der.is_empty() || der[0] != 0x30 {
         return Ok(Zeroizing::new(der.to_vec()));
     }
 
-    let expected_sizes = match algo {
-        "ML-KEM-512" => vec![1632],
-        "ML-KEM-768" => vec![2400],
-        "ML-KEM-1024" => vec![3168],
-        "ML-DSA-44" => vec![2560],
-        "ML-DSA-65" => vec![4032],
-        "ML-DSA-87" => vec![4896],
-        _ => vec![1632, 2400, 3168, 2560, 4032, 4896],
-    };
+    use pkcs8::PrivateKeyInfo;
+    let pki = PrivateKeyInfo::try_from(der)
+        .map_err(|e| CryptoError::Parameter(format!("Invalid PKCS#8: {}", e)))?;
 
-    // Simple heuristic-based PQC PKCS#8 unwrap
-    // Look for nested OCTET STRINGs that match expected sizes
-    let mut best_sk = Zeroizing::new(Vec::new());
-
-    for i in 0..der.len().saturating_sub(4) {
-        if der[i] == 0x04 {
-            // OCTET STRING
-            let mut pos = i + 1;
-            let len = read_asn1_len_internal(der, &mut pos);
-            if len > 0 && pos + len <= der.len() {
-                let chunk = &der[pos..pos + len];
-                if expected_sizes.contains(&len) {
-                    // #37-5 Fix: Zeroize before replacement
-                    best_sk.zeroize();
-                    *best_sk = chunk.to_vec();
-                } else if chunk.starts_with(&[0x30]) {
-                    // Try inner sequence
-                    if let Ok(sk) = unwrap_pqc_priv_from_pkcs8_inner(chunk, algo, depth + 1) {
-                        if !sk.is_empty() {
-                            return Ok(sk);
-                        }
-                    }
-                }
-            }
+    if algo != "any" {
+        let expected_oid = get_pqc_oid_str(algo)?;
+        if pki.algorithm.oid.to_string() != expected_oid {
+            return Err(CryptoError::Parameter(format!(
+                "OID mismatch: expected {}, got {}",
+                expected_oid, pki.algorithm.oid
+            )));
         }
     }
 
-    if !best_sk.is_empty() {
-        Ok(best_sk)
-    } else if depth == 0 {
-        // Only return the whole DER as a fallback at the top level
-        Ok(Zeroizing::new(der.to_vec()))
-    } else {
-        // In recursive calls, return empty if no match found
-        Ok(Zeroizing::new(Vec::new()))
-    }
+    Ok(Zeroizing::new(pki.private_key.to_vec()))
 }
 
-fn read_asn1_len_internal(der: &[u8], pos: &mut usize) -> usize {
-    if *pos >= der.len() {
-        return 0;
+fn get_pqc_oid_str(algo: &str) -> Result<&'static str> {
+    match algo {
+        "ML-KEM-512" => Ok("2.16.840.1.101.3.4.4.1"),
+        "ML-KEM-768" => Ok("2.16.840.1.101.3.4.4.2"),
+        "ML-KEM-1024" => Ok("2.16.840.1.101.3.4.4.3"),
+        "ML-DSA-44" => Ok("2.16.840.1.101.3.4.3.17"),
+        "ML-DSA-65" => Ok("2.16.840.1.101.3.4.3.18"),
+        "ML-DSA-87" => Ok("2.16.840.1.101.3.4.3.19"),
+        _ => Err(CryptoError::Parameter(format!(
+            "Unsupported PQC algorithm for OID: {}",
+            algo
+        ))),
     }
-    let b = der[*pos];
-    *pos += 1;
-    if b < 128 {
-        return b as usize;
-    }
-    let n = (b & 0x7F) as usize;
-    if *pos + n > der.len() || n > 4 {
-        return 0;
-    }
-    let mut res = 0usize;
-    for _ in 0..n {
-        res = (res << 8) | (der[*pos] as usize);
-        *pos += 1;
-    }
-    res
 }
 
 pub fn get_passphrase_if_needed(

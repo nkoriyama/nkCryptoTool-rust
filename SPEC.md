@@ -414,7 +414,7 @@ The long-term signing private key cached in `Arc<SecureBuffer>` resides in proce
 - **Mitigation**: The default deployment should run on hardened systems with `ptrace` restrictions (`kernel.yama.ptrace_scope=2` or `=3`).
 - **Future Roadmap**: TPM-backed signing in network mode would obviate the need to hold raw key material in process memory.
 
-### 13.5 Heuristic ASN.1 Parsing
-PKCS#8 / SPKI parsing for PQC keys uses heuristic byte scanning rather than a structured DER decoder.
-- **Limitation**: Adversarially-crafted PEM files (e.g., maliciously crafted by a peer or supply-chain attacker controlling the user's key files) may be parsed incorrectly. This is mitigated by the algorithm-specific size matching but not eliminated.
-- **Future Roadmap**: Migrate to the `pkcs8`/`der` crates for full structural validation.
+### 13.5 Structural ASN.1 Parsing
+PKCS#8 / SPKI parsing for PQC keys uses structured DER decoders via the `pkcs8` and `spki` crates.
+- **Improvement**: Strict validation of OIDs and DER structures is now performed, significantly increasing robustness against malformed or maliciously crafted keys.
+- **Future Roadmap**: Continuously update to the latest cryptographic standards as PQC specifications stabilize.
