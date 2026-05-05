@@ -18,12 +18,18 @@ pub trait KeyProvider: Send + Sync {
     }
 
     /// Unwrap a provider-specific blob into raw key bytes.
-    fn unwrap_raw(&self, _wrapped_pem: &str, _passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
+    fn unwrap_raw(
+        &self,
+        _wrapped_pem: &str,
+        _passphrase: Option<&str>,
+    ) -> Result<Zeroizing<Vec<u8>>> {
         Err(crate::error::CryptoError::ProviderNotAvailable)
     }
 
     /// Check if the hardware provider is available in the current environment.
-    fn is_available(&self) -> bool { false }
+    fn is_available(&self) -> bool {
+        false
+    }
 }
 
 pub type SharedKeyProvider = Arc<dyn KeyProvider>;

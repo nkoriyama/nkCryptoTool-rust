@@ -4,9 +4,9 @@
  * This file is part of nkCryptoTool.
  */
 
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use clap::ValueEnum;
 use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,7 +69,7 @@ pub struct CryptoConfig {
     pub user_privkey: Option<String>,
     pub signing_privkey: Option<String>,
     pub signing_pubkey: Option<String>,
-    
+
     // Hybrid keys
     pub recipient_mlkem_pubkey: Option<String>,
     pub recipient_ecdh_pubkey: Option<String>,
@@ -90,6 +90,9 @@ pub struct CryptoConfig {
     pub connect_addr: Option<String>,
     pub chat_mode: bool,
     pub allow_unauth: bool,
+    pub force: bool,
+    pub handshake_timeout: u64,
+    pub peer_allowlist: Option<String>,
 
     // For regenerate-pubkey
     pub regenerate_privkey_path: Option<String>,
@@ -127,6 +130,9 @@ impl Default for CryptoConfig {
             connect_addr: None,
             chat_mode: false,
             allow_unauth: false,
+            force: false,
+            handshake_timeout: 15,
+            peer_allowlist: None,
             regenerate_privkey_path: None,
             regenerate_pubkey_path: None,
         }

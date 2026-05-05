@@ -6,9 +6,10 @@
 
 use clap::Parser;
 use nk_crypto_tool::config::{CryptoConfig, CryptoMode, Operation};
-use nk_crypto_tool::processor::CryptoProcessor;
 use nk_crypto_tool::key::create_best_provider;
+use nk_crypto_tool::processor::CryptoProcessor;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -73,8 +74,20 @@ struct Args {
     #[arg(long)]
     chat: bool,
 
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "Allow unauthenticated connections (SECURITY WARNING: Default is false since v49)"
+    )]
     allow_unauth: bool,
+
+    #[arg(long, help = "Force overwrite of existing files")]
+    force: bool,
+
+    #[arg(long, default_value = "15", help = "Handshake timeout in seconds")]
+    handshake_timeout: u64,
+
+    #[arg(long, help = "Path to file containing allowed peer public key fingerprints")]
+    peer_allowlist: Option<String>,
 
     #[arg(long, default_value = "SHA3-512")]
     digest_algo: String,
@@ -100,6 +113,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    nk_crypto_tool::utils::disable_core_dumps();
+
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::is_x86_feature_detected!("aes") {
         eprintln!("AES-NI is available!");
@@ -107,23 +122,42 @@ async fn main() -> anyhow::Result<()> {
 
     let args = Args::parse();
 
-    let operation = if args.encrypt { Operation::Encrypt }
-        else if args.decrypt { Operation::Decrypt }
-        else if args.sign { Operation::Sign }
-        else if args.verify { Operation::Verify }
-        else if args.gen_enc_key { Operation::GenerateEncKey }
-        else if args.gen_sign_key { Operation::GenerateSignKey }
-        else if args.listen.is_some() { Operation::Listen }
-        else if args.connect.is_some() { Operation::Connect }
-        else { anyhow::bail!("No operation specified") };
+    let operation = if args.encrypt {
+        Operation::Encrypt
+    } else if args.decrypt {
+        Operation::Decrypt
+    } else if args.sign {
+        Operation::Sign
+    } else if args.verify {
+        Operation::Verify
+    } else if args.gen_enc_key {
+        Operation::GenerateEncKey
+    } else if args.gen_sign_key {
+        Operation::GenerateSignKey
+    } else if args.listen.is_some() {
+        Operation::Listen
+    } else if args.connect.is_some() {
+        Operation::Connect
+    } else {
+        anyhow::bail!("No operation specified")
+    };
 
     // Initial passphrase from CLI args is now removed for security.
-    let mut passphrase = None;
+    let mut passphrase = if let Ok(p) = std::env::var("NK_PASSPHRASE") {
+        eprintln!("WARNING: Using passphrase from NK_PASSPHRASE environment variable. This is less secure than interactive entry.");
+        Some(Zeroizing::new(p))
+    } else {
+        None
+    };
 
-    // If it's a key generation operation, we should ask for one by default 
-    // to protect the new private key.
-    if operation == Operation::GenerateEncKey || operation == Operation::GenerateSignKey {
-        passphrase = Some(nk_crypto_tool::utils::get_and_verify_passphrase("Generate new key pair")?);
+    // If it's a key generation operation, we should ask for one by default
+    // to protect the new private key, UNLESS it's already in the environment.
+    if (operation == Operation::GenerateEncKey || operation == Operation::GenerateSignKey)
+        && passphrase.is_none()
+    {
+        passphrase = Some(nk_crypto_tool::utils::get_and_verify_passphrase(
+            "Generate new key pair",
+        )?);
     }
 
     let mut config = CryptoConfig::default();
@@ -151,6 +185,20 @@ async fn main() -> anyhow::Result<()> {
     config.connect_addr = args.connect;
     config.chat_mode = args.chat;
     config.allow_unauth = args.allow_unauth;
+    config.force = args.force;
+    config.handshake_timeout = args.handshake_timeout;
+    config.peer_allowlist = args.peer_allowlist;
+
+    if config.chat_mode
+        && !config.allow_unauth
+        && config.signing_privkey.is_none()
+        && config.signing_pubkey.is_none()
+    {
+        eprintln!("WARNING: --allow-unauth is false (default) and no signing keys are provided.");
+        eprintln!(
+            "This may prevent connections from succeeding. Use --allow-unauth if you want anonymous chat."
+        );
+    }
 
     if operation == Operation::Listen {
         nk_crypto_tool::network::NetworkProcessor::listen(&config).await?;
@@ -172,14 +220,23 @@ async fn main() -> anyhow::Result<()> {
     let provider = create_best_provider();
     processor.set_key_provider(provider);
 
-    processor.process(&config, Some(Arc::new(|progress| {
-        print!("\rProgress: [{:<50}] {:.1}%", 
-            "#".repeat((progress * 50.0) as usize), 
-            progress * 100.0);
-        use std::io::Write;
-        std::io::stdout().flush().unwrap();
-        if progress >= 1.0 { println!(); }
-    }))).await?;
+    processor
+        .process(
+            &config,
+            Some(Arc::new(|progress| {
+                print!(
+                    "\rProgress: [{:<50}] {:.1}%",
+                    "#".repeat((progress * 50.0) as usize),
+                    progress * 100.0
+                );
+                use std::io::Write;
+                std::io::stdout().flush().unwrap();
+                if progress >= 1.0 {
+                    println!();
+                }
+            })),
+        )
+        .await?;
 
     println!("Operation completed successfully.");
     Ok(())

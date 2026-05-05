@@ -26,8 +26,12 @@ pub use rustcrypto_impl::RustCryptoHash as Hash;
 
 /// Common traits and types for all cryptographic backends.
 pub trait AeadBackend: Zeroize {
-    fn new_encrypt(cipher: &str, key: &[u8], iv: &[u8]) -> Result<Self> where Self: Sized;
-    fn new_decrypt(cipher: &str, key: &[u8], iv: &[u8]) -> Result<Self> where Self: Sized;
+    fn new_encrypt(cipher: &str, key: &[u8], iv: &[u8]) -> Result<Self>
+    where
+        Self: Sized;
+    fn new_decrypt(cipher: &str, key: &[u8], iv: &[u8]) -> Result<Self>
+    where
+        Self: Sized;
     fn re_init(&mut self, key: &[u8], iv: &[u8]) -> Result<()>;
     fn update(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize>;
     fn finalize(&mut self, output: &mut [u8]) -> Result<usize>;
@@ -36,7 +40,9 @@ pub trait AeadBackend: Zeroize {
 }
 
 pub trait HashBackend {
-    fn new(algo: &str) -> Result<Self> where Self: Sized;
+    fn new(algo: &str) -> Result<Self>
+    where
+        Self: Sized;
     fn update(&mut self, data: &[u8]) -> Result<()>;
     fn finalize_sign(&mut self, key_der: &[u8]) -> Result<Vec<u8>>;
     fn finalize_verify(&mut self, key_der: &[u8], signature: &[u8]) -> Result<bool>;
@@ -60,7 +66,11 @@ pub fn generate_ecc_key_pair(curve: &str) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>
     crypto_impl::generate_ecc_key_pair(curve)
 }
 
-pub fn ecc_dh(my_priv_der: &[u8], peer_pub_der: &[u8], passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
+pub fn ecc_dh(
+    my_priv_der: &[u8],
+    peer_pub_der: &[u8],
+    passphrase: Option<&str>,
+) -> Result<Zeroizing<Vec<u8>>> {
     crypto_impl::ecc_dh(my_priv_der, peer_pub_der, passphrase)
 }
 
@@ -68,19 +78,31 @@ pub fn extract_public_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<V
     crypto_impl::extract_public_key(priv_der, passphrase)
 }
 
-pub fn extract_raw_private_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
+pub fn extract_raw_private_key(
+    priv_der: &[u8],
+    passphrase: Option<&str>,
+) -> Result<Zeroizing<Vec<u8>>> {
     crypto_impl::extract_raw_private_key(priv_der, passphrase)
 }
 
-pub fn pqc_keygen_kem(algo: &str) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option<Zeroizing<Vec<u8>>>)> {
+pub fn pqc_keygen_kem(
+    algo: &str,
+) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option<Zeroizing<Vec<u8>>>)> {
     crypto_impl::pqc_keygen_kem(algo)
 }
 
-pub fn pqc_keygen_dsa(algo: &str) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option<Zeroizing<Vec<u8>>>)> {
+pub fn pqc_keygen_dsa(
+    algo: &str,
+) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option<Zeroizing<Vec<u8>>>)> {
     crypto_impl::pqc_keygen_dsa(algo)
 }
 
-pub fn pqc_sign(algo: &str, priv_der: &[u8], message: &[u8], passphrase: Option<&str>) -> Result<Vec<u8>> {
+pub fn pqc_sign(
+    algo: &str,
+    priv_der: &[u8],
+    message: &[u8],
+    passphrase: Option<&str>,
+) -> Result<Vec<u8>> {
     crypto_impl::pqc_sign(algo, priv_der, message, passphrase)
 }
 
@@ -92,10 +114,21 @@ pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Zeroizing<Vec<u8>>,
     crypto_impl::pqc_encap(algo, peer_pub_der)
 }
 
-pub fn pqc_decap(algo: &str, priv_der: &[u8], kem_ct: &[u8], passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
+pub fn pqc_decap(
+    algo: &str,
+    priv_der: &[u8],
+    kem_ct: &[u8],
+    passphrase: Option<&str>,
+) -> Result<Zeroizing<Vec<u8>>> {
     crypto_impl::pqc_decap(algo, priv_der, kem_ct, passphrase)
 }
 
-pub fn hkdf(ikm: &[u8], length: usize, salt: &[u8], info: &str, md_name: &str) -> Result<Zeroizing<Vec<u8>>> {
+pub fn hkdf(
+    ikm: &[u8],
+    length: usize,
+    salt: &[u8],
+    info: &str,
+    md_name: &str,
+) -> Result<Zeroizing<Vec<u8>>> {
     crypto_impl::hkdf(ikm, length, salt, info, md_name)
 }

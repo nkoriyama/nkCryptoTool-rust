@@ -5,11 +5,95 @@
  */
 
 use crate::error::{CryptoError, Result};
-use zeroize::{Zeroize, Zeroizing};
-use std::io::{self, Write};
 use rpassword::read_password;
+use std::io::{self, Write};
+use zeroize::{Zeroize, Zeroizing};
 
+use pkcs8::der::Decode;
 use std::ops::{Deref, DerefMut};
+
+use std::path::Path;
+
+pub fn secure_write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C, force: bool) -> Result<()> {
+    let path_ref = path.as_ref();
+    let dir = path_ref.parent().ok_or_else(|| {
+        CryptoError::FileWrite("Failed to determine parent directory".to_string())
+    })?;
+
+    // F-48-10: Check directory writability for better error messages (F-49-2 improved)
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+        let writable = unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 };
+        if !writable {
+            return Err(CryptoError::FileWrite(format!(
+                "Directory {} is not writable. Cannot create secure file.",
+                dir.display()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let dir_metadata = std::fs::metadata(dir).map_err(|e| {
+            CryptoError::FileWrite(format!("Failed to access directory {}: {}", dir.display(), e))
+        })?;
+        if dir_metadata.permissions().readonly() {
+            return Err(CryptoError::FileWrite(format!(
+                "Directory {} is read-only. Cannot create secure file.",
+                dir.display()
+            )));
+        }
+    }
+
+    use tempfile::NamedTempFile;
+    let mut tmp = NamedTempFile::new_in(dir)
+        .map_err(|e| CryptoError::FileWrite(format!("Failed to create temporary file: {}", e)))?;
+
+    // F-48-2 Fix: Set 0600 permissions on the temp file using the file descriptor (fchmod equivalent)
+    use std::os::unix::fs::PermissionsExt;
+    tmp.as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| CryptoError::FileWrite(format!("Failed to set temp file permissions: {}", e)))?;
+
+    use std::io::Write;
+    tmp.as_file_mut()
+        .write_all(contents.as_ref())
+        .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+    tmp.as_file_mut()
+        .sync_all()
+        .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+
+    // F-48-1 Note: O_NOFOLLOW is not explicitly needed here because:
+    // 1. NamedTempFile uses a random name with O_EXCL, preventing pre-existing symlink attacks.
+    // 2. rename(2) (via persist) atomically replaces a destination symlink rather than following it.
+    // 3. persist_noclobber uses linkat() which fails if the destination exists, preventing link following.
+    if force {
+        // POSIX atomic: rename overwrites existing file atomically
+        tmp.persist(path_ref).map_err(|e| {
+            CryptoError::FileWrite(format!("Failed to persist secure file {}: {}", path_ref.display(), e))
+        })?;
+    } else {
+        // O_EXCL semantics: fail if destination already exists
+        match tmp.persist_noclobber(path_ref) {
+            Ok(_) => {}
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(CryptoError::FileWrite(format!(
+                    "File already exists: {}. Please remove it manually or use --force to overwrite.",
+                    path_ref.display()
+                )));
+            }
+            Err(e) => {
+                return Err(CryptoError::FileWrite(format!(
+                    "Failed to create secure file {}: {}",
+                    path_ref.display(),
+                    e
+                )));
+            }
+        }
+    }
+    Ok(())
+}
 
 #[derive(Zeroize)]
 #[zeroize(drop)]
@@ -19,15 +103,15 @@ impl SecureBuffer {
     pub fn new(size: usize) -> Result<Self> {
         let mut buf = Vec::with_capacity(size);
         buf.resize(size, 0);
-        
+
         // Lock memory to prevent swapping
         unsafe {
             if libc::mlock(buf.as_ptr() as *const libc::c_void, buf.len()) != 0 {
-                // We ignore mlock failure as in the C++ version, 
+                // We ignore mlock failure as in the C++ version,
                 // but zeroize(drop) ensures it's cleared on drop.
             }
         }
-        
+
         Ok(SecureBuffer(buf))
     }
 
@@ -53,7 +137,7 @@ impl SecureBuffer {
         self.0.extend_from_slice(data);
         let new_ptr = self.0.as_ptr();
         let new_cap = self.0.capacity();
-        
+
         if new_ptr != old_ptr || new_cap != old_cap {
             unsafe {
                 let _ = libc::mlock(new_ptr as *const libc::c_void, new_cap);
@@ -103,18 +187,19 @@ pub fn get_and_verify_passphrase(prompt: &str) -> Result<Zeroizing<String>> {
     print!("Enter passphrase: ");
     io::stdout().flush()?;
     let p1 = Zeroizing::new(read_password()?);
-    
+
     print!("Verify passphrase: ");
     io::stdout().flush()?;
     let p2 = Zeroizing::new(read_password()?);
-    
+
     if *p1 != *p2 {
-        return Err(CryptoError::Parameter("Passphrases do not match".to_string()));
+        return Err(CryptoError::Parameter(
+            "Passphrases do not match".to_string(),
+        ));
     }
-    
+
     Ok(p1)
 }
-
 
 pub fn disable_core_dumps() {
     unsafe {
@@ -122,62 +207,18 @@ pub fn disable_core_dumps() {
             rlim_cur: 0,
             rlim_max: 0,
         };
-        libc::setrlimit(libc::RLIMIT_CORE, &limit);
+        if libc::setrlimit(libc::RLIMIT_CORE, &limit) != 0 {
+            eprintln!("Warning: Failed to disable core dumps via setrlimit");
+        }
+        #[cfg(target_os = "linux")]
+        if libc::prctl(libc::PR_SET_DUMPABLE, 0) != 0 {
+            eprintln!("Warning: Failed to disable core dumps via prctl");
+        }
     }
 }
 
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
-use std::os::unix::io::AsRawFd;
-
-pub struct Mmap {
-    ptr: *mut libc::c_void,
-    len: usize,
-}
-
-impl Mmap {
-    pub fn new(file: &std::fs::File) -> Result<Self> {
-        let metadata = file.metadata().map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        let len = metadata.len() as usize;
-        if len == 0 {
-            return Ok(Self { ptr: std::ptr::null_mut(), len: 0 });
-        }
-
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-
-        if ptr == libc::MAP_FAILED {
-            return Err(CryptoError::FileRead("mmap failed".to_string()));
-        }
-
-        Ok(Self { ptr, len })
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        if self.len == 0 {
-            return &[];
-        }
-        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
-    }
-}
-
-impl Drop for Mmap {
-    fn drop(&mut self) {
-        if !self.ptr.is_null() && self.ptr != libc::MAP_FAILED {
-            unsafe {
-                libc::munmap(self.ptr, self.len);
-            }
-        }
-    }
-}
 
 pub fn wrap_to_pem(data: &[u8], label: &str) -> String {
     let mut pem = format!("-----BEGIN {}-----\n", label);
@@ -201,19 +242,30 @@ pub fn unwrap_from_pem(pem: &str, label: &str) -> Result<Zeroizing<Vec<u8>>> {
     } else if let Some(idx) = pem.find(&begin_enc) {
         (idx + begin_enc.len(), end_enc)
     } else {
-        return Err(CryptoError::Parameter(format!("Missing PEM header for {}", label)));
+        return Err(CryptoError::Parameter(format!(
+            "Missing PEM header for {}",
+            label
+        )));
     };
 
-    let end_idx = pem.find(&actual_end).ok_or(CryptoError::Parameter(format!("Missing PEM footer for {}", label)))?;
+    let end_idx = pem[start_idx..]
+        .find(&actual_end)
+        .map(|rel| start_idx + rel)
+        .ok_or(CryptoError::Parameter(format!(
+            "Missing PEM footer for {}",
+            label
+        )))?;
 
     let b64_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(
         pem[start_idx..end_idx]
             .bytes()
             .filter(|&b| !b.is_ascii_whitespace())
-            .collect()
+            .collect(),
     );
 
-    Ok(Zeroizing::new(BASE64.decode(&*b64_bytes).map_err(|e| CryptoError::Parameter(format!("Base64 decode error: {}", e)))?))
+    Ok(Zeroizing::new(BASE64.decode(&*b64_bytes).map_err(|e| {
+        CryptoError::Parameter(format!("Base64 decode error: {}", e))
+    })?))
 }
 
 pub fn is_encrypted_pem(pem: &str) -> bool {
@@ -276,18 +328,26 @@ fn get_pqc_oid(algo: &str) -> Result<Vec<u8>> {
         "ML-DSA-44" => vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11],
         "ML-DSA-65" => vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12],
         "ML-DSA-87" => vec![0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13],
-        _ => return Err(CryptoError::Parameter(format!("Unsupported PQC algorithm for OID: {}", algo))),
+        _ => {
+            return Err(CryptoError::Parameter(format!(
+                "Unsupported PQC algorithm for OID: {}",
+                algo
+            )))
+        }
     };
     let mut res = vec![0x06, oid.len() as u8];
     res.extend(oid);
     Ok(res)
 }
 
-pub fn wrap_pqc_priv_to_pkcs8(raw_priv: &[u8], algo: &str, _seed: Option<&[u8]>) -> Result<Zeroizing<Vec<u8>>> {
+pub fn wrap_pqc_priv_to_pkcs8(
+    raw_priv: &[u8],
+    algo: &str,
+) -> Result<Zeroizing<Vec<u8>>> {
     let oid = get_pqc_oid(algo)?;
     // AlgorithmIdentifier ::= SEQUENCE { algorithm OBJECT IDENTIFIER, parameters ANY OPTIONAL }
     let alg_id = wrap_der_sequence(&oid);
-    
+
     let mut pkcs8 = SecureBuffer::with_capacity(raw_priv.len() + 64)?;
     pkcs8.extend_from_slice(&[0x02, 0x01, 0x00]); // version 0
     pkcs8.extend_from_slice(&alg_id);
@@ -296,28 +356,59 @@ pub fn wrap_pqc_priv_to_pkcs8(raw_priv: &[u8], algo: &str, _seed: Option<&[u8]>)
     Ok(wrap_der_sequence_zeroizing(&pkcs8))
 }
 
+pub fn wrap_pqc_priv_to_pkcs8_encrypted(
+    raw_priv: &[u8],
+    algo: &str,
+    passphrase: &str,
+) -> Result<Vec<u8>> {
+    let pkcs8_der = wrap_pqc_priv_to_pkcs8(raw_priv, algo)?;
+
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        use pkcs8::PrivateKeyInfo;
+        use rand_core::OsRng;
+        let pki = PrivateKeyInfo::from_der(&pkcs8_der)
+            .map_err(|e| CryptoError::PrivateKeyLoad(format!("PKCS#8 parse failed: {}", e)))?;
+        let encrypted = pki
+            .encrypt(OsRng, passphrase)
+            .map_err(|e| CryptoError::PrivateKeyLoad(format!("Encryption failed: {}", e)))?;
+
+        return Ok(encrypted.as_bytes().to_vec());
+    }
+
+    #[cfg(not(feature = "backend-rustcrypto"))]
+    {
+        let _ = (raw_priv, algo, passphrase);
+        Err(CryptoError::Parameter(
+            "Encryption not supported in this build".to_string(),
+        ))
+    }
+}
 
 pub fn wrap_to_pem_zeroizing(data: &[u8], label: &str) -> Zeroizing<String> {
     let mut b64_buf = Zeroizing::new(vec![0u8; (data.len() + 2) / 3 * 4]);
-    let n = BASE64.encode_slice(data, &mut *b64_buf).map_err(|e| CryptoError::Parameter(format!("Base64 encode error: {}", e))).unwrap();
-    
+    let n = BASE64
+        .encode_slice(data, &mut *b64_buf)
+        .map_err(|e| CryptoError::Parameter(format!("Base64 encode error: {}", e)))
+        .unwrap();
+
     // Pre-calculate capacity to avoid reallocations
     let estimated_size = label.len() * 2 + n + (n / 64) + 40;
     let mut pem = String::with_capacity(estimated_size);
-    
+
     pem.push_str("-----BEGIN ");
     pem.push_str(label);
     pem.push_str("-----\n");
-    
+
     for chunk in b64_buf[..n].chunks(64) {
         pem.push_str(std::str::from_utf8(chunk).unwrap());
         pem.push('\n');
     }
-    
+
     pem.push_str("-----END ");
     pem.push_str(label);
     pem.push_str("-----\n");
-    
+
     Zeroizing::new(pem)
 }
 
@@ -326,56 +417,175 @@ pub fn wrap_pqc_pub_to_spki(raw_pub: &[u8], algo: &str) -> Result<Vec<u8>> {
     let oid = get_pqc_oid(algo)?;
     let alg_id = wrap_der_sequence(&oid);
     let pub_bits = encode_der_bit_string(raw_pub);
-    
+
     let mut spki = Vec::new();
     spki.extend(alg_id);
     spki.extend(pub_bits);
-    
+
     Ok(wrap_der_sequence(&spki))
 }
 
-pub fn unwrap_pqc_priv_from_pkcs8(der: &[u8], _algo: &str) -> Result<(Zeroizing<Vec<u8>>, Option<Zeroizing<Vec<u8>>>)> {
-    if der.is_empty() || der[0] != 0x30 { return Ok((Zeroizing::new(der.to_vec()), None)); }
-    
-    // Simple heuristic-based PQC PKCS#8 unwrap
-    // Look for nested OCTET STRINGs that match expected sizes
-    let mut best_sk = Zeroizing::new(Vec::new());
-    let mut best_seed = None;
-    
+pub fn unwrap_pqc_pub_from_spki(
+    der: &[u8],
+    algo: &str,
+) -> Result<Vec<u8>> {
+    unwrap_pqc_pub_from_spki_inner(der, algo, 0)
+}
+
+fn unwrap_pqc_pub_from_spki_inner(
+    der: &[u8],
+    algo: &str,
+    depth: usize,
+) -> Result<Vec<u8>> {
+    if depth > MAX_PKCS8_RECURSION_DEPTH {
+        return Err(CryptoError::Parameter(
+            "SPKI nesting too deep".to_string(),
+        ));
+    }
+    if der.is_empty() || der[0] != 0x30 {
+        return Ok(der.to_vec());
+    }
+
+    let expected_sizes = match algo {
+        "ML-KEM-512" => vec![800],
+        "ML-KEM-768" => vec![1184],
+        "ML-KEM-1024" => vec![1568],
+        "ML-DSA-44" => vec![1312],
+        "ML-DSA-65" => vec![1952],
+        "ML-DSA-87" => vec![2592],
+        _ => vec![800, 1184, 1568, 1312, 1952, 2592],
+    };
+
+    let mut best_pk = Vec::new();
+
     for i in 0..der.len().saturating_sub(4) {
-        if der[i] == 0x04 { // OCTET STRING
+        if der[i] == 0x03 {
+            // BIT STRING
+            let mut pos = i + 1;
+            let len = read_asn1_len_internal(der, &mut pos);
+            if len > 1 && pos + len <= der.len() && der[pos] == 0x00 {
+                let chunk = &der[pos + 1..pos + len];
+                let actual_len = chunk.len();
+                if expected_sizes.contains(&actual_len) {
+                    return Ok(chunk.to_vec());
+                }
+                if actual_len > best_pk.len() {
+                    best_pk = chunk.to_vec();
+                }
+            }
+        } else if der[i] == 0x30 {
+            // Try inner sequence
             let mut pos = i + 1;
             let len = read_asn1_len_internal(der, &mut pos);
             if len > 0 && pos + len <= der.len() {
-                let chunk = &der[pos..pos + len];
-                if [1632, 2400, 3168, 2560, 4032, 4896, 800, 1184, 1568, 1312, 1952, 2592].contains(&len) {
-                    *best_sk = chunk.to_vec();
-                } else if len == 32 || len == 64 {
-                    best_seed = Some(Zeroizing::new(chunk.to_vec()));
-                } else if chunk.starts_with(&[0x30]) {
-                    // Try inner sequence
-                    if let Ok((sk, s)) = unwrap_pqc_priv_from_pkcs8(chunk, _algo) {
-                        if !sk.is_empty() { return Ok((sk, s)); }
+                if let Ok(pk) = unwrap_pqc_pub_from_spki_inner(&der[pos..pos+len], algo, depth + 1) {
+                    if !pk.is_empty() && expected_sizes.contains(&pk.len()) {
+                        return Ok(pk);
                     }
                 }
             }
         }
     }
-    
-    if !best_sk.is_empty() {
-        Ok((best_sk, best_seed))
+
+    if !best_pk.is_empty() {
+        Ok(best_pk)
     } else {
-        Ok((Zeroizing::new(der.to_vec()), None))
+        Ok(der.to_vec())
+    }
+}
+
+const MAX_PKCS8_RECURSION_DEPTH: usize = 5;
+
+pub fn unwrap_pqc_priv_from_pkcs8(
+    der: &[u8],
+    algo: &str,
+) -> Result<Zeroizing<Vec<u8>>> {
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        if pkcs8::EncryptedPrivateKeyInfo::from_der(der).is_ok() {
+            return Err(crate::error::CryptoError::Parameter(
+                "Encrypted private key detected. Decryption required.".to_string(),
+            ));
+        }
+    }
+    unwrap_pqc_priv_from_pkcs8_inner(der, algo, 0)
+}
+
+fn unwrap_pqc_priv_from_pkcs8_inner(
+    der: &[u8],
+    algo: &str,
+    depth: usize,
+) -> Result<Zeroizing<Vec<u8>>> {
+    if depth > MAX_PKCS8_RECURSION_DEPTH {
+        return Err(CryptoError::Parameter(
+            "PKCS#8 nesting too deep".to_string(),
+        ));
+    }
+    if der.is_empty() || der[0] != 0x30 {
+        return Ok(Zeroizing::new(der.to_vec()));
+    }
+
+    let expected_sizes = match algo {
+        "ML-KEM-512" => vec![1632],
+        "ML-KEM-768" => vec![2400],
+        "ML-KEM-1024" => vec![3168],
+        "ML-DSA-44" => vec![2560],
+        "ML-DSA-65" => vec![4032],
+        "ML-DSA-87" => vec![4896],
+        _ => vec![1632, 2400, 3168, 2560, 4032, 4896],
+    };
+
+    // Simple heuristic-based PQC PKCS#8 unwrap
+    // Look for nested OCTET STRINGs that match expected sizes
+    let mut best_sk = Zeroizing::new(Vec::new());
+
+    for i in 0..der.len().saturating_sub(4) {
+        if der[i] == 0x04 {
+            // OCTET STRING
+            let mut pos = i + 1;
+            let len = read_asn1_len_internal(der, &mut pos);
+            if len > 0 && pos + len <= der.len() {
+                let chunk = &der[pos..pos + len];
+                if expected_sizes.contains(&len) {
+                    // #37-5 Fix: Zeroize before replacement
+                    best_sk.zeroize();
+                    *best_sk = chunk.to_vec();
+                } else if chunk.starts_with(&[0x30]) {
+                    // Try inner sequence
+                    if let Ok(sk) = unwrap_pqc_priv_from_pkcs8_inner(chunk, algo, depth + 1) {
+                        if !sk.is_empty() {
+                            return Ok(sk);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if !best_sk.is_empty() {
+        Ok(best_sk)
+    } else if depth == 0 {
+        // Only return the whole DER as a fallback at the top level
+        Ok(Zeroizing::new(der.to_vec()))
+    } else {
+        // In recursive calls, return empty if no match found
+        Ok(Zeroizing::new(Vec::new()))
     }
 }
 
 fn read_asn1_len_internal(der: &[u8], pos: &mut usize) -> usize {
-    if *pos >= der.len() { return 0; }
+    if *pos >= der.len() {
+        return 0;
+    }
     let b = der[*pos];
     *pos += 1;
-    if b < 128 { return b as usize; }
+    if b < 128 {
+        return b as usize;
+    }
     let n = (b & 0x7F) as usize;
-    if *pos + n > der.len() || n > 4 { return 0; }
+    if *pos + n > der.len() || n > 4 {
+        return 0;
+    }
     let mut res = 0usize;
     for _ in 0..n {
         res = (res << 8) | (der[*pos] as usize);
@@ -384,7 +594,10 @@ fn read_asn1_len_internal(der: &[u8], pos: &mut usize) -> usize {
     res
 }
 
-pub fn get_passphrase_if_needed(content: &str, provided_passphrase: Option<&str>) -> Result<Option<Zeroizing<String>>> {
+pub fn get_passphrase_if_needed(
+    content: &str,
+    provided_passphrase: Option<&str>,
+) -> Result<Option<Zeroizing<String>>> {
     if let Some(pass) = provided_passphrase {
         return Ok(Some(Zeroizing::new(pass.to_string())));
     }
@@ -395,11 +608,53 @@ pub fn get_passphrase_if_needed(content: &str, provided_passphrase: Option<&str>
     Ok(None)
 }
 
-
-
-#[cfg(test)]
+#[cfg(all(test, feature = "backend-rustcrypto"))]
 mod tests {
     use super::*;
+    use crate::backend;
+
+    fn test_kem_roundtrip(algo: &str) {
+        let (sk, pk, _) = backend::pqc_keygen_kem(algo).unwrap();
+        
+        let pkcs8 = wrap_pqc_priv_to_pkcs8(&sk, algo).unwrap();
+        let unwrapped_sk = unwrap_pqc_priv_from_pkcs8(&pkcs8, algo).unwrap();
+        
+        assert_eq!(&*unwrapped_sk, &*sk, "SK mismatch for {}", algo);
+        
+        let (ss1, ct) = backend::pqc_encap(algo, &pk).unwrap();
+        let ss2 = backend::pqc_decap(algo, &unwrapped_sk, &ct, None).unwrap();
+        
+        assert_eq!(&*ss1, &*ss2, "SS mismatch for {}", algo);
+    }
+
+    fn test_dsa_roundtrip(algo: &str) {
+        let (sk, pk, _) = backend::pqc_keygen_dsa(algo).unwrap();
+        
+        let pkcs8 = wrap_pqc_priv_to_pkcs8(&sk, algo).unwrap();
+        let unwrapped_sk = unwrap_pqc_priv_from_pkcs8(&pkcs8, algo).unwrap();
+        
+        assert_eq!(&*unwrapped_sk, &*sk, "SK mismatch for {}", algo);
+        
+        let message = b"hello world";
+        let sig = backend::pqc_sign(algo, &unwrapped_sk, message, None).unwrap();
+        let ok = backend::pqc_verify(algo, &pk, message, &sig).unwrap();
+        
+        assert!(ok, "Verification failed for {}", algo);
+    }
+
+    #[test]
+    fn test_pqc_kem_roundtrips() {
+        test_kem_roundtrip("ML-KEM-512");
+        test_kem_roundtrip("ML-KEM-768");
+        test_kem_roundtrip("ML-KEM-1024");
+    }
+
+    #[test]
+    fn test_pqc_dsa_roundtrips() {
+        test_dsa_roundtrip("ML-DSA-44");
+        test_dsa_roundtrip("ML-DSA-65");
+        test_dsa_roundtrip("ML-DSA-87");
+    }
 
     #[test]
     fn test_pem_cycle() {
@@ -408,7 +663,7 @@ mod tests {
         let pem = wrap_to_pem(data, label);
         assert!(pem.starts_with("-----BEGIN TEST LABEL-----"));
         assert!(pem.trim().ends_with("-----END TEST LABEL-----"));
-        
+
         let unwrapped = unwrap_from_pem(&pem, label).unwrap();
         assert_eq!(&*unwrapped, data);
     }

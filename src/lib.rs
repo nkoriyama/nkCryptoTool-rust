@@ -4,14 +4,14 @@
  * This file is part of nkCryptoTool.
  */
 
-pub mod error;
-pub mod config;
-pub mod utils;
-pub mod key;
-pub mod strategy;
-pub mod processor;
 pub mod backend;
+pub mod config;
+pub mod error;
+pub mod key;
 pub mod network;
+pub mod processor;
+pub mod strategy;
+pub mod utils;
 
 pub use error::CryptoError;
 pub use processor::{CryptoProcessor, ProgressCallback};

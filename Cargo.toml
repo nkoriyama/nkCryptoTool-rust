@@ -24,10 +24,13 @@ zeroize = { version = "1.0", features = ["derive"] }
 rpassword = "7.2"
 libc = "0.2"
 tempfile = "3.8"
+parking_lot = "0.12"
+hex = "0.4"
 
 # RustCrypto ecosystem
 aes-gcm = { version = "0.10", optional = true }
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pem", "pkcs8"], optional = true }
+pkcs8 = { version = "0.10", features = ["encryption"], optional = true }
 ecdsa = { version = "0.16", optional = true }
 signature = { version = "2.2", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -46,4 +49,15 @@ once_cell = "1.21.4"
 [features]
 default = ["backend-openssl"]
 backend-openssl = ["openssl", "openssl-sys", "foreign-types"]
-backend-rustcrypto = ["aes-gcm", "p256", "ecdsa", "signature", "aes", "ctr", "ghash", "subtle", "generic-array"]
+backend-rustcrypto = [
+    "aes-gcm",
+    "p256",
+    "pkcs8",
+    "ecdsa",
+    "signature",
+    "aes",
+    "ctr",
+    "ghash",
+    "subtle",
+    "generic-array",
+]
