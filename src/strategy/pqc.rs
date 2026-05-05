@@ -137,7 +137,7 @@ impl PqcStrategy {
                 *passphrase = Some(p);
             }
             let der = crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?;
-            backend::extract_raw_private_key(&der, passphrase.as_deref().map(|x| x.as_str()))?
+            crate::utils::extract_raw_private_key(&der, passphrase.as_deref().map(|x| x.as_str()))?
         };
 
         let raw_priv = crate::utils::unwrap_pqc_priv_from_pkcs8(&decrypted_der, &self.kem_algo)?;
@@ -328,7 +328,7 @@ impl CryptoStrategy for PqcStrategy {
 
         let der = crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?;
         let decrypted_der =
-            backend::extract_raw_private_key(&der, passphrase_opt.as_deref().map(|x| x.as_str()))?;
+            crate::utils::extract_raw_private_key(&der, passphrase_opt.as_deref().map(|x| x.as_str()))?;
         let raw_priv = crate::utils::unwrap_pqc_priv_from_pkcs8(&decrypted_der, &self.dsa_algo)?;
         self.dsa_privkey = raw_priv;
         self.sign_buffer = Zeroizing::new(Vec::new());

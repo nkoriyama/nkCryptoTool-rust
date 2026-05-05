@@ -14,6 +14,24 @@ use std::ops::{Deref, DerefMut};
 
 use std::path::Path;
 
+pub fn extract_raw_private_key(
+    priv_der: &[u8],
+    passphrase: Option<&str>,
+) -> Result<Zeroizing<Vec<u8>>> {
+    use pkcs8::der::Decode;
+    if let Ok(pki) = pkcs8::EncryptedPrivateKeyInfo::from_der(priv_der) {
+        let pass = passphrase.ok_or_else(|| {
+            CryptoError::Parameter("Encrypted private key requires a passphrase".to_string())
+        })?;
+        let decrypted = pki
+            .decrypt(pass)
+            .map_err(|e| CryptoError::PrivateKeyLoad(format!("Decryption failed: {}", e)))?;
+        return Ok(Zeroizing::new(decrypted.as_bytes().to_vec()));
+    }
+    // If not encrypted, return as is. Caller (strategy) will handle if it's invalid plain PKCS#8.
+    Ok(Zeroizing::new(priv_der.to_vec()))
+}
+
 pub fn secure_write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C, force: bool) -> Result<()> {
     let path_ref = path.as_ref();
     let dir = path_ref.parent().ok_or_else(|| {

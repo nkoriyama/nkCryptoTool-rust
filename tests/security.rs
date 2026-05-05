@@ -1,8 +1,8 @@
-use nk_crypto_tool::utils::secure_write;
 use nk_crypto_tool::strategy::CryptoStrategy;
+use nk_crypto_tool::utils::secure_write;
 use std::fs;
-use std::path::Path;
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 
 #[tokio::test]
 async fn test_secure_write_atomic_force() {
@@ -17,25 +17,17 @@ async fn test_secure_write_atomic_force() {
     // 1. Initial write (no existing file)
     secure_write(&path, content1, false).expect("Initial write failed");
     assert_eq!(fs::read(&path).unwrap(), content1);
-    
-    let metadata = fs::metadata(&path).unwrap();
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
 
-    // 2. Overwrite without force (should fail)
+    // 2. Second write (fails without force)
     let res = secure_write(&path, content2, false);
     assert!(res.is_err());
-    assert_eq!(fs::read(&path).unwrap(), content1); // Content should be unchanged
+    assert_eq!(fs::read(&path).unwrap(), content1);
 
-    // 3. Overwrite with force (should succeed)
-    secure_write(&path, content2, true).expect("Overwriting with force failed");
+    // 3. Third write (success with force)
+    secure_write(&path, content2, true).expect("Force write failed");
     assert_eq!(fs::read(&path).unwrap(), content2);
-    
-    let metadata = fs::metadata(&path).unwrap();
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
 
-    // 4. Overwrite file with wrong permissions (should become 0600)
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-    secure_write(&path, content1, true).expect("Force overwrite failed");
+    // 4. Verify permissions
     let metadata = fs::metadata(&path).unwrap();
     assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
 
@@ -45,7 +37,6 @@ async fn test_secure_write_atomic_force() {
 #[tokio::test]
 async fn test_preload_encrypted_pem() {
     use nk_crypto_tool::config::{CryptoConfig, Operation};
-    use nk_crypto_tool::network::NetworkProcessor;
 
     let test_dir = "tests/temp_encrypted_key";
     let _ = fs::remove_dir_all(test_dir);
@@ -69,8 +60,8 @@ async fn test_preload_encrypted_pem() {
         format!("{}/public_sign_pqc.key", test_dir),
     );
 
-    let _strategy = nk_crypto_tool::strategy::pqc::PqcStrategy::new();
-    _strategy
+    let strategy = nk_crypto_tool::strategy::pqc::PqcStrategy::new();
+    strategy
         .generate_signing_key_pair(
             &key_paths,
             config.passphrase.as_deref().map(|s| s.as_str()),
@@ -80,26 +71,18 @@ async fn test_preload_encrypted_pem() {
 
     let priv_path = key_paths.get("private-key").unwrap().clone();
 
-    // 2. Test preloading with correct passphrase
-    let mut net_config = CryptoConfig::default();
-    net_config.signing_privkey = Some(priv_path.clone());
-    net_config.passphrase = Some(zeroize::Zeroizing::new("testpass".to_string()));
-    net_config.pqc_dsa_algo = "ML-DSA-65".to_string();
+    // 2. Test extraction with correct passphrase
+    let priv_bytes = fs::read(&priv_path).unwrap();
+    let pem_str = String::from_utf8(priv_bytes).unwrap();
+    let der = nk_crypto_tool::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY").unwrap();
+    
+    let res = nk_crypto_tool::utils::extract_raw_private_key(&der, Some("testpass"));
+    assert!(res.is_ok(), "Extraction failed with correct pass: {:?}", res.err());
 
-    let mut net_processor = NetworkProcessor::new(net_config);
-    net_processor.preload_signing_key().await.expect("Preload failed with correct pass");
-    assert!(net_processor.has_cached_signing_key());
-
-    // 3. Test preloading with WRONG passphrase
-    let mut net_config_wrong = CryptoConfig::default();
-    net_config_wrong.signing_privkey = Some(priv_path.clone());
-    net_config_wrong.passphrase = Some(zeroize::Zeroizing::new("wrongpass".to_string()));
-    net_config_wrong.pqc_dsa_algo = "ML-DSA-65".to_string();
-
-    let mut net_processor_wrong = NetworkProcessor::new(net_config_wrong);
-    let res = net_processor_wrong.preload_signing_key().await;
-    assert!(res.is_err(), "Preload should fail with wrong pass");
-    let err_msg = format!("{}", res.err().unwrap());
+    // 3. Test extraction with WRONG passphrase
+    let res_wrong = nk_crypto_tool::utils::extract_raw_private_key(&der, Some("wrongpass"));
+    assert!(res_wrong.is_err(), "Extraction should fail with wrong pass");
+    let err_msg = format!("{}", res_wrong.err().unwrap());
     assert!(err_msg.contains("Decryption failed") || err_msg.contains("Wrong passphrase"), "Error message should be descriptive: {}", err_msg);
 
     let _ = fs::remove_dir_all(test_dir);

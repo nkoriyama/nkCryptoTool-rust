@@ -23,6 +23,7 @@ pub enum Operation {
     Info,
     Listen,
     Connect,
+    Fingerprint,
     None,
 }
 

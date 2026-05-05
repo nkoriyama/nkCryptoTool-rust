@@ -29,6 +29,9 @@ struct Args {
     #[arg(long)]
     verify: bool,
 
+    #[arg(long, help = "Calculate and display the SHA3-256 fingerprint of a public key")]
+    fingerprint: bool,
+
     #[arg(long)]
     gen_enc_key: bool,
 
@@ -130,6 +133,8 @@ async fn main() -> anyhow::Result<()> {
         Operation::Sign
     } else if args.verify {
         Operation::Verify
+    } else if args.fingerprint {
+        Operation::Fingerprint
     } else if args.gen_enc_key {
         Operation::GenerateEncKey
     } else if args.gen_sign_key {

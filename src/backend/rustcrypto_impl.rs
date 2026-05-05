@@ -17,7 +17,6 @@ use fips204::traits::{KeyGen as _, SerDes as _, Signer as _, Verifier as _};
 mod rc_internal {
     pub use p256::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
     pub use pkcs8::der::Decode;
-    pub use pkcs8::EncryptedPrivateKeyInfo;
     pub use p256::{PublicKey, SecretKey};
     pub use rand_core::OsRng;
     pub use sha3::{Digest, Sha3_256, Sha3_512};
@@ -990,27 +989,6 @@ pub fn hkdf(
             "RustCrypto backend not enabled".to_string(),
         ))
     }
-}
-
-pub fn extract_raw_private_key(
-    priv_der: &[u8],
-    _passphrase_opt: Option<&str>,
-) -> Result<Zeroizing<Vec<u8>>> {
-    #[cfg(feature = "backend-rustcrypto")]
-    {
-        use rc_internal::*;
-        if let Ok(info) = EncryptedPrivateKeyInfo::from_der(priv_der) {
-            let pass = _passphrase_opt.ok_or_else(|| {
-                CryptoError::Parameter("Encrypted private key requires a passphrase".to_string())
-            })?;
-            let decrypted = info.decrypt(pass).map_err(|e| {
-                CryptoError::PrivateKeyLoad(format!("Wrong passphrase or corrupt key: {}", e))
-            })?;
-            return Ok(Zeroizing::new(decrypted.as_bytes().to_vec()));
-        }
-    }
-    // If not encrypted, return as is. Caller will handle if it's invalid plain PKCS#8.
-    Ok(Zeroizing::new(priv_der.to_vec()))
 }
 
 pub fn new_encrypt(cipher: &str, key: &[u8], iv: &[u8]) -> Result<Aead> {

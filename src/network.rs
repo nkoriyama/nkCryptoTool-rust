@@ -53,7 +53,6 @@ impl Drop for ChatActiveGuard {
 pub struct NetworkProcessor {
     config: CryptoConfig,
     semaphore: Arc<Semaphore>,
-    cached_signing_key: Option<Arc<crate::utils::SecureBuffer>>,
     cached_allowlist: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
 }
 
@@ -62,23 +61,28 @@ impl NetworkProcessor {
         Self {
             config,
             semaphore: Arc::new(Semaphore::new(100)),
-            cached_signing_key: None,
             cached_allowlist: None,
         }
     }
 
     async fn preload_allowlist(&mut self) -> Result<()> {
         if let Some(ref path) = self.config.peer_allowlist {
-            let content = std::fs::read_to_string(path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
+            let content =
+                std::fs::read_to_string(path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
             let mut set = std::collections::HashSet::new();
             for line in content.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
                     continue;
                 }
-                let bytes = hex::decode(line).map_err(|_| CryptoError::Parameter(format!("Invalid hex in allowlist: {}", line)))?;
+                let bytes = hex::decode(line).map_err(|_| {
+                    CryptoError::Parameter(format!("Invalid hex in allowlist: {}", line))
+                })?;
                 if bytes.len() != 32 {
-                    return Err(CryptoError::Parameter(format!("Invalid fingerprint length in allowlist: {}", line)));
+                    return Err(CryptoError::Parameter(format!(
+                        "Invalid fingerprint length in allowlist: {}",
+                        line
+                    )));
                 }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&bytes);
@@ -89,48 +93,14 @@ impl NetworkProcessor {
         Ok(())
     }
 
-    async fn preload_signing_key_internal(&mut self) -> Result<()> {
-        if let Some(ref privkey_path) = self.config.signing_privkey {
-            let privkey_bytes = Zeroizing::new(
-                std::fs::read(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?,
-            );
-            let privkey_pem = Zeroizing::new(
-                std::str::from_utf8(&*privkey_bytes)
-                    .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
-                    .to_string(),
-            );
-            let pass = self.config.passphrase.clone();
-            let der = crate::utils::unwrap_from_pem(&privkey_pem, "PRIVATE KEY")?;
-            let decrypted_der =
-                backend::extract_raw_private_key(&der, pass.as_deref().map(|s| s.as_str()))?;
-            // We store the raw private key bits for PQC in a SecureBuffer (with mlock)
-            let raw_priv =
-                crate::utils::unwrap_pqc_priv_from_pkcs8(&decrypted_der, &self.config.pqc_dsa_algo)?;
-            let mut secure_key = crate::utils::SecureBuffer::new(raw_priv.len())?;
-            secure_key.copy_from_slice(&raw_priv);
-            self.cached_signing_key = Some(Arc::new(secure_key));
-        }
-        Ok(())
-    }
-
-    pub async fn preload_signing_key(&mut self) -> Result<()> {
-        self.preload_signing_key_internal().await
-    }
-
-    pub fn has_cached_signing_key(&self) -> bool {
-        self.cached_signing_key.is_some()
-    }
-
     pub async fn listen(config: &CryptoConfig) -> Result<()> {
         let mut processor = Self::new(config.clone());
-        processor.preload_signing_key_internal().await?;
         processor.preload_allowlist().await?;
         processor.start().await
     }
 
     pub async fn connect(config: &CryptoConfig) -> Result<()> {
         let mut processor = Self::new(config.clone());
-        processor.preload_signing_key_internal().await?;
         processor.preload_allowlist().await?;
         processor.run_connect().await
     }
@@ -162,7 +132,7 @@ impl NetworkProcessor {
                 // F-52-3 Fix: Move early IP check BEFORE spawn to save resources
                 let mut cooldowns = PEER_COOLDOWNS.lock();
                 cooldowns.retain(|_, last_seen| last_seen.elapsed() < Duration::from_secs(120));
-                
+
                 let peer_ip = _peer.ip();
                 if let Some(last_seen) = cooldowns.get(&PeerId::Ip(peer_ip)) {
                     if last_seen.elapsed() < Duration::from_secs(2) {
@@ -170,24 +140,14 @@ impl NetworkProcessor {
                         continue;
                     }
                 }
-                // F-54 Fix: Removed IP_TO_PEER_ID cache to prevent selective DoS (Attack B/C)
-
-                // We don't insert here yet, as we haven't even started the handshake
             }
 
             let config_clone = self.config.clone();
-            let cached_key = self.cached_signing_key.clone();
             let cached_list = self.cached_allowlist.clone();
             tokio::spawn(async move {
-                if let Err(e) = Self::handle_server_connection(
-                    stream,
-                    _peer,
-                    &config_clone,
-                    permit,
-                    cached_key,
-                    cached_list,
-                )
-                .await
+                if let Err(e) =
+                    Self::handle_server_connection(stream, _peer, &config_clone, permit, cached_list)
+                        .await
                 {
                     eprintln!("Connection error with {}: {}", _peer, e);
                 }
@@ -201,7 +161,6 @@ impl NetworkProcessor {
         _peer: std::net::SocketAddr,
         config: &CryptoConfig,
         _permit: OwnedSemaphorePermit,
-        cached_signing_key: Option<Arc<crate::utils::SecureBuffer>>,
         cached_allowlist: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
     ) -> Result<()> {
         let handshake_timeout = Duration::from_secs(config.handshake_timeout);
@@ -254,7 +213,6 @@ impl NetworkProcessor {
                     hash.copy_from_slice(&hasher.finalize());
                     let peer_id = PeerId::Pubkey(hash);
                     peer_id_opt = Some(peer_id.clone());
-                    // F-54 Fix: Removed IP_TO_PEER_ID cache update to prevent Attack B/C
                 } else if !config.allow_unauth {
                     return Err(CryptoError::Parameter(
                         "Client authentication required but no public key provided".to_string(),
@@ -278,13 +236,18 @@ impl NetworkProcessor {
                     match peer_id {
                         PeerId::Pubkey(hash) => {
                             if !allowlist.contains(hash) {
-                                return Err(CryptoError::Parameter("Peer not in allowlist".to_string()));
+                                return Err(CryptoError::Parameter(
+                                    "Peer not in allowlist".to_string(),
+                                ));
                             }
                         }
                         PeerId::Ip(_) => {
                             // If we have an allowlist, we usually don't want anonymous users
                             if !config.allow_unauth {
-                                return Err(CryptoError::Parameter("Anonymous peers not allowed when allowlist is active".to_string()));
+                                return Err(CryptoError::Parameter(
+                                    "Anonymous peers not allowed when allowlist is active"
+                                        .to_string(),
+                                ));
                             }
                         }
                     }
@@ -307,7 +270,9 @@ impl NetworkProcessor {
                 )
                 .is_err()
                 {
-                    return Err(CryptoError::Parameter("Chat session already active".to_string()));
+                    return Err(CryptoError::Parameter(
+                        "Chat session already active".to_string(),
+                    ));
                 }
             }
 
@@ -345,9 +310,8 @@ impl NetworkProcessor {
 
             let mut server_hello = Vec::new();
             if server_auth_flag[0] == 1 {
-                let raw_priv = if let Some(key) = cached_signing_key {
-                    Zeroizing::new(key.as_slice().to_vec())
-                } else {
+                // F-49-10 Fix: Lazy load signing key for improved security
+                let raw_priv = {
                     let privkey_path = config.signing_privkey.as_ref().unwrap();
                     let privkey_bytes = Zeroizing::new(
                         std::fs::read(privkey_path)
@@ -366,7 +330,11 @@ impl NetworkProcessor {
                         ));
                     } else {
                         let der = crate::utils::unwrap_from_pem(&privkey_pem, "PRIVATE KEY")?;
-                        crate::utils::unwrap_pqc_priv_from_pkcs8(&der, &config.pqc_dsa_algo)?
+                        let decrypted_der = crate::utils::extract_raw_private_key(
+                            &der,
+                            config.passphrase.as_deref().map(|s| s.as_str()),
+                        )?;
+                        crate::utils::unwrap_pqc_priv_from_pkcs8(&decrypted_der, &config.pqc_dsa_algo)?
                     }
                 };
 
@@ -560,9 +528,8 @@ impl NetworkProcessor {
             transcript.extend_from_slice(&client_auth_flag);
 
             if client_auth_flag[0] == 1 {
-                let raw_priv = if let Some(key) = &self.cached_signing_key {
-                    Zeroizing::new(key.as_slice().to_vec())
-                } else {
+                // F-49-10 Fix: Lazy load signing key
+                let raw_priv = {
                     let privkey_path = self.config.signing_privkey.as_ref().unwrap();
                     let privkey_bytes = Zeroizing::new(
                         std::fs::read(privkey_path)
@@ -581,7 +548,11 @@ impl NetworkProcessor {
                         ));
                     } else {
                         let der = crate::utils::unwrap_from_pem(&privkey_pem, "PRIVATE KEY")?;
-                        crate::utils::unwrap_pqc_priv_from_pkcs8(&der, &self.config.pqc_dsa_algo)?
+                        let decrypted_der = crate::utils::extract_raw_private_key(
+                            &der,
+                            self.config.passphrase.as_deref().map(|s| s.as_str()),
+                        )?;
+                        crate::utils::unwrap_pqc_priv_from_pkcs8(&decrypted_der, &self.config.pqc_dsa_algo)?
                     }
                 };
 
@@ -804,7 +775,8 @@ impl NetworkProcessor {
                     let mut len_bytes = [0u8; 4];
                     // #1: Add idle timeout for data phase
                     let read_res =
-                        tokio::time::timeout(IDLE_TIMEOUT, stream_rx.read_exact(&mut len_bytes)).await;
+                        tokio::time::timeout(IDLE_TIMEOUT, stream_rx.read_exact(&mut len_bytes))
+                            .await;
                     match read_res {
                         Ok(Ok(_)) => {}
                         Ok(Err(_)) | Err(_) => break, // Error or Timeout
@@ -822,7 +794,9 @@ impl NetworkProcessor {
                     tokio::time::timeout(IDLE_TIMEOUT, stream_rx.read_exact(&mut packet))
                         .await
                         .map_err(|_| {
-                            CryptoError::Parameter("Idle timeout while reading chat packet".to_string())
+                            CryptoError::Parameter(
+                                "Idle timeout while reading chat packet".to_string(),
+                            )
                         })?
                         .map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
@@ -886,7 +860,8 @@ impl NetworkProcessor {
                     out_buf.fill(0);
                 }
                 Ok::<(), CryptoError>(())
-            }.await;
+            }
+            .await;
             let _ = rx_done_tx.send(result).await;
         });
 

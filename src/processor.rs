@@ -70,8 +70,38 @@ impl CryptoProcessor {
             Operation::GenerateEncKey => self.generate_encryption_key_pair(config),
             Operation::GenerateSignKey => self.generate_signing_key_pair(config),
             Operation::RegeneratePubKey => self.regenerate_pubkey(config, &mut passphrase),
+            Operation::Fingerprint => self.calculate_fingerprint(config),
             _ => Err(CryptoError::Parameter("Unsupported operation".to_string())),
         }
+    }
+
+    fn calculate_fingerprint(&self, config: &CryptoConfig) -> Result<()> {
+        let pub_path = config.recipient_pubkey.as_ref().or(config.signing_pubkey.as_ref())
+            .ok_or(CryptoError::Parameter("No public key path specified. Use --recipient-pubkey or --signing-pubkey".to_string()))?;
+        
+        let pub_bytes = std::fs::read(pub_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
+        let pem_str = std::str::from_utf8(&pub_bytes)
+            .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
+        
+        let der = crate::utils::unwrap_from_pem(pem_str, "PUBLIC KEY")?;
+        
+        let raw_pub = match config.mode {
+            CryptoMode::PQC => {
+                crate::utils::unwrap_pqc_pub_from_spki(&der, "any")?
+            }
+            _ => {
+                return Err(CryptoError::Parameter("Fingerprint calculation only supported for PQC mode for now".to_string()));
+            }
+        };
+
+        use sha3::{Digest, Sha3_256};
+        let mut hasher = Sha3_256::new();
+        hasher.update(&raw_pub);
+        let hash = hasher.finalize();
+        
+        println!("Fingerprint: {}", hex::encode(hash));
+        
+        Ok(())
     }
 
     fn regenerate_pubkey(
@@ -652,7 +682,7 @@ impl CryptoProcessor {
     pub fn generate_signing_key_pair(&self, config: &CryptoConfig) -> Result<()> {
         let mut key_paths = HashMap::new();
         key_paths.insert(
-            "signing-public-key".to_string(),
+            "public-key".to_string(),
             format!(
                 "{}/public_sign_{}.key",
                 config.key_dir,
@@ -660,7 +690,7 @@ impl CryptoProcessor {
             ),
         );
         key_paths.insert(
-            "signing-private-key".to_string(),
+            "private-key".to_string(),
             format!(
                 "{}/private_sign_{}.key",
                 config.key_dir,
