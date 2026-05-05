@@ -19,6 +19,7 @@ sha3 = { version = "0.10", features = ["zeroize"] }
 sha2 = "0.10"
 hkdf = "0.12"
 base64 = "0.21"
+pkcs8 = { version = "0.10", features = ["encryption"] }
 foreign-types = { version = "0.3", optional = true }
 zeroize = { version = "1.0", features = ["derive"] }
 rpassword = "7.2"
@@ -30,7 +31,6 @@ hex = "0.4"
 # RustCrypto ecosystem
 aes-gcm = { version = "0.10", optional = true }
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pem", "pkcs8"], optional = true }
-pkcs8 = { version = "0.10", features = ["encryption"], optional = true }
 ecdsa = { version = "0.16", optional = true }
 signature = { version = "2.2", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
@@ -52,7 +52,6 @@ backend-openssl = ["openssl", "openssl-sys", "foreign-types"]
 backend-rustcrypto = [
     "aes-gcm",
     "p256",
-    "pkcs8",
     "ecdsa",
     "signature",
     "aes",

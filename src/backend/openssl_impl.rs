@@ -74,6 +74,118 @@ fn load_private_key_robust(
 }
 
 #[cfg(feature = "backend-openssl")]
+mod ffi_ext {
+    use libc;
+    use openssl_sys as ffi;
+
+    pub const OSSL_PKEY_PARAM_PRIV_KEY: *const libc::c_char = b"priv\0".as_ptr() as *const _;
+    pub const OSSL_PKEY_PARAM_PUB_KEY: *const libc::c_char = b"pub\0".as_ptr() as *const _;
+    pub const OSSL_PKEY_PARAM_ML_KEM_SEED: *const libc::c_char = b"seed\0".as_ptr() as *const _;
+
+    pub const EVP_PKEY_KEY_PARAMETERS: libc::c_int = 0x0001;
+    pub const EVP_PKEY_PUBLIC_KEY: libc::c_int = 0x0002;
+    pub const EVP_PKEY_PRIVATE_KEY: libc::c_int = 0x0004;
+    pub const EVP_PKEY_KEYPAIR: libc::c_int =
+        EVP_PKEY_KEY_PARAMETERS | EVP_PKEY_PUBLIC_KEY | EVP_PKEY_PRIVATE_KEY;
+
+    extern "C" {
+        pub fn EVP_PKEY_Q_keygen(
+            libctx: *mut ffi::OSSL_LIB_CTX,
+            propq: *const libc::c_char,
+            name: *const libc::c_char,
+            ...
+        ) -> *mut ffi::EVP_PKEY;
+
+        pub fn EVP_PKEY_get_octet_string_param(
+            pkey: *const ffi::EVP_PKEY,
+            key_name: *const libc::c_char,
+            buf: *mut libc::c_uchar,
+            max_buflen: libc::size_t,
+            out_len: *mut libc::size_t,
+        ) -> libc::c_int;
+
+        pub fn OSSL_PARAM_BLD_new() -> *mut libc::c_void;
+        pub fn OSSL_PARAM_BLD_to_param(bld: *mut libc::c_void) -> *mut ffi::OSSL_PARAM;
+        pub fn OSSL_PARAM_BLD_free(bld: *mut libc::c_void);
+        pub fn OSSL_PARAM_free(params: *mut ffi::OSSL_PARAM);
+        pub fn OSSL_PARAM_BLD_push_octet_string(
+            bld: *mut libc::c_void,
+            key: *const libc::c_char,
+            buf: *const libc::c_void,
+            bsize: libc::size_t,
+        ) -> libc::c_int;
+
+        pub fn EVP_PKEY_fromdata_init(ctx: *mut ffi::EVP_PKEY_CTX) -> libc::c_int;
+        pub fn EVP_PKEY_fromdata(
+            ctx: *mut ffi::EVP_PKEY_CTX,
+            ppkey: *mut *mut ffi::EVP_PKEY,
+            selection: libc::c_int,
+            params: *mut ffi::OSSL_PARAM,
+        ) -> libc::c_int;
+    }
+}
+
+#[cfg(feature = "backend-openssl")]
+fn pkey_from_raw(
+    algo: &str,
+    raw: &[u8],
+    is_private: bool,
+) -> Result<PKey<openssl::pkey::Private>> {
+    use ffi_ext::*;
+    unsafe {
+        let algo_c =
+            std::ffi::CString::new(algo).map_err(|e| CryptoError::Parameter(e.to_string()))?;
+        let ctx = ffi::EVP_PKEY_CTX_new_from_name(
+            std::ptr::null_mut(),
+            algo_c.as_ptr(),
+            std::ptr::null(),
+        );
+        if ctx.is_null() {
+            return Err(CryptoError::OpenSSL(
+                "EVP_PKEY_CTX_new_from_name failed".to_string(),
+            ));
+        }
+
+        let mut res = Err(CryptoError::OpenSSL("Failed to reconstruct PKey".to_string()));
+
+        if EVP_PKEY_fromdata_init(ctx) == 1 {
+            let bld = OSSL_PARAM_BLD_new();
+            if !bld.is_null() {
+                let key_param = if is_private {
+                    OSSL_PKEY_PARAM_PRIV_KEY
+                } else {
+                    OSSL_PKEY_PARAM_PUB_KEY
+                };
+                if OSSL_PARAM_BLD_push_octet_string(
+                    bld,
+                    key_param,
+                    raw.as_ptr() as *const _,
+                    raw.len(),
+                ) == 1
+                {
+                    let params = OSSL_PARAM_BLD_to_param(bld);
+                    if !params.is_null() {
+                        let mut pkey_ptr: *mut ffi::EVP_PKEY = std::ptr::null_mut();
+                        let selection = if is_private {
+                            EVP_PKEY_KEYPAIR
+                        } else {
+                            EVP_PKEY_PUBLIC_KEY
+                        };
+                        if EVP_PKEY_fromdata(ctx, &mut pkey_ptr, selection, params) == 1 {
+                            res = Ok(PKey::from_ptr(pkey_ptr));
+                        }
+                        OSSL_PARAM_free(params);
+                    }
+                }
+                OSSL_PARAM_BLD_free(bld);
+            }
+        }
+        ffi::EVP_PKEY_CTX_free(ctx);
+        res
+    }
+}
+
+#[cfg(feature = "backend-openssl")]
 fn load_public_key_robust(der: &[u8]) -> Result<PKey<openssl::pkey::Public>> {
     if let Ok(pkey) = PKey::public_key_from_der(der) {
         return Ok(pkey);
@@ -434,30 +546,133 @@ pub fn extract_public_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<V
 }
 
 pub fn pqc_keygen_kem(
-    _algo: &str,
+    algo: &str,
 ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option<Zeroizing<Vec<u8>>>)> {
-    Err(CryptoError::Parameter(
-        "PQC keygen not supported in this OpenSSL version".to_string(),
-    ))
+    #[cfg(feature = "backend-openssl")]
+    {
+        use ffi_ext::*;
+        unsafe {
+            let algo_c = std::ffi::CString::new(algo)
+                .map_err(|e| CryptoError::Parameter(e.to_string()))?;
+            let pkey_ptr =
+                EVP_PKEY_Q_keygen(std::ptr::null_mut(), std::ptr::null(), algo_c.as_ptr());
+            if pkey_ptr.is_null() {
+                return Err(CryptoError::OpenSSL("EVP_PKEY_Q_keygen failed".to_string()));
+            }
+            let pkey: PKey<openssl::pkey::Private> = PKey::from_ptr(pkey_ptr);
+
+            let mut sk_len: libc::size_t = 0;
+            if EVP_PKEY_get_octet_string_param(
+                pkey.as_ptr(),
+                OSSL_PKEY_PARAM_PRIV_KEY,
+                std::ptr::null_mut(),
+                0,
+                &mut sk_len,
+            ) != 1
+            {
+                return Err(CryptoError::OpenSSL(
+                    "Failed to get SK length".to_string(),
+                ));
+            }
+            let mut sk = Zeroizing::new(vec![0u8; sk_len]);
+            if EVP_PKEY_get_octet_string_param(
+                pkey.as_ptr(),
+                OSSL_PKEY_PARAM_PRIV_KEY,
+                sk.as_mut_ptr(),
+                sk_len,
+                &mut sk_len,
+            ) != 1
+            {
+                return Err(CryptoError::OpenSSL("Failed to get SK".to_string()));
+            }
+
+            let mut pk_len: libc::size_t = 0;
+            if EVP_PKEY_get_octet_string_param(
+                pkey.as_ptr(),
+                OSSL_PKEY_PARAM_PUB_KEY,
+                std::ptr::null_mut(),
+                0,
+                &mut pk_len,
+            ) != 1
+            {
+                return Err(CryptoError::OpenSSL(
+                    "Failed to get PK length".to_string(),
+                ));
+            }
+            let mut pk = vec![0u8; pk_len];
+            if EVP_PKEY_get_octet_string_param(
+                pkey.as_ptr(),
+                OSSL_PKEY_PARAM_PUB_KEY,
+                pk.as_mut_ptr(),
+                pk_len,
+                &mut pk_len,
+            ) != 1
+            {
+                return Err(CryptoError::OpenSSL("Failed to get PK".to_string()));
+            }
+
+            let mut seed_len: libc::size_t = 0;
+            let mut seed = None;
+            if EVP_PKEY_get_octet_string_param(
+                pkey.as_ptr(),
+                OSSL_PKEY_PARAM_ML_KEM_SEED,
+                std::ptr::null_mut(),
+                0,
+                &mut seed_len,
+            ) == 1
+            {
+                let mut s = Zeroizing::new(vec![0u8; seed_len]);
+                if EVP_PKEY_get_octet_string_param(
+                    pkey.as_ptr(),
+                    OSSL_PKEY_PARAM_ML_KEM_SEED,
+                    s.as_mut_ptr(),
+                    seed_len,
+                    &mut seed_len,
+                ) == 1
+                {
+                    seed = Some(s);
+                }
+            }
+
+            Ok((sk, pk, seed))
+        }
+    }
+    #[cfg(not(feature = "backend-openssl"))]
+    {
+        let _ = algo;
+        Err(CryptoError::Parameter(
+            "OpenSSL backend not enabled".to_string(),
+        ))
+    }
 }
 
 pub fn pqc_keygen_dsa(
-    _algo: &str,
+    algo: &str,
 ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option<Zeroizing<Vec<u8>>>)> {
-    Err(CryptoError::Parameter(
-        "PQC keygen not supported in this OpenSSL version".to_string(),
-    ))
+    #[cfg(feature = "backend-openssl")]
+    {
+        // DSA version of keygen is the same as KEM in OpenSSL 3.5+
+        pqc_keygen_kem(algo)
+    }
+    #[cfg(not(feature = "backend-openssl"))]
+    {
+        let _ = algo;
+        Err(CryptoError::Parameter(
+            "OpenSSL backend not enabled".to_string(),
+        ))
+    }
 }
 
 pub fn pqc_sign(
-    _algo: &str,
-    priv_der: &[u8],
+    algo: &str,
+    raw_priv: &[u8],
     message: &[u8],
     passphrase: Option<&str>,
 ) -> Result<Vec<u8>> {
     #[cfg(feature = "backend-openssl")]
     {
-        let pkey = load_private_key_robust(priv_der, passphrase)?;
+        let _ = passphrase;
+        let pkey = pkey_from_raw(algo, raw_priv, true)?;
         let ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         // PQC DSA in OpenSSL uses DigestSign with NULL digest
         unsafe {
@@ -507,17 +722,22 @@ pub fn pqc_sign(
     }
     #[cfg(not(feature = "backend-openssl"))]
     {
-        let _ = (priv_der, message, passphrase, _algo);
+        let _ = (raw_priv, message, passphrase, algo);
         Err(CryptoError::Parameter(
             "OpenSSL backend not enabled".to_string(),
         ))
     }
 }
 
-pub fn pqc_verify(_algo: &str, pub_der: &[u8], message: &[u8], signature: &[u8]) -> Result<bool> {
+pub fn pqc_verify(
+    algo: &str,
+    raw_pub: &[u8],
+    message: &[u8],
+    signature: &[u8],
+) -> Result<bool> {
     #[cfg(feature = "backend-openssl")]
     {
-        let pkey = load_public_key_robust(pub_der)?;
+        let pkey = pkey_from_raw(algo, raw_pub, false)?;
         let ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         unsafe {
             if ffi::EVP_DigestVerifyInit(
@@ -550,17 +770,17 @@ pub fn pqc_verify(_algo: &str, pub_der: &[u8], message: &[u8], signature: &[u8])
     }
     #[cfg(not(feature = "backend-openssl"))]
     {
-        let _ = (pub_der, message, signature, _algo);
+        let _ = (raw_pub, message, signature, algo);
         Err(CryptoError::Parameter(
             "OpenSSL backend not enabled".to_string(),
         ))
     }
 }
 
-pub fn pqc_encap(_algo: &str, peer_pub_der: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
+pub fn pqc_encap(algo: &str, peer_pub_raw: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
     #[cfg(feature = "backend-openssl")]
     {
-        let pkey = load_public_key_robust(peer_pub_der)?;
+        let pkey = pkey_from_raw(algo, peer_pub_raw, false)?;
         unsafe {
             let ctx = ffi::EVP_PKEY_CTX_new(pkey.as_ptr(), ptr::null_mut());
             if ctx.is_null() {
@@ -610,7 +830,7 @@ pub fn pqc_encap(_algo: &str, peer_pub_der: &[u8]) -> Result<(Zeroizing<Vec<u8>>
     }
     #[cfg(not(feature = "backend-openssl"))]
     {
-        let _ = (peer_pub_der, _algo);
+        let _ = (peer_pub_raw, algo);
         Err(CryptoError::Parameter(
             "OpenSSL backend not enabled".to_string(),
         ))
@@ -618,14 +838,14 @@ pub fn pqc_encap(_algo: &str, peer_pub_der: &[u8]) -> Result<(Zeroizing<Vec<u8>>
 }
 
 pub fn pqc_decap(
-    _algo: &str,
-    priv_der: &[u8],
+    algo: &str,
+    raw_priv: &[u8],
     kem_ct: &[u8],
-    passphrase: Option<&str>,
+    _passphrase: Option<&str>,
 ) -> Result<Zeroizing<Vec<u8>>> {
     #[cfg(feature = "backend-openssl")]
     {
-        let pkey = load_private_key_robust(priv_der, passphrase)?;
+        let pkey = pkey_from_raw(algo, raw_priv, true)?;
         unsafe {
             let ctx = ffi::EVP_PKEY_CTX_new(pkey.as_ptr(), ptr::null_mut());
             if ctx.is_null() {
@@ -672,7 +892,7 @@ pub fn pqc_decap(
     }
     #[cfg(not(feature = "backend-openssl"))]
     {
-        let _ = (priv_der, kem_ct, passphrase, _algo);
+        let _ = (raw_priv, kem_ct, _passphrase, algo);
         Err(CryptoError::Parameter(
             "OpenSSL backend not enabled".to_string(),
         ))
@@ -685,38 +905,18 @@ pub fn extract_raw_private_key(
 ) -> Result<Zeroizing<Vec<u8>>> {
     #[cfg(feature = "backend-openssl")]
     {
-        // F-51-2: Detect PQC OIDs and advise users to use rustcrypto backend for encrypted PQC keys
-        let pqc_oids = [
-            vec![0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x04, 0x01], // ML-KEM-512
-            vec![0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x04, 0x02], // ML-KEM-768
-            vec![0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x04, 0x03], // ML-KEM-1024
-            vec![0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11], // ML-DSA-44
-            vec![0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x12], // ML-DSA-65
-            vec![0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x13], // ML-DSA-87
-        ];
-
-        let mut is_pqc = false;
-        for oid in &pqc_oids {
-            if priv_der.windows(oid.len()).any(|w| w == oid) {
-                is_pqc = true;
-                break;
+        use pkcs8::der::Decode;
+        if let Some(pass) = passphrase {
+            if let Ok(pki) = pkcs8::EncryptedPrivateKeyInfo::from_der(priv_der) {
+                let decrypted = pki
+                    .decrypt(pass)
+                    .map_err(|e| CryptoError::PrivateKeyLoad(format!("Decryption failed: {}", e)))?;
+                return Ok(Zeroizing::new(decrypted.as_bytes().to_vec()));
             }
         }
 
-        // F-53-1/2 Fix: Reject known PLAIN PQC keys in OpenSSL backend with clear advice.
-        // We don't reject PBES2 here because it might be an encrypted ECC key (Attack I fix).
-        if is_pqc {
-            return Err(CryptoError::Parameter(
-                "PQC keys are not supported with OpenSSL backend. \
-                 Please use --features backend-rustcrypto."
-                    .to_string(),
-            ));
-        }
-
-        let pkey = load_private_key_robust(priv_der, passphrase)?;
-        pkey.private_key_to_der()
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))
-            .map(Zeroizing::new)
+        // If not encrypted or decryption failed (and we want to try loading as is), return original
+        Ok(Zeroizing::new(priv_der.to_vec()))
     }
     #[cfg(not(feature = "backend-openssl"))]
     {

@@ -40,11 +40,13 @@ Keys are derived using HKDF-SHA3-256 and exist only during active cryptographic 
 
 Sensitive data is protected in memory using:
 
-* `SecureBuffer` which uses `mlock` (where supported) to prevent swapping to disk
-* Explicit zeroization using the `zeroize` crate (via `#[derive(Zeroize)]` and `Zeroizing<T>` wrappers)
-* Memory-mapped files (`mmap`) for large data processing to avoid unnecessary copies
+* `SecureBuffer` which uses `mlock` (where supported) to prevent the page from being **swapped to disk**.
+* Explicit zeroization using the `zeroize` crate (via `#[derive(Zeroize)]` and `Zeroizing<T>` wrappers).
+* Streaming I/O via Tokio for large data processing to avoid unnecessary copies.
 
-All sensitive buffers and keys are stored in `Zeroizing` containers to ensure they are wiped before deallocation.
+All sensitive buffers and ephemeral keys are stored in `Zeroizing` containers to ensure they are wiped before deallocation.
+
+**Scope of `mlock` protection**: `mlock` only prevents the OS from paging the memory out to swap. It does **not** prevent in-RAM scraping by an attacker with `ptrace` capability or read access to `/proc/<pid>/mem`. See "Known Limitations" below.
 
 ---
 
@@ -87,6 +89,8 @@ When TPM is used:
 * Operations are performed using TPM 2.0 HMAC sessions to protect against interception.
 * No secrets are passed via command-line arguments.
 * Communication with TPM is performed directly via `tpm2-tools` with secure argument handling.
+
+**Current scope**: TPM-backed key protection is supported only for **local file operations** (encrypt / decrypt / sign / verify). The network mode (chat / file transfer over TCP) **does not currently support TPM-wrapped keys** and will reject them at handshake. For network use, plain or PBES2-encrypted keys must be supplied.
 
 ---
 
@@ -145,11 +149,14 @@ The following are outside the scope of user-space protections:
 * Compromised or untrusted operating system kernels.
 * Privileged attackers (e.g., root access, ptrace).
 * Abrupt process termination that prevents cleanup (e.g., `SIGKILL`, hardware failure).
+* In-RAM scraping by same-user processes (the `cached_signing_key` cache used in network mode persists for the process lifetime; an attacker able to `ptrace` or read `/proc/<pid>/mem` can recover it).
 
 In such cases:
 
 * Sensitive data may temporarily remain in RAM.
 * However, it is never written to disk due to `mlock` and disabled core dumps.
+
+To harden against same-user memory scraping, deploy on systems with `kernel.yama.ptrace_scope=2` (admin-only attach) or `=3` (no attach) and run the tool under a dedicated UID.
 
 ---
 
@@ -157,21 +164,22 @@ In such cases:
 
 This tool is designed to protect against:
 
-* Accidental data leakage.
-* Memory scraping from user-space processes.
-* Network-based replay and slow-sender attacks.
-* Disk persistence of sensitive material.
+* Accidental data leakage to disk.
+* Casual memory inspection (zeroization on drop, no swap via `mlock`, disabled core dumps).
+* Network-based replay, slow-sender, and many-key DoS attacks.
+* Man-in-the-middle attacks on the network handshake (when authentication is enabled).
 
-**Assumed attacker capabilities:**
-* Unprivileged local user.
-* Ability to inspect process memory (limited).
+**Assumed attacker capabilities (in scope):**
+* Unprivileged local user without `ptrace` capability.
 * Network eavesdropper or active man-in-the-middle.
+* Adversary controlling many peer keypairs attempting DoS via chat-slot occupation.
 
 This tool does **not** defend against:
 
-* Physical attacks on memory hardware.
-* Kernel-level compromise.
-* Advanced side-channel attacks (e.g., power analysis).
+* Physical attacks on memory hardware (cold boot, hardware probing).
+* Kernel-level compromise or root attackers.
+* Same-user attackers with `ptrace` capability or read access to `/proc/<pid>/mem` (the network-mode signing-key cache is exposed).
+* Advanced side-channel attacks (e.g., power analysis, fine-grained timing).
 
 ---
 
@@ -180,9 +188,11 @@ This tool does **not** defend against:
 For maximum security:
 
 * Run on a trusted operating system with a modern kernel.
-* Use TPM-backed key protection (`--use-tpm`) for long-term keys.
-* Enable mutual authentication using ML-DSA signatures.
+* Use TPM-backed key protection (`--use-tpm`) for long-term keys **used in local file operations**. (Network mode does not currently consume TPM-wrapped keys.)
+* Enable mutual authentication using ML-DSA signatures (the default; do not pass `--allow-unauth`).
+* In chat mode, use `--peer-allowlist` to restrict access to known peer fingerprints.
 * Regularly rotate signing keys.
+* Restrict `ptrace` (e.g., `kernel.yama.ptrace_scope=2`) on the host running the network mode to harden the in-memory signing-key cache.
 
 ---
 
@@ -198,11 +208,15 @@ Since nkCryptoTool does not utilize a central Certificate Authority (CA), the se
 ### Availability and Anti-Replay
 To ensure server availability and protect against session-level attacks:
 
+*   **Handshake Timeout:** 15 seconds default (`--handshake-timeout`, configurable). Prevents half-open handshake DoS.
 *   **Idle Timeouts:** Strict idle timeout (300 seconds) across all data transfer stages.
-*   **Cumulative Session Timeout:** aggregate timeout (2 hours) for the entire data transfer session to prevent "Slow Sender" attacks.
-*   **Resource Capping:** Simultaneous connections are limited to 100 via a global semaphore.
-*   **Anti-Replay (Chat Mode):** A memory-limited history of used nonces (up to 10,000) is maintained per session.
-*   **CPU Load Mitigation:** Handshake costs (ML-KEM/ML-DSA) and strict timeouts provide defense against CPU exhaustion.
+*   **Cumulative Session Timeouts:** Aggregate 2-hour timeout for both file transfer (`CUMULATIVE_TIMEOUT`) and chat (`CHAT_SESSION_TIMEOUT`) to bound resource occupation.
+*   **Resource Capping:** Simultaneous connections are limited to 100 via a global semaphore. Handshake vectors (`read_vec`) are capped at 8 KiB.
+*   **Anti-Replay (Chat Mode):** A memory-limited sliding window of used nonces (up to 100,000) is maintained per session; oldest entries are evicted on overflow.
+*   **Peer Identity Cooldown (Chat):** After a chat session ends, the peer (identified by long-term ML-DSA pubkey fingerprint, or by source IP for unauthenticated peers) is barred from reconnecting for 60 seconds.
+*   **Peer Allowlist (Optional):** `--peer-allowlist <file>` restricts chat to a fixed set of known peer fingerprints, raising the cost of "many-key DoS" attacks.
+*   **Authentication Default:** `--allow-unauth` defaults to `false`. Mutual ML-DSA authentication is required by default.
+*   **CPU Load Mitigation:** Handshake costs (ML-KEM/ML-DSA) and strict timeouts provide defense against CPU exhaustion. Heavy crypto runs on `tokio::task::spawn_blocking`.
 
 
 ---
@@ -243,14 +257,14 @@ Violation of these invariants may invalidate the guarantees described in this do
 
 ## Summary
 
-nkCryptoTool enforces a strict security model:
+nkCryptoTool enforces a layered security model:
 
-* Keys are ephemeral and hybrid (Classical + PQC).
-* Memory is protected with `mlock` and zeroed via `zeroize`.
-* Network sessions are protected against replay and slow-sender attacks.
-* Disk exposure is prevented.
+* **Cryptography**: Hybrid (Classical + PQC) keys, ephemeral session keys derived per handshake via HKDF-SHA3-256.
+* **Memory**: `mlock` to prevent swap, `zeroize` on drop, disabled core dumps. `mlock` does not defend against in-RAM scraping.
+* **Network**: Mutual authentication required by default, replay protection (sliding-window nonce store, 100k entries), per-peer cooldown (60 s), optional peer allowlist, configurable handshake timeout.
+* **Disk**: PKCS#8 / PBES2-encrypted private keys. `secure_write` enforces atomic writes with `O_NOFOLLOW`-equivalent semantics and 0o600 permission.
 
 This design maximizes protection within the constraints of user-space cryptographic security.
 
-**This document reflects the actual implementation and is kept in sync with the codebase.**
+**This document reflects the actual implementation (v55) and is kept in sync with the codebase.**
 

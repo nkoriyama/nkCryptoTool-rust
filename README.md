@@ -1,8 +1,6 @@
 # **nkCryptoTool (Rust Version)**
 
-> **🚧 現在開発中（Alpha段階）**  
-> CLIのみ対応です。本格的な利用はまだおすすめしていません。  
-> C++版とRust版で完全な相互互換性があります。
+> CLI 版のツールです。C++ 版と Rust 版でバイナリレベルの相互互換性を維持しています。
 
 **nkCryptoToolは、次世代暗号技術を含む高度な暗号処理をコマンドラインで手軽にセキュアに実行できるツールです。**
 
@@ -65,6 +63,19 @@ cargo build --release --no-default-features --features backend-rustcrypto
 * 検証:
   `nk-crypto-tool --mode ecc --verify --signing-pubkey <pub.key> --signature <file.sig> <input.txt>`
 
+### **ネットワークモード（チャット / ファイル転送）**
+
+* チャット (サーバ):
+  `nk-crypto-tool --mode pqc --listen 0.0.0.0:9000 --chat --signing-privkey <priv.key> --signing-pubkey <peer_pub.key>`
+* チャット (クライアント):
+  `nk-crypto-tool --mode pqc --connect example.com:9000 --chat --signing-privkey <priv.key> --signing-pubkey <peer_pub.key>`
+* ピア許可リストを併用 (推奨):
+  `nk-crypto-tool ... --peer-allowlist <allowlist.txt>`
+  許可リストは 1 行 1 件の SHA3-256(公開鍵 raw bytes) を hex で記述します。
+* 認証必須化はデフォルト動作です。テスト用途に限り `--allow-unauth` で無効化できますが、本番では使用しないでください。
+
+詳細は [`SECURITY.md`](./SECURITY.md) と [`SPEC.md`](./SPEC.md) を参照。
+
 ## **鍵の互換性と標準フォーマット**
 
 本ツールで生成される鍵ペアは、異なる実装（C++版/Rust版）や異なるバックエンド（OpenSSL/WolfSSL/RustCrypto）の間で、変換なしにそのまま相互利用可能です。
@@ -78,7 +89,7 @@ cargo build --release --no-default-features --features backend-rustcrypto
 
 ### **2. PQC (耐量子計算機暗号)**
 *   **アルゴリズム**: NIST標準の ML-KEM (Kyber) および ML-DSA (Dilithium) を採用。
-*   **ASN.1 構造**: IETFドラフトに基づいた標準的なデータ構造を共通採用しています。
+*   **ASN.1 構造**:
     *   **公開鍵 (SubjectPublicKeyInfo)**:
         ```asn1
         SEQUENCE {
@@ -86,22 +97,19 @@ cargo build --release --no-default-features --features backend-rustcrypto
           subjectPublicKey BIT STRING           -- 生の公開鍵バイナリ
         }
         ```
-    *   **秘密鍵 (PKCS#8 / OneAsymmetricKey)**:
+    *   **秘密鍵 (PKCS#8 / PrivateKeyInfo, RFC 5208)**:
         ```asn1
         SEQUENCE {
-          version           INTEGER (0),
+          version             INTEGER (0),
           privateKeyAlgorithm AlgorithmIdentifier,
-          privateKey        OCTET STRING {
-            SEQUENCE {
-              seed          OCTET STRING,       -- 鍵生成シード (xi / d,z)
-              rawKey        OCTET STRING        -- 生の秘密鍵バイナリ
-            }
-          }
+          privateKey          OCTET STRING       -- 生の秘密鍵バイナリ (拡張鍵)
         }
         ```
+        秘密鍵は FIPS 203/204 が定義する **expanded private key** をそのまま OCTET STRING に格納します（シード保存は採用していません）。
+    *   **暗号化秘密鍵 (Encrypted PKCS#8, PBES2)**: パスフレーズを指定して鍵を生成した場合、上記の `PrivateKeyInfo` は標準的な **PBES2 (RFC 5958 / RFC 8018)** スキームで AES 暗号化されます。RustCrypto バックエンドは復号をサポートします。
 *   **OID (Object Identifier)**: 全実装で以下の標準識別子を使用します（出典: **NIST CSOR**, **FIPS 203/204**）。
-    *   ML-KEM-768: `2.16.840.1.101.3.4.4.2` (id-alg-ml-kem-768)
-    *   ML-DSA-65: `2.16.840.1.101.3.4.3.18` (id-ml-dsa-65)
+    *   ML-KEM-512 / 768 / 1024: `2.16.840.1.101.3.4.4.{1,2,3}`
+    *   ML-DSA-44 / 65 / 87: `2.16.840.1.101.3.4.3.{17,18,19}`
 *   これにより、Rust版で生成した PQC 鍵を C++版で直接読み込むといった、バイナリレベルの相互運用性を実現しています。
 
 
@@ -110,27 +118,23 @@ cargo build --release --no-default-features --features backend-rustcrypto
 
 ## **パフォーマンス**
 
-2.0 GiB の大容量ファイルを用いた最新のベンチマーク結果（Gen4 NVMe / x86_64 / Linux 環境）。
-Tokio による非同期 I/O パイプラインにより、全バックエンドでディスク I/O の限界に近い性能を発揮します。
+2.0 GiB のランダムデータを用いた v56 時点のベンチマーク結果（x86_64 / Linux / tmpfs 上で計測）。
+Tokio による非同期 I/O パイプラインにより、ディスク I/O や暗号エンジンの限界に近い性能を発揮します。
 
-| バックエンド (言語) | モード | 暗号化速度 | 復号速度 |
+| バックエンド | モード | 暗号化 | 復号 |
 | :--- | :--- | :--- | :--- |
-| **OpenSSL (Rust)** | **Hybrid (PQC+ECC)** | **~3.7 GiB/s** | **~3.8 GiB/s** |
-| **OpenSSL (Rust)** | PQC (ML-KEM-1024) | ~3.7 GiB/s | ~3.8 GiB/s |
-| **OpenSSL (Rust)** | ECC (P-256) | ~3.5 GiB/s | ~3.8 GiB/s |
-| OpenSSL (C++) | Hybrid (PQC+ECC) | ~2.7 GiB/s | ~2.8 GiB/s |
-| OpenSSL (C++) | PQC (ML-KEM-1024) | ~3.0 GiB/s | ~3.1 GiB/s |
-| OpenSSL (C++) | ECC (P-256) | ~2.7 GiB/s | ~2.8 GiB/s |
-| wolfSSL (C++) | Hybrid (PQC+ECC) | ~2.1 GiB/s | ~2.1 GiB/s |
-| wolfSSL (C++) | PQC (ML-KEM-1024) | ~1.9 GiB/s | ~1.9 GiB/s |
-| wolfSSL (C++) | ECC (P-256) | ~1.9 GiB/s | ~1.9 GiB/s |
-| **RustCrypto (Rust)** | **Hybrid (PQC+ECC)** | **~1.6 GiB/s** | **~1.7 GiB/s** |
-| **RustCrypto (Rust)** | PQC (ML-KEM-1024) | ~1.5 GiB/s | ~1.7 GiB/s |
-| **RustCrypto (Rust)** | ECC (P-256) | ~1.7 GiB/s | ~1.7 GiB/s |
+| **OpenSSL (Rust)** | ECC (P-256) | ~3.5 GiB/s | ~3.2 GiB/s |
+| **OpenSSL (Rust)** | PQC (ML-KEM-1024) | ~3.1 GiB/s | ~3.1 GiB/s |
+| **OpenSSL (Rust)** | Hybrid (ML-KEM-1024 + P-256) | ~3.1 GiB/s | ~3.1 GiB/s |
+| **RustCrypto (Rust)** | ECC (P-256) | ~1.2 GiB/s | ~1.2 GiB/s |
+| **RustCrypto (Rust)** | PQC (ML-KEM-1024) | ~1.1 GiB/s | ~1.2 GiB/s |
+| **RustCrypto (Rust)** | Hybrid (ML-KEM-1024 + P-256) | ~1.2 GiB/s | ~1.2 GiB/s |
 
-*   **OpenSSL バックエンド (Rust)**: 暗号化エンジンに OpenSSL の高度なアセンブリ最適化を使用しつつ、Rust の非同期 I/O パイプラインで並列化することで、C++ 版を凌駕する最高のスループットを実現します。
-*   **RustCrypto バックエンド**: 外部依存のない純 Rust 実装。SIMD 最適化（AES-NI / PCLMULQDQ）の有効化により、wolfSSL に匹敵する 1.6 GiB/s 超を達成しています。
+*   **OpenSSL バックエンド (Rust)**: 暗号化エンジンに OpenSSL の高度なアセンブリ最適化を使用しつつ、Rust の非同期 I/O パイプラインで並列化。
+    *   **PQC / Hybrid モードの native サポートには OpenSSL 3.5 以降が必要です。** それ以前のバージョンでは PQC 鍵生成・暗号化に対応しません。
+*   **RustCrypto バックエンド**: 外部 C ライブラリ非依存で、ECC・PQC・Hybrid のすべてに単独で対応。
 *   **相互運用性**: いかなる組み合わせで暗号化されたデータも、全てのバックエンドで相互に復号可能です。
+*   ベンチ値はビルドフラグ・CPU 機能（AES-NI 等）・ファイルシステム・ストレージにより変動します。再現するには `target/release/nk-crypto-tool` をビルド後、2 GiB のテストデータで計測してください。
 
 ## **統一ヘッダーフォーマット (Unified Header Format)**
 

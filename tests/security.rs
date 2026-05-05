@@ -42,7 +42,6 @@ async fn test_secure_write_atomic_force() {
     let _ = fs::remove_dir_all(test_dir);
 }
 
-#[cfg(feature = "backend-rustcrypto")]
 #[tokio::test]
 async fn test_preload_encrypted_pem() {
     use nk_crypto_tool::config::{CryptoConfig, Operation};

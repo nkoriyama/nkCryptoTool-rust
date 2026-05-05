@@ -363,26 +363,15 @@ pub fn wrap_pqc_priv_to_pkcs8_encrypted(
 ) -> Result<Vec<u8>> {
     let pkcs8_der = wrap_pqc_priv_to_pkcs8(raw_priv, algo)?;
 
-    #[cfg(feature = "backend-rustcrypto")]
-    {
-        use pkcs8::PrivateKeyInfo;
-        use rand_core::OsRng;
-        let pki = PrivateKeyInfo::from_der(&pkcs8_der)
-            .map_err(|e| CryptoError::PrivateKeyLoad(format!("PKCS#8 parse failed: {}", e)))?;
-        let encrypted = pki
-            .encrypt(OsRng, passphrase)
-            .map_err(|e| CryptoError::PrivateKeyLoad(format!("Encryption failed: {}", e)))?;
+    use pkcs8::PrivateKeyInfo;
+    use rand_core::OsRng;
+    let pki = PrivateKeyInfo::from_der(&pkcs8_der)
+        .map_err(|e| CryptoError::PrivateKeyLoad(format!("PKCS#8 parse failed: {}", e)))?;
+    let encrypted = pki
+        .encrypt(OsRng, passphrase)
+        .map_err(|e| CryptoError::PrivateKeyLoad(format!("Encryption failed: {}", e)))?;
 
-        return Ok(encrypted.as_bytes().to_vec());
-    }
-
-    #[cfg(not(feature = "backend-rustcrypto"))]
-    {
-        let _ = (raw_priv, algo, passphrase);
-        Err(CryptoError::Parameter(
-            "Encryption not supported in this build".to_string(),
-        ))
-    }
+    Ok(encrypted.as_bytes().to_vec())
 }
 
 pub fn wrap_to_pem_zeroizing(data: &[u8], label: &str) -> Zeroizing<String> {
@@ -500,13 +489,11 @@ pub fn unwrap_pqc_priv_from_pkcs8(
     der: &[u8],
     algo: &str,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    #[cfg(feature = "backend-rustcrypto")]
-    {
-        if pkcs8::EncryptedPrivateKeyInfo::from_der(der).is_ok() {
-            return Err(crate::error::CryptoError::Parameter(
-                "Encrypted private key detected. Decryption required.".to_string(),
-            ));
-        }
+    use pkcs8::der::Decode;
+    if pkcs8::EncryptedPrivateKeyInfo::from_der(der).is_ok() {
+        return Err(crate::error::CryptoError::Parameter(
+            "Encrypted private key detected. Decryption required.".to_string(),
+        ));
     }
     unwrap_pqc_priv_from_pkcs8_inner(der, algo, 0)
 }
