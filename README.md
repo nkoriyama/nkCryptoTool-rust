@@ -577,15 +577,15 @@ packet-beta
 
 | バックエンド | モード | 暗号化 | 復号 |
 | :--- | :--- | :--- | :--- |
-| **OpenSSL (Rust)** | ECC (P-256) | ~3.4 GiB/s | ~3.4 GiB/s |
-| **OpenSSL (Rust)** | PQC (ML-KEM-1024) | ~3.4 GiB/s | ~3.3 GiB/s |
-| **OpenSSL (Rust)** | Hybrid (ML-KEM + P-256) | ~3.4 GiB/s | ~3.4 GiB/s |
-| **RustCrypto (Rust)** | ECC (P-256) | ~1.2 GiB/s | ~1.3 GiB/s |
-| **RustCrypto (Rust)** | PQC (ML-KEM-1024) | ~1.1 GiB/s | ~1.2 GiB/s |
-| **RustCrypto (Rust)** | Hybrid | ~1.1 GiB/s | ~1.3 GiB/s |
+| **OpenSSL (Rust)** | ECC (P-256) | ~3.3 GiB/s | ~3.3 GiB/s |
+| **OpenSSL (Rust)** | PQC (ML-KEM-768) | ~3.2 GiB/s | ~2.5 GiB/s |
+| **OpenSSL (Rust)** | Hybrid (ML-KEM + P-256) | ~3.4 GiB/s | ~2.7 GiB/s |
+| **RustCrypto (Rust)** | ECC (P-256) | ~1.3 GiB/s | ~1.3 GiB/s |
+| **RustCrypto (Rust)** | PQC (ML-KEM-768) | ~1.2 GiB/s | ~1.3 GiB/s |
+| **RustCrypto (Rust)** | Hybrid | ~1.2 GiB/s | ~1.2 GiB/s |
 
 * **大規模ファイル対応**: v57 以降、10 GiB 以上の巨大ファイルでも性能低下が発生しないストリーミング設計に刷新。
-* **低メモリ消費**: ファイルサイズに関わらず、常時 **10〜20 MiB** のメモリ (RSS) で動作。
+* **低メモリ消費**: ファイルサイズに関わらず、常時 **10 MiB 以下** のメモリ (RSS) で動作。
 * **C++ 版との比較**: PQC モードでは Rust v57 が C++ 版とほぼ同等または微差で勝利。
 * **ベンチ実行方法**: `target/release/nk-crypto-tool` をビルド後、2〜10 GiB のテストデータで `--encrypt`/`--decrypt` を時間計測。
 
