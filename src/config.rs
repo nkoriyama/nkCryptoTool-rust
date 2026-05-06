@@ -40,6 +40,18 @@ pub enum CryptoMode {
     Hybrid,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+pub enum TransportKind {
+    Iroh,
+    Tcp,
+}
+
+impl Default for TransportKind {
+    fn default() -> Self {
+        TransportKind::Iroh
+    }
+}
+
 impl fmt::Display for CryptoMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)
@@ -94,6 +106,15 @@ pub struct CryptoConfig {
     pub force: bool,
     pub handshake_timeout: u64,
     pub peer_allowlist: Option<String>,
+    pub transport: TransportKind,
+
+    // MITM verification fingerprints
+    pub target_sign_fp: Option<[u8; 32]>,
+    pub target_enc_fp: Option<[u8; 32]>,
+
+    // Relay settings
+    pub no_relay: bool,
+    pub relay_url: Option<String>,
 
     // For regenerate-pubkey
     pub regenerate_privkey_path: Option<String>,
@@ -134,6 +155,11 @@ impl Default for CryptoConfig {
             force: false,
             handshake_timeout: 15,
             peer_allowlist: None,
+            transport: TransportKind::default(),
+            target_sign_fp: None,
+            target_enc_fp: None,
+            no_relay: false,
+            relay_url: None,
             regenerate_privkey_path: None,
             regenerate_pubkey_path: None,
         }

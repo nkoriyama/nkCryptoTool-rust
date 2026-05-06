@@ -545,6 +545,56 @@ pub fn extract_public_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<V
     }
 }
 
+pub fn pqc_pub_from_priv_dsa(algo: &str, raw_priv: &[u8]) -> Result<Vec<u8>> {
+    #[cfg(feature = "backend-openssl")]
+    {
+        use ffi_ext::*;
+        let pkey = pkey_from_raw(algo, raw_priv, true)?;
+        unsafe {
+            let mut pk_len: libc::size_t = 0;
+            if EVP_PKEY_get_octet_string_param(pkey.as_ptr(), OSSL_PKEY_PARAM_PUB_KEY, std::ptr::null_mut(), 0, &mut pk_len) != 1 {
+                return Err(CryptoError::OpenSSL("Failed to get PK length".to_string()));
+            }
+            let mut pk = vec![0u8; pk_len];
+            if EVP_PKEY_get_octet_string_param(pkey.as_ptr(), OSSL_PKEY_PARAM_PUB_KEY, pk.as_mut_ptr(), pk_len, &mut pk_len) != 1 {
+                return Err(CryptoError::OpenSSL("Failed to get PK".to_string()));
+            }
+            pk.truncate(pk_len);
+            Ok(pk)
+        }
+    }
+    #[cfg(not(feature = "backend-openssl"))]
+    {
+        let _ = (algo, raw_priv);
+        Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string()))
+    }
+}
+
+pub fn pqc_pub_from_priv_kem(algo: &str, raw_priv: &[u8]) -> Result<Vec<u8>> {
+    #[cfg(feature = "backend-openssl")]
+    {
+        use ffi_ext::*;
+        let pkey = pkey_from_raw(algo, raw_priv, true)?;
+        unsafe {
+            let mut pk_len: libc::size_t = 0;
+            if EVP_PKEY_get_octet_string_param(pkey.as_ptr(), OSSL_PKEY_PARAM_PUB_KEY, std::ptr::null_mut(), 0, &mut pk_len) != 1 {
+                return Err(CryptoError::OpenSSL("Failed to get PK length".to_string()));
+            }
+            let mut pk = vec![0u8; pk_len];
+            if EVP_PKEY_get_octet_string_param(pkey.as_ptr(), OSSL_PKEY_PARAM_PUB_KEY, pk.as_mut_ptr(), pk_len, &mut pk_len) != 1 {
+                return Err(CryptoError::OpenSSL("Failed to get PK".to_string()));
+            }
+            pk.truncate(pk_len);
+            Ok(pk)
+        }
+    }
+    #[cfg(not(feature = "backend-openssl"))]
+    {
+        let _ = (algo, raw_priv);
+        Err(CryptoError::Parameter("OpenSSL backend not enabled".to_string()))
+    }
+}
+
 pub fn pqc_keygen_kem(
     algo: &str,
 ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option<Zeroizing<Vec<u8>>>)> {

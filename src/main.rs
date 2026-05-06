@@ -50,7 +50,7 @@ struct Args {
     #[arg(long)]
     recipient_ecdh_pubkey: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, alias = "my-enc-key")]
     user_privkey: Option<String>,
 
     #[arg(long)]
@@ -59,7 +59,7 @@ struct Args {
     #[arg(long)]
     user_ecdh_privkey: Option<String>,
 
-    #[arg(long)]
+    #[arg(long, alias = "my-sign-key")]
     signing_privkey: Option<String>,
 
     #[arg(long)]
@@ -103,6 +103,15 @@ struct Args {
 
     #[arg(long, default_value = "ML-DSA-65")]
     dsa_algo: String,
+
+    #[arg(long, value_enum, default_value = "iroh")]
+    transport: nk_crypto_tool::config::TransportKind,
+
+    #[arg(long, help = "Disable Iroh relay (only direct connections)")]
+    no_relay: bool,
+
+    #[arg(long, help = "Custom Iroh relay URL")]
+    relay_url: Option<String>,
 
     #[arg(long)]
     use_tpm: bool,
@@ -188,6 +197,12 @@ async fn main() -> anyhow::Result<()> {
     config.aead_algo = args.aead_algo;
     config.pqc_kem_algo = args.kem_algo;
     config.pqc_dsa_algo = args.dsa_algo;
+    config.transport = args.transport;
+    if config.transport == nk_crypto_tool::config::TransportKind::Tcp {
+        eprintln!("[WARNING] TCP transport is deprecated and will be removed in a future version. Please use Iroh transport for better security and NAT traversal.");
+    }
+    config.no_relay = args.no_relay;
+    config.relay_url = args.relay_url;
     config.passphrase = passphrase;
     config.use_tpm = args.use_tpm;
     config.listen_addr = args.listen;

@@ -89,10 +89,59 @@ Once the handshake is complete, both parties derive symmetric keys:
 2.  **Salt Generation**: `Salt = SHA3-256(Full Handshake Transcript)`. Using the full transcript as salt ensures that the session keys are uniquely bound to the specific handshake, including all public keys and algorithm choices.
 3.  **HKDF Expansion**:
     - `PRK = HKDF-Extract(Salt, Combined_Shared_Secret)`
-    - `s2c-key = HKDF-Expand(PRK, "s2c-key", 32)`
-    - `s2c-iv = HKDF-Expand(PRK, "s2c-iv", 12)`
-    - `c2s-key = HKDF-Expand(PRK, "c2s-key", 32)`
-    - `c2s-iv = HKDF-Expand(PRK, "c2s-iv", 12)`
+    - `Label`: `"nk-auth-v3"` (for Iroh/V3) or `"nk-auth-v2"` (for legacy TCP).
+    - `s2c-key = HKDF-Expand(PRK, Label || "s2c-key", 32)`
+    - `s2c-iv = HKDF-Expand(PRK, Label || "s2c-iv", 12)`
+    - `c2s-key = HKDF-Expand(PRK, Label || "c2s-key", 32)`
+    - `c2s-iv = HKDF-Expand(PRK, Label || "c2s-iv", 12)`
+
+...
+
+## 14. Iroh-based Secure Transport
+
+`nkCryptoTool` uses the [Iroh](https://iroh.computer/) network library to provide robust, P2P connectivity with automatic NAT traversal and relay fallback.
+
+### 14.1 ALPN Multiplexing
+To support multiple modes of operation on a single endpoint, the tool uses ALPN (Application-Layer Protocol Negotiation):
+- **`nkct/chat/1`**: Dedicated to interactive chat sessions.
+- **`nkct/file/1`**: Dedicated to secure file transfer.
+
+The server (Listener) registers both ALPNs and automatically switches its logic based on the negotiated protocol of the incoming connection.
+
+### 14.2 V3 Handshake and Channel Binding
+The V3 handshake extends the base NKCT protocol with additional security and flexibility:
+- **Public Key Transmission**: Both Client and Server transmit their long-term PQC public keys (DSA and KEM) during the handshake. This enables:
+    - **Multi-client Authentication**: Servers can verify any client present in their `peer_allowlist` without needing pinned key files for each specific peer.
+    - **MITM Fingerprint Verification**: Clients can verify that the server's public key matches a fingerprint provided in the connection ticket.
+- **Channel Binding**: The handshake transcript explicitly includes the Iroh `NodeId` of both the local and remote peers in a canonical order: `[Client_NodeId][Server_NodeId]`. This binds the PQC authentication layer to the underlying Iroh TLS 1.3 transport, preventing MITM attacks even if the classical TLS layer is compromised.
+
+### 14.3 Resource Management
+Resource cleanup is managed via an explicit asynchronous block and `close().await` pattern, ensuring that Iroh's background networking tasks are terminated when a session or process ends.
+
+## 15. Connection Ticket Format (NKCT1)
+
+Connection information is encapsulated in a shareable string format for ease of use and QR code compatibility.
+
+### 15.1 Structure
+The ticket uses a binary payload encoded in Base32 (nopad) with a versioned prefix:
+`nkct1<Base32(Payload + Checksum)>`
+
+### 15.2 Binary Payload (Version 1)
+| Field | Size | Description |
+| :--- | :--- | :--- |
+| **Version** | 1 byte | Currently `0x01`. |
+| **NodeId** | 32 bytes | The peer's ed25519 public key. |
+| **Relay URL Len** | 2 bytes | Length of the relay URL string (LE). |
+| **Relay URL** | N bytes | UTF-8 URL string. |
+| **Direct Addrs Count**| 2 bytes | Number of socket addresses (LE). |
+| **Address List** | Variable | Sequence of `[Family (1b)][IP][Port (2b)]`. |
+| **PQC FP Algo** | 1 byte | Bitmask: `1` for DSA, `2` for KEM. |
+| **DSA Fingerprint** | 32 bytes | SHA3-256 of the ML-DSA public key. |
+| **KEM Fingerprint** | 32 bytes | SHA3-256 of the ML-KEM public key. |
+| **Checksum** | 4 bytes | CRC32 (ISO HDLC) over the above payload. |
+
+### 15.3 MITM Protection
+When a user connects via a ticket, the tool pins the included PQC fingerprints. During the handshake, the received public keys are hashed and compared against these pinned values. If a mismatch is detected, the connection is immediately terminated, effectively thwarting MITM attempts even on untrusted relay servers.
 
 ### 3.5 AEAD Packet Format
 

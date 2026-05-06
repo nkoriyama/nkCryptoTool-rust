@@ -11,6 +11,7 @@ pub mod key;
 pub mod network;
 pub mod processor;
 pub mod strategy;
+pub mod ticket;
 pub mod utils;
 
 pub use error::CryptoError;

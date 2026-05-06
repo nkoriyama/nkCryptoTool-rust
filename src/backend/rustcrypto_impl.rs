@@ -592,6 +592,73 @@ pub fn extract_public_key(priv_der: &[u8], _passphrase: Option<&str>) -> Result<
     }
 }
 
+pub fn pqc_pub_from_priv_dsa(algo: &str, raw_priv: &[u8]) -> Result<Vec<u8>> {
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        match algo {
+            "ML-DSA-44" => {
+                let sk_bytes: [u8; 2560] = raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?;
+                let sk = fips204::ml_dsa_44::PrivateKey::try_from_bytes(sk_bytes).map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+                Ok(sk.get_public_key().into_bytes().to_vec())
+            }
+            "ML-DSA-65" => {
+                let sk_bytes: [u8; 4032] = raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?;
+                let sk = fips204::ml_dsa_65::PrivateKey::try_from_bytes(sk_bytes).map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+                Ok(sk.get_public_key().into_bytes().to_vec())
+            }
+            "ML-DSA-87" => {
+                let sk_bytes: [u8; 4896] = raw_priv.try_into().map_err(|_| CryptoError::Parameter("Invalid key size".to_string()))?;
+                let sk = fips204::ml_dsa_87::PrivateKey::try_from_bytes(sk_bytes).map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
+                Ok(sk.get_public_key().into_bytes().to_vec())
+            }
+            _ => Err(CryptoError::Parameter(format!("Unsupported DSA: {}", algo))),
+        }
+    }
+    #[cfg(not(feature = "backend-rustcrypto"))]
+    {
+        let _ = (algo, raw_priv);
+        Err(CryptoError::Parameter("RustCrypto backend not enabled".to_string()))
+    }
+}
+
+pub fn pqc_pub_from_priv_kem(algo: &str, raw_priv: &[u8]) -> Result<Vec<u8>> {
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        match algo {
+            "ML-KEM-512" => {
+                if raw_priv.len() != 1632 {
+                    return Err(CryptoError::Parameter("Invalid key size".to_string()));
+                }
+                // FIPS 203 §7.2: dk = dk_pke || ek || H(ek) || z
+                // ML-KEM-512: dk_pke = 768, ek = 800
+                Ok(raw_priv[768..768 + 800].to_vec())
+            }
+            "ML-KEM-768" => {
+                if raw_priv.len() != 2400 {
+                    return Err(CryptoError::Parameter("Invalid key size".to_string()));
+                }
+                // ML-KEM-768: dk_pke = 1152, ek = 1184
+                Ok(raw_priv[1152..1152 + 1184].to_vec())
+            }
+            "ML-KEM-1024" => {
+                if raw_priv.len() != 3168 {
+                    return Err(CryptoError::Parameter("Invalid key size".to_string()));
+                }
+                // ML-KEM-1024: dk_pke = 1536, ek = 1568
+                Ok(raw_priv[1536..1536 + 1568].to_vec())
+            }
+            _ => Err(CryptoError::Parameter(format!("Unsupported KEM: {}", algo))),
+        }
+    }
+    #[cfg(not(feature = "backend-rustcrypto"))]
+    {
+        let _ = (algo, raw_priv);
+        Err(CryptoError::Parameter(
+            "RustCrypto backend not enabled".to_string(),
+        ))
+    }
+}
+
 #[cfg(feature = "backend-rustcrypto")]
 
 pub fn pqc_keygen_kem(

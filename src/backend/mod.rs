@@ -78,6 +78,14 @@ pub fn extract_public_key(priv_der: &[u8], passphrase: Option<&str>) -> Result<V
     crypto_impl::extract_public_key(priv_der, passphrase)
 }
 
+pub fn pqc_pub_from_priv_dsa(algo: &str, raw_priv: &[u8]) -> Result<Vec<u8>> {
+    crypto_impl::pqc_pub_from_priv_dsa(algo, raw_priv)
+}
+
+pub fn pqc_pub_from_priv_kem(algo: &str, raw_priv: &[u8]) -> Result<Vec<u8>> {
+    crypto_impl::pqc_pub_from_priv_kem(algo, raw_priv)
+}
+
 pub fn pqc_keygen_kem(
     algo: &str,
 ) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>, Option<Zeroizing<Vec<u8>>>)> {

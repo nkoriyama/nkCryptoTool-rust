@@ -29,6 +29,7 @@ libc = "0.2"
 tempfile = "3.8"
 parking_lot = "0.12"
 hex = "0.4"
+serial_test = "3.0"
 
 # RustCrypto ecosystem
 aes-gcm = { version = "0.10", optional = true }
@@ -47,6 +48,12 @@ chacha20poly1305 = "0.10.1"
 chacha20 = { version = "0.9", features = ["zeroize"] }
 poly1305 = { version = "0.8", features = ["zeroize"] }
 once_cell = "1.21.4"
+iroh = "0.91"
+iroh-base = { version = "0.91", features = ["key", "relay"] }
+iroh-relay = "0.91"
+data-encoding = "2.4"
+qrcode = "0.12"
+crc = "3.0"
 
 [features]
 default = ["backend-openssl"]
