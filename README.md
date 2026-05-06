@@ -55,7 +55,18 @@ Rust版は、C++版の設計思想を継承しつつ、Rustのメモリ安全性
 * **Lazy Loading 鍵管理**: ネットワークモードの署名秘密鍵は**毎ハンドシェイクごとに必要時のみロード**し、即座に破棄。プロセス全期間メモリ常駐させず、`/proc/<pid>/mem` 等の攻撃面を最小化。
 * **ASN.1 構造的パース**: PKCS#8/SPKI の鍵読み込みは `pkcs8` / `spki` クレートによる厳格な構造検証で行われ、OID 不一致などの異常は明示的に拒否。
 
-詳細は [`SECURITY.md`](./SECURITY.md) と [`SPEC.md`](./SPEC.md) を参照してください。
+詳細は [`SECURITY.md`](./SECURITY.md) (脆弱性報告ポリシー) と [`SPEC.md`](./SPEC.md) (技術仕様) を参照してください。
+
+### **チャット機能のセキュリティ評価**
+
+Iroh トランスポート + V3.1 PQC ハンドシェイクによるチャット機能は、現時点で **「PQC ネイティブ × 中央サーバなし × FIPS 標準準拠 × OSS」を全て満たす唯一のクラス**に属します。
+
+* ✅ 一般的な脅威 (ISP・公衆 WiFi・Telegram 級サーバ侵入・商用 SaaS 召喚状) に対し**ほぼ完璧な防御**
+* ✅ 量子計算機が将来登場した時の "Harvest Now, Decrypt Later" 攻撃に対し**解読不能** (ML-KEM-768)
+* ✅ Signal / WhatsApp / iMessage と同等以上、Telegram のデフォルトチャットとは**比較にならない強さ**
+* ⚠️ 完璧ではない領域 (Post-Quantum Forward Secrecy / メタデータ秘匿) は今後の改善対象
+
+**詳細な脅威モデル別評価・競合比較・正直な弱点**については [`SECURITY_PROFILE.md`](./SECURITY_PROFILE.md) を参照してください。
 
 ### **プロセス終了時の鍵保護**
 
