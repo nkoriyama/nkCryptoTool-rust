@@ -1,6 +1,14 @@
 /target
+/target_rustcrypto
+
+# Test/runtime artifacts
 test_keys/
 pqc_keys/
 hybrid_keys/
 bench_keys/
-/target_rustcrypto
+client_keys*/
+server_keys*/
+keys_chat/
+*.log
+test.dec
+test_file.txt
