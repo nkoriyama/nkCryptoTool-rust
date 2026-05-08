@@ -23,6 +23,7 @@ pkcs8 = { version = "0.10", features = ["encryption"] }
 spki = "0.7"
 der = "0.7"
 foreign-types = { version = "0.3", optional = true }
+openssl-src = { version = "300.6", optional = true }
 zeroize = { version = "1.0", features = ["derive"] }
 rpassword = "7.2"
 libc = "0.2"
@@ -58,6 +59,7 @@ crc = "3.0"
 [features]
 default = ["backend-openssl"]
 backend-openssl = ["openssl", "openssl-sys", "foreign-types"]
+backend-openssl-vendored = ["backend-openssl", "openssl/vendored", "openssl-src"]
 backend-rustcrypto = [
     "aes-gcm",
     "p256",

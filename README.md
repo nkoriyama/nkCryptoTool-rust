@@ -86,7 +86,18 @@ Iroh トランスポート + V3.1 PQC ハンドシェイクによるチャット
 | バックエンド | 特徴 | 推奨ユースケース |
 | :--- | :--- | :--- |
 | **OpenSSL** (デフォルト) | 高度に最適化されたアセンブリ実装。OpenSSL 3.5+ で PQC (ML-KEM/ML-DSA) もネイティブサポート。 | サーバー、大規模データ処理、既存の C++ 版との併用 |
+| **OpenSSL (Vendored)** | **[NEW]** OpenSSL 3.6.2 をソースからビルドして静的リンク。環境依存を排除。 | Windows、古い Linux (Ubuntu 24.04 等)、静的バイナリ配布 |
 | **RustCrypto** (純 Rust) | 外部 C ライブラリ非依存。`fips203` / `fips204` クレート使用。 | コンテナ、OpenSSL 未導入環境、セキュリティ監査重視 |
+
+## **バックエンド選択ガイド**
+
+| 環境 | 推奨 backend |
+|---|---|
+| Arch Linux / openSUSE Tumbleweed (rolling) | `backend-openssl` (system 3.5+) |
+| Ubuntu 24.04 / Debian 12 / RHEL 9 | `backend-openssl-vendored` または `backend-rustcrypto` |
+| Windows | `backend-openssl-vendored` または `backend-rustcrypto` |
+| macOS | `backend-openssl` (Homebrew) または `backend-openssl-vendored` |
+| 静的リンク + PQC 標準実装 | `backend-openssl-vendored` |
 
 ## **ビルド方法**
 
@@ -119,7 +130,18 @@ Iroh トランスポート + V3.1 PQC ハンドシェイクによるチャット
 
 ビルド成果物: `target/release/nk-crypto-tool`
 
-#### **2. 純 Rust バックエンド (RustCrypto)**
+#### **2. OpenSSL バックエンド (Vendored/静的リンク)**
+OpenSSL 3.6.2 をソースからビルドし、バイナリに静的リンクします。システム側の OpenSSL に依存したくない場合や Windows でのビルドに使用します。
+
+**要件:** Perl 5.10+, Cコンパイラ, (Windows のみ) NASM
+
+```bash
+cargo build --release --no-default-features --features backend-openssl-vendored
+```
+
+※ 初回ビルドには 10〜15 分程度かかります。
+
+#### **3. 純 Rust バックエンド (RustCrypto)**
 外部の C ライブラリに依存せず、Cargo のみでビルド可能です。
 
 ```bash
