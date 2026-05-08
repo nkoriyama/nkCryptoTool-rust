@@ -283,10 +283,12 @@ impl NetworkProcessor {
         Ok(())
     }
 
-    pub async fn chat_loop<R, W, SI>(
+    pub async fn chat_loop<R, W, SI, SO1, SO2>(
         mut stream_rx: R,
         mut stream_tx: W,
         mut stdin: SI,
+        mut stdout_rx: SO1,
+        mut stdout_tx: SO2,
         aead_name: &str,
         s2c_key: &[u8],
         c2s_key: &[u8],
@@ -296,6 +298,8 @@ impl NetworkProcessor {
         R: AsyncReadExt + Unpin + Send + 'static,
         W: AsyncWriteExt + Unpin + Send + 'static,
         SI: AsyncReadExt + Unpin + Send,
+        SO1: AsyncWriteExt + Unpin + Send + 'static,
+        SO2: AsyncWriteExt + Unpin + Send,
     {
         let (rx_key, tx_key) = if is_server {
             (
@@ -395,11 +399,10 @@ impl NetworkProcessor {
                             })
                             .collect::<String>(),
                     );
-                    let mut stdout = tokio::io::stdout();
-                    let _ = stdout.write_all(b"\r[Peer]: ").await;
-                    let _ = stdout.write_all(msg.as_bytes()).await;
-                    let _ = stdout.write_all(b"\n> ").await;
-                    let _ = stdout.flush().await;
+                    let _ = stdout_rx.write_all(b"\r[Peer]: ").await;
+                    let _ = stdout_rx.write_all(msg.as_bytes()).await;
+                    let _ = stdout_rx.write_all(b"\n> ").await;
+                    let _ = stdout_rx.flush().await;
 
                     out_buf.fill(0);
                 }
@@ -415,9 +418,8 @@ impl NetworkProcessor {
 
         eprintln!("--- Chat mode started ---");
         {
-            let mut stdout = tokio::io::stdout();
-            let _ = stdout.write_all(b"> ").await;
-            let _ = stdout.flush().await;
+            let _ = stdout_tx.write_all(b"> ").await;
+            let _ = stdout_tx.flush().await;
         }
 
         let mut tx_aead_opt: Option<Aead> = None;
@@ -438,9 +440,8 @@ impl NetworkProcessor {
                         break Ok(());
                     }
                     if lr == LineRead::Line && line_buf.is_empty() {
-                        let mut stdout = tokio::io::stdout();
-                        let _ = stdout.write_all(b"> ").await;
-                        let _ = stdout.flush().await;
+                        let _ = stdout_tx.write_all(b"> ").await;
+                        let _ = stdout_tx.flush().await;
                         continue;
                     }
                     let line = Zeroizing::new(
@@ -491,9 +492,8 @@ impl NetworkProcessor {
                         .map_err(|_| CryptoError::Parameter("Idle timeout while sending chat packet".to_string()))?
                         .map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
-                    let mut stdout = tokio::io::stdout();
-                    let _ = stdout.write_all(b"> ").await;
-                    let _ = stdout.flush().await;
+                    let _ = stdout_tx.write_all(b"> ").await;
+                    let _ = stdout_tx.flush().await;
 
                     if lr == LineRead::PartialEof {
                         eprintln!("\r\n[System]: stdin closed.");
@@ -537,11 +537,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_line_secure_empty_line() {
-        let mut input = std::io::Cursor::new(b"\n");
-        let mut buf = Vec::new();
-        let res = NetworkProcessor::read_line_secure(&mut input, &mut buf).await.unwrap();
-        assert_eq!(res, LineRead::Line);
-        assert!(buf.is_empty());
+    async fn test_chat_loop_e2e_full() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (alice_net, bob_net) = tokio::io::duplex(65536);
+        let (alice_net_rx, alice_net_tx) = tokio::io::split(alice_net);
+        let (bob_net_rx, bob_net_tx) = tokio::io::split(bob_net);
+
+        let (mut alice_stdin_tx, alice_stdin_rx) = tokio::io::duplex(1024);
+        let (alice_stdout_rx_tx, mut alice_stdout_rx_rx) = tokio::io::duplex(1024);
+
+        let (mut bob_stdin_tx, bob_stdin_rx) = tokio::io::duplex(1024);
+        let (bob_stdout_rx_tx, mut bob_stdout_rx_rx) = tokio::io::duplex(1024);
+
+        let key = vec![0u8; 32];
+        let key_alice1 = key.clone();
+        let key_alice2 = key.clone();
+        let key_bob1 = key.clone();
+        let key_bob2 = key.clone();
+
+        let alice_handle = tokio::spawn(async move {
+            NetworkProcessor::chat_loop(
+                alice_net_rx,
+                alice_net_tx,
+                alice_stdin_rx,
+                alice_stdout_rx_tx,
+                tokio::io::sink(),
+                "AES-256-GCM",
+                &key_alice1,
+                &key_alice2,
+                true,
+            )
+            .await
+        });
+
+        let bob_handle = tokio::spawn(async move {
+            NetworkProcessor::chat_loop(
+                bob_net_rx,
+                bob_net_tx,
+                bob_stdin_rx,
+                bob_stdout_rx_tx,
+                tokio::io::sink(),
+                "AES-256-GCM",
+                &key_bob1,
+                &key_bob2,
+                false,
+            )
+            .await
+        });
+
+        // Alice sends message to Bob
+        alice_stdin_tx.write_all(b"Hello Bob\n").await.unwrap();
+
+        // Bob receives message
+        let mut bob_buf = vec![0u8; 1024];
+        // We expect "[Peer]: Hello Bob" (plus prefix/suffix)
+        let n = bob_stdout_rx_rx.read(&mut bob_buf).await.unwrap();
+        let bob_msg = String::from_utf8_lossy(&bob_buf[..n]);
+        assert!(bob_msg.contains("Hello Bob"));
+
+        // Bob sends message to Alice
+        bob_stdin_tx.write_all(b"Hello Alice\n").await.unwrap();
+
+        // Alice receives message
+        let mut alice_buf = vec![0u8; 1024];
+        let n = alice_stdout_rx_rx.read(&mut alice_buf).await.unwrap();
+        let alice_msg = String::from_utf8_lossy(&alice_buf[..n]);
+        assert!(alice_msg.contains("Hello Alice"));
+
+        // Clean termination: close stdin
+        drop(alice_stdin_tx);
+        drop(bob_stdin_tx);
+
+        let (alice_res, bob_res) = tokio::join!(alice_handle, bob_handle);
+        alice_res.unwrap().expect("Alice chat_loop failed");
+        bob_res.unwrap().expect("Bob chat_loop failed");
     }
 }

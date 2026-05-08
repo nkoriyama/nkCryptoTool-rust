@@ -423,7 +423,13 @@ impl NetworkProcessor {
             let stdin = tokio::io::stdin();
             #[cfg(test)]
             let stdin = tokio::io::empty();
-            CommonProcessor::chat_loop(reader, writer, stdin, &config.aead_algo, &s2c_key, &c2s_key, true).await?;
+            
+            #[cfg(not(test))]
+            let (stdout_rx, stdout_tx) = (tokio::io::stdout(), tokio::io::stdout());
+            #[cfg(test)]
+            let (stdout_rx, stdout_tx) = (tokio::io::sink(), tokio::io::sink());
+
+            CommonProcessor::chat_loop(reader, writer, stdin, stdout_rx, stdout_tx, &config.aead_algo, &s2c_key, &c2s_key, true).await?;
         } else if cfg!(test) {
             writer.shutdown().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -604,7 +610,13 @@ impl NetworkProcessor {
                 let stdin = tokio::io::stdin();
                 #[cfg(test)]
                 let stdin = tokio::io::empty();
-                CommonProcessor::chat_loop(reader, writer, stdin, &config.aead_algo, &s2c_key, &c2s_key, false).await
+
+                #[cfg(not(test))]
+                let (stdout_rx, stdout_tx) = (tokio::io::stdout(), tokio::io::stdout());
+                #[cfg(test)]
+                let (stdout_rx, stdout_tx) = (tokio::io::sink(), tokio::io::sink());
+
+                CommonProcessor::chat_loop(reader, writer, stdin, stdout_rx, stdout_tx, &config.aead_algo, &s2c_key, &c2s_key, false).await
             } else if cfg!(test) {
                 writer.shutdown().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
                 Ok(())

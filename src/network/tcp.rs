@@ -372,9 +372,15 @@ impl NetworkProcessor {
             let stdin = tokio::io::stdin();
             #[cfg(test)]
             let stdin = tokio::io::empty();
+
+            #[cfg(not(test))]
+            let (stdout_rx, stdout_tx) = (tokio::io::stdout(), tokio::io::stdout());
+            #[cfg(test)]
+            let (stdout_rx, stdout_tx) = (tokio::io::sink(), tokio::io::sink());
+
             tokio::time::timeout(
                 CHAT_SESSION_TIMEOUT,
-                CommonProcessor::chat_loop(rx, tx, stdin, &config.aead_algo, &s2c_key, &c2s_key, true),
+                CommonProcessor::chat_loop(rx, tx, stdin, stdout_rx, stdout_tx, &config.aead_algo, &s2c_key, &c2s_key, true),
             )
             .await
             .map_err(|_| CryptoError::Parameter("Chat session timed out".to_string()))??;
@@ -577,9 +583,15 @@ impl NetworkProcessor {
             let stdin = tokio::io::stdin();
             #[cfg(test)]
             let stdin = tokio::io::empty();
+
+            #[cfg(not(test))]
+            let (stdout_rx, stdout_tx) = (tokio::io::stdout(), tokio::io::stdout());
+            #[cfg(test)]
+            let (stdout_rx, stdout_tx) = (tokio::io::sink(), tokio::io::sink());
+
             tokio::time::timeout(
                 CHAT_SESSION_TIMEOUT,
-                CommonProcessor::chat_loop(rx, tx, stdin, &self.config.aead_algo, &s2c_key, &c2s_key, false),
+                CommonProcessor::chat_loop(rx, tx, stdin, stdout_rx, stdout_tx, &self.config.aead_algo, &s2c_key, &c2s_key, false),
             )
             .await
             .map_err(|_| CryptoError::Parameter("Handshake timed out".to_string()))??;
