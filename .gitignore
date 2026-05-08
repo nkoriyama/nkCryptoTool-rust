@@ -1,5 +1,9 @@
 /target
 /target_rustcrypto
+/target_vendored
+
+# Historical reports/summaries (moved to /src/archive/nkCryptoTool-rust/)
+archive/
 
 # Test/runtime artifacts
 test_keys/
