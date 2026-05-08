@@ -329,6 +329,7 @@ impl CryptoProcessor {
                 output_path_str,
                 header,
                 total_input_size,
+                config.force,
                 progress_callback,
             )
             .await;
@@ -411,6 +412,7 @@ impl CryptoProcessor {
                 header_size,
                 ciphertext_size,
                 tag,
+                config.force,
                 progress_callback,
             )
             .await;
@@ -431,6 +433,7 @@ impl CryptoProcessor {
         output_path: String,
         header: Vec<u8>,
         total_input_size: u64,
+        force: bool,
         progress_callback: Option<ProgressCallback>,
     ) -> Result<Box<dyn CryptoStrategy>> {
         let cb_clone = progress_callback.clone();
@@ -441,6 +444,10 @@ impl CryptoProcessor {
             let in_file =
                 std::fs::File::open(&input_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
             let mut reader = BufReader::with_capacity(BUF_SIZE * 4, in_file);
+
+            if force {
+                let _ = std::fs::remove_file(&output_path);
+            }
 
             let out_file = OpenOptions::new()
                 .write(true)
@@ -504,6 +511,7 @@ impl CryptoProcessor {
         header_size: u64,
         ciphertext_size: u64,
         tag: Vec<u8>,
+        force: bool,
         progress_callback: Option<ProgressCallback>,
     ) -> Result<Box<dyn CryptoStrategy>> {
         let temp_output_path = format!("{}.tmp.{}", output_path, rand_core::OsRng.next_u64());
@@ -568,8 +576,15 @@ impl CryptoProcessor {
 
         match res {
             Ok(s) => {
+                if !force && Path::new(&output_path).exists() {
+                    let _ = std::fs::remove_file(&temp_output_path);
+                    return Err(CryptoError::FileWrite("File exists".to_string()));
+                }
                 std::fs::rename(&temp_output_path, &output_path)
-                    .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+                    .map_err(|e| {
+                        let _ = std::fs::remove_file(&temp_output_path);
+                        CryptoError::FileWrite(e.to_string())
+                    })?;
                 Ok(s)
             }
             Err(e) => {
