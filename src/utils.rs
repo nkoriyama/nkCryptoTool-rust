@@ -534,6 +534,7 @@ pub fn unwrap_pqc_priv_from_pkcs8(der: &[u8], algo: &str) -> Result<Zeroizing<Ve
                         }
                         if chunk.len() > best_sk.len() {
                             best_sk.zeroize();
+                            best_sk.zeroize();
                             *best_sk = chunk.to_vec();
                         }
                     }
