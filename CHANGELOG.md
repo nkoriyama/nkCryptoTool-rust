@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.1] - 2026-05-09
+
+### Fixed
+- **M5 test coverage completion**: v2.0.0 shipped with 3/5 of the M5 test suite. v2.0.1 adds the missing 2 tests: `test_privacy_mode_noop_on_linux` and `test_privacy_mode_unsupported_os_warning`.
+
+### Documentation
+- **SECURITY_PROFILE_GUI restoration**: Restored §1.5 (M2 QR threats) and §1.6 (M4 notification threats) sections that were inadvertently lost during v2.0.0 file rewrite.
+
+## [2.0.0] - 2026-05-09
+
+### Added
+- **Phase 3 GUI Completion**: Final stabilization of the Slint-based graphical user interface.
+- **Privacy Mode (M5)**: Integrated screen capture prevention for Windows and macOS. Prevents sensitive chat content from appearing in screenshots, screen recordings, and window sharing.
+- **Unified GUI Binary**: The application now supports a full-featured graphical mode via the `--gui` flag, including secure passphrase entry (M1), QR ticket scanning (M2), clipboard protection (M3), and desktop notifications (M4).
+
+### Changed
+- **Major Version Upgrade**: Transitioned from v1.x to v2.0.0 to mark the official support of the Graphical User Interface as a primary feature.
+
+
 ## [1.4.1] - 2026-05-09
 
 ### Fixed
