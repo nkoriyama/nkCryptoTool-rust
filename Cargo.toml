@@ -34,7 +34,7 @@ serial_test = "3.0"
 slint = { version = "1.16", optional = true }
 
 # RustCrypto ecosystem
-aes-gcm = { version = "0.10", optional = true }
+aes-gcm = { version = "0.10", optional = true, features = ["zeroize"] }
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pem", "pkcs8"], optional = true }
 ecdsa = { version = "0.16", optional = true }
 signature = { version = "2.2", optional = true }
