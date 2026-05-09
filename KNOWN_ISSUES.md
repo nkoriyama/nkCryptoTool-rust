@@ -20,3 +20,15 @@ The underlying `fips203` library may perform internal copies of sensitive seeds 
 
 ### 1. Stdin/Stdout only File Transfer
 Iroh file transfer currently only supports redirection via stdin/stdout. Direct file path arguments for network transfer are not yet implemented.
+
+## GUI Features (deferred)
+
+### 1. QR Code Scan (M2)
+Automatic NKCT1 ticket reading via camera is not yet implemented.
+- **Workaround**: Manual copy-paste of connection tickets.
+
+### 2. Desktop Notifications (M4)
+Background message notifications are not yet implemented.
+
+### 3. Screen Capture Protection (M5)
+Explicit window capture exclusion for sensitive fields is not yet implemented.

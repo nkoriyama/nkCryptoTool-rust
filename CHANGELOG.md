@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.2.0] - 2026-05-09
+
+### Added
+- **Secure Passphrase Dialog (M1)**: Implemented a password-type input field for encrypted private keys, preventing shoulder surfing and ensuring plaintext does not reside in UI properties after use.
+- **Clipboard Protection (M3)**: Added automatic 30-second clear timer for sensitive information copied to the clipboard (e.g., connection tickets).
+- **GUI CI Integration (M6)**: Configured GitHub Actions to verify `gui` feature builds and automated UI testing.
+
+### Fixed
+- **M3 stdout leak**: Removed sensitive `println!` logs from the clipboard handler to ensure no confidential data is recorded in process logs.
+
+### Security
+- **Passphrase copy prevention**: Explicitly documented and configured passphrase fields to prevent clipboard copy operations.
+
 ## [1.1.0] - 2026-05-09
 
 ### Security
