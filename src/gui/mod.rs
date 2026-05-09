@@ -25,6 +25,7 @@ pub mod camera;
 #[cfg(feature = "gui-notifications")]
 pub mod notifications;
 pub mod screen_protection;
+pub mod file_picker;
 
 #[cfg(feature = "gui-camera")]
 use crate::ticket::Ticket;

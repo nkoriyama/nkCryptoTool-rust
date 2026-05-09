@@ -1,6 +1,6 @@
 [package]
 name = "nk-crypto-tool"
-version = "2.0.4"
+version = "2.1.0-rc2"
 edition = "2021"
 license = "MIT"
 
@@ -36,6 +36,7 @@ arboard = { version = "3.4", optional = true }
 nokhwa = { version = "0.10", optional = true, features = ["input-native", "output-threaded"] }
 rqrr = { version = "0.6", optional = true }
 image = { version = "0.24", optional = true }
+rfd = { version = "0.14", optional = true }
 notify-rust = { version = "4.0", optional = true }
 
 # RustCrypto ecosystem
@@ -77,6 +78,7 @@ gui = ["slint", "slint-build", "arboard"]
 testing = []
 gui-camera = ["gui", "nokhwa", "rqrr", "image"]
 gui-notifications = ["gui", "notify-rust"]
+gui-file-transfer = ["gui", "rfd"]
 gui-screen-protection = ["gui", "windows", "objc2"]
 backend-openssl = ["openssl", "openssl-sys", "foreign-types"]
 backend-openssl-vendored = ["backend-openssl", "openssl/vendored", "openssl-src"]
@@ -93,3 +95,6 @@ backend-rustcrypto = [
 ]
 
 [dev-dependencies]
+tempfile = "3.8"
+serial_test = "3.0"
+i-slint-backend-testing = "=1.16.1"
