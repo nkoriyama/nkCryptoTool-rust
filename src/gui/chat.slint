@@ -1,29 +1,46 @@
-import { Button, VerticalBox, LineEdit, TextEdit, StandardListView, GroupBox } from "std-widgets.slint";
+import { Button, VerticalBox, LineEdit, TextEdit, StandardListView, GroupBox, HorizontalBox } from "std-widgets.slint";
 
 export component ChatWindow inherits Window {
-    title: "nkCryptoTool Chat (Slint PoC)";
+    title: "nkCryptoTool Chat (Phase 3 M1-M3)";
     width: 800px;
     height: 600px;
 
     callback connect-pressed(string, string, string); // ticket, privkey_path, pubkey_path
+    callback passphrase-provided(string);
     callback send-message(string);
+    callback copy-to-clipboard(string);
     
     in property <[StandardListViewItem]> messages: [];
     in property <bool> connected: false;
-    in-out property <string> input-text: "";
+    in property <bool> asking-passphrase: false;
+    in property <string> connection-error: "";
     
+    in-out property <string> input-text: "";
     in-out property <string> ticket-text: "";
     in-out property <string> privkey-path: "";
     in-out property <string> pubkey-path: "";
+    in-out property <string> passphrase-input: "";
 
     VerticalBox {
-        GroupBox {
+        // Error display
+        if connection-error != "" : Text {
+            text: connection-error;
+            color: red;
+        }
+
+        // 1. Connection Settings
+        if !connected && !asking-passphrase : GroupBox {
             title: "Connection Settings";
-            visible: !connected;
             VerticalBox {
-                LineEdit {
-                    placeholder-text: "Ticket (nkct1...)";
-                    text <=> ticket-text;
+                HorizontalBox {
+                    LineEdit {
+                        placeholder-text: "Ticket (nkct1...)";
+                        text <=> ticket-text;
+                    }
+                    Button {
+                        text: "Copy";
+                        clicked => { root.copy-to-clipboard(root.ticket-text); }
+                    }
                 }
                 LineEdit {
                     placeholder-text: "Private Key Path";
@@ -36,20 +53,60 @@ export component ChatWindow inherits Window {
                 Button {
                     text: "Connect";
                     clicked => {
+                        root.connection-error = "";
                         root.connect-pressed(root.ticket-text, root.privkey-path, root.pubkey-path);
                     }
                 }
             }
         }
         
-        StandardListView {
-            model: messages;
-            min-height: 200px;
-            visible: connected;
+        // 2. Passphrase Dialog (M1)
+        if asking-passphrase : GroupBox {
+            title: "Passphrase Required";
+            VerticalBox {
+                Text {
+                    text: "The private key is encrypted. Please enter the passphrase.";
+                }
+                Text {
+                    text: "⚠️ Please turn OFF IME and use half-width characters.";
+                    font-size: 10px;
+                    color: orange;
+                }
+                LineEdit {
+                    // M1/M3: password type hides input and prevents clipboard copy on most platforms
+                    input-type: password;
+                    placeholder-text: "Enter Passphrase";
+                    text <=> passphrase-input;
+                    accepted => {
+                        root.passphrase-provided(root.passphrase-input);
+                        root.passphrase-input = "";
+                    }
+                }
+                Button {
+                    text: "Unlock and Connect";
+                    clicked => {
+                        root.passphrase-provided(root.passphrase-input);
+                        root.passphrase-input = "";
+                    }
+                }
+                Button {
+                    text: "Cancel";
+                    clicked => {
+                        root.asking-passphrase = false;
+                        root.passphrase-input = "";
+                    }
+                }
+            }
         }
         
-        VerticalBox {
-            visible: connected;
+        // 3. Chat Messages
+        if connected : StandardListView {
+            model: messages;
+            min-height: 200px;
+        }
+        
+        // 4. Message Input
+        if connected : VerticalBox {
             LineEdit {
                 text <=> input-text;
                 placeholder-text: "Type a message...";

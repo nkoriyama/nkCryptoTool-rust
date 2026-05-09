@@ -32,6 +32,7 @@ parking_lot = "0.12"
 hex = "0.4"
 serial_test = "3.0"
 slint = { version = "1.16", optional = true }
+arboard = { version = "3.4", optional = true }
 
 # RustCrypto ecosystem
 aes-gcm = { version = "0.10", optional = true, features = ["zeroize"] }
@@ -62,7 +63,7 @@ slint-build = { version = "1.16", optional = true }
 
 [features]
 default = ["backend-openssl"]
-gui = ["slint", "slint-build"]
+gui = ["slint", "slint-build", "arboard"]
 backend-openssl = ["openssl", "openssl-sys", "foreign-types"]
 backend-openssl-vendored = ["backend-openssl", "openssl/vendored", "openssl-src"]
 backend-rustcrypto = [
