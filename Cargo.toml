@@ -1,6 +1,6 @@
 [package]
 name = "nk-crypto-tool"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2021"
 license = "MIT"
 
@@ -37,6 +37,8 @@ nokhwa = { version = "0.10", optional = true, features = ["input-native"] }
 rqrr = { version = "0.6", optional = true }
 image = { version = "0.24", optional = true }
 notify-rust = { version = "4.0", optional = true }
+windows = { version = "0.52", optional = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_SystemInformation"] }
+objc2 = { version = "0.5", optional = true }
 
 # RustCrypto ecosystem
 aes-gcm = { version = "0.10", optional = true, features = ["zeroize"] }
@@ -70,6 +72,7 @@ default = ["backend-openssl"]
 gui = ["slint", "slint-build", "arboard"]
 gui-camera = ["gui", "nokhwa", "rqrr", "image"]
 gui-notifications = ["gui", "notify-rust"]
+gui-screen-protection = ["gui", "windows", "objc2"]
 backend-openssl = ["openssl", "openssl-sys", "foreign-types"]
 backend-openssl-vendored = ["backend-openssl", "openssl/vendored", "openssl-src"]
 backend-rustcrypto = [
