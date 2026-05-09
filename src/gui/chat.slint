@@ -1,7 +1,7 @@
-import { Button, VerticalBox, LineEdit, TextEdit, StandardListView, GroupBox, HorizontalBox } from "std-widgets.slint";
+import { Button, VerticalBox, LineEdit, TextEdit, StandardListView, GroupBox, HorizontalBox, Switch } from "std-widgets.slint";
 
 export component ChatWindow inherits Window {
-    title: "nkCryptoTool Chat (Phase 3 M1-M3)";
+    title: "nkCryptoTool Chat (v2.0.0)";
     width: 800px;
     height: 600px;
 
@@ -9,19 +9,45 @@ export component ChatWindow inherits Window {
     callback passphrase-provided(string);
     callback send-message(string);
     callback copy-to-clipboard(string);
+    callback scan-qr-pressed();
+    callback scan-cancel();
+    callback privacy-mode-toggled(bool);
     
     in property <[StandardListViewItem]> messages: [];
     in property <bool> connected: false;
     in property <bool> asking-passphrase: false;
+    in property <bool> scanning-qr: false;
     in property <string> connection-error: "";
+    in property <string> scanner-status: "";
+    in property <string> privacy-warning: "";
     
     in-out property <string> input-text: "";
     in-out property <string> ticket-text: "";
     in-out property <string> privkey-path: "";
     in-out property <string> pubkey-path: "";
     in-out property <string> passphrase-input: "";
+    in-out property <bool> privacy-mode: false;
 
     VerticalBox {
+        // Privacy Mode and Warning
+        HorizontalBox {
+            alignment: start;
+            Text {
+                text: "Privacy Mode:";
+                vertical-alignment: center;
+            }
+            Switch {
+                checked <=> privacy-mode;
+                toggled => { root.privacy-mode-toggled(self.checked); }
+            }
+            if privacy-warning != "" : Text {
+                text: privacy-warning;
+                color: orange;
+                font-size: 10px;
+                vertical-alignment: center;
+            }
+        }
+
         // Error display
         if connection-error != "" : Text {
             text: connection-error;
@@ -29,7 +55,7 @@ export component ChatWindow inherits Window {
         }
 
         // 1. Connection Settings
-        if !connected && !asking-passphrase : GroupBox {
+        if !connected && !asking-passphrase && !scanning-qr : GroupBox {
             title: "Connection Settings";
             VerticalBox {
                 HorizontalBox {
@@ -40,6 +66,10 @@ export component ChatWindow inherits Window {
                     Button {
                         text: "Copy";
                         clicked => { root.copy-to-clipboard(root.ticket-text); }
+                    }
+                    Button {
+                        text: "Scan QR";
+                        clicked => { root.scan-qr-pressed(); }
                     }
                 }
                 LineEdit {
@@ -98,14 +128,33 @@ export component ChatWindow inherits Window {
                 }
             }
         }
+
+        // 3. QR Scanner (M2)
+        if scanning-qr : GroupBox {
+            title: "QR Code Scanner";
+            VerticalBox {
+                Text {
+                    text: "📷 Camera Active (Scanning for Ticket)";
+                    color: green;
+                }
+                Text {
+                    text: scanner-status;
+                }
+                // Preview would ideally be here, but for now we focus on logic
+                Button {
+                    text: "Cancel";
+                    clicked => { root.scan-cancel(); }
+                }
+            }
+        }
         
-        // 3. Chat Messages
+        // 4. Chat Messages
         if connected : StandardListView {
             model: messages;
             min-height: 200px;
         }
         
-        // 4. Message Input
+        // 5. Message Input
         if connected : VerticalBox {
             LineEdit {
                 text <=> input-text;

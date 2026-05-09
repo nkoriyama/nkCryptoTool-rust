@@ -22,6 +22,7 @@ use std::time::Duration;
 pub mod camera;
 #[cfg(feature = "gui-notifications")]
 pub mod notifications;
+pub mod screen_protection;
 
 #[cfg(feature = "gui-camera")]
 use crate::ticket::Ticket;
@@ -50,6 +51,12 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(NotificationManager::new(Arc::new(DesktopNotificationSink)))
     };
 
+    // M5: Screen Protection
+    let protection_api: Arc<dyn screen_protection::ScreenProtectionApi> = Arc::new(screen_protection::OsScreenProtectionApi);
+    if let Some(warn) = protection_api.get_warning_message() {
+        ui.set_privacy_warning(warn.into());
+    }
+
     // Update UI when messages arrive from network
     let mut stdout_rx = stdout_rx;
     let ui_handle_out = ui_handle.clone();
@@ -74,8 +81,6 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(feature = "gui-notifications")]
             {
                  // M4: Trigger notification
-                 // For now, focus suppression is best-effort.
-                 // We could extend Slint window properties if needed.
                  let _ = nm.notify_message(&peer_id, false);
             }
 
@@ -122,6 +127,15 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+    });
+
+    // M5: Privacy Mode Toggle
+    let ui_handle_privacy = ui_handle.clone();
+    let pa = protection_api.clone();
+    ui.on_privacy_mode_toggled(move |enabled| {
+        if let Some(ui) = ui_handle_privacy.upgrade() {
+            let _ = pa.set_protection(ui.window(), enabled);
+        }
     });
 
     // M2: QR Scanner (Full Functional Integration)

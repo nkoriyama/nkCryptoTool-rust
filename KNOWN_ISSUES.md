@@ -28,5 +28,3 @@ Automatic NKCT1 ticket reading via camera is not yet implemented.
 - **Workaround**: Manual copy-paste of connection tickets.
 
 
-### 2. Screen Capture Protection (M5)
-Explicit window capture exclusion for sensitive fields is not yet implemented.
