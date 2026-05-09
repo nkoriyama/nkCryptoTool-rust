@@ -33,6 +33,10 @@ hex = "0.4"
 serial_test = "3.0"
 slint = { version = "1.16", optional = true }
 
+[build-dependencies]
+slint-build = { version = "1.16", optional = true }
+slint = { version = "1.16", optional = true }
+
 # RustCrypto ecosystem
 aes-gcm = { version = "0.10", optional = true, features = ["zeroize"] }
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pem", "pkcs8"], optional = true }
@@ -61,6 +65,7 @@ crc = "3.0"
 slint-build = { version = "1.16", optional = true }
 
 [features]
+gui = ["slint", "slint-build"]
 default = ["backend-openssl"]
 gui = ["slint", "slint-build"]
 backend-openssl = ["openssl", "openssl-sys", "foreign-types"]
