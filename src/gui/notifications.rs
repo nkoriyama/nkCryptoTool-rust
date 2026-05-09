@@ -73,13 +73,13 @@ impl NotificationManager {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub struct MockNotificationSink {
     pub history: Mutex<Vec<(String, String)>>,
 }
 
 #[cfg(feature = "gui-notifications")]
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl NotificationSink for MockNotificationSink {
     fn notify(&self, title: &str, body: &str) -> Result<()> {
         self.history.lock().unwrap().push((title.to_string(), body.to_string()));

@@ -1,7 +1,7 @@
 import { Button, VerticalBox, LineEdit, TextEdit, StandardListView, GroupBox, HorizontalBox, Switch } from "std-widgets.slint";
 
 export component ChatWindow inherits Window {
-    title: "nkCryptoTool Chat (v2.0.0)";
+    title: "nkCryptoTool Chat (v2.0.2)";
     width: 800px;
     height: 600px;
 
@@ -14,12 +14,12 @@ export component ChatWindow inherits Window {
     callback privacy-mode-toggled(bool);
     
     in property <[StandardListViewItem]> messages: [];
-    in property <bool> connected: false;
-    in property <bool> asking-passphrase: false;
-    in property <bool> scanning-qr: false;
-    in property <string> connection-error: "";
-    in property <string> scanner-status: "";
-    in property <string> privacy-warning: "";
+    in-out property <bool> connected: false;
+    in-out property <bool> asking-passphrase: false;
+    in-out property <bool> scanning-qr: false;
+    in-out property <string> connection-error: "";
+    in-out property <string> scanner-status: "";
+    in-out property <string> privacy-warning: "";
     
     in-out property <string> input-text: "";
     in-out property <string> ticket-text: "";

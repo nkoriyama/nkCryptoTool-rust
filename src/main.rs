@@ -15,7 +15,7 @@ use zeroize::Zeroizing;
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(long, value_enum)]
-    mode: CryptoMode,
+    mode: Option<CryptoMode>,
 
     #[arg(long)]
     encrypt: bool,
@@ -139,8 +139,13 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(feature = "gui")]
     if args.gui {
-        return nk_crypto_tool::gui::run_gui().await.map_err(|e| anyhow::anyhow!(e));
+        return nk_crypto_tool::gui::run_gui().await.map_err(|e| anyhow::anyhow!(e.to_string()));
     }
+
+    let mode = match args.mode {
+        Some(m) => m,
+        None => return Err(anyhow::anyhow!("--mode is required for CLI operations")),
+    };
 
     let operation = if args.encrypt {
         Operation::Encrypt
@@ -187,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut config = CryptoConfig::default();
-    config.mode = args.mode;
+    config.mode = mode;
     config.operation = operation;
     config.input_files = args.input_files;
     config.output_file = args.output_file;

@@ -8,6 +8,8 @@ use std::sync::Arc;
 #[cfg(feature = "gui")]
 use tokio::sync::mpsc;
 #[cfg(feature = "gui")]
+use slint::Model;
+use std::str::FromStr;
 use crate::network::GuiIOProvider;
 #[cfg(feature = "gui")]
 use slint::VecModel;
@@ -36,8 +38,9 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
 
     let (stdin_tx, stdin_rx) = mpsc::channel(100);
     let (stdout_tx, stdout_rx) = mpsc::channel(100);
-    // Channel for M1 passphrase response
-    let (pass_tx, mut pass_rx) = mpsc::channel::<Zeroizing<String>>(1);
+    
+    // Channel for M1 passphrase response: (passphrase, ticket, privkey, pubkey)
+    let (pass_tx, mut pass_rx) = mpsc::channel::<(Zeroizing<String>, String, String, String)>(1);
 
     let gui_provider = Arc::new(GuiIOProvider {
         stdin_rx: Arc::new(tokio::sync::Mutex::new(stdin_rx)),
@@ -88,12 +91,12 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_handle.upgrade() {
                     let messages = ui.get_messages();
-                    let new_messages = Arc::new(VecModel::default());
+                    let new_messages = VecModel::default();
                     for i in 0..messages.row_count() {
                         new_messages.push(messages.row_data(i).unwrap());
                     }
-                    new_messages.push(StandardListViewItem::from(clean_msg.as_str().into()));
-                    ui.set_messages(new_messages.into());
+                    new_messages.push(StandardListViewItem::from(slint::SharedString::from(clean_msg.as_str())));
+                    ui.set_messages(slint::ModelRc::new(new_messages));
                 }
             });
         }
@@ -102,12 +105,19 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     let gp = gui_provider.clone();
     let ui_handle_conn = ui_handle.clone();
     let pass_tx_for_ui = pass_tx.clone();
+    let ui_handle_pass_cb = ui_handle.clone();
     
     ui.on_passphrase_provided(move |pass| {
         let pass_tx = pass_tx_for_ui.clone();
-        tokio::spawn(async move {
-            let _ = pass_tx.send(Zeroizing::new(pass.to_string())).await;
-        });
+        if let Some(ui) = ui_handle_pass_cb.upgrade() {
+            let ticket = ui.get_ticket_text().to_string();
+            let privkey = ui.get_privkey_path().to_string();
+            let pubkey = ui.get_pubkey_path().to_string();
+            let pass_val = Zeroizing::new(pass.to_string());
+            tokio::spawn(async move {
+                let _ = pass_tx.send((pass_val, ticket, privkey, pubkey)).await;
+            });
+        }
     });
 
     ui.on_copy_to_clipboard(move |text| {
@@ -274,7 +284,6 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         let ticket = ticket.to_string();
         let privkey = privkey.to_string();
         let pubkey = pubkey.to_string();
-        let pass_tx = pass_tx.clone();
 
         tokio::spawn(async move {
             let mut config = crate::config::CryptoConfig::default();
@@ -313,17 +322,10 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    let ui_handle_pass = ui_handle.clone();
     let gp_pass = gui_provider.clone();
+    let ui_handle_pass_retry = ui_handle.clone();
     tokio::spawn(async move {
-        while let Some(passphrase) = pass_rx.recv().await {
-            let ui = match ui_handle_pass.upgrade() {
-                Some(ui) => ui,
-                None => break,
-            };
-            let ticket = ui.get_ticket_text().to_string();
-            let privkey = ui.get_privkey_path().to_string();
-            let pubkey = ui.get_pubkey_path().to_string();
+        while let Some((passphrase, ticket, privkey, pubkey)) = pass_rx.recv().await {
             let mut config = crate::config::CryptoConfig::default();
             config.connect_addr = Some(ticket);
             config.signing_privkey = Some(privkey);
@@ -331,8 +333,9 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             config.chat_mode = true;
             config.transport = crate::config::TransportKind::Iroh;
             config.passphrase = Some(passphrase);
+            
             let processor = crate::network::iroh::NetworkProcessor::with_io(config, gp_pass.clone());
-            let ui_handle = ui_handle_pass.clone();
+            let ui_handle = ui_handle_pass_retry.clone();
             match processor.run_connect().await {
                 Ok(_) => {
                     let _ = slint::invoke_from_event_loop(move || {

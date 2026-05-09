@@ -4783,7 +4783,7 @@ dependencies = [
 
 [[package]]
 name = "nk-crypto-tool"
-version = "1.4.1"
+version = "2.0.2"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -4869,6 +4869,7 @@ dependencies = [
  "nokhwa-bindings-macos",
  "nokhwa-bindings-windows",
  "nokhwa-core",
+ "parking_lot",
  "paste",
  "thiserror 2.0.18",
 ]

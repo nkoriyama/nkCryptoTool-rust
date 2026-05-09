@@ -87,13 +87,13 @@ impl ScreenProtectionApi for OsScreenProtectionApi {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub struct MockScreenProtectionApi {
     pub state: Arc<Mutex<bool>>,
 }
 
 #[cfg(feature = "gui")]
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl ScreenProtectionApi for MockScreenProtectionApi {
     fn set_protection(&self, _window: &slint::Window, enabled: bool) -> Result<()> {
         let mut lock = self.state.lock().unwrap();

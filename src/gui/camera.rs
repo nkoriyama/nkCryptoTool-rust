@@ -39,7 +39,7 @@ impl NokhwaCameraSource {
 impl CameraSource for NokhwaCameraSource {
     fn start_scan(&self, callback: Arc<dyn Fn(Vec<u8>, u32, u32) + Send + Sync>) -> Result<()> {
         let index = CameraIndex::Index(0);
-        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Absolute(
+        let requested = RequestedFormat::new::<RgbFormat>(RequestedFormatType::Exact(
             CameraFormat::new_from(640, 480, nokhwa::utils::FrameFormat::YUYV, 30),
         ));
         
@@ -70,8 +70,8 @@ impl CameraSource for NokhwaCameraSource {
 #[cfg(feature = "gui-camera")]
 pub fn decode_qr_from_rgb(data: &[u8], width: u32, height: u32) -> Option<String> {
     use rqrr::PreparedImage;
-    let mut img = PreparedImage::prepare_from_grey(width as usize, height as usize, |x, y| {
-        let idx = ((y * width + x) * 3) as usize;
+    let mut img = PreparedImage::prepare_from_greyscale(width as usize, height as usize, |x, y| {
+        let idx = ((y * width as usize + x) * 3) as usize;
         if idx + 2 < data.len() {
             // Simple grayscale conversion
             ((data[idx] as u32 + data[idx+1] as u32 + data[idx+2] as u32) / 3) as u8
