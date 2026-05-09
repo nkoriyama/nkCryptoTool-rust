@@ -1,6 +1,6 @@
 [package]
 name = "nk-crypto-tool"
-version = "2.0.4"
+version = "2.1.0-rc2"
 edition = "2021"
 license = "MIT"
 
@@ -32,11 +32,6 @@ parking_lot = "0.12"
 hex = "0.4"
 serial_test = "3.0"
 slint = { version = "1.16", optional = true }
-arboard = { version = "3.4", optional = true }
-nokhwa = { version = "0.10", optional = true, features = ["input-native", "output-threaded"] }
-rqrr = { version = "0.6", optional = true }
-image = { version = "0.24", optional = true }
-notify-rust = { version = "4.0", optional = true }
 
 # RustCrypto ecosystem
 aes-gcm = { version = "0.10", optional = true, features = ["zeroize"] }
@@ -62,22 +57,12 @@ data-encoding = "2.4"
 qrcode = "0.12"
 crc = "3.0"
 
-[target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.52", optional = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_SystemInformation"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = { version = "0.5", optional = true }
-
 [build-dependencies]
 slint-build = { version = "1.16", optional = true }
 
 [features]
 default = ["backend-openssl"]
-gui = ["slint", "slint-build", "arboard"]
-testing = []
-gui-camera = ["gui", "nokhwa", "rqrr", "image"]
-gui-notifications = ["gui", "notify-rust"]
-gui-screen-protection = ["gui", "windows", "objc2"]
+gui = ["slint", "slint-build"]
 backend-openssl = ["openssl", "openssl-sys", "foreign-types"]
 backend-openssl-vendored = ["backend-openssl", "openssl/vendored", "openssl-src"]
 backend-rustcrypto = [
@@ -91,5 +76,3 @@ backend-rustcrypto = [
     "subtle",
     "generic-array",
 ]
-
-[dev-dependencies]
