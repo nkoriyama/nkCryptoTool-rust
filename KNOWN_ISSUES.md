@@ -4,12 +4,7 @@ Despite reaching v1.0.0, the following security and usability issues are known a
 
 ## Security Issues
 
-### 1. Write-then-Verify window (37-1)
-During file decryption, data is written to a temporary file before the final authentication tag is verified.
-- **Mitigation**: Temporary files are created with `0600` permissions and random suffixes in the destination directory. They are deleted immediately if verification fails.
-- **Root Fix**: Planned transition to full memory buffering or streaming AEAD verification.
-
-### 2. HKDF Zeroization (36-3) — Blocked
+### 1. HKDF Zeroization (36-3) — Blocked
 The `hkdf` crate (v0.12 / v0.13) does **not** expose a `zeroize` feature, so internal HMAC context and PRK are not auto-zeroized on drop.
 - **Status**: **Blocked** by upstream ecosystem. The `hmac` crate added `zeroize` in v0.13, but `hkdf` does not propagate it. Forcing `hkdf` v0.13 also pulls in `digest` v0.11, which conflicts with the `digest` v0.10-locked majority of our crypto stack (`p256`, `ecdsa`, `aes-gcm`, `sha3`).
 - **Mitigation**: Output keys produced from HKDF are already wrapped in `Zeroizing` at call sites (`src/strategy/`, `src/backend/`). Only the crate-internal intermediate state remains potentially residual.
@@ -17,7 +12,7 @@ The `hkdf` crate (v0.12 / v0.13) does **not** expose a `zeroize` feature, so int
 - **Root Fix**: Wait for the RustCrypto ecosystem to migrate to `digest` v0.11 across `p256` / `aes-gcm` / `sha3`, then upgrade in lockstep with `hkdf` zeroize-aware revisions. Re-evaluate then.
 - **Investigation reference**: `THREAT_36-3_INVESTIGATION_REPORT.md`.
 
-### 3. ML-KEM Seed Internal Copy (37-2)
+### 2. ML-KEM Seed Internal Copy (37-2)
 The underlying `fips203` library may perform internal copies of sensitive seeds that are outside the control of `nkCryptoTool`.
 - **Status**: Blocked by upstream library updates.
 

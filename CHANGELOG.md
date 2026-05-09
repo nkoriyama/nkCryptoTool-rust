@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.0] - 2026-05-09
+
+### Security
+- **Two-pass decryption (closes 37-1)**: Decryption now verifies the
+  AEAD tag in a dedicated read-only pass before any plaintext is
+  written to disk. Eliminates the unverified-plaintext-on-disk window.
+- **`aes-gcm` zeroize feature (partial 36-3 mitigation)**: Internal
+  symmetric key material is now cleared from memory on drop. Note that
+  `hkdf` itself remains Blocked — see KNOWN_ISSUES.md and
+  THREAT_36-3_INVESTIGATION_REPORT.md.
+- **`unwrap_pqc_priv_from_pkcs8` zeroize fix (closes 37-5)**: The
+  `best_sk` candidate buffer in PKCS#8 scanning is now wrapped in
+  `Zeroizing` and explicitly zeroized before each reassignment.
+
+### Added
+- **Slint GUI prototype (`--gui` flag, optional `gui` feature)**:
+  Initial PoC with `GuiIOProvider` bridge to `chat_loop`. Fonts/system
+  dependencies still required for full build (see PHASE2_GUI_PROTOTYPE_REPORT.md).
+
+### Changed
+- **`CryptoStrategy::restart_decryption()`**: New trait method to reset
+  AEAD context for the Two-pass decryption flow.
+
+### Documentation
+- `KNOWN_ISSUES.md`: Removed 37-1 (closed). 36-3 marked as Blocked with
+  ecosystem rationale. 37-2 remains Blocked (upstream `fips203`).
+- `SECURITY_PROFILE.md`: Documented Two-pass decryption invariant.
+
 ## [1.0.0] - 2026-05-09
 
 ### Added
