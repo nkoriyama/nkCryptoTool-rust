@@ -9,11 +9,15 @@ export component ChatWindow inherits Window {
     callback passphrase-provided(string);
     callback send-message(string);
     callback copy-to-clipboard(string);
+    callback scan-qr-pressed();
+    callback scan-cancel();
     
     in property <[StandardListViewItem]> messages: [];
     in property <bool> connected: false;
     in property <bool> asking-passphrase: false;
+    in property <bool> scanning-qr: false;
     in property <string> connection-error: "";
+    in property <string> scanner-status: "";
     
     in-out property <string> input-text: "";
     in-out property <string> ticket-text: "";
@@ -29,7 +33,7 @@ export component ChatWindow inherits Window {
         }
 
         // 1. Connection Settings
-        if !connected && !asking-passphrase : GroupBox {
+        if !connected && !asking-passphrase && !scanning-qr : GroupBox {
             title: "Connection Settings";
             VerticalBox {
                 HorizontalBox {
@@ -40,6 +44,10 @@ export component ChatWindow inherits Window {
                     Button {
                         text: "Copy";
                         clicked => { root.copy-to-clipboard(root.ticket-text); }
+                    }
+                    Button {
+                        text: "Scan QR";
+                        clicked => { root.scan-qr-pressed(); }
                     }
                 }
                 LineEdit {
@@ -98,14 +106,33 @@ export component ChatWindow inherits Window {
                 }
             }
         }
+
+        // 3. QR Scanner (M2)
+        if scanning-qr : GroupBox {
+            title: "QR Code Scanner";
+            VerticalBox {
+                Text {
+                    text: "📷 Camera Active (Scanning for Ticket)";
+                    color: green;
+                }
+                Text {
+                    text: scanner-status;
+                }
+                // Preview would ideally be here, but for now we focus on logic
+                Button {
+                    text: "Cancel";
+                    clicked => { root.scan-cancel(); }
+                }
+            }
+        }
         
-        // 3. Chat Messages
+        // 4. Chat Messages
         if connected : StandardListView {
             model: messages;
             min-height: 200px;
         }
         
-        // 4. Message Input
+        // 5. Message Input
         if connected : VerticalBox {
             LineEdit {
                 text <=> input-text;

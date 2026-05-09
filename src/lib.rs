@@ -11,6 +11,10 @@ pub mod key;
 pub mod network;
 pub mod processor;
 pub mod gui;
+#[cfg(feature = "gui-camera")]
+pub mod camera { pub use crate::gui::camera::*; }
+#[cfg(feature = "gui-camera")]
+pub mod camera { pub use crate::gui::camera::*; }
 pub mod strategy;
 pub mod ticket;
 pub mod utils;

@@ -18,6 +18,33 @@ use zeroize::Zeroizing;
 #[cfg(feature = "gui")]
 use std::time::Duration;
 
+#[cfg(feature = "gui-camera")]
+pub mod camera;
+#[cfg(feature = "gui-camera")]
+use crate::ticket::Ticket;
+#[cfg(feature = "gui-camera")]
+use rqrr::PreparedImage;
+
+#[cfg(feature = "gui-camera")]
+pub fn scan_qr_frame(data: Vec<u8>, width: u32, height: u32) -> Option<String> {
+    let mut img = PreparedImage::prepare_from_grey(width as usize, height as usize, |x, y| {
+        let idx = ((y * width + x) * 3) as usize;
+        if idx + 2 < data.len() {
+            // Simple grayscale conversion
+            ((data[idx] as u32 + data[idx+1] as u32 + data[idx+2] as u32) / 3) as u8
+        } else {
+            0
+        }
+    });
+    let grids = img.detect_grids();
+    for grid in grids {
+        if let Ok((_meta, content)) = grid.decode() {
+            return Some(content);
+        }
+    }
+    None
+}
+
 #[cfg(feature = "gui")]
 pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     let ui = ChatWindow::new()?;
@@ -87,6 +114,34 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     });
+
+    // M2: QR Scanner
+    #[cfg(feature = "gui-camera")]
+    {
+        let ui_handle_qr = ui_handle.clone();
+        ui.on_scan_qr_pressed(move || {
+            let ui_handle = ui_handle_qr.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_handle.upgrade() {
+                    ui.set_scanning_qr(true);
+                    ui.set_scanner_status("Initializing camera...".into());
+                }
+            });
+            
+            // In a real implementation, we would start the camera thread here.
+            // For now, this serves as the UI PoC for M2.
+        });
+
+        let ui_handle_qr_cancel = ui_handle.clone();
+        ui.on_scan_cancel(move || {
+            let ui_handle = ui_handle_qr_cancel.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_handle.upgrade() {
+                    ui.set_scanning_qr(false);
+                }
+            });
+        });
+    }
 
     ui.on_connect_pressed(move |ticket, privkey, pubkey| {
         let ui_handle = ui_handle_conn.clone();

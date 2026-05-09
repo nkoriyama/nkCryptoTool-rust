@@ -74,3 +74,15 @@ mod tests {
         assert_eq!(ui.get_connection_error(), "");
     }
 }
+
+    #[test]
+    fn test_qr_scanner_ui_transition() {
+        let ui = ChatWindow::new().unwrap();
+        assert!(!ui.get_scanning_qr());
+        
+        ui.invoke_scan_qr_pressed();
+        assert!(ui.get_scanning_qr());
+        
+        ui.invoke_scan_cancel();
+        assert!(!ui.get_scanning_qr());
+    }
