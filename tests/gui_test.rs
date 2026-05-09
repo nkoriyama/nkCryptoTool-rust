@@ -73,4 +73,25 @@ mod tests {
         assert!(!ui.get_asking_passphrase());
         assert_eq!(ui.get_connection_error(), "");
     }
+
+    #[test]
+    fn test_qr_scanner_ui_transition() {
+        let ui = ChatWindow::new().unwrap();
+        assert!(!ui.get_scanning_qr());
+        
+        ui.invoke_scan_qr_pressed();
+        assert!(ui.get_scanning_qr());
+        
+        ui.invoke_scan_cancel();
+        assert!(!ui.get_scanning_qr());
+    }
+
+    #[test]
+    fn test_no_placeholder_comments_in_gui_callbacks() {
+        let mod_rs = include_str!("../src/gui/mod.rs");
+        assert!(!mod_rs.contains("In a real implementation"));
+        assert!(!mod_rs.contains("we would start"));
+        assert!(!mod_rs.contains("For now,"));
+        assert!(!mod_rs.contains("simulate with"));
+    }
 }

@@ -18,6 +18,13 @@ use zeroize::Zeroizing;
 #[cfg(feature = "gui")]
 use std::time::Duration;
 
+#[cfg(feature = "gui-camera")]
+pub mod camera;
+#[cfg(feature = "gui-camera")]
+use crate::ticket::Ticket;
+#[cfg(feature = "gui-camera")]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 #[cfg(feature = "gui")]
 pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     let ui = ChatWindow::new()?;
@@ -25,7 +32,6 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
 
     let (stdin_tx, stdin_rx) = mpsc::channel(100);
     let (stdout_tx, stdout_rx) = mpsc::channel(100);
-    // Channel for M1 passphrase response
     let (pass_tx, mut pass_rx) = mpsc::channel::<Zeroizing<String>>(1);
 
     let gui_provider = Arc::new(GuiIOProvider {
@@ -33,7 +39,6 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         stdout_tx,
     });
 
-    // Update UI when messages arrive from network
     let mut stdout_rx = stdout_rx;
     let ui_handle_out = ui_handle.clone();
     tokio::spawn(async move {
@@ -68,7 +73,6 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // M3: Clipboard handling
     ui.on_copy_to_clipboard(move |text| {
         let text = text.to_string();
         tokio::spawn(async move {
@@ -87,6 +91,136 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     });
+
+    // M2: QR Scanner (Full Functional Integration)
+    #[cfg(feature = "gui-camera")]
+    {
+        use crate::gui::camera::{CameraSource, NokhwaCameraSource, decode_qr_from_rgb, format_camera_error, format_ticket_parse_error};
+        
+        let ui_handle_qr = ui_handle.clone();
+        let current_camera: Arc<tokio::sync::Mutex<Option<Arc<dyn CameraSource>>>> = Arc::new(tokio::sync::Mutex::new(None));
+        let cancel_flag = Arc::new(AtomicBool::new(false));
+
+        let camera_mutex = current_camera.clone();
+        let cancel_flag_scan = cancel_flag.clone();
+        ui.on_scan_qr_pressed(move || {
+            let ui_handle = ui_handle_qr.clone();
+            let camera_mutex = camera_mutex.clone();
+            let cancel_flag = cancel_flag_scan.clone();
+            cancel_flag.store(false, Ordering::Relaxed);
+            
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_handle.upgrade() {
+                    ui.set_scanning_qr(true);
+                    ui.set_scanner_status("Initializing camera...".into());
+                }
+            });
+
+            let ui_handle_cb = ui_handle_qr.clone();
+            let cancel_flag_cb = cancel_flag_scan.clone();
+            let camera_mutex_cb = camera_mutex.clone();
+            
+            tokio::spawn(async move {
+                let camera: Arc<dyn CameraSource> = Arc::new(NokhwaCameraSource::new());
+                {
+                    let mut lock = camera_mutex_cb.lock().await;
+                    *lock = Some(camera.clone());
+                }
+
+                let ui_handle_frame = ui_handle_cb.clone();
+                let cancel_flag_frame = cancel_flag_cb.clone();
+                let camera_mutex_frame = camera_mutex_cb.clone();
+
+                let frame_callback = Arc::new(move |rgb: Vec<u8>, w: u32, h: u32| {
+                    if cancel_flag_frame.load(Ordering::Relaxed) { return; }
+
+                    if let Some(decoded) = decode_qr_from_rgb(&rgb, w, h) {
+                        match Ticket::from_str(&decoded) {
+                            Ok(ticket) => {
+                                cancel_flag_frame.store(true, Ordering::Relaxed);
+                                let ui_handle = ui_handle_frame.clone();
+                                let camera_mutex = camera_mutex_frame.clone();
+                                slint::invoke_from_event_loop(move || {
+                                    if let Some(ui) = ui_handle.upgrade() {
+                                        ui.set_ticket_text(ticket.to_string().into());
+                                        ui.set_scanning_qr(false);
+                                        ui.set_scanner_status("QR code recognized.".into());
+                                    }
+                                }).ok();
+                                tokio::spawn(async move {
+                                    let mut lock = camera_mutex.lock().await;
+                                    if let Some(cam) = lock.take() {
+                                        let _ = cam.stop_scan();
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                let ui_handle = ui_handle_frame.clone();
+                                let msg = format_ticket_parse_error(&crate::error::CryptoError::Parameter(e.to_string()));
+                                slint::invoke_from_event_loop(move || {
+                                    if let Some(ui) = ui_handle.upgrade() {
+                                        ui.set_scanner_status(msg.into());
+                                    }
+                                }).ok();
+                            }
+                        }
+                    }
+                });
+
+                if let Err(e) = camera.start_scan(frame_callback) {
+                    let ui_handle = ui_handle_cb.clone();
+                    let msg = format_camera_error(&e);
+                    slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_handle.upgrade() {
+                            ui.set_scanning_qr(false);
+                            ui.set_scanner_status(msg.into());
+                        }
+                    }).ok();
+                } else {
+                    let ui_handle_to = ui_handle_cb.clone();
+                    let cancel_flag_to = cancel_flag_cb.clone();
+                    let camera_mutex_to = camera_mutex_cb.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        if !cancel_flag_to.load(Ordering::Relaxed) {
+                            cancel_flag_to.store(true, Ordering::Relaxed);
+                            let mut lock = camera_mutex_to.lock().await;
+                            if let Some(cam) = lock.take() {
+                                let _ = cam.stop_scan();
+                            }
+                            slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_handle_to.upgrade() {
+                                    ui.set_scanning_qr(false);
+                                    ui.set_scanner_status("No QR code detected (Timeout).".into());
+                                }
+                            }).ok();
+                        }
+                    });
+                }
+            });
+        });
+
+        let ui_handle_qr_cancel = ui_handle.clone();
+        let camera_mutex_cancel = current_camera.clone();
+        let cancel_flag_cancel = cancel_flag.clone();
+        ui.on_scan_cancel(move || {
+            let ui_handle = ui_handle_qr_cancel.clone();
+            let camera_mutex = camera_mutex_cancel.clone();
+            let cancel_flag = cancel_flag_cancel.clone();
+            cancel_flag.store(true, Ordering::Relaxed);
+            tokio::spawn(async move {
+                let mut lock = camera_mutex.lock().await;
+                if let Some(cam) = lock.take() {
+                    let _ = cam.stop_scan();
+                }
+            });
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_handle.upgrade() {
+                    ui.set_scanning_qr(false);
+                }
+            });
+        });
+    }
 
     ui.on_connect_pressed(move |ticket, privkey, pubkey| {
         let ui_handle = ui_handle_conn.clone();
@@ -133,7 +267,6 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // Background task to handle M1 passphrase-retry flow
     let ui_handle_pass = ui_handle.clone();
     let gp_pass = gui_provider.clone();
     tokio::spawn(async move {
@@ -142,11 +275,9 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                 Some(ui) => ui,
                 None => break,
             };
-            
             let ticket = ui.get_ticket_text().to_string();
             let privkey = ui.get_privkey_path().to_string();
             let pubkey = ui.get_pubkey_path().to_string();
-            
             let mut config = crate::config::CryptoConfig::default();
             config.connect_addr = Some(ticket);
             config.signing_privkey = Some(privkey);
@@ -154,7 +285,6 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             config.chat_mode = true;
             config.transport = crate::config::TransportKind::Iroh;
             config.passphrase = Some(passphrase);
-
             let processor = crate::network::iroh::NetworkProcessor::with_io(config, gp_pass.clone());
             let ui_handle = ui_handle_pass.clone();
             match processor.run_connect().await {

@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.1] - 2026-05-09
+
+### Fixed
+- **M2 camera integration completion**: v1.3.0 shipped scaffolding only
+  (CameraSource trait, NokhwaCameraSource impl, UI state transitions,
+  but the button handler contained a placeholder comment in place of
+  the actual camera thread launch). v1.3.1 wires up the full flow:
+  button press → NokhwaCameraSource::start_scan → rqrr decode →
+  Ticket::from_str → UI inject. Includes proper 30-second timeout,
+  cancel handling, and error UX per PHASE3_M2_DESIGN_PROPOSAL.md v2 §3.2.
+
+## [1.3.0] - 2026-05-09
+
+### Added
+- **QR Code Scan Input (M2 scaffolding)**: Initial integration of
+  camera-based NKCT1 ticket reading using nokhwa and rqrr. Includes
+  CameraSource trait abstraction, NokhwaCameraSource and MockCameraSource
+  implementations, Slint UI for scanning state transitions, and Wayland
+  Portal permission considerations.
+  Note: v1.3.0 shipped scaffolding only; full functional integration
+  arrived in v1.3.1.
+
 ## [1.2.0] - 2026-05-09
 
 ### Added
