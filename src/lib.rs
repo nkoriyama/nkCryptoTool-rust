@@ -10,6 +10,7 @@ pub mod error;
 pub mod key;
 pub mod network;
 pub mod processor;
+pub mod gui;
 pub mod strategy;
 pub mod ticket;
 pub mod utils;

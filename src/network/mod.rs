@@ -80,6 +80,79 @@ impl IOProvider for DefaultIOProvider {
     }
 }
 
+#[cfg(feature = "gui")]
+pub struct GuiIOProvider {
+    pub stdin_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+    pub stdout_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+#[cfg(feature = "gui")]
+impl IOProvider for GuiIOProvider {
+    fn stdin(&self) -> Box<dyn tokio::io::AsyncRead + Unpin + Send> {
+        Box::new(GuiStdin(self.stdin_rx.clone()))
+    }
+    fn stdout(&self) -> Box<dyn tokio::io::AsyncWrite + Unpin + Send> {
+        Box::new(GuiStdout(self.stdout_tx.clone()))
+    }
+}
+
+#[cfg(feature = "gui")]
+struct GuiStdin(Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>);
+#[cfg(feature = "gui")]
+impl tokio::io::AsyncRead for GuiStdin {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let mut rx = match self.0.try_lock() {
+            Ok(rx) => rx,
+            Err(_) => return std::task::Poll::Pending,
+        };
+        match rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(data)) => {
+                buf.put_slice(&data);
+                std::task::Poll::Ready(Ok(()))
+            }
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+#[cfg(feature = "gui")]
+struct GuiStdout(tokio::sync::mpsc::Sender<Vec<u8>>);
+#[cfg(feature = "gui")]
+impl tokio::io::AsyncWrite for GuiStdout {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let data = buf.to_vec();
+        match self.0.try_send(data) {
+            Ok(_) => std::task::Poll::Ready(Ok(buf.len())),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => std::task::Poll::Pending,
+            Err(_) => std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "GUI stdout closed",
+            ))),
+        }
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
 #[cfg(test)]
 pub struct TestIOProvider;
 #[cfg(test)]

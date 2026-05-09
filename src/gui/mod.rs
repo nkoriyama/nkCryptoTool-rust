@@ -33,7 +33,6 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         while let Some(data) = stdout_rx.recv().await {
             let msg = String::from_utf8_lossy(&data).to_string();
-            // Filter out the prompt and other CLI-specific prefixes if any
             let clean_msg = msg.trim_start_matches("\r[Peer]: ").trim_end_matches("\n> ").trim_start_matches("> ").to_string();
             if clean_msg.is_empty() || clean_msg == ">" { continue; }
             

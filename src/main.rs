@@ -86,6 +86,9 @@ struct Args {
     #[arg(long, help = "Force overwrite of existing files")]
     force: bool,
 
+    #[arg(long, help = "Start the graphical user interface (Slint)")]
+    gui: bool,
+
     #[arg(long, default_value = "15", help = "Handshake timeout in seconds")]
     handshake_timeout: u64,
 
@@ -133,6 +136,11 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let args = Args::parse();
+
+    #[cfg(feature = "gui")]
+    if args.gui {
+        return nk_crypto_tool::gui::run_gui().await.map_err(|e| anyhow::anyhow!(e));
+    }
 
     let operation = if args.encrypt {
         Operation::Encrypt
