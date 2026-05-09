@@ -1,0 +1,38 @@
+name: Rust
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        backend: [openssl, vendored, rustcrypto, gui]
+        include:
+          - backend: openssl
+            features: ""
+          - backend: vendored
+            features: "--features backend-openssl-vendored"
+          - backend: rustcrypto
+            features: "--no-default-features --features backend-rustcrypto"
+          - backend: gui
+            features: "--features gui"
+            deps: |
+              sudo apt-get update
+              sudo apt-get install -y libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev libgbm-dev
+    steps:
+    - uses: actions/checkout@v3
+    - name: Install dependencies
+      if: matrix.deps != ''
+      run: ${{ matrix.deps }}
+    - name: Build
+      run: cargo build --verbose ${{ matrix.features }}
+    - name: Run tests
+      run: cargo test --verbose ${{ matrix.features }}
