@@ -433,7 +433,9 @@ impl NetworkProcessor {
             let stdin = io_provider.stdin();
             let stdout = Arc::new(tokio::sync::Mutex::new(io_provider.stdout()));
 
-            CommonProcessor::chat_loop(reader, writer, stdin, stdout, &config.aead_algo, &s2c_key, &c2s_key, true).await?;
+            let res = CommonProcessor::chat_loop(reader, writer, stdin, stdout, &config.aead_algo, &s2c_key, &c2s_key, true).await;
+            CHAT_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+            res?;
         } else {            tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
                 CommonProcessor::receive_file(reader, io_provider.stdout(), &config.aead_algo, &c2s_key, &c2s_iv).await
             }).await.map_err(|e| CryptoError::Parameter(format!("File receive failed: {}", e)))??;
@@ -442,6 +444,16 @@ impl NetworkProcessor {
     }
 
     pub async fn run_connect(&self) -> Result<()> {
+        self.run_connect_with_handshake_callback(|| {}).await
+    }
+
+    pub async fn run_connect_with_handshake_callback<F>(
+        &self,
+        on_handshake_done: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
         let ticket_str = self.config.connect_addr.as_ref().ok_or(CryptoError::Parameter("Missing ticket".to_string()))?;
         
         let ticket = Ticket::from_str(ticket_str)?;
@@ -609,7 +621,9 @@ impl NetworkProcessor {
                     let stdin = self.io_provider.stdin();
                     let stdout = Arc::new(tokio::sync::Mutex::new(self.io_provider.stdout()));
 
-                    CommonProcessor::chat_loop(reader, writer, stdin, stdout, &config.aead_algo, &s2c_key, &c2s_key, false).await
+                    let res = CommonProcessor::chat_loop(reader, writer, stdin, stdout, &config.aead_algo, &s2c_key, &c2s_key, false).await;
+                    CHAT_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
+                    res
                 } else {
                     tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
                         CommonProcessor::send_file(self.io_provider.stdin(), writer, &config.aead_algo, &c2s_key, &c2s_iv).await

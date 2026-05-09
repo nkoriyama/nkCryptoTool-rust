@@ -294,29 +294,39 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             config.transport = crate::config::TransportKind::Iroh;
 
             let processor = crate::network::iroh::NetworkProcessor::with_io(config.clone(), gp.clone());
-            match processor.run_connect().await {
-                Ok(_) => {
+            let ui_handle_for_callback = ui_handle.clone();
+            let on_handshake = move || {
+                let ui_handle = ui_handle_for_callback.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_handle.upgrade() {
+                        ui.set_connected(true);
+                    }
+                });
+            };
+
+            let res = processor.run_connect_with_handshake_callback(on_handshake).await;
+            
+            let ui_handle_end = ui_handle.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_handle_end.upgrade() {
+                    ui.set_connected(false);
+                }
+            });
+
+            if let Err(e) = res {
+                let err_str = e.to_string();
+                if err_str.contains("passphrase") || err_str.contains("encrypted") {
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_handle.upgrade() {
-                            ui.set_connected(true);
+                            ui.set_asking_passphrase(true);
                         }
                     });
-                }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    if err_str.contains("passphrase") || err_str.contains("encrypted") {
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_handle.upgrade() {
-                                ui.set_asking_passphrase(true);
-                            }
-                        });
-                    } else {
-                        let _ = slint::invoke_from_event_loop(move || {
-                            if let Some(ui) = ui_handle.upgrade() {
-                                ui.set_connection_error(err_str.into());
-                            }
-                        });
-                    }
+                } else {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_handle.upgrade() {
+                            ui.set_connection_error(err_str.into());
+                        }
+                    });
                 }
             }
         });
@@ -335,25 +345,35 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             config.passphrase = Some(passphrase);
             
             let processor = crate::network::iroh::NetworkProcessor::with_io(config, gp_pass.clone());
-            let ui_handle = ui_handle_pass_retry.clone();
-            match processor.run_connect().await {
-                Ok(_) => {
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_handle.upgrade() {
-                            ui.set_connected(true);
-                            ui.set_asking_passphrase(false);
-                            ui.set_connection_error("".into());
-                        }
-                    });
+            let ui_handle_for_callback = ui_handle_pass_retry.clone();
+            let on_handshake = move || {
+                let ui_handle = ui_handle_for_callback.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_handle.upgrade() {
+                        ui.set_connected(true);
+                        ui.set_asking_passphrase(false);
+                        ui.set_connection_error("".into());
+                    }
+                });
+            };
+
+            let res = processor.run_connect_with_handshake_callback(on_handshake).await;
+
+            let ui_handle_end = ui_handle_pass_retry.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_handle_end.upgrade() {
+                    ui.set_connected(false);
                 }
-                Err(e) => {
-                    let err_str = e.to_string();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(ui) = ui_handle.upgrade() {
-                            ui.set_connection_error(err_str.into());
-                        }
-                    });
-                }
+            });
+
+            if let Err(e) = res {
+                let err_str = e.to_string();
+                let ui_handle = ui_handle_pass_retry.clone();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_handle.upgrade() {
+                        ui.set_connection_error(err_str.into());
+                    }
+                });
             }
         }
     });
