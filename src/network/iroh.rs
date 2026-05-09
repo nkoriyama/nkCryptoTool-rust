@@ -3,7 +3,7 @@ use crate::config::CryptoConfig;
 use crate::error::{CryptoError, Result};
 use crate::network::{
     NetworkProcessor as CommonProcessor, PeerId, CHAT_ACTIVE, PEER_COOLDOWNS, ChatActiveGuard,
-    ALPN_CHAT, ALPN_FILE,
+    ALPN_CHAT, ALPN_FILE, IOProvider, DefaultIOProvider,
 };
 use iroh::{Endpoint, NodeId, Watcher};
 use std::sync::Arc;
@@ -19,6 +19,7 @@ pub struct NetworkProcessor {
     config: CryptoConfig,
     semaphore: Arc<Semaphore>,
     cached_allowlist: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
+    io_provider: Arc<dyn IOProvider>,
 }
 
 pub struct EndpointGuard(pub Endpoint);
@@ -40,6 +41,16 @@ impl NetworkProcessor {
             config,
             semaphore: Arc::new(Semaphore::new(10)),
             cached_allowlist: None,
+            io_provider: Arc::new(DefaultIOProvider),
+        }
+    }
+
+    pub fn with_io(config: CryptoConfig, io_provider: Arc<dyn IOProvider>) -> Self {
+        Self {
+            config,
+            semaphore: Arc::new(Semaphore::new(10)),
+            cached_allowlist: None,
+            io_provider,
         }
     }
 
@@ -71,20 +82,6 @@ impl NetworkProcessor {
         let mut processor = Self::new(config.clone());
         processor.preload_allowlist().await?;
         processor.start().await
-    }
-
-    #[cfg(test)]
-    pub async fn listen_with_sender(
-        config: &CryptoConfig,
-        node_addr_tx: tokio::sync::oneshot::Sender<(iroh::NodeAddr, iroh::Endpoint)>,
-    ) -> Result<()> {
-        let mut processor = Self::new(config.clone());
-        processor.preload_allowlist().await?;
-        let endpoint = processor.create_endpoint(true).await?;
-
-        let _guard = EndpointGuard(endpoint.clone());
-        let _ = node_addr_tx.send((endpoint.node_addr().initialized().await, endpoint.clone()));
-        processor.run_listen_loop(endpoint).await
     }
 
     pub async fn connect(config: &CryptoConfig) -> Result<()> {
@@ -155,7 +152,16 @@ impl NetworkProcessor {
             eprintln!("\n[nkct] Scan QR to connect:\n{}", image);
         }
 
-        self.run_listen_loop(endpoint).await
+        let endpoint_clone = endpoint.clone();
+        let res = tokio::select! {
+            r = self.run_listen_loop(endpoint) => r,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\r\n[nkct] Interrupted by user. Closing...");
+                Ok(())
+            }
+        };
+        let _ = endpoint_clone.close().await;
+        res
     }
 
     async fn run_listen_loop(&self, endpoint: Endpoint) -> Result<()> {
@@ -164,6 +170,7 @@ impl NetworkProcessor {
             let semaphore = self.semaphore.clone();
             let cached_allowlist = self.cached_allowlist.clone();
             let local_node_id = endpoint.node_id();
+            let io_provider = self.io_provider.clone();
             tokio::spawn(async move {
                 let mut connecting = match incoming.accept() {
                     Ok(c) => c,
@@ -223,6 +230,7 @@ impl NetworkProcessor {
                     local_node_id,
                     remote_node_id,
                     cached_allowlist,
+                    io_provider,
                 )
                 .await
                 {
@@ -240,6 +248,7 @@ impl NetworkProcessor {
         local_node_id: NodeId,
         remote_node_id: NodeId,
         cached_allowlist: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
+        io_provider: Arc<dyn IOProvider>,
     ) -> Result<()>
     where
         R: AsyncReadExt + Unpin + Send + 'static,
@@ -269,6 +278,14 @@ impl NetworkProcessor {
 
                 let sig = CommonProcessor::read_vec(&mut reader).await?;
                 
+                // Verify signature regardless of whether we have a pinned key
+                if !backend::pqc_verify(&config.pqc_dsa_algo, &client_dsa_pub, &transcript, &sig)? {
+                    return Err(CryptoError::SignatureVerification);
+                }
+
+                let hash: [u8; 32] = Sha3_256::digest(&client_dsa_pub).into();
+                peer_id_opt = Some(PeerId::Pubkey(hash));
+
                 if let Some(ref pubkey_path) = config.signing_pubkey {
                     let pubkey_bytes = Zeroizing::new(std::fs::read(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
                     let pubkey_pem = std::str::from_utf8(&*pubkey_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
@@ -278,17 +295,11 @@ impl NetworkProcessor {
                     if pinned_raw_pub != client_dsa_pub {
                         return Err(CryptoError::Parameter("Client public key mismatch with pinned key".to_string()));
                     }
+                    eprintln!("Client authenticated successfully (pinned key).");
+                } else {
+                    eprintln!("Client authenticated successfully (allowlist-only mode).");
                 }
-
-                if !backend::pqc_verify(&config.pqc_dsa_algo, &client_dsa_pub, &transcript, &sig)? {
-                    return Err(CryptoError::SignatureVerification);
-                }
-
-                use sha3::{Digest, Sha3_256};
-                let hash: [u8; 32] = Sha3_256::digest(&client_dsa_pub).into();
-                peer_id_opt = Some(PeerId::Pubkey(hash));
-                eprintln!("Client authenticated successfully.");
-            } else if config.signing_pubkey.is_some() || !config.allow_unauth {
+            } else if !config.allow_unauth || config.signing_pubkey.is_some() {
                 return Err(CryptoError::Parameter("Handshake failed: Client authentication required".to_string()));
             }
 
@@ -419,24 +430,12 @@ impl NetworkProcessor {
         };
 
         if config.chat_mode {
-            #[cfg(not(test))]
-            let stdin = tokio::io::stdin();
-            #[cfg(test)]
-            let stdin = tokio::io::empty();
-            
-            #[cfg(not(test))]
-            let (stdout_rx, stdout_tx) = (tokio::io::stdout(), tokio::io::stdout());
-            #[cfg(test)]
-            let (stdout_rx, stdout_tx) = (tokio::io::sink(), tokio::io::sink());
+            let stdin = io_provider.stdin();
+            let stdout = Arc::new(tokio::sync::Mutex::new(io_provider.stdout()));
 
-            CommonProcessor::chat_loop(reader, writer, stdin, stdout_rx, stdout_tx, &config.aead_algo, &s2c_key, &c2s_key, true).await?;
-        } else if cfg!(test) {
-            writer.shutdown().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            return Ok(());
-        } else {
-            tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
-                CommonProcessor::receive_file(reader, tokio::io::stdout(), &config.aead_algo, &c2s_key, &c2s_iv).await
+            CommonProcessor::chat_loop(reader, writer, stdin, stdout, &config.aead_algo, &s2c_key, &c2s_key, true).await?;
+        } else {            tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
+                CommonProcessor::receive_file(reader, io_provider.stdout(), &config.aead_algo, &c2s_key, &c2s_iv).await
             }).await.map_err(|e| CryptoError::Parameter(format!("File receive failed: {}", e)))??;
         }
         Ok(())
@@ -462,173 +461,169 @@ impl NetworkProcessor {
         let _guard = EndpointGuard(endpoint.clone());
         let alpn = if config.chat_mode { ALPN_CHAT } else { ALPN_FILE };
 
-        let res = async {
-            let local_node_id = endpoint.node_id();
-            eprintln!("[nkct] Connecting to NodeId: {}", remote_node_id);
-            let connection = endpoint.connect(node_addr, alpn).await.map_err(|e| CryptoError::Parameter(e.to_string()))?;
-            let (mut writer, mut reader) = connection.open_bi().await.map_err(|e| CryptoError::Parameter(e.to_string()))?;
+        let res = tokio::select! {
+            r = async {
+                let local_node_id = endpoint.node_id();
+                eprintln!("[nkct] Connecting to NodeId: {}", remote_node_id);
+                let connection = endpoint.connect(node_addr, alpn).await.map_err(|e| CryptoError::Parameter(e.to_string()))?;
+                let (mut writer, mut reader) = connection.open_bi().await.map_err(|e| CryptoError::Parameter(e.to_string()))?;
 
-            let handshake_timeout = Duration::from_secs(config.handshake_timeout);
-            let handshake_result = tokio::time::timeout(handshake_timeout, async {
-                let mut transcript = Vec::new();
-                transcript.extend_from_slice(local_node_id.as_bytes());  // Client
-                transcript.extend_from_slice(remote_node_id.as_bytes()); // Server
+                let handshake_timeout = Duration::from_secs(config.handshake_timeout);
+                let handshake_result = tokio::time::timeout(handshake_timeout, async {
+                    let mut transcript = Vec::new();
+                    transcript.extend_from_slice(local_node_id.as_bytes());  // Client
+                    transcript.extend_from_slice(remote_node_id.as_bytes()); // Server
 
-                let kem_algo = config.pqc_kem_algo.clone();
-                let (client_ecc_priv, client_ecc_pub, client_kem_priv, client_kem_pub) = {
-                    let kem_algo_clone = kem_algo.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let (ecc_priv, ecc_pub) = backend::generate_ecc_key_pair("prime256v1")?;
-                        let (kem_priv, kem_pub, _) = backend::pqc_keygen_kem(&kem_algo_clone)?;
-                        Ok::<(Zeroizing<Vec<u8>>, Vec<u8>, Zeroizing<Vec<u8>>, Vec<u8>), CryptoError>((
-                            ecc_priv, ecc_pub, kem_priv, kem_pub,
-                        ))
-                    }).await.map_err(|e| CryptoError::Parameter(e.to_string()))??
-                };
-
-                CommonProcessor::write_vec(&mut writer, &client_ecc_pub).await?;
-                CommonProcessor::write_vec(&mut writer, &client_kem_pub).await?;
-
-                CommonProcessor::update_transcript(&mut transcript, &client_ecc_pub);
-                CommonProcessor::update_transcript(&mut transcript, &client_kem_pub);
-
-                let client_auth_flag = if config.signing_privkey.is_some() { [1u8] } else { [0u8] };
-                writer.write_all(&client_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                transcript.extend_from_slice(&client_auth_flag);
-
-                if client_auth_flag[0] == 1 {
-                    let raw_priv = {
-                        let privkey_path = config.signing_privkey.as_ref().unwrap();
-                        let privkey_bytes = Zeroizing::new(std::fs::read(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
-                        let privkey_pem = std::str::from_utf8(&*privkey_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
-                        let der = crate::utils::unwrap_from_pem(privkey_pem, "PRIVATE KEY")?;
-                        let decrypted_der = crate::utils::extract_raw_private_key(&der, config.passphrase.as_deref().map(|s| s.as_str()))?;
-                        crate::utils::unwrap_pqc_priv_from_pkcs8(&decrypted_der, &config.pqc_dsa_algo)?
+                    let kem_algo = config.pqc_kem_algo.clone();
+                    let (client_ecc_priv, client_ecc_pub, client_kem_priv, client_kem_pub) = {
+                        let kem_algo_clone = kem_algo.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let (ecc_priv, ecc_pub) = backend::generate_ecc_key_pair("prime256v1")?;
+                            let (kem_priv, kem_pub, _) = backend::pqc_keygen_kem(&kem_algo_clone)?;
+                            Ok::<(Zeroizing<Vec<u8>>, Vec<u8>, Zeroizing<Vec<u8>>, Vec<u8>), CryptoError>((
+                                ecc_priv, ecc_pub, kem_priv, kem_pub,
+                            ))
+                        }).await.map_err(|e| CryptoError::Parameter(e.to_string()))??
                     };
-                    let client_dsa_pub = backend::pqc_pub_from_priv_dsa(&config.pqc_dsa_algo, &raw_priv)?;
-                    CommonProcessor::write_vec(&mut writer, &client_dsa_pub).await?;
-                    CommonProcessor::update_transcript(&mut transcript, &client_dsa_pub);
 
-                    let sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, &transcript, None)?;
-                    CommonProcessor::write_vec(&mut writer, &sig).await?;
-                }
+                    CommonProcessor::write_vec(&mut writer, &client_ecc_pub).await?;
+                    CommonProcessor::write_vec(&mut writer, &client_kem_pub).await?;
 
-                let server_ecc_pub = CommonProcessor::read_vec(&mut reader).await?;
-                let kem_ct = CommonProcessor::read_vec(&mut reader).await?;
-                let mut server_auth_flag = [0u8; 1];
-                reader.read_exact(&mut server_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                    CommonProcessor::update_transcript(&mut transcript, &client_ecc_pub);
+                    CommonProcessor::update_transcript(&mut transcript, &client_kem_pub);
 
-                let mut server_transcript = transcript.clone();
-                CommonProcessor::update_transcript(&mut server_transcript, &server_ecc_pub);
-                CommonProcessor::update_transcript(&mut server_transcript, &kem_ct);
-                server_transcript.extend_from_slice(&server_auth_flag);
+                    let client_auth_flag = if config.signing_privkey.is_some() { [1u8] } else { [0u8] };
+                    writer.write_all(&client_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                    transcript.extend_from_slice(&client_auth_flag);
 
-                if server_auth_flag[0] == 1 {
-                    let server_dsa_pub = CommonProcessor::read_vec(&mut reader).await?;
-                    CommonProcessor::update_transcript(&mut server_transcript, &server_dsa_pub);
+                    if client_auth_flag[0] == 1 {
+                        let raw_priv = {
+                            let privkey_path = config.signing_privkey.as_ref().unwrap();
+                            let privkey_bytes = Zeroizing::new(std::fs::read(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
+                            let privkey_pem = std::str::from_utf8(&*privkey_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
+                            let der = crate::utils::unwrap_from_pem(privkey_pem, "PRIVATE KEY")?;
+                            let decrypted_der = crate::utils::extract_raw_private_key(&der, config.passphrase.as_deref().map(|s| s.as_str()))?;
+                            crate::utils::unwrap_pqc_priv_from_pkcs8(&decrypted_der, &config.pqc_dsa_algo)?
+                        };
+                        let client_dsa_pub = backend::pqc_pub_from_priv_dsa(&config.pqc_dsa_algo, &raw_priv)?;
+                        CommonProcessor::write_vec(&mut writer, &client_dsa_pub).await?;
+                        CommonProcessor::update_transcript(&mut transcript, &client_dsa_pub);
 
-                    let sig = CommonProcessor::read_vec(&mut reader).await?;
-                    
-                    let server_kem_pub = CommonProcessor::read_vec(&mut reader).await?;
-                    CommonProcessor::update_transcript(&mut server_transcript, &server_kem_pub);
+                        let sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, &transcript, None)?;
+                        CommonProcessor::write_vec(&mut writer, &sig).await?;
+                    }
 
-                    if let Some(ref pubkey_path) = config.signing_pubkey {
-                        let pubkey_bytes = Zeroizing::new(std::fs::read(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
-                        let pubkey_pem = std::str::from_utf8(&*pubkey_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
-                        let pubkey_der = crate::utils::unwrap_from_pem(pubkey_pem, "PUBLIC KEY")?;
-                        let pinned_raw_pub = crate::utils::unwrap_pqc_pub_from_spki(&pubkey_der, &config.pqc_dsa_algo)?;
+                    let server_ecc_pub = CommonProcessor::read_vec(&mut reader).await?;
+                    let kem_ct = CommonProcessor::read_vec(&mut reader).await?;
+                    let mut server_auth_flag = [0u8; 1];
+                    reader.read_exact(&mut server_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+
+                    let mut server_transcript = transcript.clone();
+                    CommonProcessor::update_transcript(&mut server_transcript, &server_ecc_pub);
+                    CommonProcessor::update_transcript(&mut server_transcript, &kem_ct);
+                    server_transcript.extend_from_slice(&server_auth_flag);
+
+                    if server_auth_flag[0] == 1 {
+                        let server_dsa_pub = CommonProcessor::read_vec(&mut reader).await?;
+                        CommonProcessor::update_transcript(&mut server_transcript, &server_dsa_pub);
+
+                        let sig = CommonProcessor::read_vec(&mut reader).await?;
                         
-                        if pinned_raw_pub != server_dsa_pub {
-                            return Err(CryptoError::Parameter("Server public key mismatch with pinned key".to_string()));
+                        let server_kem_pub = CommonProcessor::read_vec(&mut reader).await?;
+                        CommonProcessor::update_transcript(&mut server_transcript, &server_kem_pub);
+
+                        if let Some(ref pubkey_path) = config.signing_pubkey {
+                            let pubkey_bytes = Zeroizing::new(std::fs::read(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
+                            let pubkey_pem = std::str::from_utf8(&*pubkey_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
+                            let pubkey_der = crate::utils::unwrap_from_pem(pubkey_pem, "PUBLIC KEY")?;
+                            let pinned_raw_pub = crate::utils::unwrap_pqc_pub_from_spki(&pubkey_der, &config.pqc_dsa_algo)?;
+                            
+                            if pinned_raw_pub != server_dsa_pub {
+                                return Err(CryptoError::Parameter("Server public key mismatch with pinned key".to_string()));
+                            }
                         }
+
+                        if let Some(expected_fp) = config.target_sign_fp {
+                            let actual_fp: [u8; 32] = Sha3_256::digest(&server_dsa_pub).into();
+                            if actual_fp != expected_fp {
+                                return Err(CryptoError::Parameter("Server PQC public key fingerprint mismatch (MITM detected!)".to_string()));
+                            }
+                        }
+
+                        if let Some(expected_fp) = config.target_enc_fp {
+                            let actual_fp: [u8; 32] = Sha3_256::digest(&server_kem_pub).into();
+                            if actual_fp != expected_fp {
+                                return Err(CryptoError::Parameter("Server PQC encryption public key fingerprint mismatch (MITM detected!)".to_string()));
+                            }
+                        }
+
+                        if !backend::pqc_verify(&config.pqc_dsa_algo, &server_dsa_pub, &server_transcript, &sig)? {
+                            return Err(CryptoError::SignatureVerification);
+                        }
+                        eprintln!("Server authenticated successfully.");
+                        
+                        if let Some(ref allowlist) = self.cached_allowlist {
+                            let hash: [u8; 32] = Sha3_256::digest(&server_dsa_pub).into();
+                            if !allowlist.contains(&hash) {
+                                return Err(CryptoError::Parameter("Server not in allowlist".to_string()));
+                            }
+                        }
+                    } else if config.signing_pubkey.is_some() || !config.allow_unauth {
+                        return Err(CryptoError::Parameter("Handshake failed: Server authentication required".to_string()));
                     }
 
-                    if let Some(expected_fp) = config.target_sign_fp {
-                        let actual_fp: [u8; 32] = Sha3_256::digest(&server_dsa_pub).into();
-                        if actual_fp != expected_fp {
-                            return Err(CryptoError::Parameter("Server PQC public key fingerprint mismatch (MITM detected!)".to_string()));
-                        }
-                    }
+                    let client_ecc_priv_clone = client_ecc_priv.clone();
+                    let client_kem_priv_clone = client_kem_priv.clone();
+                    let server_ecc_pub_clone = server_ecc_pub.clone();
+                    let kem_ct_clone = kem_ct.clone();
+                    let passphrase = config.passphrase.as_ref().map(|s| s.clone());
+                    let kem_algo_clone = kem_algo.clone();
 
-                    if let Some(expected_fp) = config.target_enc_fp {
-                        let actual_fp: [u8; 32] = Sha3_256::digest(&server_kem_pub).into();
-                        if actual_fp != expected_fp {
-                            return Err(CryptoError::Parameter("Server PQC encryption public key fingerprint mismatch (MITM detected!)".to_string()));
-                        }
-                    }
+                    let (ss_ecc, kem_ss) = tokio::task::spawn_blocking(move || {
+                        let ss_ecc = backend::ecc_dh(&client_ecc_priv_clone, &server_ecc_pub_clone, None)?;
+                        let p_str = passphrase.as_deref().map(|s| s.as_str());
+                        let kem_ss = backend::pqc_decap(&kem_algo_clone, &client_kem_priv_clone, &kem_ct_clone, p_str)?;
+                        Ok::<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>), CryptoError>((ss_ecc, kem_ss))
+                    }).await.map_err(|e| CryptoError::Parameter(e.to_string()))??;
 
-                    if !backend::pqc_verify(&config.pqc_dsa_algo, &server_dsa_pub, &server_transcript, &sig)? {
-                        return Err(CryptoError::SignatureVerification);
-                    }
-                    eprintln!("Server authenticated successfully.");
-                    
-                    if let Some(ref allowlist) = self.cached_allowlist {
-                        let hash: [u8; 32] = Sha3_256::digest(&server_dsa_pub).into();
-                        if !allowlist.contains(&hash) {
-                            return Err(CryptoError::Parameter("Server not in allowlist".to_string()));
-                        }
-                    }
-                } else if config.signing_pubkey.is_some() || !config.allow_unauth {
-                    return Err(CryptoError::Parameter("Handshake failed: Server authentication required".to_string()));
+                    let mut combined_ss = crate::utils::SecureBuffer::new(ss_ecc.len() + kem_ss.len())?;
+                    combined_ss[..ss_ecc.len()].copy_from_slice(&ss_ecc);
+                    combined_ss[ss_ecc.len()..].copy_from_slice(&kem_ss);
+
+                    let salt = Sha3_256::digest(&server_transcript).to_vec();
+                    let okm = backend::hkdf(&combined_ss, 88, &salt, "nk-auth-v3", "SHA3-256")?;
+
+                    let keys = (
+                        Zeroizing::new(okm[0..32].to_vec()),
+                        Zeroizing::new(okm[32..44].to_vec()),
+                        Zeroizing::new(okm[44..76].to_vec()),
+                        Zeroizing::new(okm[76..88].to_vec()),
+                    );
+
+                    Ok::<_, CryptoError>(keys)
+                }).await.map_err(|_| CryptoError::Parameter("Handshake timed out".to_string()))??;
+
+                let (s2c_key, s2c_iv, c2s_key, c2s_iv) = handshake_result;
+
+                if config.chat_mode {
+                    let stdin = self.io_provider.stdin();
+                    let stdout = Arc::new(tokio::sync::Mutex::new(self.io_provider.stdout()));
+
+                    CommonProcessor::chat_loop(reader, writer, stdin, stdout, &config.aead_algo, &s2c_key, &c2s_key, false).await
+                } else {
+                    tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
+                        CommonProcessor::send_file(self.io_provider.stdin(), writer, &config.aead_algo, &c2s_key, &c2s_iv).await
+                    }).await.map_err(|e| CryptoError::Parameter(format!("File send failed: {}", e)))??;
+                    Ok(())
                 }
-
-                let client_ecc_priv_clone = client_ecc_priv.clone();
-                let client_kem_priv_clone = client_kem_priv.clone();
-                let server_ecc_pub_clone = server_ecc_pub.clone();
-                let kem_ct_clone = kem_ct.clone();
-                let passphrase = config.passphrase.as_ref().map(|s| s.clone());
-                let kem_algo_clone = kem_algo.clone();
-
-                let (ss_ecc, kem_ss) = tokio::task::spawn_blocking(move || {
-                    let ss_ecc = backend::ecc_dh(&client_ecc_priv_clone, &server_ecc_pub_clone, None)?;
-                    let p_str = passphrase.as_deref().map(|s| s.as_str());
-                    let kem_ss = backend::pqc_decap(&kem_algo_clone, &client_kem_priv_clone, &kem_ct_clone, p_str)?;
-                    Ok::<(Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>), CryptoError>((ss_ecc, kem_ss))
-                }).await.map_err(|e| CryptoError::Parameter(e.to_string()))??;
-
-                let mut combined_ss = crate::utils::SecureBuffer::new(ss_ecc.len() + kem_ss.len())?;
-                combined_ss[..ss_ecc.len()].copy_from_slice(&ss_ecc);
-                combined_ss[ss_ecc.len()..].copy_from_slice(&kem_ss);
-
-                let salt = Sha3_256::digest(&server_transcript).to_vec();
-                let okm = backend::hkdf(&combined_ss, 88, &salt, "nk-auth-v3", "SHA3-256")?;
-
-                let keys = (
-                    Zeroizing::new(okm[0..32].to_vec()),
-                    Zeroizing::new(okm[32..44].to_vec()),
-                    Zeroizing::new(okm[44..76].to_vec()),
-                    Zeroizing::new(okm[76..88].to_vec()),
-                );
-
-                Ok::<_, CryptoError>(keys)
-            }).await.map_err(|_| CryptoError::Parameter("Handshake timed out".to_string()))??;
-
-            let (s2c_key, s2c_iv, c2s_key, c2s_iv) = handshake_result;
-
-            if config.chat_mode {
-                #[cfg(not(test))]
-                let stdin = tokio::io::stdin();
-                #[cfg(test)]
-                let stdin = tokio::io::empty();
-
-                #[cfg(not(test))]
-                let (stdout_rx, stdout_tx) = (tokio::io::stdout(), tokio::io::stdout());
-                #[cfg(test)]
-                let (stdout_rx, stdout_tx) = (tokio::io::sink(), tokio::io::sink());
-
-                CommonProcessor::chat_loop(reader, writer, stdin, stdout_rx, stdout_tx, &config.aead_algo, &s2c_key, &c2s_key, false).await
-            } else if cfg!(test) {
-                writer.shutdown().await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                Ok(())
-            } else {
-                tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
-                    CommonProcessor::send_file(tokio::io::stdin(), writer, &config.aead_algo, &c2s_key, &c2s_iv).await
-                }).await.map_err(|e| CryptoError::Parameter(format!("File send failed: {}", e)))??;
+            } => r,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\r\n[nkct] Interrupted by user. Closing...");
                 Ok(())
             }
-        }.await;
+        };
 
-        endpoint_cleanup.close().await;
+        let _ = endpoint_cleanup.close().await;
         res
     }
 }
@@ -641,6 +636,7 @@ mod tests {
     use crate::utils;
     use std::sync::atomic::Ordering;
     use serial_test::serial;
+    use crate::network::TestIOProvider;
 
     fn reset_state() {
         CHAT_ACTIVE.store(false, Ordering::SeqCst);
@@ -662,7 +658,12 @@ mod tests {
         server_config.allow_unauth = true;
         server_config.handshake_timeout = 2;
         let server_task = tokio::spawn(async move {
-            let _ = NetworkProcessor::listen_with_sender(&server_config, node_id_tx).await;
+            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            processor.preload_allowlist().await.unwrap();
+            let endpoint = processor.create_endpoint(true).await.unwrap();
+            let _guard = EndpointGuard(endpoint.clone());
+            let _ = node_id_tx.send((endpoint.node_addr().initialized().await, endpoint.clone()));
+            let _ = processor.run_listen_loop(endpoint).await;
         });
         let (node_addr, _server_endpoint) = tokio::time::timeout(Duration::from_secs(2), node_id_rx).await.unwrap().unwrap();
         let mut client_config = CryptoConfig::default();
@@ -672,7 +673,7 @@ mod tests {
         client_config.allow_unauth = true;
         client_config.handshake_timeout = 2;
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::new(client_config);
+            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
             processor.run_connect().await
         }).await;
         server_task.abort();
@@ -704,7 +705,12 @@ mod tests {
         server_config.signing_pubkey = Some(c_pub_path.to_str().unwrap().to_string());
         server_config.handshake_timeout = 2;
         let _server_task = tokio::spawn(async move {
-            let _ = NetworkProcessor::listen_with_sender(&server_config, node_id_tx).await;
+            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            processor.preload_allowlist().await.unwrap();
+            let endpoint = processor.create_endpoint(true).await.unwrap();
+            let _guard = EndpointGuard(endpoint.clone());
+            let _ = node_id_tx.send((endpoint.node_addr().initialized().await, endpoint.clone()));
+            let _ = processor.run_listen_loop(endpoint).await;
         });
         let (node_addr, _server_endpoint) = node_id_rx.await.unwrap();
         let mut client_config = CryptoConfig::default();
@@ -716,7 +722,7 @@ mod tests {
         client_config.signing_pubkey = Some(s_pub_path.to_str().unwrap().to_string());
         client_config.handshake_timeout = 2;
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::new(client_config);
+            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_ok());
@@ -742,7 +748,12 @@ mod tests {
         server_config.signing_privkey = Some(s_key_path.to_str().unwrap().to_string());
         server_config.handshake_timeout = 2;
         let _server_task = tokio::spawn(async move {
-            let _ = NetworkProcessor::listen_with_sender(&server_config, node_id_tx).await;
+            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            processor.preload_allowlist().await.unwrap();
+            let endpoint = processor.create_endpoint(true).await.unwrap();
+            let _guard = EndpointGuard(endpoint.clone());
+            let _ = node_id_tx.send((endpoint.node_addr().initialized().await, endpoint.clone()));
+            let _ = processor.run_listen_loop(endpoint).await;
         });
         let (node_addr, _server_endpoint) = node_id_rx.await.unwrap();
         let mut client_config = CryptoConfig::default();
@@ -752,7 +763,7 @@ mod tests {
         client_config.allow_unauth = true;
         client_config.handshake_timeout = 2;
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::new(client_config);
+            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_err());
@@ -779,7 +790,12 @@ mod tests {
         server_config.signing_pubkey = Some(c_pub_path.to_str().unwrap().to_string());
         server_config.handshake_timeout = 2;
         let _server_task = tokio::spawn(async move {
-            let _ = NetworkProcessor::listen_with_sender(&server_config, node_id_tx).await;
+            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            processor.preload_allowlist().await.unwrap();
+            let endpoint = processor.create_endpoint(true).await.unwrap();
+            let _guard = EndpointGuard(endpoint.clone());
+            let _ = node_id_tx.send((endpoint.node_addr().initialized().await, endpoint.clone()));
+            let _ = processor.run_listen_loop(endpoint).await;
         });
         let (node_addr, _server_endpoint) = node_id_rx.await.unwrap();
         let mut client_config = CryptoConfig::default();
@@ -788,7 +804,7 @@ mod tests {
         client_config.chat_mode = false;
         client_config.allow_unauth = true;
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::new(client_config);
+            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_err());
@@ -809,7 +825,12 @@ mod tests {
         server_config.peer_allowlist = Some(allowlist_path.to_str().unwrap().to_string());
         server_config.handshake_timeout = 2;
         let _server_task = tokio::spawn(async move {
-            let _ = NetworkProcessor::listen_with_sender(&server_config, node_id_tx).await;
+            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            processor.preload_allowlist().await.unwrap();
+            let endpoint = processor.create_endpoint(true).await.unwrap();
+            let _guard = EndpointGuard(endpoint.clone());
+            let _ = node_id_tx.send((endpoint.node_addr().initialized().await, endpoint.clone()));
+            let _ = processor.run_listen_loop(endpoint).await;
         });
         let (node_addr, _server_endpoint) = node_id_rx.await.unwrap();
         let mut client_config = CryptoConfig::default();
@@ -818,7 +839,7 @@ mod tests {
         client_config.chat_mode = false;
         client_config.allow_unauth = true;
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::new(client_config);
+            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_err());
@@ -846,7 +867,12 @@ mod tests {
         server_config.peer_allowlist = Some(allowlist_path.to_str().unwrap().to_string());
         server_config.handshake_timeout = 2;
         let _server_task = tokio::spawn(async move {
-            let _ = NetworkProcessor::listen_with_sender(&server_config, node_id_tx).await;
+            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            processor.preload_allowlist().await.unwrap();
+            let endpoint = processor.create_endpoint(true).await.unwrap();
+            let _guard = EndpointGuard(endpoint.clone());
+            let _ = node_id_tx.send((endpoint.node_addr().initialized().await, endpoint.clone()));
+            let _ = processor.run_listen_loop(endpoint).await;
         });
         let (node_addr, _server_endpoint) = node_id_rx.await.unwrap();
         let mut client_config = CryptoConfig::default();
@@ -856,7 +882,7 @@ mod tests {
         client_config.allow_unauth = false;
         client_config.signing_privkey = Some(c_key_path.to_str().unwrap().to_string());
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::new(client_config);
+            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_ok());
@@ -872,7 +898,12 @@ mod tests {
         server_config.chat_mode = true;
         server_config.allow_unauth = true;
         let _server_task = tokio::spawn(async move {
-            let _ = NetworkProcessor::listen_with_sender(&server_config, node_id_tx).await;
+            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            processor.preload_allowlist().await.unwrap();
+            let endpoint = processor.create_endpoint(true).await.unwrap();
+            let _guard = EndpointGuard(endpoint.clone());
+            let _ = node_id_tx.send((endpoint.node_addr().initialized().await, endpoint.clone()));
+            let _ = processor.run_listen_loop(endpoint).await;
         });
         let (node_addr, _server_endpoint) = tokio::time::timeout(Duration::from_secs(2), node_id_rx).await.unwrap().unwrap();
         let mut client_config = CryptoConfig::default();
@@ -881,7 +912,7 @@ mod tests {
         client_config.chat_mode = true;
         client_config.allow_unauth = true;
         let client_res = tokio::time::timeout(Duration::from_secs(5), async {
-            let processor = NetworkProcessor::new(client_config);
+            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
             processor.run_connect().await
         }).await;
         // After F-IROH-39 fix, stdin EOF should lead to a clean exit, not a timeout.
@@ -901,7 +932,12 @@ mod tests {
         server_config.chat_mode = false;
         server_config.allow_unauth = true;
         let _server_task = tokio::spawn(async move {
-            let _ = NetworkProcessor::listen_with_sender(&server_config, node_id_tx).await;
+            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            processor.preload_allowlist().await.unwrap();
+            let endpoint = processor.create_endpoint(true).await.unwrap();
+            let _guard = EndpointGuard(endpoint.clone());
+            let _ = node_id_tx.send((endpoint.node_addr().initialized().await, endpoint.clone()));
+            let _ = processor.run_listen_loop(endpoint).await;
         });
         let (node_addr, _server_endpoint) = tokio::time::timeout(Duration::from_secs(2), node_id_rx).await.unwrap().unwrap();
         let mut client_config = CryptoConfig::default();
@@ -910,7 +946,7 @@ mod tests {
         client_config.chat_mode = false;
         client_config.allow_unauth = true;
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::new(client_config);
+            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_ok());

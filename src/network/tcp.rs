@@ -11,6 +11,7 @@ use crate::error::{CryptoError, Result};
 use super::{
     ChatActiveGuard, NetworkProcessor as CommonProcessor, PeerId, BUF_SIZE, CHAT_ACTIVE,
     CHAT_SESSION_TIMEOUT, CUMULATIVE_TIMEOUT, IDLE_TIMEOUT, MAX_FILE_SIZE, PEER_COOLDOWNS,
+    IOProvider, DefaultIOProvider,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +24,7 @@ pub struct NetworkProcessor {
     config: CryptoConfig,
     semaphore: Arc<Semaphore>,
     cached_allowlist: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
+    io_provider: Arc<dyn IOProvider>,
 }
 
 impl NetworkProcessor {
@@ -31,6 +33,16 @@ impl NetworkProcessor {
             config,
             semaphore: Arc::new(Semaphore::new(100)),
             cached_allowlist: None,
+            io_provider: Arc::new(DefaultIOProvider),
+        }
+    }
+
+    pub fn with_io(config: CryptoConfig, io_provider: Arc<dyn IOProvider>) -> Self {
+        Self {
+            config,
+            semaphore: Arc::new(Semaphore::new(100)),
+            cached_allowlist: None,
+            io_provider,
         }
     }
 
@@ -113,9 +125,10 @@ impl NetworkProcessor {
 
             let config_clone = self.config.clone();
             let cached_list = self.cached_allowlist.clone();
+            let io_provider = self.io_provider.clone();
             tokio::spawn(async move {
                 if let Err(e) =
-                    Self::handle_server_connection(stream, _peer, &config_clone, permit, cached_list)
+                    Self::handle_server_connection(stream, _peer, &config_clone, permit, cached_list, io_provider)
                         .await
                 {
                     eprintln!("Connection error with {}: {}", _peer, e);
@@ -131,6 +144,7 @@ impl NetworkProcessor {
         config: &CryptoConfig,
         _permit: OwnedSemaphorePermit,
         cached_allowlist: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
+        io_provider: Arc<dyn IOProvider>,
     ) -> Result<()> {
         let handshake_timeout = Duration::from_secs(config.handshake_timeout);
         let mut peer_id_opt: Option<PeerId> = None;
@@ -152,6 +166,18 @@ impl NetworkProcessor {
 
             if client_auth_flag[0] == 1 {
                 let sig = CommonProcessor::read_vec(&mut stream).await?;
+                let client_dsa_pub = CommonProcessor::read_vec(&mut stream).await?; // Read client's public key
+                CommonProcessor::update_transcript(&mut transcript, &client_dsa_pub);
+
+                // Verify signature regardless of whether we have a pinned key
+                let algo = config.pqc_dsa_algo.clone();
+                if !backend::pqc_verify(&algo, &client_dsa_pub, &transcript, &sig)? {
+                    return Err(CryptoError::SignatureVerification);
+                }
+
+                let hash: [u8; 32] = Sha3_256::digest(&client_dsa_pub).into();
+                peer_id_opt = Some(PeerId::Pubkey(hash));
+
                 if let Some(ref pubkey_path) = config.signing_pubkey {
                     let pubkey_bytes = Zeroizing::new(
                         std::fs::read(pubkey_path)
@@ -165,31 +191,20 @@ impl NetworkProcessor {
                             .to_string(),
                     );
                     let pubkey_der = crate::utils::unwrap_from_pem(&pubkey_pem, "PUBLIC KEY")?;
-                    let raw_pub =
+                    let pinned_raw_pub =
                         crate::utils::unwrap_pqc_pub_from_spki(&pubkey_der, &config.pqc_dsa_algo)?;
 
-                    let algo = config.pqc_dsa_algo.clone();
-                    if !backend::pqc_verify(&algo, &raw_pub, &transcript, &sig)? {
-                        // F-54 Fix: Removed short IP cooldown on handshake failure to prevent Attack D
-                        return Err(CryptoError::SignatureVerification);
+                    if pinned_raw_pub != client_dsa_pub {
+                        return Err(CryptoError::Parameter("Client public key mismatch with pinned key".to_string()));
                     }
-
-                    // F-52-1 Fix: Peer identified by LONG-TERM signing public key fingerprint
-                    use sha3::{Digest, Sha3_256};
-                    let mut hasher = Sha3_256::new();
-                    hasher.update(&raw_pub);
-                    let mut hash = [0u8; 32];
-                    hash.copy_from_slice(&hasher.finalize());
-                    let peer_id = PeerId::Pubkey(hash);
-                    peer_id_opt = Some(peer_id.clone());
-                } else if !config.allow_unauth {
-                    return Err(CryptoError::Parameter(
-                        "Client authentication required but no public key provided".to_string(),
-                    ));
+                    eprintln!("Client authenticated successfully (pinned key).");
+                } else {
+                    eprintln!("Client authenticated successfully (allowlist-only mode).");
                 }
-                eprintln!("Client authenticated successfully.");
-            } else if config.signing_pubkey.is_some() || !config.allow_unauth {
-                return Err(CryptoError::Parameter("Handshake failed".to_string()));
+            } else if !config.allow_unauth || config.signing_pubkey.is_some() {
+                return Err(CryptoError::Parameter(
+                    "Handshake failed: Client authentication required".to_string(),
+                ));
             }
 
             if peer_id_opt.is_none() {
@@ -368,19 +383,12 @@ impl NetworkProcessor {
         // 6. Data Transfer or Chat
         if config.chat_mode {
             let (rx, tx) = stream.into_split();
-            #[cfg(not(test))]
-            let stdin = tokio::io::stdin();
-            #[cfg(test)]
-            let stdin = tokio::io::empty();
-
-            #[cfg(not(test))]
-            let (stdout_rx, stdout_tx) = (tokio::io::stdout(), tokio::io::stdout());
-            #[cfg(test)]
-            let (stdout_rx, stdout_tx) = (tokio::io::sink(), tokio::io::sink());
+            let stdin = io_provider.stdin();
+            let stdout = Arc::new(tokio::sync::Mutex::new(io_provider.stdout()));
 
             tokio::time::timeout(
                 CHAT_SESSION_TIMEOUT,
-                CommonProcessor::chat_loop(rx, tx, stdin, stdout_rx, stdout_tx, &config.aead_algo, &s2c_key, &c2s_key, true),
+                CommonProcessor::chat_loop(rx, tx, stdin, stdout, &config.aead_algo, &s2c_key, &c2s_key, true),
             )
             .await
             .map_err(|_| CryptoError::Parameter("Chat session timed out".to_string()))??;
@@ -388,7 +396,7 @@ impl NetworkProcessor {
             tokio::time::timeout(CUMULATIVE_TIMEOUT, async {
                 CommonProcessor::receive_file(
                     stream,
-                    tokio::io::stdout(),
+                    io_provider.stdout(),
                     &config.aead_algo,
                     &c2s_key,
                     &c2s_iv,
@@ -450,7 +458,6 @@ impl NetworkProcessor {
             transcript.extend_from_slice(&client_auth_flag);
 
             if client_auth_flag[0] == 1 {
-                // F-49-10 Fix: Lazy load signing key
                 let raw_priv = {
                     let privkey_path = self.config.signing_privkey.as_ref().unwrap();
                     let privkey_bytes = Zeroizing::new(
@@ -478,11 +485,12 @@ impl NetworkProcessor {
                     }
                 };
 
+                let client_dsa_pub = backend::pqc_pub_from_priv_dsa(&self.config.pqc_dsa_algo, &raw_priv)?;
                 let sig =
                     backend::pqc_sign(&self.config.pqc_dsa_algo, &raw_priv, &transcript, None)?;
                 CommonProcessor::write_vec(&mut stream, &sig).await?;
+                CommonProcessor::write_vec(&mut stream, &client_dsa_pub).await?;
             }
-
             // 2. Receive Server Hello
             let server_ecc_pub = CommonProcessor::read_vec(&mut stream).await?;
             let kem_ct = CommonProcessor::read_vec(&mut stream).await?;
@@ -576,43 +584,46 @@ impl NetworkProcessor {
         .await
         .map_err(|_| CryptoError::Parameter("Handshake timed out".to_string()))??;
 
-        // 4. Data Transfer or Chat
-        if self.config.chat_mode {
-            let (rx, tx) = stream.into_split();
-            #[cfg(not(test))]
-            let stdin = tokio::io::stdin();
-            #[cfg(test)]
-            let stdin = tokio::io::empty();
+        let res = async {
+            // 4. Data Transfer or Chat
+            if self.config.chat_mode {
+                let (rx, tx) = stream.into_split();
+                let stdin = self.io_provider.stdin();
+                let stdout = Arc::new(tokio::sync::Mutex::new(self.io_provider.stdout()));
 
-            #[cfg(not(test))]
-            let (stdout_rx, stdout_tx) = (tokio::io::stdout(), tokio::io::stdout());
-            #[cfg(test)]
-            let (stdout_rx, stdout_tx) = (tokio::io::sink(), tokio::io::sink());
-
-            tokio::time::timeout(
-                CHAT_SESSION_TIMEOUT,
-                CommonProcessor::chat_loop(rx, tx, stdin, stdout_rx, stdout_tx, &self.config.aead_algo, &s2c_key, &c2s_key, false),
-            )
-            .await
-            .map_err(|_| CryptoError::Parameter("Handshake timed out".to_string()))??;
-        } else {
-
-            tokio::time::timeout(CUMULATIVE_TIMEOUT, async {
-                CommonProcessor::send_file(
-                    tokio::io::stdin(),
-                    stream,
-                    &self.config.aead_algo,
-                    &c2s_key,
-                    &c2s_iv,
+                tokio::time::timeout(
+                    CHAT_SESSION_TIMEOUT,
+                    CommonProcessor::chat_loop(rx, tx, stdin, stdout, &self.config.aead_algo, &s2c_key, &c2s_key, false),
                 )
                 .await
-            })
-            .await
-            .map_err(|e| {
-                CryptoError::Parameter(format!("Data transfer timed out or failed: {}", e))
-            })??;
+                .map_err(|_| CryptoError::Parameter("Chat session timed out".to_string()))??;
+            } else {
+
+                tokio::time::timeout(CUMULATIVE_TIMEOUT, async {
+                    CommonProcessor::send_file(
+                        self.io_provider.stdin(),
+                        stream,
+                        &self.config.aead_algo,
+                        &c2s_key,
+                        &c2s_iv,
+                    )
+                    .await
+                })
+                .await
+                .map_err(|e| {
+                    CryptoError::Parameter(format!("Data transfer timed out or failed: {}", e))
+                })??;
+            }
+            Ok(())
+        };
+
+        tokio::select! {
+            r = res => r,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\r\n[nkct] Interrupted by user.");
+                Ok(())
+            }
         }
-        Ok(())
     }
 }
 
@@ -622,6 +633,12 @@ mod tests {
     use std::sync::atomic::Ordering;
     use tokio::net::TcpListener;
     use crate::network::AbortGuard;
+    use serial_test::serial;
+
+    fn reset_state() {
+        CHAT_ACTIVE.store(false, Ordering::SeqCst);
+        PEER_COOLDOWNS.lock().clear();
+    }
 
     #[tokio::test]
     async fn test_rx_task_abort_on_drop() {
@@ -670,7 +687,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial]
     async fn test_cooldown_logic_non_blocking() {
+        reset_state();
         use tokio::time::Duration;
         let ip = "127.0.0.1".parse::<std::net::IpAddr>().unwrap();
         let peer_id = PeerId::Ip(ip);
@@ -703,7 +722,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial]
     async fn test_short_session_triggers_cooldown() {
+        reset_state();
         let ip = "127.0.0.2".parse::<std::net::IpAddr>().unwrap();
         let peer_id = PeerId::Ip(ip);
 
@@ -725,7 +746,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial]
     async fn test_long_session_also_triggers_cooldown() {
+        reset_state();
         use tokio::time::Duration;
         let ip = "127.0.0.3".parse::<std::net::IpAddr>().unwrap();
         let peer_id = PeerId::Ip(ip);
@@ -754,7 +777,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial]
     async fn test_peer_cooldown_uses_long_term_pubkey() {
+        reset_state();
         use sha3::{Digest, Sha3_256};
         let long_term_pubkey = vec![0x42u8; 1952]; // ML-DSA-65 pubkey size
         let mut hasher = Sha3_256::new();
