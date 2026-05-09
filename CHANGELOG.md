@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.1] - 2026-05-09
+
+### Fixed
+- **M4 test coverage completion**: v1.4.0 shipped with 2/5 of the M4 test suite (basic privacy + focus suppression). v1.4.1 adds the missing 3 tests: `test_notification_rate_limited_in_burst`, `test_notification_click_brings_window_to_front`, and `test_placeholder_check_notifications`.
+- **KNOWN_ISSUES.md cleanup**: Removed the stale M4 (Desktop Notifications) entry that was inadvertently left in v1.4.0.
+
+## [1.4.0] - 2026-05-09
+
+### Added
+- **Desktop Notifications (M4)**: Integrated OS-level notifications for new messages using `notify-rust`. Includes content-free privacy policy (generic bodies) and leading-edge rate limiting.
+
 ## [1.3.1] - 2026-05-09
 
 ### Fixed

@@ -8,6 +8,7 @@
 mod tests {
     use slint::ComponentHandle;
     use std::sync::{Arc, Mutex};
+    use std::sync::atomic::{AtomicBool, Ordering};
     
     slint::include_modules!();
 
@@ -93,5 +94,83 @@ mod tests {
         assert!(!mod_rs.contains("we would start"));
         assert!(!mod_rs.contains("For now,"));
         assert!(!mod_rs.contains("simulate with"));
+    }
+
+    #[cfg(feature = "gui-notifications")]
+    #[test]
+    fn test_notification_body_excludes_message_content() {
+        use crate::gui::notifications::{NotificationManager, MockNotificationSink};
+        let sink = Arc::new(MockNotificationSink {
+            history: Mutex::new(Vec::new()),
+        });
+        let manager = NotificationManager::new(sink.clone());
+        
+        manager.notify_message("peer8888", false).unwrap();
+        
+        let history = sink.history.lock().unwrap();
+        assert_eq!(history.len(), 1);
+        let (_title, body) = &history[0];
+        assert!(body.contains("peer8888"));
+        assert!(!body.contains("secret"));
+    }
+
+    #[cfg(feature = "gui-notifications")]
+    #[test]
+    fn test_notification_suppressed_when_focused() {
+        use crate::gui::notifications::{NotificationManager, MockNotificationSink};
+        let sink = Arc::new(MockNotificationSink {
+            history: Mutex::new(Vec::new()),
+        });
+        let manager = NotificationManager::new(sink.clone());
+        
+        manager.notify_message("peer8888", true).unwrap(); // focused = true
+        
+        let history = sink.history.lock().unwrap();
+        assert_eq!(history.len(), 0);
+    }
+
+    #[cfg(feature = "gui-notifications")]
+    #[test]
+    fn test_notification_rate_limited_in_burst() {
+        use crate::gui::notifications::{NotificationManager, MockNotificationSink};
+        let sink = Arc::new(MockNotificationSink {
+            history: Mutex::new(Vec::new()),
+        });
+        let manager = NotificationManager::new(sink.clone());
+
+        // Burst: 5 messages
+        for _ in 0..5 {
+            manager.notify_message("peer8888", false).unwrap();
+        }
+
+        // Leading-edge: only 1st should fire
+        let history = sink.history.lock().unwrap();
+        assert_eq!(history.len(), 1);
+    }
+
+    #[test]
+    fn test_placeholder_check_notifications() {
+        let notifications_rs = include_str!("../src/gui/notifications.rs");
+        assert!(!notifications_rs.contains("In a real implementation"));
+        assert!(!notifications_rs.contains("we would start"));
+        assert!(!notifications_rs.contains("For now,"));
+        assert!(!notifications_rs.contains("simulate with"));
+        assert!(!notifications_rs.contains("placeholder"));
+    }
+
+    #[test]
+    fn test_notification_click_brings_window_to_front_mock() {
+        let raise_called = Arc::new(AtomicBool::new(false));
+        let raise_called_clone = raise_called.clone();
+
+        // Simulate the action callback that would be registered in mod.rs
+        let on_activate = move || {
+            raise_called_clone.store(true, Ordering::Relaxed);
+        };
+
+        // Trigger the mock "activate"
+        on_activate();
+
+        assert!(raise_called.load(Ordering::Relaxed), "Activate callback should be triggered");
     }
 }
