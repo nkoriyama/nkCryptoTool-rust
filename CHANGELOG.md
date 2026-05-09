@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.0.0] - 2026-05-09
 
 ### Added
 - **Iroh P2P Transport**: Migrated network mode from TCP to Iroh for automatic NAT traversal and relay fallback.
@@ -17,6 +17,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - **Default Transport**: Iroh is now the default transport mode.
 - **Authentication**: Fingerprint verification and multi-client auth are now standard in Iroh mode.
+- **CLI Robustness**: Fixed authentication logic regressions and enhanced endpoint closing reliability.
 
 ### Deprecated
 - **TCP Transport**: Legacy TCP mode (`--transport tcp`) is now deprecated and scheduled for removal.
