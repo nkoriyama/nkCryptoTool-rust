@@ -5,6 +5,9 @@
 # Historical reports/summaries (moved to /src/archive/nkCryptoTool-rust/)
 archive/
 
+# Issue/process documents (canonical copies live at /src/issue/nkCryptoTool-rust/)
+issue/
+
 # Test/runtime artifacts
 test_keys/
 pqc_keys/
