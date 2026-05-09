@@ -20,6 +20,9 @@ use std::time::Duration;
 
 #[cfg(feature = "gui-camera")]
 pub mod camera;
+#[cfg(feature = "gui-notifications")]
+pub mod notifications;
+
 #[cfg(feature = "gui-camera")]
 use crate::ticket::Ticket;
 #[cfg(feature = "gui-camera")]
@@ -32,6 +35,7 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
 
     let (stdin_tx, stdin_rx) = mpsc::channel(100);
     let (stdout_tx, stdout_rx) = mpsc::channel(100);
+    // Channel for M1 passphrase response
     let (pass_tx, mut pass_rx) = mpsc::channel::<Zeroizing<String>>(1);
 
     let gui_provider = Arc::new(GuiIOProvider {
@@ -39,14 +43,42 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         stdout_tx,
     });
 
+    // M4: Notification Manager
+    #[cfg(feature = "gui-notifications")]
+    let notif_manager = {
+        use crate::gui::notifications::{NotificationManager, DesktopNotificationSink};
+        Arc::new(NotificationManager::new(Arc::new(DesktopNotificationSink)))
+    };
+
+    // Update UI when messages arrive from network
     let mut stdout_rx = stdout_rx;
     let ui_handle_out = ui_handle.clone();
+    #[cfg(feature = "gui-notifications")]
+    let nm = notif_manager.clone();
+    
     tokio::spawn(async move {
         while let Some(data) = stdout_rx.recv().await {
             let msg = String::from_utf8_lossy(&data).to_string();
             let clean_msg = msg.trim_start_matches("\r[Peer]: ").trim_end_matches("\n> ").trim_start_matches("> ").to_string();
             if clean_msg.is_empty() || clean_msg == ">" { continue; }
             
+            let mut peer_id = "Peer".to_string();
+            if msg.contains("[") && msg.contains("]") {
+                 if let Some(start) = msg.find('[') {
+                     if let Some(end) = msg.find(']') {
+                         peer_id = msg[start+1..end].to_string();
+                     }
+                 }
+            }
+
+            #[cfg(feature = "gui-notifications")]
+            {
+                 // M4: Trigger notification
+                 // For now, focus suppression is best-effort.
+                 // We could extend Slint window properties if needed.
+                 let _ = nm.notify_message(&peer_id, false);
+            }
+
             let ui_handle = ui_handle_out.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_handle.upgrade() {

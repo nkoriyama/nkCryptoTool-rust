@@ -94,4 +94,37 @@ mod tests {
         assert!(!mod_rs.contains("For now,"));
         assert!(!mod_rs.contains("simulate with"));
     }
+
+    #[cfg(feature = "gui-notifications")]
+    #[test]
+    fn test_notification_body_excludes_message_content() {
+        use crate::gui::notifications::{NotificationManager, MockNotificationSink};
+        let sink = Arc::new(MockNotificationSink {
+            history: Mutex::new(Vec::new()),
+        });
+        let manager = NotificationManager::new(sink.clone());
+        
+        manager.notify_message("peer8888", false).unwrap();
+        
+        let history = sink.history.lock().unwrap();
+        assert_eq!(history.len(), 1);
+        let (_title, body) = &history[0];
+        assert!(body.contains("peer8888"));
+        assert!(!body.contains("secret"));
+    }
+
+    #[cfg(feature = "gui-notifications")]
+    #[test]
+    fn test_notification_suppressed_when_focused() {
+        use crate::gui::notifications::{NotificationManager, MockNotificationSink};
+        let sink = Arc::new(MockNotificationSink {
+            history: Mutex::new(Vec::new()),
+        });
+        let manager = NotificationManager::new(sink.clone());
+        
+        manager.notify_message("peer8888", true).unwrap(); // focused = true
+        
+        let history = sink.history.lock().unwrap();
+        assert_eq!(history.len(), 0);
+    }
 }

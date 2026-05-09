@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0] - 2026-05-09
+
+### Added
+- **Desktop Notifications (M4)**: Integrated OS-level notifications for new messages using `notify-rust`. Includes content-free privacy policy (generic bodies) and leading-edge rate limiting.
+
 ## [1.3.1] - 2026-05-09
 
 ### Fixed
