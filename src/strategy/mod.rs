@@ -69,6 +69,13 @@ pub trait CryptoStrategy: Send + Sync {
     fn finalize_encryption(&mut self) -> Result<Vec<u8>>;
     fn finalize_decryption(&mut self, tag: &[u8]) -> Result<()>;
 
+    /// Restarts the decryption AEAD context for Two-pass processing.
+    fn restart_decryption(&mut self) -> Result<()> {
+        Err(crate::error::CryptoError::Parameter(
+            "Two-pass decryption not supported by this strategy".to_string(),
+        ))
+    }
+
     // Signing / Verification
     fn prepare_signing(
         &mut self,

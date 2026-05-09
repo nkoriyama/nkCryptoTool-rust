@@ -522,6 +522,47 @@ impl CryptoProcessor {
             use std::fs::OpenOptions;
             use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
+            // Pass 1: Verification (no disk writing)
+            {
+                let mut in_file = std::fs::File::open(&input_path)
+                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                in_file
+                    .seek(SeekFrom::Start(header_size))
+                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                let mut reader = BufReader::with_capacity(BUF_SIZE * 4, in_file);
+
+                let mut in_buf = vec![0u8; BUF_SIZE];
+                // Defense-in-depth: Zeroize Pass 1 dummy buffer to prevent plaintext residue in memory
+                let mut out_buf = Zeroizing::new(vec![0u8; BUF_SIZE + AEAD_OVERHEAD]);
+                let mut total_read = 0u64;
+
+                while total_read < ciphertext_size {
+                    let to_read =
+                        std::cmp::min(BUF_SIZE as u64, ciphertext_size - total_read) as usize;
+                    reader
+                        .read_exact(&mut in_buf[..to_read])
+                        .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+
+                    // Decrypt but discard results
+                    let _ = strategy.decrypt_into(&in_buf[..to_read], &mut out_buf)?;
+                    out_buf.fill(0); // Immediate clear
+
+                    total_read += to_read as u64;
+                    if let Some(ref cb) = cb_clone {
+                        if ciphertext_size > 0 {
+                            // Pass 1 takes 0% -> 50% of progress
+                            cb((total_read as f64 / ciphertext_size as f64) * 0.5);
+                        }
+                    }
+                }
+
+                // Verify the final tag
+                strategy.finalize_decryption(&tag)?;
+            }
+
+            // Pass 1 succeeded. Now Pass 2: Actually writing to temporary file.
+            strategy.restart_decryption()?;
+
             let mut in_file =
                 std::fs::File::open(&input_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
             in_file
@@ -540,10 +581,10 @@ impl CryptoProcessor {
 
             let mut in_buf = vec![0u8; BUF_SIZE];
             let mut out_buf = vec![0u8; BUF_SIZE + AEAD_OVERHEAD];
-            let mut total_read = 0u64;
+            let mut total_read_pass2 = 0u64;
 
-            while total_read < ciphertext_size {
-                let to_read = std::cmp::min(BUF_SIZE as u64, ciphertext_size - total_read) as usize;
+            while total_read_pass2 < ciphertext_size {
+                let to_read = std::cmp::min(BUF_SIZE as u64, ciphertext_size - total_read_pass2) as usize;
                 reader
                     .read_exact(&mut in_buf[..to_read])
                     .map_err(|e| CryptoError::FileRead(e.to_string()))?;
@@ -553,15 +594,18 @@ impl CryptoProcessor {
                     .write_all(&out_buf[..m])
                     .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
 
-                total_read += to_read as u64;
+                total_read_pass2 += to_read as u64;
                 if let Some(ref cb) = cb_clone {
                     if ciphertext_size > 0 {
-                        cb(total_read as f64 / ciphertext_size as f64);
+                        // Pass 2 takes 50% -> 100% of progress
+                        cb(0.5 + (total_read_pass2 as f64 / ciphertext_size as f64) * 0.5);
                     }
                 }
             }
 
+            // Optional: Re-verify in Pass 2
             strategy.finalize_decryption(&tag)?;
+
             writer
                 .flush()
                 .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
@@ -687,5 +731,86 @@ impl CryptoProcessor {
                 "Strategy not initialized".to_string(),
             ))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::strategy::ecc::EccStrategy;
+    use tempfile::tempdir;
+    use std::fs;
+    use std::sync::Arc;
+    use crate::config::*;
+    use std::collections::HashMap;
+    use zeroize::Zeroizing;
+
+    #[tokio::test]
+    async fn test_streaming_decrypt_invariant_37_1_internal() {
+        let dir = tempdir().unwrap();
+        let input_path = dir.path().join("input.txt");
+        let encrypted_path = dir.path().join("output.enc");
+        let decrypted_path = dir.path().join("output.dec");
+        let key_dir = dir.path().join("keys");
+        fs::create_dir_all(&key_dir).unwrap();
+
+        let mut processor = CryptoProcessor::new(CryptoMode::ECC);
+        let mut key_paths = HashMap::new();
+        key_paths.insert("recipient-pubkey".to_string(), key_dir.join("public_enc_ecc.key").to_str().unwrap().to_string());
+        key_paths.insert("user-privkey".to_string(), key_dir.join("private_enc_ecc.key").to_str().unwrap().to_string());
+        key_paths.insert("public-key".to_string(), key_dir.join("public_enc_ecc.key").to_str().unwrap().to_string());
+        key_paths.insert("private-key".to_string(), key_dir.join("private_enc_ecc.key").to_str().unwrap().to_string());
+        
+        let mut strategy = Box::new(EccStrategy::new());
+        // Non-empty dummy bypasses prompt
+        strategy.generate_encryption_key_pair(&key_paths, Some("test"), true).unwrap();
+
+        let content = vec![0u8; 1024];
+        fs::write(&input_path, &content).unwrap();
+        
+        let config = CryptoConfig {
+            operation: Operation::Encrypt,
+            input_files: vec![input_path.to_str().unwrap().to_string()],
+            output_file: Some(encrypted_path.to_str().unwrap().to_string()),
+            recipient_pubkey: Some(key_dir.join("public_enc_ecc.key").to_str().unwrap().to_string()),
+            passphrase: Some(Zeroizing::new("test".to_string())),
+            key_dir: key_dir.to_str().unwrap().to_string(),
+            force: true,
+            mode: CryptoMode::ECC,
+            ..CryptoConfig::default()
+        };
+        processor.process(&config, None).await.expect("Encryption failed");
+
+        let mut dec_processor = CryptoProcessor::new(CryptoMode::ECC);
+        let dec_config = CryptoConfig {
+            operation: Operation::Decrypt,
+            input_files: vec![encrypted_path.to_str().unwrap().to_string()],
+            output_file: Some(decrypted_path.to_str().unwrap().to_string()),
+            user_privkey: Some(key_dir.join("private_enc_ecc.key").to_str().unwrap().to_string()),
+            passphrase: Some(Zeroizing::new("test".to_string())),
+            key_dir: key_dir.to_str().unwrap().to_string(),
+            force: true,
+            mode: CryptoMode::ECC,
+            ..CryptoConfig::default()
+        };
+
+        let dec_path_clone = decrypted_path.clone();
+        let check_callback = Arc::new(move |progress| {
+            let parent = dec_path_clone.parent().unwrap();
+            let file_name = dec_path_clone.file_name().unwrap().to_str().unwrap();
+            let prefix = format!("{}.tmp.", file_name);
+            
+            if progress < 0.5 {
+                for entry in fs::read_dir(parent).unwrap() {
+                    let entry = entry.unwrap();
+                    if entry.file_name().to_str().unwrap().starts_with(&prefix) {
+                        panic!("SECURITY VIOLATION (37-1): Temp file exists during Pass 1!");
+                    }
+                }
+            }
+        });
+
+        dec_processor.process(&dec_config, Some(check_callback)).await.expect("Decryption failed");
+        assert_eq!(fs::read(&decrypted_path).unwrap(), content);
     }
 }

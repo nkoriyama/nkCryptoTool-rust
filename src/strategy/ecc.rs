@@ -355,6 +355,15 @@ impl CryptoStrategy for EccStrategy {
         Ok(())
     }
 
+    fn restart_decryption(&mut self) -> Result<()> {
+        if self.encryption_key.is_empty() {
+            return Err(CryptoError::Parameter("Key not set".to_string()));
+        }
+        let ctx = crate::backend::new_decrypt(&self.aead_algo, &self.encryption_key, &self.iv)?;
+        self.aead_ctx = Some(ctx);
+        Ok(())
+    }
+
     fn prepare_signing(
         &mut self,
         priv_key_path: &Path,
