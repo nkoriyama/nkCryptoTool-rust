@@ -1,0 +1,70 @@
+import { Button, VerticalBox, LineEdit, TextEdit, StandardListView, GroupBox } from "std-widgets.slint";
+
+export component ChatWindow inherits Window {
+    title: "nkCryptoTool Chat (Slint PoC)";
+    width: 800px;
+    height: 600px;
+
+    callback connect-pressed(string, string, string); // ticket, privkey_path, pubkey_path
+    callback send-message(string);
+    
+    in property <[StandardListViewItem]> messages: [];
+    in property <bool> connected: false;
+    in-out property <string> input-text: "";
+    
+    in-out property <string> ticket-text: "";
+    in-out property <string> privkey-path: "";
+    in-out property <string> pubkey-path: "";
+
+    VerticalBox {
+        GroupBox {
+            title: "Connection Settings";
+            visible: !connected;
+            VerticalBox {
+                LineEdit {
+                    placeholder-text: "Ticket (nkct1...)";
+                    text <=> ticket-text;
+                }
+                LineEdit {
+                    placeholder-text: "Private Key Path";
+                    text <=> privkey-path;
+                }
+                LineEdit {
+                    placeholder-text: "Public Key Path (Peer)";
+                    text <=> pubkey-path;
+                }
+                Button {
+                    text: "Connect";
+                    clicked => {
+                        root.connect-pressed(root.ticket-text, root.privkey-path, root.pubkey-path);
+                    }
+                }
+            }
+        }
+        
+        StandardListView {
+            model: messages;
+            min-height: 200px;
+            visible: connected;
+        }
+        
+        VerticalBox {
+            visible: connected;
+            LineEdit {
+                text <=> input-text;
+                placeholder-text: "Type a message...";
+                accepted => {
+                    root.send-message(root.input-text);
+                    root.input-text = "";
+                }
+            }
+            Button {
+                text: "Send";
+                clicked => {
+                    root.send-message(root.input-text);
+                    root.input-text = "";
+                }
+            }
+        }
+    }
+}
