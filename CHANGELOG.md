@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-05-09
+
+### Added
+- **QR Code Scan Input (M2)**: Integrated camera-based NKCT1 ticket reading using nokhwa and rqrr. Includes permission handling for Wayland/Portal and privacy indicators.
+
 ## [1.2.0] - 2026-05-09
 
 ### Added

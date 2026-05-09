@@ -23,10 +23,6 @@ Iroh file transfer currently only supports redirection via stdin/stdout. Direct 
 
 ## GUI Features (deferred)
 
-### 1. QR Code Scan (M2)
-Automatic NKCT1 ticket reading via camera is not yet implemented.
-- **Workaround**: Manual copy-paste of connection tickets.
-
 ### 2. Desktop Notifications (M4)
 Background message notifications are not yet implemented.
 
