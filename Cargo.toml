@@ -31,6 +31,7 @@ tempfile = "3.8"
 parking_lot = "0.12"
 hex = "0.4"
 serial_test = "3.0"
+slint = { version = "1.16", optional = true }
 
 # RustCrypto ecosystem
 aes-gcm = { version = "0.10", optional = true }
@@ -56,8 +57,12 @@ data-encoding = "2.4"
 qrcode = "0.12"
 crc = "3.0"
 
+[build-dependencies]
+slint-build = { version = "1.16", optional = true }
+
 [features]
 default = ["backend-openssl"]
+gui = ["slint", "slint-build"]
 backend-openssl = ["openssl", "openssl-sys", "foreign-types"]
 backend-openssl-vendored = ["backend-openssl", "openssl/vendored", "openssl-src"]
 backend-rustcrypto = [
