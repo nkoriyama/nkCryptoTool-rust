@@ -454,6 +454,7 @@ impl NetworkProcessor {
     where
         F: FnOnce() + Send + 'static,
     {
+        let mut on_handshake_done = Some(on_handshake_done);
         let ticket_str = self.config.connect_addr.as_ref().ok_or(CryptoError::Parameter("Missing ticket".to_string()))?;
         
         let ticket = Ticket::from_str(ticket_str)?;
@@ -616,6 +617,10 @@ impl NetworkProcessor {
                 }).await.map_err(|_| CryptoError::Parameter("Handshake timed out".to_string()))??;
 
                 let (s2c_key, s2c_iv, c2s_key, c2s_iv) = handshake_result;
+
+                if let Some(cb) = on_handshake_done.take() {
+                    cb();
+                }
 
                 if config.chat_mode {
                     let stdin = self.io_provider.stdin();

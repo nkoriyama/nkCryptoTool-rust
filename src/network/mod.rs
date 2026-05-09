@@ -89,7 +89,10 @@ pub struct GuiIOProvider {
 #[cfg(feature = "gui")]
 impl IOProvider for GuiIOProvider {
     fn stdin(&self) -> Box<dyn tokio::io::AsyncRead + Unpin + Send> {
-        Box::new(GuiStdin(self.stdin_rx.clone()))
+        Box::new(GuiStdin {
+            rx: self.stdin_rx.clone(),
+            pending: std::collections::VecDeque::new(),
+        })
     }
     fn stdout(&self) -> Box<dyn tokio::io::AsyncWrite + Unpin + Send> {
         Box::new(GuiStdout(self.stdout_tx.clone()))
@@ -97,7 +100,10 @@ impl IOProvider for GuiIOProvider {
 }
 
 #[cfg(feature = "gui")]
-struct GuiStdin(Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>);
+struct GuiStdin {
+    rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Vec<u8>>>>,
+    pending: std::collections::VecDeque<u8>,
+}
 #[cfg(feature = "gui")]
 impl tokio::io::AsyncRead for GuiStdin {
     fn poll_read(
@@ -105,13 +111,29 @@ impl tokio::io::AsyncRead for GuiStdin {
         cx: &mut std::task::Context<'_>,
         buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        let mut rx = match self.0.try_lock() {
+        let this = self.get_mut();
+
+        // First, drain pending buffer up to buf.remaining()
+        if !this.pending.is_empty() {
+            let n = std::cmp::min(buf.remaining(), this.pending.len());
+            let drained: Vec<u8> = this.pending.drain(..n).collect();
+            buf.put_slice(&drained);
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        // Otherwise, try to receive new data
+        let mut rx = match this.rx.try_lock() {
             Ok(rx) => rx,
             Err(_) => return std::task::Poll::Pending,
         };
         match rx.poll_recv(cx) {
             std::task::Poll::Ready(Some(data)) => {
-                buf.put_slice(&data);
+                let n = std::cmp::min(buf.remaining(), data.len());
+                buf.put_slice(&data[..n]);
+                if n < data.len() {
+                    // Stash leftover for next poll_read
+                    this.pending.extend(data[n..].iter().copied());
+                }
                 std::task::Poll::Ready(Ok(()))
             }
             std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),

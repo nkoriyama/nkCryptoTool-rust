@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.4] - 2026-05-10
+
+### Fixed
+- **GUI handshake callback actually invoked**: The `run_connect_with_handshake_callback` API added in v2.0.3 declared the `on_handshake_done` parameter but never invoked it. Now wraps the FnOnce in `Option` and calls it after handshake completes, before `chat_loop` begins. This restores the intended UI transition: `Connect` → chat panel immediately (not after disconnect).
+- **GuiStdin buffer overflow panic**: `GuiStdin::poll_read` previously called `buf.put_slice(&data)` directly, which panics when the channel-received `Vec<u8>` is larger than `buf.remaining()` (e.g. typing "hello\n" into a 1-byte read buffer). Refactored to a pending-buffer model: drain into local `VecDeque` first, then write up to `buf.remaining()` per poll. This eliminates the immediate "Connection closed by peer" disconnect on first message send.
+
+### Phase 3 Status
+- v2.0.4 marks Phase 3 as **build-verified + E2E-verified**: GUI builds, runs, and successfully exchanges messages bidirectionally over Iroh PQC chat. Self-loopback test (CLI listener + GUI connector) confirms full round-trip messaging.
+
+## [2.0.3] - 2026-05-10
+
+### Added
+- **`run_connect_with_handshake_callback` API**: Extended `NetworkProcessor` with a callback parameter intended to fire after handshake but before `chat_loop` blocks, to enable GUI state transition. (Note: the callback was not actually invoked in v2.0.3; this was fixed in v2.0.4.)
+
+### Fixed
+- **CHAT_ACTIVE flag reset on session end**: The session-active flag is now explicitly reset on chat_loop completion (both Ok and Err paths), preventing "Chat session already active" errors on reconnect attempts after abnormal disconnects.
+
 ## [2.0.2] - 2026-05-10
 
 ### Fixed
