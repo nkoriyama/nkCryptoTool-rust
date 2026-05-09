@@ -519,7 +519,7 @@ pub fn unwrap_pqc_priv_from_pkcs8(der: &[u8], algo: &str) -> Result<Zeroizing<Ve
         };
         
         // Use a simple scanner to find the expanded key in the sequence
-        let mut best_sk = Vec::new();
+        let mut best_sk = Zeroizing::new(Vec::new());
         // Skip SEQUENCE header
         if let Ok(len_info) = read_asn1_len_safe(priv_key_bytes, 1) {
             let mut i = len_info.1;
@@ -533,7 +533,8 @@ pub fn unwrap_pqc_priv_from_pkcs8(der: &[u8], algo: &str) -> Result<Zeroizing<Ve
                             return Ok(Zeroizing::new(chunk.to_vec()));
                         }
                         if chunk.len() > best_sk.len() {
-                            best_sk = chunk.to_vec();
+                            best_sk.zeroize();
+                            *best_sk = chunk.to_vec();
                         }
                     }
                     i = next_pos + len;
@@ -543,7 +544,7 @@ pub fn unwrap_pqc_priv_from_pkcs8(der: &[u8], algo: &str) -> Result<Zeroizing<Ve
             }
         }
         if !best_sk.is_empty() {
-            return Ok(Zeroizing::new(best_sk));
+            return Ok(best_sk);
         }
     }
 
