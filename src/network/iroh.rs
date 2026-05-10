@@ -798,6 +798,19 @@ impl NetworkProcessor {
                             on_progress,
                         ).await
                     }).await.map_err(|e| CryptoError::Parameter(format!("File send failed: {}", e)))??;
+
+                    // F4: give the QUIC FIN (sent via writer.shutdown() inside
+                    // send_file_with_progress) time to reach the peer before
+                    // endpoint.close() abruptly terminates in-flight streams.
+                    // Without this, the receiver sees "connection lost" mid-read
+                    // of the GCM tag in the localhost / low-latency path.
+                    // Wait for the connection's natural close as observed by
+                    // the peer's reader half draining.
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        connection.closed(),
+                    ).await;
+
                     Ok(())
                 }
             } => r,

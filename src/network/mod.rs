@@ -507,6 +507,15 @@ impl NetworkProcessor {
             .await
             .map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
+        // Graceful close: signal end-of-stream to the receiver. Without this,
+        // iroh QUIC SendStream reset on drop causes a "connection lost"
+        // error on the receiver mid-read of the GCM tag. AsyncWrite shutdown
+        // maps to QUIC FIN/finish for iroh streams and to a no-op for TCP.
+        writer
+            .shutdown()
+            .await
+            .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+
         if let Some(ref cb) = on_progress {
             cb(sent, None);
         }
