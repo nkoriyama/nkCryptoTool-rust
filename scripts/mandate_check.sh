@@ -87,13 +87,15 @@ else
     fail "src/network/mod.rs line count" "expected >= 800, got $NETMOD_LINES"
 fi
 
-# 6. Placeholder comments absent (Gemini §3.2#1 reflection: extended phrases).
+# 6. Placeholder comments absent (Gemini §3.2#1 + Trigger 2 §4.4 reflection).
 # Patterns are chosen to catch known stub-ish phrasings while avoiding
 # false positives on benign descriptive comments. F3 v1's "For now, we'll
 # use a hacky way" is caught by the "hacky way" pattern, so the more
 # generic "For now," is intentionally not listed here.
+# Trigger 2 §4.4 additions: temp comments, FIXME, cleanup later — common
+# LLM "temporary escape hatch" patterns.
 PLACEHOLDER_HITS="$(grep -rE \
-    'Simplified for brevity|Shortened for brevity|Omitted for brevity|for brevity|hacky way|In a real implementation|we would start|// placeholder|// stub: implement' \
+    'Simplified for brevity|Shortened for brevity|Omitted for brevity|for brevity|hacky way|In a real implementation|we would start|// placeholder|// stub: implement|// temp:|// cleanup later|// FIXME' \
     src/ 2>/dev/null || true)"
 if [ -z "$PLACEHOLDER_HITS" ]; then
     pass "no placeholder phrases in src/"
@@ -137,15 +139,24 @@ else
     warn "CI yaml" "no .github/workflows/*.yml present yet (F4 in progress)"
 fi
 
-# 9. Cargo.lock baseline check (Gemini §3.2#3 reflection)
+# 9. Cargo.lock baseline check (Gemini §3.2#3 + Trigger 2 §4.4 reflection).
 # Detect unintended bumps for security-critical deps since v2.0.4 baseline.
-# In RELEASE_MODE we accept changes (intentional v2.1.0 release prep).
-if [ "${RELEASE_MODE:-0}" != "1" ]; then
-    if git diff b9ec19a -- Cargo.lock 2>/dev/null | grep -qE '^[+-]name = "(slint|iroh|tokio|rfd)"'; then
-        warn "Cargo.lock" "security-critical deps changed vs v2.0.4 baseline; manual review required (slint/iroh/tokio/rfd)"
+# Trigger 2 §4.4 escalation: in RELEASE_MODE, unexpected security-critical
+# dep drift is FAIL (must be intentional and documented in commit message
+# or CHANGELOG). In dev mode it remains WARN.
+if git diff b9ec19a -- Cargo.lock 2>/dev/null | grep -qE '^[+-]name = "(slint|iroh|tokio|rfd|sha2|aes-gcm|chacha20poly1305|fips203|fips204)"'; then
+    if [ "${RELEASE_MODE:-0}" = "1" ]; then
+        # In release mode require explicit ALLOW_LOCK_DRIFT=1 to bypass.
+        if [ "${ALLOW_LOCK_DRIFT:-0}" = "1" ]; then
+            warn "Cargo.lock" "RELEASE_MODE: security-critical deps drifted; ALLOW_LOCK_DRIFT=1 acknowledged"
+        else
+            fail "Cargo.lock" "RELEASE_MODE: security-critical deps drifted vs v2.0.4. If intentional, set ALLOW_LOCK_DRIFT=1 and document in CHANGELOG"
+        fi
     else
-        pass "Cargo.lock: no slint/iroh/tokio/rfd version drift since v2.0.4"
+        warn "Cargo.lock" "security-critical deps drifted vs v2.0.4 baseline; manual review required (slint/iroh/tokio/rfd/sha2/aes-gcm/chacha20poly1305/fips*)"
     fi
+else
+    pass "Cargo.lock: no security-critical dep drift since v2.0.4"
 fi
 
 # Summary
