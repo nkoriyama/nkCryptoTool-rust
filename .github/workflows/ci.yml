@@ -93,32 +93,30 @@ jobs:
           cargo test \
             --features "testing gui-camera gui-notifications gui-screen-protection gui-file-transfer"
 
-  # Windows / macOS: build-only cross-compile sanity check.
-  # Test full is deferred to v2.2 (PHASE5_ROADMAP §3.1) due to Slint backend
-  # OS-specific flakiness needing further investigation.
-  build-other-os:
-    name: Build (${{ matrix.os }}, build-only)
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [windows-latest, macos-latest]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install Rust toolchain (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: ${{ matrix.os }}-stable
-
-      - name: cargo build (full features)
+      # Run #[ignore]'d tests (notably src/network/iroh.rs internal tests
+      # using a tight 2s handshake_timeout that is flaky on slow CI runners).
+      # Advisory only — surfaces results without blocking release. Tracked
+      # for proper resolution in PHASE5_ROADMAP §3.3.
+      - name: cargo test --ignored (advisory, slow PQC handshake tests)
+        continue-on-error: true  # F4-X13 explicit allowance
         run: |
-          cargo build --features "gui-camera gui-notifications gui-screen-protection gui-file-transfer"
+          cargo test \
+            --features "testing gui-camera gui-notifications gui-screen-protection gui-file-transfer" \
+            --lib -- --ignored
+
+  # Windows / macOS build-only matrix is DEFERRED to v2.2.
+  #
+  # Initial F4 attempt revealed:
+  #   - macos-latest (Apple Silicon): ring crate 0.17.x compile error on
+  #     aarch64-darwin (CAPS_STATIC assertion) — requires ring pin / patch
+  #     or macos-13 Intel runner switch
+  #   - windows-latest: openssl-sys cannot locate OpenSSL — requires
+  #     `vcpkg install openssl` setup or `backend-openssl-vendored` feature
+  #     wiring at workflow level
+  #
+  # Both fixes are workflow / OS-setup work, not source code changes.
+  # Deferred to v2.2 (PHASE5_ROADMAP §3.1: OS matrix の test full 化) with
+  # explicit OS-specific environment preparation.
 
   # Optional: cargo audit for security advisories (F4-O2 推奨).
   # Non-blocking — security advisories are reviewed but do not fail the
