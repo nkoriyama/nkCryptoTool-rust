@@ -33,34 +33,40 @@ fail() { printf '[mandate] %s .. \033[31mFAIL\033[0m %s\n' "$1" "${2:-}"; FAIL_C
 warn() { printf '[mandate] %s .. \033[33mWARN\033[0m %s\n' "$1" "${2:-}"; WARN_COUNT=$((WARN_COUNT + 1)); }
 
 # 1. Cargo.toml version
+# Default (development) mode accepts the most recent shipped baseline (2.1.0,
+# the v2.1.0 release) OR its predecessor (2.0.4, the previous baseline).
+# This way the script tolerates the version transition while still preventing
+# arbitrary version bumps. RELEASE_MODE=1 expects exactly the next release
+# (2.1.0 prior to its tag, will be bumped per release).
 if [ "${RELEASE_MODE:-0}" = "1" ]; then
-    if grep -q '^version = "2.1.0"$' Cargo.toml; then
-        pass "Cargo.toml version 2.1.0 (release mode)"
+    if grep -qE '^version = "(2\.1\.0|2\.2\.0)"$' Cargo.toml; then
+        pass "Cargo.toml version (release mode): $(grep '^version' Cargo.toml | head -1)"
     else
-        fail "Cargo.toml version" "expected 2.1.0 in RELEASE_MODE, got: $(grep '^version' Cargo.toml | head -1)"
+        fail "Cargo.toml version" "expected 2.1.0 or 2.2.0 in RELEASE_MODE, got: $(grep '^version' Cargo.toml | head -1)"
     fi
 else
-    if grep -q '^version = "2.0.4"$' Cargo.toml; then
-        pass "Cargo.toml version 2.0.4 (development mode)"
+    if grep -qE '^version = "(2\.0\.4|2\.1\.0)"$' Cargo.toml; then
+        pass "Cargo.toml version (dev mode, accepted baseline): $(grep '^version' Cargo.toml | head -1)"
     else
-        fail "Cargo.toml version" "expected 2.0.4, got: $(grep '^version' Cargo.toml | head -1)"
+        fail "Cargo.toml version" "expected 2.0.4 or 2.1.0 baseline, got: $(grep '^version' Cargo.toml | head -1)"
     fi
 fi
 
-# 2. v2.1* tag absent (RELEASE_MODE allows v2.1.0 tag presence as well)
-TAGS="$(git tag -l 'v2.1*' 2>/dev/null || true)"
+# 2. Tag check: ensure no PREMATURE tags exist for unreleased versions.
+# The "released" set after v2.1.0 = v2.1.0 + all v2.0.x. Future versions
+# (v2.1.1, v2.2.0, etc.) must NOT be tagged before their respective release.
+# RELEASE_MODE=1 additionally allows the next release (v2.2.0 etc.) to be
+# tagged simultaneously with the release commit.
+ALL_TAGS="$(git tag -l 'v2.*' 2>/dev/null || true)"
+PREMATURE="$(echo "$ALL_TAGS" | grep -vE '^v2\.0\.[0-9]+$|^v2\.1\.0$' || true)"
 if [ "${RELEASE_MODE:-0}" = "1" ]; then
-    if [ "$TAGS" = "v2.1.0" ] || [ -z "$TAGS" ]; then
-        pass "v2.1* tag (release mode allows v2.1.0)"
-    else
-        fail "v2.1* tag" "unexpected tags: $TAGS"
-    fi
+    # Allow the upcoming release tags (broaden as needed at release time).
+    PREMATURE="$(echo "$PREMATURE" | grep -vE '^v2\.1\.[1-9][0-9]*$|^v2\.2\.0$' || true)"
+fi
+if [ -z "$PREMATURE" ] || [ "$PREMATURE" = "" ]; then
+    pass "no premature future-version tags"
 else
-    if [ -z "$TAGS" ]; then
-        pass "v2.1* tag absent (development mode)"
-    else
-        fail "v2.1* tag" "premature tags found: $TAGS"
-    fi
+    fail "premature tags" "$(echo "$PREMATURE" | tr '\n' ' ')"
 fi
 
 # 3. gui_test fn count >= 33
