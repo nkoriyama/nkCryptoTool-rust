@@ -61,6 +61,62 @@ fn chrono_like_timestamp() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
+/// F3: format the transfer-status string from (sent, total). Public so the
+/// test suite can verify the canonical format without driving a real
+/// transfer.
+pub fn format_transfer_status(sent: u64, total: Option<u64>) -> String {
+    match total {
+        Some(t) if t > 0 => {
+            let pct = ((sent as f64 / t as f64) * 100.0).clamp(0.0, 100.0) as u32;
+            format!("{}/{} bytes ({}%)", sent, t, pct)
+        }
+        _ => format!("{} bytes", sent),
+    }
+}
+
+/// F3: Build a progress callback + pump task that updates the UI
+/// transfer-progress / transfer-bytes / transfer-total / transfer-status
+/// properties from a tokio::sync::mpsc::channel(1) (latest-wins via
+/// try_send drop-on-full).
+///
+/// `total_hint` is the GUI-side known total (e.g. file size from
+/// FileIOProvider); it is forwarded to the UI so progress percentage can
+/// be rendered. None when the total is not knowable upfront (receive side).
+#[cfg(feature = "gui")]
+pub fn make_progress_pipeline(
+    ui_handle: slint::Weak<ChatWindow>,
+    total_hint: Option<u64>,
+) -> (crate::network::ProgressCallback, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(u64, Option<u64>)>(1);
+
+    let cb: crate::network::ProgressCallback = {
+        Arc::new(move |sent: u64, _total_hint_from_fn: Option<u64>| {
+            let _ = tx.try_send((sent, total_hint));
+        })
+    };
+
+    let pump = tokio::spawn(async move {
+        while let Some((sent, total)) = rx.recv().await {
+            let ui_handle = ui_handle.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_handle.upgrade() {
+                    let progress = match total {
+                        Some(t) if t > 0 => (sent as f32 / t as f32).clamp(0.0, 1.0),
+                        _ => 0.0,
+                    };
+                    let status = format_transfer_status(sent, total);
+                    ui.set_transfer_progress(progress);
+                    ui.set_transfer_bytes(sent.min(i32::MAX as u64) as i32);
+                    ui.set_transfer_total(total.unwrap_or(0).min(i32::MAX as u64) as i32);
+                    ui.set_transfer_status(status.into());
+                }
+            });
+        }
+    });
+
+    (cb, pump)
+}
+
 #[cfg(feature = "gui")]
 pub fn validate_and_apply_save_file_name(ui: &ChatWindow) {
     let name = ui.get_save_file_name().to_string();
@@ -408,6 +464,7 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
 
             // Branch on transfer mode: Chat reuses GuiIOProvider, FileSend
             // builds a FileIOProvider with the selected file as input.
+            let mut total_send_bytes: Option<u64> = None;
             let (io_provider, is_file_mode): (Arc<dyn crate::network::IOProvider>, bool) = match mode {
                 TransferMode::Chat => {
                     config.chat_mode = true;
@@ -425,6 +482,7 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                         return;
                     }
                     let path = std::path::PathBuf::from(&selected_file_path);
+                    total_send_bytes = tokio::fs::metadata(&path).await.ok().map(|m| m.len());
                     match crate::network::FileIOProvider::new_send(path).await {
                         Ok(p) => (Arc::new(p), true),
                         Err(e) => {
@@ -450,8 +508,17 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            // F3: build progress pipeline if in file mode
+            let (on_progress_opt, progress_pump) = if is_file_mode {
+                let (cb, pump) = make_progress_pipeline(ui_handle.clone(), total_send_bytes);
+                (Some(cb), Some(pump))
+            } else {
+                (None, None)
+            };
+
             let processor = crate::network::iroh::NetworkProcessor::with_io(config.clone(), io_provider);
             let ui_handle_for_callback = ui_handle.clone();
+            let total_for_handshake = total_send_bytes;
             let on_handshake = move || {
                 let ui_handle = ui_handle_for_callback.clone();
                 let _ = slint::invoke_from_event_loop(move || {
@@ -459,24 +526,40 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                         ui.set_connected(true);
                         if is_file_mode {
                             ui.set_file_transfer_active(true);
+                            ui.set_transfer_progress(0.0);
+                            ui.set_transfer_bytes(0);
+                            ui.set_transfer_total(total_for_handshake.unwrap_or(0).min(i32::MAX as u64) as i32);
                             ui.set_transfer_status("Transferring...".into());
                         }
                     }
                 });
             };
 
-            let res = processor.run_connect_with_handshake_callback(on_handshake).await;
+            let res = processor
+                .run_connect_with_handshake_callback_and_progress(on_handshake, on_progress_opt)
+                .await;
+
+            // Stop the progress pump after the transfer completes
+            if let Some(pump) = progress_pump {
+                pump.abort();
+            }
 
             let ui_handle_end = ui_handle.clone();
             let res_msg = match &res {
                 Ok(_) if is_file_mode => "File sent successfully.".to_string(),
                 _ => "".to_string(),
             };
+            let final_total = total_send_bytes;
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_handle_end.upgrade() {
                     ui.set_connected(false);
                     ui.set_file_transfer_active(false);
                     if !res_msg.is_empty() {
+                        // On success, force progress to 100% for visual completeness
+                        if let Some(t) = final_total {
+                            ui.set_transfer_progress(1.0);
+                            ui.set_transfer_bytes(t.min(i32::MAX as u64) as i32);
+                        }
                         ui.set_transfer_status(res_msg.into());
                     }
                 }
@@ -593,12 +676,23 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                         ui.set_listening(false);
                         ui.set_connected(true);
                         ui.set_file_transfer_active(true);
+                        ui.set_transfer_progress(0.0);
+                        ui.set_transfer_bytes(0);
+                        ui.set_transfer_total(0); // unknown for receive side
                         ui.set_transfer_status("Receiving...".into());
                     }
                 });
             };
 
-            let res = processor.run_listen_once(on_ticket, on_handshake).await;
+            // F3: progress pipeline for receive side. Total bytes are unknown
+            // until end-of-stream so total_hint is None; the pump will render
+            // an indeterminate progress bar (transfer-total == 0).
+            let (on_progress, progress_pump) = make_progress_pipeline(ui_handle.clone(), None);
+
+            let res = processor
+                .run_listen_once_with_progress(on_ticket, on_handshake, Some(on_progress))
+                .await;
+            progress_pump.abort();
 
             let ui_handle_end = ui_handle.clone();
             let final_msg = match &res {

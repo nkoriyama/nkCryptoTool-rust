@@ -21,6 +21,17 @@ pub const CHAT_SESSION_TIMEOUT: Duration = Duration::from_secs(7200); // 2 hours
 pub const ALPN_CHAT: &[u8] = b"nkct/chat/1";
 pub const ALPN_FILE: &[u8] = b"nkct/file/1";
 
+/// F3: 64 KiB chunk threshold for progress callback emission. Progress is
+/// emitted at most once per `PROGRESS_CHUNK_BYTES` bytes plus a final emission
+/// at end-of-transfer.
+pub const PROGRESS_CHUNK_BYTES: u64 = 64 * 1024;
+
+/// F3: Progress callback type. `(sent_bytes, total_bytes_if_known)`. The
+/// `total` argument is None when the function itself does not know the
+/// expected total (e.g. receive side reads from the wire). Callers may wrap
+/// this in a closure that substitutes a captured total when needed.
+pub type ProgressCallback = Arc<dyn Fn(u64, Option<u64>) + Send + Sync>;
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PeerId {
     Ip(std::net::IpAddr),
@@ -318,15 +329,27 @@ impl NetworkProcessor {
     }
 
     pub async fn receive_file<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
+        reader: R,
+        writer: W,
+        aead_algo: &str,
+        key: &[u8],
+        iv: &[u8],
+    ) -> Result<()> {
+        Self::receive_file_with_progress(reader, writer, aead_algo, key, iv, None).await
+    }
+
+    pub async fn receive_file_with_progress<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
         mut reader: R,
         mut writer: W,
         aead_algo: &str,
         key: &[u8],
         iv: &[u8],
+        on_progress: Option<ProgressCallback>,
     ) -> Result<()> {
         let mut aead = backend::new_decrypt(aead_algo, key, iv)?;
         let mut out_buffer = Zeroizing::new(vec![0u8; BUF_SIZE + 32]);
         let mut total_received = 0u64;
+        let mut next_emit_at = PROGRESS_CHUNK_BYTES;
         loop {
             let mut len_bytes = [0u8; 4];
             let read_res =
@@ -366,6 +389,13 @@ impl NetworkProcessor {
                 .write_all(&out_buffer[..n])
                 .await
                 .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+
+            if let Some(ref cb) = on_progress {
+                if total_received >= next_emit_at {
+                    cb(total_received, None);
+                    next_emit_at = total_received + PROGRESS_CHUNK_BYTES;
+                }
+            }
         }
 
         let mut tag = [0u8; 16];
@@ -385,20 +415,37 @@ impl NetworkProcessor {
             .await
             .map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
+        if let Some(ref cb) = on_progress {
+            cb(total_received, None);
+        }
+
         eprintln!("File received and decrypted successfully.");
         Ok(())
     }
 
     pub async fn send_file<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
+        reader: R,
+        writer: W,
+        aead_algo: &str,
+        key: &[u8],
+        iv: &[u8],
+    ) -> Result<()> {
+        Self::send_file_with_progress(reader, writer, aead_algo, key, iv, None).await
+    }
+
+    pub async fn send_file_with_progress<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
         mut reader: R,
         mut writer: W,
         aead_algo: &str,
         key: &[u8],
         iv: &[u8],
+        on_progress: Option<ProgressCallback>,
     ) -> Result<()> {
         let mut aead = backend::new_encrypt(aead_algo, key, iv)?;
         let mut buffer = Zeroizing::new(vec![0u8; BUF_SIZE]);
         let mut out_buffer = Zeroizing::new(vec![0u8; BUF_SIZE + 32]);
+        let mut sent: u64 = 0;
+        let mut next_emit_at: u64 = PROGRESS_CHUNK_BYTES;
 
         loop {
             let n = reader
@@ -422,6 +469,14 @@ impl NetworkProcessor {
                     CryptoError::Parameter("Idle timeout while sending chunk".to_string())
                 })?
                 .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+
+            sent += n as u64;
+            if let Some(ref cb) = on_progress {
+                if sent >= next_emit_at {
+                    cb(sent, None);
+                    next_emit_at = sent + PROGRESS_CHUNK_BYTES;
+                }
+            }
         }
 
         let final_n = aead.finalize(&mut out_buffer)?;
@@ -451,6 +506,11 @@ impl NetworkProcessor {
             .flush()
             .await
             .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+
+        if let Some(ref cb) = on_progress {
+            cb(sent, None);
+        }
+
         eprintln!("File sent successfully.");
         Ok(())
     }

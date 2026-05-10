@@ -22,3 +22,10 @@
 - **CHAT_ACTIVE フラグの取扱い**: `run_listen_once` は chat_mode = false (ALPN_FILE) の場合 CHAT_ACTIVE を取得しない。chat_mode = true (将来的な GUI Chat-Listen) では既存と同様 CHAT_ACTIVE を取得 + drop で release。
 - **allowlist / pinned key**: GUI 受信側は `signing_pubkey` (送信者の公開鍵) を任意指定可。指定時は handshake 中に固定鍵検証が動作。未指定 + `allow_unauth = true` で署名なし接続を許容するが、同時に `signing_pubkey` を指定した場合は ALPN フェーズ後の handshake で MITM 検出が動作。
 - **F2 段階の UX 制約**: 進捗表示は F3 で実装。F2 段階では `transfer-status` 文字列で「Receiving...」「Sending...」「File received: <path>」を表示するのみ。バイト数進捗は不可視。
+
+## 1.10 F3: ファイル転送進捗表示
+- **進捗の非秘匿**: 転送済バイト数 (`transfer-bytes`) および総バイト数 (`transfer-total`) はメタデータとして扱い、UI 表示を許可。AEAD で保護されるべき本文 / 鍵 / IV とは異なるカテゴリ。
+- **ローカル限定**: 進捗値は GUI プロセス内のローカル状態のみで保持され、`tokio::sync::mpsc::channel(1)` 経由で UI スレッドに転送される。**ネットワーク経由で peer に送信されない**。
+- **信頼境界**: 送信側の `total_bytes` は `tokio::fs::metadata().len()` で取得した**ローカル FS 値**を信頼。受信側の `total_bytes` は受信中に確定しない (chunk 単位 AEAD frame で逐次到着) ため `None` 扱い、進捗バーは indeterminate animation で表示。peer が偽装した chunk header (chunk_len) は AEAD 認証 + `MAX_FILE_SIZE` 上限で検出され、転送 Error となる。
+- **DoS 対策**: 進捗 callback の発火頻度は `PROGRESS_CHUNK_BYTES = 64 KiB` を threshold とした chunk counter ベースで制限。1 回の `try_send` で `mpsc::channel(1)` が full の場合は **新規発火を drop** (latest-wins semantic) し、UI スレッドが処理しきれない高速転送でも back-pressure せず、UI thread の hang を防止。
+- **One-shot pump task**: `make_progress_pipeline` が返す `JoinHandle` は転送終了時に `abort()` され、未消費の channel エントリ + pump task が即時 drop される。abort は idempotent で再発火耐性あり。

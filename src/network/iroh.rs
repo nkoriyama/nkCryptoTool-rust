@@ -244,6 +244,7 @@ impl NetworkProcessor {
                     cached_allowlist,
                     io_provider,
                     None,
+                    None,
                 )
                 .await
                 {
@@ -270,6 +271,22 @@ impl NetworkProcessor {
         F1: FnOnce(&Ticket),
         F2: FnOnce() + Send + 'static,
     {
+        self.run_listen_once_with_progress(on_ticket, on_handshake_done, None).await
+    }
+
+    /// F3: single-shot listen with optional progress callback. The callback
+    /// is forwarded to receive_file_with_progress for the file-receive path
+    /// (chat_mode=false). Chat mode ignores it.
+    pub async fn run_listen_once_with_progress<F1, F2>(
+        &self,
+        on_ticket: F1,
+        on_handshake_done: F2,
+        on_progress: Option<crate::network::ProgressCallback>,
+    ) -> Result<()>
+    where
+        F1: FnOnce(&Ticket),
+        F2: FnOnce() + Send + 'static,
+    {
         let endpoint = self.create_endpoint(false).await?;
         let _guard = EndpointGuard(endpoint.clone());
 
@@ -289,7 +306,7 @@ impl NetworkProcessor {
 
         let endpoint_clone = endpoint.clone();
         let res = tokio::select! {
-            r = self.run_listen_once_inner(endpoint, on_handshake_done) => r,
+            r = self.run_listen_once_inner(endpoint, on_handshake_done, on_progress) => r,
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("\r\n[nkct] Interrupted by user. Closing...");
                 Ok(())
@@ -303,6 +320,7 @@ impl NetworkProcessor {
         &self,
         endpoint: Endpoint,
         on_handshake_done: F,
+        on_progress: Option<crate::network::ProgressCallback>,
     ) -> Result<()>
     where
         F: FnOnce() + Send + 'static,
@@ -349,6 +367,7 @@ impl NetworkProcessor {
             self.cached_allowlist.clone(),
             self.io_provider.clone(),
             Some(Box::new(on_handshake_done)),
+            on_progress,
         ).await
     }
 
@@ -361,6 +380,7 @@ impl NetworkProcessor {
         cached_allowlist: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
         io_provider: Arc<dyn IOProvider>,
         on_handshake_done: Option<Box<dyn FnOnce() + Send>>,
+        on_progress: Option<crate::network::ProgressCallback>,
     ) -> Result<()>
     where
         R: AsyncReadExt + Unpin + Send + 'static,
@@ -553,8 +573,16 @@ impl NetworkProcessor {
             let res = CommonProcessor::chat_loop(reader, writer, stdin, stdout, &config.aead_algo, &s2c_key, &c2s_key, true).await;
             CHAT_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
             res?;
-        } else {            tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
-                CommonProcessor::receive_file(reader, io_provider.stdout(), &config.aead_algo, &c2s_key, &c2s_iv).await
+        } else {
+            tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
+                CommonProcessor::receive_file_with_progress(
+                    reader,
+                    io_provider.stdout(),
+                    &config.aead_algo,
+                    &c2s_key,
+                    &c2s_iv,
+                    on_progress,
+                ).await
             }).await.map_err(|e| CryptoError::Parameter(format!("File receive failed: {}", e)))??;
         }
         Ok(())
@@ -567,6 +595,19 @@ impl NetworkProcessor {
     pub async fn run_connect_with_handshake_callback<F>(
         &self,
         on_handshake_done: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        self.run_connect_with_handshake_callback_and_progress(on_handshake_done, None).await
+    }
+
+    /// F3: connect-side variant that also accepts a progress callback,
+    /// forwarded to send_file_with_progress for the FileSend path.
+    pub async fn run_connect_with_handshake_callback_and_progress<F>(
+        &self,
+        on_handshake_done: F,
+        on_progress: Option<crate::network::ProgressCallback>,
     ) -> Result<()>
     where
         F: FnOnce() + Send + 'static,
@@ -748,7 +789,14 @@ impl NetworkProcessor {
                     res
                 } else {
                     tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
-                        CommonProcessor::send_file(self.io_provider.stdin(), writer, &config.aead_algo, &c2s_key, &c2s_iv).await
+                        CommonProcessor::send_file_with_progress(
+                            self.io_provider.stdin(),
+                            writer,
+                            &config.aead_algo,
+                            &c2s_key,
+                            &c2s_iv,
+                            on_progress,
+                        ).await
                     }).await.map_err(|e| CryptoError::Parameter(format!("File send failed: {}", e)))??;
                     Ok(())
                 }

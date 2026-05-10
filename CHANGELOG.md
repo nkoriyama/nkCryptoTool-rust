@@ -16,10 +16,15 @@ All notable changes to this project will be documented in this file.
 - **`NetworkProcessor::start_with_ticket_callback` (Phase 4 F2)**: 既存 `start()` のリファクタ。ticket をコールバック経由で公開して GUI / CLI 両方で再利用可能化。
 - **GUI File Send 統合 (Phase 4 F2)**: FileSend モードで Connect ボタン押下時、選択ファイルを `FileIOProvider::new_send` で開き、`run_connect_with_handshake_callback` 経由で送信。
 - **GUI File Transfer UI (Phase 4 F2)**: `listening` / `generated-ticket` / `file-transfer-active` / `transfer-status` プロパティと `listen-display-visible` / `file-transfer-visible` / `connection-settings-visible` 計算プロパティで listen / 転送中 / 完了の状態遷移を UI に反映。
+- **`ProgressCallback` type alias (Phase 4 F3)**: `pub type ProgressCallback = Arc<dyn Fn(u64, Option<u64>) + Send + Sync>` を `src/network/mod.rs` に追加。CLI / GUI 両方で進捗監視に利用可能。
+- **`send_file_with_progress` / `receive_file_with_progress` (Phase 4 F3)**: 既存 `send_file` / `receive_file` を `_with_progress(_, _, _, _, _, None)` の薄ラッパに refactor。新 API は `64 KiB chunk counter` で進捗発火を制限。
+- **`run_connect_with_handshake_callback_and_progress` / `run_listen_once_with_progress` (Phase 4 F3)**: iroh.rs の connect / listen API に進捗コールバック転送を追加。既存 API は `_with_progress(_, _, None)` の薄ラッパとして維持、CLI 互換性確保。
+- **GUI 進捗 UI (Phase 4 F3)**: Slint UI に `transfer-progress` (float 0.0〜1.0) / `transfer-bytes` / `transfer-total` プロパティ + `ProgressIndicator` widget を統合。FileSend は `metadata().len()` から total を取得して進捗 % を表示、FileReceive は total 不明のため indeterminate animation。
+- **`make_progress_pipeline` (Phase 4 F3)**: `tokio::sync::mpsc::channel(1)` ベースの latest-wins 進捗 channel + Slint pump task。`format_transfer_status` で「`<sent>/<total> bytes (<percent>%)`」形式の status 文字列を生成。
 
 ### Notes
 - Cargo.toml version は v2.0.4 据置。F1〜F4 完了後に v2.1.0 として release tag を切る。
-- F2 段階では転送進捗 (バイト数 %) は表示しない。F3 で実装予定。
+- F3 段階では転送速度 / ETA は未表示。必要なら F3.5 か v2.2 で追加検討 (handoff §1.2 F3-O1〜O3 推奨機能)。
 
 ## [2.0.4] - 2026-05-10
 
