@@ -175,6 +175,51 @@ impl tokio::io::AsyncWrite for GuiStdout {
     }
 }
 
+/// File-backed IOProvider for GUI file transfer (Phase 4 F2).
+///
+/// `stdin()` returns a reader for the send file (one-shot; subsequent calls
+/// return an empty reader). `stdout()` returns a writer for the receive file
+/// (one-shot; subsequent calls return a sink). File handles are pre-opened in
+/// the async constructor so any path/permission errors surface before listen
+/// or connect starts.
+pub struct FileIOProvider {
+    send_file: parking_lot::Mutex<Option<tokio::fs::File>>,
+    recv_file: parking_lot::Mutex<Option<tokio::fs::File>>,
+}
+
+impl FileIOProvider {
+    pub async fn new_send(path: std::path::PathBuf) -> std::io::Result<Self> {
+        let file = tokio::fs::File::open(&path).await?;
+        Ok(Self {
+            send_file: parking_lot::Mutex::new(Some(file)),
+            recv_file: parking_lot::Mutex::new(None),
+        })
+    }
+
+    pub async fn new_recv(path: std::path::PathBuf) -> std::io::Result<Self> {
+        let file = tokio::fs::File::create(&path).await?;
+        Ok(Self {
+            send_file: parking_lot::Mutex::new(None),
+            recv_file: parking_lot::Mutex::new(Some(file)),
+        })
+    }
+}
+
+impl IOProvider for FileIOProvider {
+    fn stdin(&self) -> Box<dyn tokio::io::AsyncRead + Unpin + Send> {
+        match self.send_file.lock().take() {
+            Some(f) => Box::new(f),
+            None => Box::new(tokio::io::empty()),
+        }
+    }
+    fn stdout(&self) -> Box<dyn tokio::io::AsyncWrite + Unpin + Send> {
+        match self.recv_file.lock().take() {
+            Some(f) => Box::new(f),
+            None => Box::new(tokio::io::sink()),
+        }
+    }
+}
+
 #[cfg(test)]
 pub struct TestIOProvider;
 #[cfg(test)]

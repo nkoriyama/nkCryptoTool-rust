@@ -127,6 +127,26 @@ impl NetworkProcessor {
     }
 
     pub async fn start(&self) -> Result<()> {
+        self.start_with_ticket_callback(|ticket| {
+            eprintln!("[nkct] Ticket: {}", ticket);
+            if let Ok(code) = qrcode::QrCode::new(ticket.to_string().as_bytes()) {
+                let image = code.render::<qrcode::render::unicode::Dense1x2>()
+                    .dark_color(qrcode::render::unicode::Dense1x2::Light)
+                    .light_color(qrcode::render::unicode::Dense1x2::Dark)
+                    .build();
+                eprintln!("\n[nkct] Scan QR to connect:\n{}", image);
+            }
+        }).await
+    }
+
+    /// Listen workflow with a ticket callback that fires once after the
+    /// ticket is constructed but before `run_listen_loop` begins. The GUI
+    /// uses this to surface the ticket in the UI without blocking the listen
+    /// loop. CLI's `start()` uses it to print the ticket + QR.
+    pub async fn start_with_ticket_callback<F>(&self, on_ticket: F) -> Result<()>
+    where
+        F: FnOnce(&Ticket),
+    {
         let endpoint = self.create_endpoint(false).await?;
         let _guard = EndpointGuard(endpoint.clone());
 
@@ -142,15 +162,7 @@ impl NetworkProcessor {
             .transpose()?;
 
         let ticket = Ticket::new(node_addr, sign_fp, enc_fp);
-        eprintln!("[nkct] Ticket: {}", ticket);
-        
-        if let Ok(code) = qrcode::QrCode::new(ticket.to_string().as_bytes()) {
-            let image = code.render::<qrcode::render::unicode::Dense1x2>()
-                .dark_color(qrcode::render::unicode::Dense1x2::Light)
-                .light_color(qrcode::render::unicode::Dense1x2::Dark)
-                .build();
-            eprintln!("\n[nkct] Scan QR to connect:\n{}", image);
-        }
+        on_ticket(&ticket);
 
         let endpoint_clone = endpoint.clone();
         let res = tokio::select! {
@@ -231,6 +243,7 @@ impl NetworkProcessor {
                     remote_node_id,
                     cached_allowlist,
                     io_provider,
+                    None,
                 )
                 .await
                 {
@@ -241,6 +254,104 @@ impl NetworkProcessor {
         Ok(())
     }
 
+    /// Single-shot listen: accept one incoming connection, run handshake +
+    /// chat or file transfer, then close the endpoint and return.
+    ///
+    /// Used by the GUI for FileReceive (and Chat-Listen if added later) to
+    /// avoid the multi-shot accept loop. `on_ticket` fires once the ticket
+    /// is constructed (before accept). `on_handshake_done` fires once the
+    /// handshake completes (before chat_loop / receive_file begins).
+    pub async fn run_listen_once<F1, F2>(
+        &self,
+        on_ticket: F1,
+        on_handshake_done: F2,
+    ) -> Result<()>
+    where
+        F1: FnOnce(&Ticket),
+        F2: FnOnce() + Send + 'static,
+    {
+        let endpoint = self.create_endpoint(false).await?;
+        let _guard = EndpointGuard(endpoint.clone());
+
+        let node_addr = endpoint.node_addr().initialized().await;
+        eprintln!("[nkct] Listening (single-shot) as NodeId: {}", node_addr.node_id);
+
+        let sign_fp = self.config.signing_privkey.as_ref()
+            .map(|path| self.get_pqc_fingerprint(path, &self.config.pqc_dsa_algo, true))
+            .transpose()?;
+
+        let enc_fp = self.config.user_privkey.as_ref()
+            .map(|path| self.get_pqc_fingerprint(path, &self.config.pqc_kem_algo, false))
+            .transpose()?;
+
+        let ticket = Ticket::new(node_addr, sign_fp, enc_fp);
+        on_ticket(&ticket);
+
+        let endpoint_clone = endpoint.clone();
+        let res = tokio::select! {
+            r = self.run_listen_once_inner(endpoint, on_handshake_done) => r,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\r\n[nkct] Interrupted by user. Closing...");
+                Ok(())
+            }
+        };
+        let _ = endpoint_clone.close().await;
+        res
+    }
+
+    async fn run_listen_once_inner<F>(
+        &self,
+        endpoint: Endpoint,
+        on_handshake_done: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let incoming = match endpoint.accept().await {
+            Some(i) => i,
+            None => return Ok(()),
+        };
+
+        let local_node_id = endpoint.node_id();
+        let mut connecting = incoming.accept()
+            .map_err(|e| CryptoError::Parameter(format!("Accept failed: {}", e)))?;
+        let alpn = connecting.alpn().await
+            .map_err(|e| CryptoError::Parameter(format!("ALPN detection failed: {}", e)))?;
+
+        let mut config = self.config.clone();
+        if alpn.as_slice() == ALPN_CHAT {
+            config.chat_mode = true;
+        } else if alpn.as_slice() == ALPN_FILE {
+            config.chat_mode = false;
+        } else {
+            return Err(CryptoError::Parameter(format!(
+                "Unknown ALPN: {:?}", String::from_utf8_lossy(alpn.as_slice())
+            )));
+        }
+
+        let connection = connecting.await
+            .map_err(|e| CryptoError::Parameter(format!("Connection failed: {}", e)))?;
+        let _permit = self.semaphore.clone().acquire_owned().await
+            .map_err(|_| CryptoError::Parameter("Semaphore closed".to_string()))?;
+
+        let (send, recv) = connection.accept_bi().await
+            .map_err(|e| CryptoError::Parameter(format!("Accept bi failed: {}", e)))?;
+
+        let remote_node_id = connection.remote_node_id()
+            .map_err(|e| CryptoError::Parameter(format!("Remote NodeId failed: {}", e)))?;
+
+        Self::handle_server_connection(
+            recv,
+            send,
+            &config,
+            local_node_id,
+            remote_node_id,
+            self.cached_allowlist.clone(),
+            self.io_provider.clone(),
+            Some(Box::new(on_handshake_done)),
+        ).await
+    }
+
     async fn handle_server_connection<R, W>(
         mut reader: R,
         mut writer: W,
@@ -249,6 +360,7 @@ impl NetworkProcessor {
         remote_node_id: NodeId,
         cached_allowlist: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
         io_provider: Arc<dyn IOProvider>,
+        on_handshake_done: Option<Box<dyn FnOnce() + Send>>,
     ) -> Result<()>
     where
         R: AsyncReadExt + Unpin + Send + 'static,
@@ -402,6 +514,11 @@ impl NetworkProcessor {
         }).await.map_err(|_| CryptoError::Parameter("Handshake timed out".to_string()))??;
 
         let (s2c_key, _s2c_iv, c2s_key, c2s_iv, peer_id) = handshake_result;
+
+        let mut on_handshake_done = on_handshake_done;
+        if let Some(cb) = on_handshake_done.take() {
+            cb();
+        }
 
         let _chat_guard = if config.chat_mode {
             let cooldowns = PEER_COOLDOWNS.lock();

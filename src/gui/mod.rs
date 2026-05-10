@@ -51,6 +51,16 @@ pub fn pick_and_apply_save_dir(ui: &ChatWindow, picker: &dyn file_picker::FilePi
     }
 }
 
+/// Unix epoch seconds as a string, used when the user does not supply a
+/// receive filename and we need a non-colliding default.
+#[cfg(feature = "gui")]
+fn chrono_like_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
+}
+
 #[cfg(feature = "gui")]
 pub fn validate_and_apply_save_file_name(ui: &ChatWindow) {
     let name = ui.get_save_file_name().to_string();
@@ -374,6 +384,7 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    let ui_handle_for_connect = ui_handle.clone();
     ui.on_connect_pressed(move |ticket, privkey, pubkey| {
         let ui_handle = ui_handle_conn.clone();
         let gp = gp.clone();
@@ -381,31 +392,93 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         let privkey = privkey.to_string();
         let pubkey = pubkey.to_string();
 
+        // Read transfer mode and selected file path from UI (UI thread)
+        let (mode, selected_file_path) = if let Some(ui) = ui_handle_for_connect.upgrade() {
+            (ui.get_transfer_mode(), ui.get_selected_file_path().to_string())
+        } else {
+            return;
+        };
+
         tokio::spawn(async move {
             let mut config = crate::config::CryptoConfig::default();
             config.connect_addr = Some(ticket.clone());
             config.signing_privkey = Some(privkey.clone());
             config.signing_pubkey = Some(pubkey.clone());
-            config.chat_mode = true;
             config.transport = crate::config::TransportKind::Iroh;
 
-            let processor = crate::network::iroh::NetworkProcessor::with_io(config.clone(), gp.clone());
+            // Branch on transfer mode: Chat reuses GuiIOProvider, FileSend
+            // builds a FileIOProvider with the selected file as input.
+            let (io_provider, is_file_mode): (Arc<dyn crate::network::IOProvider>, bool) = match mode {
+                TransferMode::Chat => {
+                    config.chat_mode = true;
+                    (gp.clone(), false)
+                }
+                TransferMode::FileSend => {
+                    config.chat_mode = false;
+                    if selected_file_path.is_empty() {
+                        let ui_handle = ui_handle.clone();
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_handle.upgrade() {
+                                ui.set_connection_error("No file selected for send.".into());
+                            }
+                        });
+                        return;
+                    }
+                    let path = std::path::PathBuf::from(&selected_file_path);
+                    match crate::network::FileIOProvider::new_send(path).await {
+                        Ok(p) => (Arc::new(p), true),
+                        Err(e) => {
+                            let ui_handle = ui_handle.clone();
+                            let msg = format!("Cannot open file: {}", e);
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_handle.upgrade() {
+                                    ui.set_connection_error(msg.into());
+                                }
+                            });
+                            return;
+                        }
+                    }
+                }
+                TransferMode::FileReceive => {
+                    let ui_handle = ui_handle.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_handle.upgrade() {
+                            ui.set_connection_error("FileReceive mode uses Generate Ticket, not Connect.".into());
+                        }
+                    });
+                    return;
+                }
+            };
+
+            let processor = crate::network::iroh::NetworkProcessor::with_io(config.clone(), io_provider);
             let ui_handle_for_callback = ui_handle.clone();
             let on_handshake = move || {
                 let ui_handle = ui_handle_for_callback.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_handle.upgrade() {
                         ui.set_connected(true);
+                        if is_file_mode {
+                            ui.set_file_transfer_active(true);
+                            ui.set_transfer_status("Transferring...".into());
+                        }
                     }
                 });
             };
 
             let res = processor.run_connect_with_handshake_callback(on_handshake).await;
-            
+
             let ui_handle_end = ui_handle.clone();
+            let res_msg = match &res {
+                Ok(_) if is_file_mode => "File sent successfully.".to_string(),
+                _ => "".to_string(),
+            };
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_handle_end.upgrade() {
                     ui.set_connected(false);
+                    ui.set_file_transfer_active(false);
+                    if !res_msg.is_empty() {
+                        ui.set_transfer_status(res_msg.into());
+                    }
                 }
             });
 
@@ -425,6 +498,154 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
             }
+        });
+    });
+
+    // F2: Listen handler (FileReceive mode)
+    let ui_handle_listen = ui_handle.clone();
+    let listen_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+    let listen_task_for_press = listen_task.clone();
+    ui.on_listen_pressed(move |privkey, pubkey| {
+        let ui_handle = ui_handle_listen.clone();
+        let privkey = privkey.to_string();
+        let pubkey = pubkey.to_string();
+        let listen_task = listen_task_for_press.clone();
+
+        // Read save dir / file name from UI thread
+        let (save_dir, save_name, mode) = if let Some(ui) = ui_handle_listen.upgrade() {
+            (
+                ui.get_save_dir_path().to_string(),
+                ui.get_save_file_name().to_string(),
+                ui.get_transfer_mode(),
+            )
+        } else {
+            return;
+        };
+
+        if mode != TransferMode::FileReceive {
+            let ui_handle = ui_handle.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_handle.upgrade() {
+                    ui.set_connection_error("Generate Ticket only available in FileReceive mode.".into());
+                }
+            });
+            return;
+        }
+        if save_dir.is_empty() {
+            let ui_handle = ui_handle.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_handle.upgrade() {
+                    ui.set_connection_error("Please choose a save directory first.".into());
+                }
+            });
+            return;
+        }
+        let final_name = if save_name.is_empty() {
+            format!("received_{}.bin", chrono_like_timestamp())
+        } else {
+            save_name.clone()
+        };
+        let recv_path = std::path::PathBuf::from(&save_dir).join(&final_name);
+
+        let task = tokio::spawn(async move {
+            let mut config = crate::config::CryptoConfig::default();
+            config.signing_privkey = if privkey.is_empty() { None } else { Some(privkey.clone()) };
+            config.signing_pubkey = if pubkey.is_empty() { None } else { Some(pubkey.clone()) };
+            config.chat_mode = false;
+            config.transport = crate::config::TransportKind::Iroh;
+            config.allow_unauth = true;
+
+            let file_io = match crate::network::FileIOProvider::new_recv(recv_path.clone()).await {
+                Ok(p) => Arc::new(p),
+                Err(e) => {
+                    let ui_handle = ui_handle.clone();
+                    let msg = format!("Cannot create receive file: {}", e);
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_handle.upgrade() {
+                            ui.set_connection_error(msg.into());
+                        }
+                    });
+                    return;
+                }
+            };
+
+            let processor = crate::network::iroh::NetworkProcessor::with_io(
+                config.clone(),
+                file_io as Arc<dyn crate::network::IOProvider>,
+            );
+
+            let ui_handle_ticket = ui_handle.clone();
+            let on_ticket = move |ticket: &crate::ticket::Ticket| {
+                let ticket_str = ticket.to_string();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_handle_ticket.upgrade() {
+                        ui.set_generated_ticket(ticket_str.into());
+                        ui.set_listening(true);
+                    }
+                });
+            };
+
+            let ui_handle_handshake = ui_handle.clone();
+            let on_handshake = move || {
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_handle_handshake.upgrade() {
+                        ui.set_listening(false);
+                        ui.set_connected(true);
+                        ui.set_file_transfer_active(true);
+                        ui.set_transfer_status("Receiving...".into());
+                    }
+                });
+            };
+
+            let res = processor.run_listen_once(on_ticket, on_handshake).await;
+
+            let ui_handle_end = ui_handle.clone();
+            let final_msg = match &res {
+                Ok(_) => format!("File received: {}", recv_path.display()),
+                Err(e) => format!("Receive failed: {}", e),
+            };
+            let is_ok = res.is_ok();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_handle_end.upgrade() {
+                    ui.set_listening(false);
+                    ui.set_connected(false);
+                    ui.set_file_transfer_active(false);
+                    ui.set_generated_ticket("".into());
+                    if is_ok {
+                        ui.set_transfer_status(final_msg.into());
+                    } else {
+                        ui.set_connection_error(final_msg.into());
+                    }
+                }
+            });
+        });
+
+        let listen_task_clone = listen_task.clone();
+        tokio::spawn(async move {
+            let mut guard = listen_task_clone.lock().await;
+            *guard = Some(task);
+        });
+    });
+
+    let listen_task_for_cancel = listen_task.clone();
+    let ui_handle_cancel = ui_handle.clone();
+    ui.on_listen_cancel(move || {
+        let listen_task = listen_task_for_cancel.clone();
+        let ui_handle = ui_handle_cancel.clone();
+        tokio::spawn(async move {
+            let mut guard = listen_task.lock().await;
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+            drop(guard);
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(ui) = ui_handle.upgrade() {
+                    ui.set_listening(false);
+                    ui.set_generated_ticket("".into());
+                    ui.set_connection_error("Listen cancelled.".into());
+                }
+            });
         });
     });
 

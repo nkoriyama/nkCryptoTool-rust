@@ -17,6 +17,8 @@ export component ChatWindow inherits Window {
     callback select-file();
     callback select-save-dir();
     callback validate-save-file-name();
+    callback listen-pressed(string, string); // privkey_path, pubkey_path
+    callback listen-cancel();
 
     in property <[StandardListViewItem]> messages: [];
     in-out property <bool> connected: false;
@@ -39,10 +41,19 @@ export component ChatWindow inherits Window {
     in-out property <string> save-dir-path: "";
     in-out property <string> save-file-name: "";
 
-    // F1: Computed visibility (test-observable)
+    // F2: Listen mode (FileReceive)
+    in-out property <bool> listening: false;
+    in-out property <string> generated-ticket: "";
+    in-out property <bool> file-transfer-active: false;
+    in-out property <string> transfer-status: "";
+
+    // F1/F2: Computed visibility (test-observable)
     out property <bool> chat-area-visible: connected && transfer-mode == TransferMode.Chat;
-    out property <bool> file-picker-visible: !connected && !asking-passphrase && !scanning-qr && transfer-mode == TransferMode.FileSend;
-    out property <bool> save-dir-visible: !connected && !asking-passphrase && !scanning-qr && transfer-mode == TransferMode.FileReceive;
+    out property <bool> file-picker-visible: !connected && !listening && !asking-passphrase && !scanning-qr && transfer-mode == TransferMode.FileSend;
+    out property <bool> save-dir-visible: !connected && !listening && !asking-passphrase && !scanning-qr && transfer-mode == TransferMode.FileReceive;
+    out property <bool> connection-settings-visible: !connected && !listening && !asking-passphrase && !scanning-qr;
+    out property <bool> listen-display-visible: listening && !connected;
+    out property <bool> file-transfer-visible: connected && transfer-mode != TransferMode.Chat;
 
     VerticalBox {
         // Privacy Mode and Warning
@@ -71,7 +82,7 @@ export component ChatWindow inherits Window {
         }
 
         // F1: Transfer Mode toggle (3-way selector)
-        if !connected && !asking-passphrase && !scanning-qr : HorizontalBox {
+        if connection-settings-visible : HorizontalBox {
             alignment: start;
             Text { text: "Mode:"; vertical-alignment: center; }
             Button {
@@ -92,10 +103,10 @@ export component ChatWindow inherits Window {
         }
 
         // 1. Connection Settings
-        if !connected && !asking-passphrase && !scanning-qr : GroupBox {
-            title: "Connection Settings";
+        if connection-settings-visible : GroupBox {
+            title: transfer-mode == TransferMode.FileReceive ? "Listen Settings" : "Connection Settings";
             VerticalBox {
-                HorizontalBox {
+                if transfer-mode != TransferMode.FileReceive : HorizontalBox {
                     LineEdit {
                         placeholder-text: "Ticket (nkct1...)";
                         text <=> ticket-text;
@@ -114,7 +125,7 @@ export component ChatWindow inherits Window {
                     text <=> privkey-path;
                 }
                 LineEdit {
-                    placeholder-text: "Public Key Path (Peer)";
+                    placeholder-text: transfer-mode == TransferMode.FileReceive ? "Public Key Path (expected sender, optional)" : "Public Key Path (Peer)";
                     text <=> pubkey-path;
                 }
 
@@ -159,15 +170,55 @@ export component ChatWindow inherits Window {
                 }
 
                 Button {
-                    text: transfer-mode == TransferMode.Chat ? "Connect" : (transfer-mode == TransferMode.FileSend ? "Send File" : "Receive File");
+                    text: transfer-mode == TransferMode.Chat ? "Connect" : (transfer-mode == TransferMode.FileSend ? "Send File" : "Generate Ticket and Wait");
                     clicked => {
                         root.connection-error = "";
-                        if (transfer-mode == TransferMode.Chat) {
-                            root.connect-pressed(root.ticket-text, root.privkey-path, root.pubkey-path);
+                        if (transfer-mode == TransferMode.FileReceive) {
+                            root.listen-pressed(root.privkey-path, root.pubkey-path);
                         } else {
-                            root.connection-error = "File transfer is scheduled for v2.1.0 (Phase 4 F2). Currently chat mode only.";
+                            root.connect-pressed(root.ticket-text, root.privkey-path, root.pubkey-path);
                         }
                     }
+                }
+            }
+        }
+
+        // F2: Listen Display (FileReceive after Generate Ticket pressed)
+        if listen-display-visible : GroupBox {
+            title: "Waiting for Sender";
+            VerticalBox {
+                Text {
+                    text: "Share this ticket with the sender:";
+                    font-size: 12px;
+                }
+                HorizontalBox {
+                    LineEdit {
+                        text: generated-ticket;
+                        read-only: true;
+                    }
+                    Button {
+                        text: "Copy";
+                        clicked => { root.copy-to-clipboard(root.generated-ticket); }
+                    }
+                }
+                Text {
+                    text: "📡 Listening for incoming connection...";
+                    color: green;
+                    font-size: 11px;
+                }
+                Button {
+                    text: "Cancel";
+                    clicked => { root.listen-cancel(); }
+                }
+            }
+        }
+
+        // F2: File Transfer in Progress (post-handshake, non-chat modes)
+        if file-transfer-visible : GroupBox {
+            title: transfer-mode == TransferMode.FileSend ? "Sending File" : "Receiving File";
+            VerticalBox {
+                Text {
+                    text: transfer-status != "" ? transfer-status : "Transfer in progress...";
                 }
             }
         }

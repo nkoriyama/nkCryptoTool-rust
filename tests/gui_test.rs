@@ -314,4 +314,124 @@ mod tests {
         assert!(!file_picker_rs.contains("TODO"));
         assert!(!file_picker_rs.contains("placeholder"));
     }
+
+    // ===== F2: Listen workflow + FileIOProvider =====
+
+    #[test]
+    fn test_listen_state_properties() {
+        let ui = ui();
+
+        // Defaults
+        assert!(!ui.get_listening());
+        assert_eq!(ui.get_generated_ticket(), "");
+        assert!(!ui.get_file_transfer_active());
+        assert_eq!(ui.get_transfer_status(), "");
+
+        // listening true → listen_display_visible (FileReceive context)
+        ui.set_transfer_mode(TransferMode::FileReceive);
+        ui.set_listening(true);
+        ui.set_generated_ticket("nkct1example...".into());
+        assert!(ui.get_listen_display_visible(), "listen-display-visible should be true while listening");
+        assert!(!ui.get_connection_settings_visible(), "connection-settings hidden during listen");
+        assert_eq!(ui.get_generated_ticket(), "nkct1example...");
+
+        // After connect (handshake done): not listening, but connected
+        ui.set_listening(false);
+        ui.set_connected(true);
+        ui.set_file_transfer_active(true);
+        ui.set_transfer_status("Receiving...".into());
+        assert!(!ui.get_listen_display_visible());
+        assert!(ui.get_file_transfer_visible(), "file-transfer-visible should be true during file-mode connection");
+        assert!(!ui.get_chat_area_visible(), "chat-area must NOT be visible in non-Chat mode");
+    }
+
+    #[test]
+    fn test_file_transfer_visibility_chat_vs_file_modes() {
+        let ui = ui();
+
+        // Chat + connected → chat-area visible, file-transfer hidden
+        ui.set_transfer_mode(TransferMode::Chat);
+        ui.set_connected(true);
+        assert!(ui.get_chat_area_visible());
+        assert!(!ui.get_file_transfer_visible());
+
+        // FileSend + connected → file-transfer visible, chat-area hidden
+        ui.set_transfer_mode(TransferMode::FileSend);
+        assert!(!ui.get_chat_area_visible());
+        assert!(ui.get_file_transfer_visible());
+
+        // FileReceive + connected → file-transfer visible
+        ui.set_transfer_mode(TransferMode::FileReceive);
+        assert!(!ui.get_chat_area_visible());
+        assert!(ui.get_file_transfer_visible());
+
+        // Disconnected → neither
+        ui.set_connected(false);
+        assert!(!ui.get_chat_area_visible());
+        assert!(!ui.get_file_transfer_visible());
+    }
+
+    #[tokio::test]
+    async fn test_file_io_provider_send_reads_file_bytes() {
+        use nk_crypto_tool::network::{FileIOProvider, IOProvider};
+        use tokio::io::AsyncReadExt;
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("nkct_f2_send_{}.bin", std::process::id()));
+        tokio::fs::write(&tmp, b"hello-f2-payload").await.unwrap();
+
+        let provider = FileIOProvider::new_send(tmp.clone()).await.unwrap();
+        let mut reader = provider.stdin();
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"hello-f2-payload");
+
+        // One-shot: second stdin() call returns empty reader
+        let mut reader2 = provider.stdin();
+        let mut buf2 = Vec::new();
+        reader2.read_to_end(&mut buf2).await.unwrap();
+        assert!(buf2.is_empty(), "second stdin() must yield empty (one-shot)");
+
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_file_io_provider_recv_writes_file_bytes() {
+        use nk_crypto_tool::network::{FileIOProvider, IOProvider};
+        use tokio::io::AsyncWriteExt;
+
+        let mut tmp = std::env::temp_dir();
+        tmp.push(format!("nkct_f2_recv_{}.bin", std::process::id()));
+        let _ = tokio::fs::remove_file(&tmp).await;
+
+        let provider = FileIOProvider::new_recv(tmp.clone()).await.unwrap();
+        let mut writer = provider.stdout();
+        writer.write_all(b"received-f2-content").await.unwrap();
+        writer.shutdown().await.unwrap();
+
+        // Drop the writer reference before reading (file handle closes via Drop)
+        drop(writer);
+
+        let contents = tokio::fs::read(&tmp).await.unwrap();
+        assert_eq!(contents, b"received-f2-content");
+
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+
+    #[tokio::test]
+    async fn test_file_io_provider_send_open_failure_propagates() {
+        use nk_crypto_tool::network::FileIOProvider;
+        let result = FileIOProvider::new_send(std::path::PathBuf::from(
+            "/nonexistent/path/that/should/never/exist/nkct_f2.bin"
+        )).await;
+        assert!(result.is_err(), "opening non-existent send file must fail");
+    }
+
+    #[test]
+    fn test_no_placeholder_comments_in_network_mod() {
+        let network_mod_rs = include_str!("../src/network/mod.rs");
+        assert!(!network_mod_rs.contains("In a real implementation"));
+        assert!(!network_mod_rs.contains("we would start"));
+        assert!(!network_mod_rs.contains("For now,"));
+    }
 }
