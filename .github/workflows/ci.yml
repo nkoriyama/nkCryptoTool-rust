@@ -75,9 +75,14 @@ jobs:
       - name: Mandate check (pre-flight)
         run: bash scripts/mandate_check.sh
 
-      - name: cargo build (full features)
+      - name: cargo build (full features, vendored openssl)
+        # Use backend-openssl-vendored to bypass ubuntu-latest libssl3
+        # idiosyncrasies in EVP_PKEY_Q_keygen for prime256v1 (observed in
+        # F4 CI: works in distrobox build-env Fedora libssl, fails on
+        # ubuntu-latest at runtime). Tracked in PHASE5_ROADMAP §3.1 for
+        # cross-platform native libssl resolution.
         run: |
-          cargo build --features "gui-camera gui-notifications gui-screen-protection gui-file-transfer"
+          cargo build --no-default-features --features "backend-openssl-vendored gui-camera gui-notifications gui-screen-protection gui-file-transfer"
 
       # NOTE: -D warnings disabled in F4 due to pre-existing clippy debt
       # in src/utils.rs, src/backend/, etc. (60+ warnings unrelated to
@@ -87,13 +92,13 @@ jobs:
       - name: cargo clippy (advisory)
         continue-on-error: true  # F4-X13 explicit allowance for advisory step
         run: |
-          cargo clippy --all-targets \
-            --features "testing gui-camera gui-notifications gui-screen-protection gui-file-transfer"
+          cargo clippy --all-targets --no-default-features \
+            --features "testing backend-openssl-vendored gui-camera gui-notifications gui-screen-protection gui-file-transfer"
 
-      - name: cargo test (gui_test + integration)
+      - name: cargo test (gui_test + integration, vendored openssl)
         run: |
-          cargo test \
-            --features "testing gui-camera gui-notifications gui-screen-protection gui-file-transfer"
+          cargo test --no-default-features \
+            --features "testing backend-openssl-vendored gui-camera gui-notifications gui-screen-protection gui-file-transfer"
 
       # Run #[ignore]'d tests (notably src/network/iroh.rs internal tests
       # using a tight 2s handshake_timeout that is flaky on slow CI runners).
@@ -102,8 +107,8 @@ jobs:
       - name: cargo test --ignored (advisory, slow PQC handshake tests)
         continue-on-error: true  # F4-X13 explicit allowance
         run: |
-          cargo test \
-            --features "testing gui-camera gui-notifications gui-screen-protection gui-file-transfer" \
+          cargo test --no-default-features \
+            --features "testing backend-openssl-vendored gui-camera gui-notifications gui-screen-protection gui-file-transfer" \
             --lib -- --ignored
 
   # Windows / macOS build-only matrix is DEFERRED to v2.2.
