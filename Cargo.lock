@@ -3169,6 +3169,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "i-slint-backend-testing"
+version = "1.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c1e38002d6f1babda30a77ce7bde2d659c7261a60f15c063ac9f7c3324ff570"
+dependencies = [
+ "i-slint-common",
+ "i-slint-core",
+ "vtable",
+]
+
+[[package]]
 name = "i-slint-backend-winit"
 version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4858,6 +4869,7 @@ dependencies = [
  "ghash",
  "hex",
  "hkdf",
+ "i-slint-backend-testing",
  "image 0.24.9",
  "iroh",
  "iroh-base",

@@ -95,3 +95,4 @@ backend-rustcrypto = [
 ]
 
 [dev-dependencies]
+i-slint-backend-testing = "=1.16.1"
