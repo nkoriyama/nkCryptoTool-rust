@@ -27,7 +27,7 @@ jobs:
             features: "--no-default-features --features backend-rustcrypto"
             extra_deps: ""
           - backend: gui
-            features: "--features gui"
+            features: "--features gui,testing"
             extra_deps: "libxcb1-dev libxkbcommon-dev libwayland-dev libgtk-3-dev"
     steps:
     - uses: actions/checkout@v4

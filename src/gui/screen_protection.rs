@@ -90,7 +90,7 @@ impl ScreenProtectionApi for OsScreenProtectionApi {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(all(feature = "gui", any(test, feature = "testing")))]
 pub struct MockScreenProtectionApi {
     pub state: Arc<Mutex<bool>>,
 }
