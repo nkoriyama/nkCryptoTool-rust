@@ -1,7 +1,9 @@
 import { Button, VerticalBox, LineEdit, TextEdit, StandardListView, GroupBox, HorizontalBox, Switch } from "std-widgets.slint";
 
+export enum TransferMode { Chat, FileSend, FileReceive }
+
 export component ChatWindow inherits Window {
-    title: "nkCryptoTool Chat (v2.0.2)";
+    title: "nkCryptoTool Chat (v2.1.0-rc1)";
     width: 800px;
     height: 600px;
 
@@ -12,7 +14,10 @@ export component ChatWindow inherits Window {
     callback scan-qr-pressed();
     callback scan-cancel();
     callback privacy-mode-toggled(bool);
-    
+    callback select-file();
+    callback select-save-dir();
+    callback validate-save-file-name();
+
     in property <[StandardListViewItem]> messages: [];
     in-out property <bool> connected: false;
     in-out property <bool> asking-passphrase: false;
@@ -20,13 +25,24 @@ export component ChatWindow inherits Window {
     in-out property <string> connection-error: "";
     in-out property <string> scanner-status: "";
     in-out property <string> privacy-warning: "";
-    
+
     in-out property <string> input-text: "";
     in-out property <string> ticket-text: "";
     in-out property <string> privkey-path: "";
     in-out property <string> pubkey-path: "";
     in-out property <string> passphrase-input: "";
     in-out property <bool> privacy-mode: false;
+
+    // F1: Transfer Mode + File Picker
+    in-out property <TransferMode> transfer-mode: TransferMode.Chat;
+    in-out property <string> selected-file-path: "";
+    in-out property <string> save-dir-path: "";
+    in-out property <string> save-file-name: "";
+
+    // F1: Computed visibility (test-observable)
+    out property <bool> chat-area-visible: connected && transfer-mode == TransferMode.Chat;
+    out property <bool> file-picker-visible: !connected && !asking-passphrase && !scanning-qr && transfer-mode == TransferMode.FileSend;
+    out property <bool> save-dir-visible: !connected && !asking-passphrase && !scanning-qr && transfer-mode == TransferMode.FileReceive;
 
     VerticalBox {
         // Privacy Mode and Warning
@@ -52,6 +68,27 @@ export component ChatWindow inherits Window {
         if connection-error != "" : Text {
             text: connection-error;
             color: red;
+        }
+
+        // F1: Transfer Mode toggle (3-way selector)
+        if !connected && !asking-passphrase && !scanning-qr : HorizontalBox {
+            alignment: start;
+            Text { text: "Mode:"; vertical-alignment: center; }
+            Button {
+                text: "Chat";
+                primary: transfer-mode == TransferMode.Chat;
+                clicked => { root.transfer-mode = TransferMode.Chat; }
+            }
+            Button {
+                text: "File Send";
+                primary: transfer-mode == TransferMode.FileSend;
+                clicked => { root.transfer-mode = TransferMode.FileSend; }
+            }
+            Button {
+                text: "File Receive";
+                primary: transfer-mode == TransferMode.FileReceive;
+                clicked => { root.transfer-mode = TransferMode.FileReceive; }
+            }
         }
 
         // 1. Connection Settings
@@ -80,11 +117,56 @@ export component ChatWindow inherits Window {
                     placeholder-text: "Public Key Path (Peer)";
                     text <=> pubkey-path;
                 }
+
+                // F1: File Send extras
+                if file-picker-visible : VerticalBox {
+                    HorizontalBox {
+                        Text { text: "File:"; vertical-alignment: center; }
+                        LineEdit {
+                            placeholder-text: "(no file selected)";
+                            text <=> selected-file-path;
+                            read-only: true;
+                        }
+                        Button {
+                            text: "Choose File";
+                            clicked => { root.select-file(); }
+                        }
+                    }
+                }
+
+                // F1: File Receive extras
+                if save-dir-visible : VerticalBox {
+                    HorizontalBox {
+                        Text { text: "Save to:"; vertical-alignment: center; }
+                        LineEdit {
+                            placeholder-text: "(no directory selected)";
+                            text <=> save-dir-path;
+                            read-only: true;
+                        }
+                        Button {
+                            text: "Choose Directory";
+                            clicked => { root.select-save-dir(); }
+                        }
+                    }
+                    HorizontalBox {
+                        Text { text: "File name (optional):"; vertical-alignment: center; }
+                        LineEdit {
+                            placeholder-text: "Leave empty to use sender's name";
+                            text <=> save-file-name;
+                            edited => { root.validate-save-file-name(); }
+                        }
+                    }
+                }
+
                 Button {
-                    text: "Connect";
+                    text: transfer-mode == TransferMode.Chat ? "Connect" : (transfer-mode == TransferMode.FileSend ? "Send File" : "Receive File");
                     clicked => {
                         root.connection-error = "";
-                        root.connect-pressed(root.ticket-text, root.privkey-path, root.pubkey-path);
+                        if (transfer-mode == TransferMode.Chat) {
+                            root.connect-pressed(root.ticket-text, root.privkey-path, root.pubkey-path);
+                        } else {
+                            root.connection-error = "File transfer is scheduled for v2.1.0 (Phase 4 F2). Currently chat mode only.";
+                        }
                     }
                 }
             }
@@ -149,13 +231,13 @@ export component ChatWindow inherits Window {
         }
         
         // 4. Chat Messages
-        if connected : StandardListView {
+        if chat-area-visible : StandardListView {
             model: messages;
             min-height: 200px;
         }
-        
+
         // 5. Message Input
-        if connected : VerticalBox {
+        if chat-area-visible : VerticalBox {
             LineEdit {
                 text <=> input-text;
                 placeholder-text: "Type a message...";

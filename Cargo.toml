@@ -37,6 +37,7 @@ nokhwa = { version = "0.10", optional = true, features = ["input-native", "outpu
 rqrr = { version = "0.6", optional = true }
 image = { version = "0.24", optional = true }
 notify-rust = { version = "4.0", optional = true }
+rfd = { version = "0.14", optional = true }
 
 # RustCrypto ecosystem
 aes-gcm = { version = "0.10", optional = true, features = ["zeroize"] }
@@ -78,6 +79,7 @@ testing = []
 gui-camera = ["gui", "nokhwa", "rqrr", "image"]
 gui-notifications = ["gui", "notify-rust"]
 gui-screen-protection = ["gui", "windows", "objc2"]
+gui-file-transfer = ["gui", "rfd"]
 backend-openssl = ["openssl", "openssl-sys", "foreign-types"]
 backend-openssl-vendored = ["backend-openssl", "openssl/vendored", "openssl-src"]
 backend-rustcrypto = [

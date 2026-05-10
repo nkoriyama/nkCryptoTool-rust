@@ -25,6 +25,93 @@ pub mod camera;
 #[cfg(feature = "gui-notifications")]
 pub mod notifications;
 pub mod screen_protection;
+#[cfg(feature = "gui")]
+pub mod file_picker;
+
+#[cfg(feature = "gui")]
+pub fn pick_and_apply_file(ui: &ChatWindow, picker: &dyn file_picker::FilePickerProvider) {
+    if let Some(path) = picker.pick_file() {
+        ui.set_selected_file_path(path.to_string_lossy().to_string().into());
+        ui.set_connection_error("".into());
+    }
+}
+
+#[cfg(feature = "gui")]
+pub fn pick_and_apply_save_dir(ui: &ChatWindow, picker: &dyn file_picker::FilePickerProvider) {
+    if let Some(path) = picker.pick_directory() {
+        let writable = std::fs::metadata(&path)
+            .map(|m| !m.permissions().readonly())
+            .unwrap_or(false);
+        if !writable {
+            ui.set_connection_error("Selected directory is not writable".into());
+        } else {
+            ui.set_save_dir_path(path.to_string_lossy().to_string().into());
+            ui.set_connection_error("".into());
+        }
+    }
+}
+
+#[cfg(feature = "gui")]
+pub fn validate_and_apply_save_file_name(ui: &ChatWindow) {
+    let name = ui.get_save_file_name().to_string();
+    if file_picker::has_invalid_filename_chars(&name) {
+        ui.set_connection_error("Invalid characters in filename".into());
+    } else if ui.get_connection_error().to_string().contains("Invalid characters") {
+        ui.set_connection_error("".into());
+    }
+}
+
+#[cfg(feature = "gui")]
+pub fn wire_file_picker_callbacks(
+    ui: &ChatWindow,
+    picker: Arc<dyn file_picker::FilePickerProvider>,
+) {
+    let ui_handle_f = ui.as_weak();
+    let picker_f = picker.clone();
+    ui.on_select_file(move || {
+        let ui_handle = ui_handle_f.clone();
+        let picker = picker_f.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = picker.pick_file();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let (Some(ui), Some(path)) = (ui_handle.upgrade(), result) {
+                    ui.set_selected_file_path(path.to_string_lossy().to_string().into());
+                    ui.set_connection_error("".into());
+                }
+            });
+        });
+    });
+
+    let ui_handle_d = ui.as_weak();
+    let picker_d = picker.clone();
+    ui.on_select_save_dir(move || {
+        let ui_handle = ui_handle_d.clone();
+        let picker = picker_d.clone();
+        tokio::task::spawn_blocking(move || {
+            let result = picker.pick_directory();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let (Some(ui), Some(path)) = (ui_handle.upgrade(), result) {
+                    let writable = std::fs::metadata(&path)
+                        .map(|m| !m.permissions().readonly())
+                        .unwrap_or(false);
+                    if !writable {
+                        ui.set_connection_error("Selected directory is not writable".into());
+                    } else {
+                        ui.set_save_dir_path(path.to_string_lossy().to_string().into());
+                        ui.set_connection_error("".into());
+                    }
+                }
+            });
+        });
+    });
+
+    let ui_handle_v = ui.as_weak();
+    ui.on_validate_save_file_name(move || {
+        if let Some(ui) = ui_handle_v.upgrade() {
+            validate_and_apply_save_file_name(&ui);
+        }
+    });
+}
 
 #[cfg(feature = "gui-camera")]
 use crate::ticket::Ticket;
@@ -58,6 +145,15 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     let protection_api: Arc<dyn screen_protection::ScreenProtectionApi> = Arc::new(screen_protection::OsScreenProtectionApi);
     if let Some(warn) = protection_api.get_warning_message() {
         ui.set_privacy_warning(warn.into());
+    }
+
+    // F1: File Picker
+    {
+        #[cfg(feature = "gui-file-transfer")]
+        let picker: Arc<dyn file_picker::FilePickerProvider> = Arc::new(file_picker::RfdFilePickerProvider);
+        #[cfg(not(feature = "gui-file-transfer"))]
+        let picker: Arc<dyn file_picker::FilePickerProvider> = Arc::new(file_picker::NoopFilePickerProvider);
+        wire_file_picker_callbacks(&ui, picker);
     }
 
     // Update UI when messages arrive from network

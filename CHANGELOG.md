@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.1.0-rc1] - 2026-05-10
+
+### Added
+- **Transfer Mode Toggle (Phase 4 F1)**: GUI に Chat / File Send / File Receive の 3 択モード切替を追加 (`TransferMode` enum + `transfer-mode` プロパティ)。
+- **Native File Dialogs (Phase 4 F1)**: `rfd` クレート経由で OS ネイティブのファイル/ディレクトリ選択ダイアログを統合。`gui-file-transfer` feature 配下で有効化。
+- **`FilePickerProvider` trait**: ダイアログ起動経路をテストから差替可能にする抽象化 (Rfd / Noop / Mock 実装)。
+- **保存ファイル名 UI 検証**: `/` `\` を含むファイル名入力に対する事前警告 (`file_picker::has_invalid_filename_chars`)。
+- **保存先ディレクトリ書込権限チェック**: 選択時に `metadata` 経由で writable を確認しエラー表示。
+- **F1 段階の File transfer 警告**: FileSend/FileReceive モードでの Connect 押下は警告メッセージのみ (実 transfer は F2 で実装予定)。
+
+### Notes
+- Cargo.toml version は v2.0.4 据置。F1 単独でリリースは切らず、F1〜F4 完了後に v2.1.0 として release tag を切る。
+
 ## [2.0.4] - 2026-05-10
 
 ### Fixed
