@@ -22,3 +22,8 @@
 - **CHAT_ACTIVE フラグの取扱い**: `run_listen_once` は chat_mode = false (ALPN_FILE) の場合 CHAT_ACTIVE を取得しない。chat_mode = true (将来的な GUI Chat-Listen) では既存と同様 CHAT_ACTIVE を取得 + drop で release。
 - **allowlist / pinned key**: GUI 受信側は `signing_pubkey` (送信者の公開鍵) を任意指定可。指定時は handshake 中に固定鍵検証が動作。未指定 + `allow_unauth = true` で署名なし接続を許容するが、同時に `signing_pubkey` を指定した場合は ALPN フェーズ後の handshake で MITM 検出が動作。
 - **F2 段階の UX 制約**: 進捗表示は F3 で実装。F2 段階では `transfer-status` 文字列で「Receiving...」「Sending...」「File received: <path>」を表示するのみ。バイト数進捗は不可視。
+
+## 1.10 F3: ファイル転送進捗表示
+- **進捗の非秘匿**: 転送済バイト数および総バイト数はメタデータとして扱い、UI 表示を許可。
+- **ローカル限定**: 進捗値は GUI プロセス内のローカル状態であり、ネットワーク経由でピアに送信されない。
+- **DoS 対策**: 64KiB 単位のチャンクベースでのみ UI 更新イベントを発行し、UI スレッドの過負荷を防止。

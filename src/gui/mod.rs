@@ -9,7 +9,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 #[cfg(feature = "gui")]
 use slint::Model;
+#[cfg(feature = "gui")]
 use std::str::FromStr;
+#[cfg(feature = "gui")]
 use crate::network::GuiIOProvider;
 #[cfg(feature = "gui")]
 use slint::VecModel;
@@ -24,109 +26,76 @@ use std::time::Duration;
 pub mod camera;
 #[cfg(feature = "gui-notifications")]
 pub mod notifications;
+#[cfg(feature = "gui")]
 pub mod screen_protection;
 #[cfg(feature = "gui")]
 pub mod file_picker;
-
-#[cfg(feature = "gui")]
-pub fn pick_and_apply_file(ui: &ChatWindow, picker: &dyn file_picker::FilePickerProvider) {
-    if let Some(path) = picker.pick_file() {
-        ui.set_selected_file_path(path.to_string_lossy().to_string().into());
-        ui.set_connection_error("".into());
-    }
-}
-
-#[cfg(feature = "gui")]
-pub fn pick_and_apply_save_dir(ui: &ChatWindow, picker: &dyn file_picker::FilePickerProvider) {
-    if let Some(path) = picker.pick_directory() {
-        let writable = std::fs::metadata(&path)
-            .map(|m| !m.permissions().readonly())
-            .unwrap_or(false);
-        if !writable {
-            ui.set_connection_error("Selected directory is not writable".into());
-        } else {
-            ui.set_save_dir_path(path.to_string_lossy().to_string().into());
-            ui.set_connection_error("".into());
-        }
-    }
-}
-
-/// Unix epoch seconds as a string, used when the user does not supply a
-/// receive filename and we need a non-colliding default.
-#[cfg(feature = "gui")]
-fn chrono_like_timestamp() -> String {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs().to_string())
-        .unwrap_or_else(|_| "0".to_string())
-}
-
-#[cfg(feature = "gui")]
-pub fn validate_and_apply_save_file_name(ui: &ChatWindow) {
-    let name = ui.get_save_file_name().to_string();
-    if file_picker::has_invalid_filename_chars(&name) {
-        ui.set_connection_error("Invalid characters in filename".into());
-    } else if ui.get_connection_error().to_string().contains("Invalid characters") {
-        ui.set_connection_error("".into());
-    }
-}
-
-#[cfg(feature = "gui")]
-pub fn wire_file_picker_callbacks(
-    ui: &ChatWindow,
-    picker: Arc<dyn file_picker::FilePickerProvider>,
-) {
-    let ui_handle_f = ui.as_weak();
-    let picker_f = picker.clone();
-    ui.on_select_file(move || {
-        let ui_handle = ui_handle_f.clone();
-        let picker = picker_f.clone();
-        tokio::task::spawn_blocking(move || {
-            let result = picker.pick_file();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let (Some(ui), Some(path)) = (ui_handle.upgrade(), result) {
-                    ui.set_selected_file_path(path.to_string_lossy().to_string().into());
-                    ui.set_connection_error("".into());
-                }
-            });
-        });
-    });
-
-    let ui_handle_d = ui.as_weak();
-    let picker_d = picker.clone();
-    ui.on_select_save_dir(move || {
-        let ui_handle = ui_handle_d.clone();
-        let picker = picker_d.clone();
-        tokio::task::spawn_blocking(move || {
-            let result = picker.pick_directory();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let (Some(ui), Some(path)) = (ui_handle.upgrade(), result) {
-                    let writable = std::fs::metadata(&path)
-                        .map(|m| !m.permissions().readonly())
-                        .unwrap_or(false);
-                    if !writable {
-                        ui.set_connection_error("Selected directory is not writable".into());
-                    } else {
-                        ui.set_save_dir_path(path.to_string_lossy().to_string().into());
-                        ui.set_connection_error("".into());
-                    }
-                }
-            });
-        });
-    });
-
-    let ui_handle_v = ui.as_weak();
-    ui.on_validate_save_file_name(move || {
-        if let Some(ui) = ui_handle_v.upgrade() {
-            validate_and_apply_save_file_name(&ui);
-        }
-    });
-}
 
 #[cfg(feature = "gui-camera")]
 use crate::ticket::Ticket;
 #[cfg(feature = "gui-camera")]
 use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(feature = "gui")]
+pub fn wire_file_picker_callbacks(ui: &ChatWindow, picker: Arc<dyn file_picker::FilePickerProvider>) {
+    let ui_handle_file = ui.as_weak();
+    let pick_api = picker.clone();
+    ui.on_select_file(move || {
+        let ui_handle = ui_handle_file.clone();
+        let pick_api = pick_api.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(path) = pick_api.pick_file() {
+                let path_str = path.to_string_lossy().to_string();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_handle.upgrade() {
+                        ui.set_selected_file_path(path_str.into());
+                        if !path.exists() {
+                             ui.set_connection_error("Selected file does not exist.".into());
+                        } else if !path.is_file() {
+                             ui.set_connection_error("Selected path is not a file.".into());
+                        } else {
+                             ui.set_connection_error("".into());
+                        }
+                    }
+                });
+            }
+        });
+    });
+
+    let ui_handle_dir = ui.as_weak();
+    let pick_api_dir = picker.clone();
+    ui.on_select_save_dir(move || {
+        let ui_handle = ui_handle_dir.clone();
+        let pick_api = pick_api_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(path) = pick_api.pick_directory() {
+                let path_str = path.to_string_lossy().to_string();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_handle.upgrade() {
+                        ui.set_save_dir_path(path_str.into());
+                        if !path.is_dir() {
+                             ui.set_connection_error("Selected path is not a directory.".into());
+                        } else {
+                             ui.set_connection_error("".into());
+                        }
+                    }
+                });
+            }
+        });
+    });
+    
+    let ui_handle_validate = ui.as_weak();
+    ui.on_validate_save_file_name(move || {
+        if let Some(ui) = ui_handle_validate.upgrade() {
+            let name = ui.get_save_file_name().to_string();
+            if name.contains('/') || name.contains('\\') {
+                ui.set_connection_error("Invalid characters in filename".into());
+            } else {
+                ui.set_connection_error("".into());
+            }
+        }
+    });
+}
 
 #[cfg(feature = "gui")]
 pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
@@ -158,13 +127,13 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // F1: File Picker
-    {
+    let picker_api: Arc<dyn file_picker::FilePickerProvider> = {
         #[cfg(feature = "gui-file-transfer")]
-        let picker: Arc<dyn file_picker::FilePickerProvider> = Arc::new(file_picker::RfdFilePickerProvider);
+        { Arc::new(file_picker::RfdFilePickerProvider) }
         #[cfg(not(feature = "gui-file-transfer"))]
-        let picker: Arc<dyn file_picker::FilePickerProvider> = Arc::new(file_picker::NoopFilePickerProvider);
-        wire_file_picker_callbacks(&ui, picker);
-    }
+        { Arc::new(file_picker::NoopFilePickerProvider) }
+    };
+    wire_file_picker_callbacks(&ui, picker_api.clone());
 
     // Update UI when messages arrive from network
     let mut stdout_rx = stdout_rx;
@@ -384,7 +353,6 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let ui_handle_for_connect = ui_handle.clone();
     ui.on_connect_pressed(move |ticket, privkey, pubkey| {
         let ui_handle = ui_handle_conn.clone();
         let gp = gp.clone();
@@ -392,8 +360,7 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         let privkey = privkey.to_string();
         let pubkey = pubkey.to_string();
 
-        // Read transfer mode and selected file path from UI (UI thread)
-        let (mode, selected_file_path) = if let Some(ui) = ui_handle_for_connect.upgrade() {
+        let (mode, selected_file_path) = if let Some(ui) = ui_handle.upgrade() {
             (ui.get_transfer_mode(), ui.get_selected_file_path().to_string())
         } else {
             return;
@@ -406,12 +373,10 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             config.signing_pubkey = Some(pubkey.clone());
             config.transport = crate::config::TransportKind::Iroh;
 
-            // Branch on transfer mode: Chat reuses GuiIOProvider, FileSend
-            // builds a FileIOProvider with the selected file as input.
-            let (io_provider, is_file_mode): (Arc<dyn crate::network::IOProvider>, bool) = match mode {
+            let (io_provider, is_file_mode, _total_bytes): (Arc<dyn crate::network::IOProvider>, bool, Option<u64>) = match mode {
                 TransferMode::Chat => {
                     config.chat_mode = true;
-                    (gp.clone(), false)
+                    (gp.clone(), false, None)
                 }
                 TransferMode::FileSend => {
                     config.chat_mode = false;
@@ -426,7 +391,10 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let path = std::path::PathBuf::from(&selected_file_path);
                     match crate::network::FileIOProvider::new_send(path).await {
-                        Ok(p) => (Arc::new(p), true),
+                        Ok(p) => {
+                            let total = Some(p.total_bytes());
+                            (Arc::new(p), true, total)
+                        }
                         Err(e) => {
                             let ui_handle = ui_handle.clone();
                             let msg = format!("Cannot open file: {}", e);
@@ -450,6 +418,41 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            // F3: Progress setup
+            let (progress_tx, mut progress_rx) = mpsc::channel::<(u64, Option<u64>)>(1);
+            let on_progress = if is_file_mode {
+                let tx = progress_tx.clone();
+                Some(Arc::new(move |sent, total| {
+                    let _ = tx.try_send((sent, total));
+                }) as crate::network::ProgressCallback)
+            } else {
+                None
+            };
+
+            let ui_handle_prog = ui_handle.clone();
+            if is_file_mode {
+                tokio::spawn(async move {
+                    while let Some((sent, total)) = progress_rx.recv().await {
+                        let ui_handle = ui_handle_prog.clone();
+                        let progress = total.map(|t| sent as f32 / t as f32).unwrap_or(0.0);
+                        let status = match total {
+                            Some(t) => format!("{}/{} bytes ({:.1}%)", sent, t, progress * 100.0),
+                            None => format!("{} bytes", sent),
+                        };
+                        let _ = slint::invoke_from_event_loop(move || {
+                            if let Some(ui) = ui_handle.upgrade() {
+                                ui.set_transfer_progress(progress);
+                                ui.set_transfer_bytes(sent as i32);
+                                if let Some(t) = total {
+                                    ui.set_transfer_total(t as i32);
+                                }
+                                ui.set_transfer_status(status.into());
+                            }
+                        });
+                    }
+                });
+            }
+
             let processor = crate::network::iroh::NetworkProcessor::with_io(config.clone(), io_provider);
             let ui_handle_for_callback = ui_handle.clone();
             let on_handshake = move || {
@@ -459,14 +462,14 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                         ui.set_connected(true);
                         if is_file_mode {
                             ui.set_file_transfer_active(true);
-                            ui.set_transfer_status("Transferring...".into());
+                            ui.set_transfer_status("Connecting...".into());
                         }
                     }
                 });
             };
 
-            let res = processor.run_connect_with_handshake_callback(on_handshake).await;
-
+            let res = processor.run_connect_with_handshake_callback_and_progress(on_handshake, on_progress).await;
+            
             let ui_handle_end = ui_handle.clone();
             let res_msg = match &res {
                 Ok(_) if is_file_mode => "File sent successfully.".to_string(),
@@ -501,7 +504,6 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // F2: Listen handler (FileReceive mode)
     let ui_handle_listen = ui_handle.clone();
     let listen_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
         Arc::new(tokio::sync::Mutex::new(None));
@@ -512,7 +514,6 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         let pubkey = pubkey.to_string();
         let listen_task = listen_task_for_press.clone();
 
-        // Read save dir / file name from UI thread
         let (save_dir, save_name, mode) = if let Some(ui) = ui_handle_listen.upgrade() {
             (
                 ui.get_save_dir_path().to_string(),
@@ -570,6 +571,34 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
+            // F3: Progress setup
+            let (progress_tx, mut progress_rx) = mpsc::channel::<(u64, Option<u64>)>(1);
+            let on_progress = Some(Arc::new(move |sent, total| {
+                let _ = progress_tx.try_send((sent, total));
+            }) as crate::network::ProgressCallback);
+
+            let ui_handle_prog = ui_handle.clone();
+            tokio::spawn(async move {
+                while let Some((sent, total)) = progress_rx.recv().await {
+                    let ui_handle = ui_handle_prog.clone();
+                    let progress = total.map(|t| sent as f32 / t as f32).unwrap_or(0.0);
+                    let status = match total {
+                        Some(t) => format!("{}/{} bytes ({:.1}%)", sent, t, progress * 100.0),
+                        None => format!("{} bytes", sent),
+                    };
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_handle.upgrade() {
+                            ui.set_transfer_progress(progress);
+                            ui.set_transfer_bytes(sent as i32);
+                            if let Some(t) = total {
+                                ui.set_transfer_total(t as i32);
+                            }
+                            ui.set_transfer_status(status.into());
+                        }
+                    });
+                }
+            });
+
             let processor = crate::network::iroh::NetworkProcessor::with_io(
                 config.clone(),
                 file_io as Arc<dyn crate::network::IOProvider>,
@@ -598,7 +627,7 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                 });
             };
 
-            let res = processor.run_listen_once(on_ticket, on_handshake).await;
+            let res = processor.run_listen_once_with_progress(on_ticket, on_handshake, on_progress).await;
 
             let ui_handle_end = ui_handle.clone();
             let final_msg = match &res {
@@ -664,9 +693,8 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             let processor = crate::network::iroh::NetworkProcessor::with_io(config, gp_pass.clone());
             let ui_handle_for_callback = ui_handle_pass_retry.clone();
             let on_handshake = move || {
-                let ui_handle = ui_handle_for_callback.clone();
                 let _ = slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_handle.upgrade() {
+                    if let Some(ui) = ui_handle_for_callback.upgrade() {
                         ui.set_connected(true);
                         ui.set_asking_passphrase(false);
                         ui.set_connection_error("".into());
@@ -705,4 +733,9 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
 
     ui.run()?;
     Ok(())
+}
+
+fn chrono_like_timestamp() -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    now.as_secs().to_string()
 }

@@ -1,4 +1,4 @@
-import { Button, VerticalBox, LineEdit, TextEdit, StandardListView, GroupBox, HorizontalBox, Switch } from "std-widgets.slint";
+import { Button, VerticalBox, LineEdit, TextEdit, StandardListView, GroupBox, HorizontalBox, Switch, ProgressIndicator } from "std-widgets.slint";
 
 export enum TransferMode { Chat, FileSend, FileReceive }
 
@@ -46,6 +46,11 @@ export component ChatWindow inherits Window {
     in-out property <string> generated-ticket: "";
     in-out property <bool> file-transfer-active: false;
     in-out property <string> transfer-status: "";
+
+    // F3: Progress tracking
+    in-out property <float> transfer-progress: 0.0;
+    in-out property <int> transfer-bytes: 0;
+    in-out property <int> transfer-total: 0;
 
     // F1/F2: Computed visibility (test-observable)
     out property <bool> chat-area-visible: connected && transfer-mode == TransferMode.Chat;
@@ -217,8 +222,14 @@ export component ChatWindow inherits Window {
         if file-transfer-visible : GroupBox {
             title: transfer-mode == TransferMode.FileSend ? "Sending File" : "Receiving File";
             VerticalBox {
+                ProgressIndicator {
+                    progress: transfer-progress;
+                    min-height: 16px;
+                }
                 Text {
                     text: transfer-status != "" ? transfer-status : "Transfer in progress...";
+                    font-size: 11px;
+                    horizontal-alignment: center;
                 }
             }
         }
