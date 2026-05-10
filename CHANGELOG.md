@@ -26,6 +26,13 @@ All notable changes to this project will be documented in this file.
 - Cargo.toml version は v2.0.4 据置。F1〜F4 完了後に v2.1.0 として release tag を切る。
 - F3 段階では転送速度 / ETA は未表示。必要なら F3.5 か v2.2 で追加検討 (handoff §1.2 F3-O1〜O3 推奨機能)。
 
+### Known Issues / 既知の制限事項 (Gemini Trigger 3 §3.1 反映)
+- **転送中キャンセル未対応 (v2.2 持ち越し)**: GUI File Send / File Receive 進行中に "cancel" 操作なし。途中で中断したい場合は **アプリケーションを終了する** (プロセス kill) こと。Listen 段階の cancel は実装済 (`listen-cancel` callback)。
+- **後方互換性のスコープ**: F4 で iroh QUIC FIN race fix (writer.shutdown 追加) を適用。新版 sender は graceful close を送り、receiver の挙動は新旧両 sender に対して同一だが、未知の互換性 corner case を避けるため **CLI/GUI 共に v2.1.x 同士の組合せを推奨**。v2.0.x sender ↔ v2.1.x receiver の混在運用は明示的にはサポート対象外。
+- **巨大ファイル UI 制限**: 10 GB 超のファイルは GUI File Send で開始前に reject 表示。`MAX_FILE_SIZE = 10 GiB` (`src/network/mod.rs`)。
+- **CI 上で flaky な内部 test 8 件**: `src/network/iroh.rs` の `test_iroh_*` は `#[ignore]` で marking 済 (build-env では reliable に PASS)。CI には advisory として `cargo test -- --ignored` step あり。詳細は `PHASE5_ROADMAP.md §3.3`。
+- **subprocess-based e2e test (test_pqc_e2e_cycle / test_hybrid_e2e_cycle)**: GitHub Actions ubuntu runner で原因不明の non-zero exit 失敗、`#[ignore]` で marking。build-env では PASS。`PHASE5_ROADMAP §3.x` で v2.2 調査予定。
+
 ## [2.0.4] - 2026-05-10
 
 ### Fixed

@@ -483,6 +483,27 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let path = std::path::PathBuf::from(&selected_file_path);
                     total_send_bytes = tokio::fs::metadata(&path).await.ok().map(|m| m.len());
+                    // F4 (Gemini Trigger 3 §3.1#2): pre-check file size against
+                    // MAX_FILE_SIZE so the UI surfaces a clear error before the
+                    // transfer starts, instead of letting the receiver reject
+                    // mid-transfer (10 GB limit, see network::MAX_FILE_SIZE).
+                    if let Some(sz) = total_send_bytes {
+                        if sz > crate::network::MAX_FILE_SIZE {
+                            let ui_handle = ui_handle.clone();
+                            let msg = format!(
+                                "File too large: {} bytes exceeds {} byte limit ({:.1} GB cap).",
+                                sz,
+                                crate::network::MAX_FILE_SIZE,
+                                (crate::network::MAX_FILE_SIZE as f64) / 1024.0 / 1024.0 / 1024.0,
+                            );
+                            let _ = slint::invoke_from_event_loop(move || {
+                                if let Some(ui) = ui_handle.upgrade() {
+                                    ui.set_connection_error(msg.into());
+                                }
+                            });
+                            return;
+                        }
+                    }
                     match crate::network::FileIOProvider::new_send(path).await {
                         Ok(p) => (Arc::new(p), true),
                         Err(e) => {
