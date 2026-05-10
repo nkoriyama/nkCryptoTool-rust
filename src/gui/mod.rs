@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 #[cfg(feature = "gui")]
 use slint::Model;
 use std::str::FromStr;
+#[cfg(feature = "gui")]
 use crate::network::GuiIOProvider;
 #[cfg(feature = "gui")]
 use slint::VecModel;

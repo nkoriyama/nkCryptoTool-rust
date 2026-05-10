@@ -65,7 +65,10 @@ impl ScreenProtectionApi for OsScreenProtectionApi {
     }
 }
 
-#[cfg(any(not(feature = "gui-screen-protection"), target_os = "linux"))]
+// The fallback impl requires ScreenProtectionApi trait + slint::Window type,
+// both of which only exist under the `gui` feature. Gate accordingly so the
+// lib still compiles without `gui` (CLI-only build via backend-rustcrypto etc.).
+#[cfg(all(feature = "gui", any(not(feature = "gui-screen-protection"), target_os = "linux")))]
 impl ScreenProtectionApi for OsScreenProtectionApi {
     fn set_protection(&self, _window: &slint::Window, _enabled: bool) -> Result<()> {
         Ok(())
