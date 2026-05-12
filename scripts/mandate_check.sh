@@ -165,6 +165,161 @@ else
     pass "Cargo.lock: no security-critical dep drift since v2.0.4"
 fi
 
+# ---- Phase 5 P1 additions (items 10-20) ----
+# Per PHASE5_P1_HANDOFF.md §1.6 + §2 commit 4. Spec numbers items 9-19;
+# code shifts to 10-20 to avoid conflict with existing F4 item #9 (Cargo.lock).
+#
+# Many items use SKIP semantics (warn instead of fail) when their prerequisite
+# commit has not yet landed, so mandate_check stays exit 0 throughout the P1
+# development loop. Final P1 completion requires all items pass (no warns).
+
+# 10. iroh internal test 8 件の #[ignore] 不在 (P1-R1, lands in commit 8)
+# Pattern note: matches both `#[ignore]` and `#[ignore = "..."]` (rust syntax
+# allows both; the message form is more common in this codebase).
+if [ -f src/network/iroh.rs ]; then
+    IROH_IGNORE_COUNT="$(grep -B1 'fn test_iroh_' src/network/iroh.rs 2>/dev/null | grep -c '#\[ignore' || true)"
+    if [ "$IROH_IGNORE_COUNT" -eq 0 ]; then
+        pass "iroh internal tests: no #[ignore]"
+    else
+        warn "iroh internal tests: $IROH_IGNORE_COUNT #[ignore...] present (lifted in P1 commit 8)"
+    fi
+else
+    warn "iroh.rs not found, skipping iroh #[ignore] check"
+fi
+
+# 11. subprocess e2e #[ignore] 不在 (P1-R2, lands in commit 9)
+# Pattern matches both #[ignore] and #[ignore = "..."] forms.
+if [ -f tests/e2e.rs ]; then
+    SUBPROC_IGNORE_COUNT="$(grep -B1 -E 'fn (test_pqc_e2e_cycle|test_hybrid_e2e_cycle)' tests/e2e.rs 2>/dev/null | grep -c '#\[ignore' || true)"
+    if [ "$SUBPROC_IGNORE_COUNT" -eq 0 ]; then
+        pass "subprocess e2e: no #[ignore]"
+    else
+        warn "subprocess e2e: $SUBPROC_IGNORE_COUNT #[ignore...] present (lifted in P1 commit 9)"
+    fi
+else
+    warn "tests/e2e.rs not found, skipping subprocess e2e #[ignore] check"
+fi
+
+# 12. 異常系 E2E 3 件存在 (P1-R3, lands in commit 10)
+ADV_FT=0
+[ -f tests/e2e_file_transfer.rs ] && \
+    ADV_FT="$(grep -cE '\basync fn test_e2e_(aead_tampering|chunk_len_forgery)' tests/e2e_file_transfer.rs 2>/dev/null || true)"
+ADV_HS=0
+[ -f tests/e2e_handshake_tampering.rs ] && \
+    ADV_HS="$(grep -cE '\basync fn test_handshake_signature_tampering' tests/e2e_handshake_tampering.rs 2>/dev/null || true)"
+if [ "$ADV_FT" -ge 2 ] && [ "$ADV_HS" -ge 1 ]; then
+    pass "adversarial E2E: $((ADV_FT + ADV_HS)) tests present (file_transfer:$ADV_FT, handshake:$ADV_HS)"
+else
+    warn "adversarial E2E: found file_transfer:$ADV_FT handshake:$ADV_HS, need >=2 + >=1 (lands in P1 commit 10)"
+fi
+
+# 13. CI yaml で clippy step に continue-on-error: true 不在 (P1-R4, lands in commit 7)
+if compgen -G "$CI_YAML_GLOB" > /dev/null; then
+    # 単純化: ファイル全体で "clippy" を含む行の前後 5 行以内に continue-on-error: true
+    # が現れたら advisory モードと判定 (false positive 許容、保守的に warn)
+    CLIPPY_ADVISORY=0
+    for f in $CI_YAML_GLOB; do
+        if grep -nE 'clippy' "$f" >/dev/null 2>&1; then
+            if awk '/clippy/{c=NR} /continue-on-error:[[:space:]]*true/{e=NR; if(c && e-c<10 && e>c){found=1}} END{exit !found}' "$f"; then
+                CLIPPY_ADVISORY=1
+                break
+            fi
+        fi
+    done
+    if [ "$CLIPPY_ADVISORY" -eq 0 ]; then
+        pass "CI yaml: clippy is release-blocking (no continue-on-error near clippy step)"
+    else
+        warn "CI yaml: clippy has continue-on-error: true (removed in P1 commit 7)"
+    fi
+else
+    warn "CI yaml not present, skipping clippy advisory check"
+fi
+
+# 14. scripts/check_env.sh 存在 + executable + exit 0 (P1-R5)
+if [ -x scripts/check_env.sh ]; then
+    if bash scripts/check_env.sh >/dev/null 2>&1; then
+        pass "scripts/check_env.sh: present, executable, exit 0"
+    else
+        fail "scripts/check_env.sh" "invocation returned non-zero (re-run manually for details)"
+    fi
+else
+    fail "scripts/check_env.sh" "missing or not executable"
+fi
+
+# 15. cargo deny + Dependabot 構成 (P1-R7, lands in commit 5)
+DENY_MISSING=""
+[ -f deny.toml ] || DENY_MISSING="$DENY_MISSING deny.toml"
+[ -f .github/dependabot.yml ] || DENY_MISSING="$DENY_MISSING .github/dependabot.yml"
+if [ -z "$DENY_MISSING" ]; then
+    pass "cargo deny + Dependabot: deny.toml + .github/dependabot.yml present"
+else
+    warn "cargo deny + Dependabot: missing$DENY_MISSING (lands in P1 commit 5)"
+fi
+
+# 16. serial_test の [dev-dependencies] 配置 (P1-R6, lands in commit 6)
+if grep -qE '^serial_test[[:space:]]*=' Cargo.toml; then
+    SERIAL_IN_DEV=$(awk '
+        /^\[dev-dependencies\]/ { in_dev=1; next }
+        /^\[/ { in_dev=0 }
+        in_dev && /^serial_test[[:space:]]*=/ { found=1 }
+        END { print found+0 }
+    ' Cargo.toml)
+    if [ "$SERIAL_IN_DEV" -eq 1 ]; then
+        pass "serial_test placed in [dev-dependencies]"
+    else
+        warn "serial_test still in [dependencies] (moved to dev-dep in P1 commit 6)"
+    fi
+else
+    pass "serial_test absent from Cargo.toml"
+fi
+
+# 17. v2.4_DEFERRED.md 存在 (P1-R11, landed in commit 1 of sibling issue/ repo).
+# Cross-repo path: from REPO_ROOT (= src/nkCryptoTool-rust/), the issue
+# docs repo is sibling at ../issue/nkCryptoTool-rust/. Override via
+# NKCT_ISSUE_DIR env var if layout differs.
+ISSUE_DIR="${NKCT_ISSUE_DIR:-../issue/nkCryptoTool-rust}"
+if [ -f "$ISSUE_DIR/v2.4_DEFERRED.md" ]; then
+    pass "v2.4_DEFERRED.md present at $ISSUE_DIR"
+else
+    warn "v2.4_DEFERRED.md not found at $ISSUE_DIR (override NKCT_ISSUE_DIR if needed)"
+fi
+
+# 18. security-critical files の unwrap()/expect() 新規追加 0 (P1-R10, diff-based vs 22a8011a).
+# Scope: src/network/*.rs + src/processor.rs + src/utils.rs + src/backend/*.rs
+NEW_UNWRAPS="$(git diff 22a8011a -- 'src/network/*.rs' src/processor.rs src/utils.rs 'src/backend/*.rs' 2>/dev/null | grep -cE '^\+[^+].*\.(unwrap|expect)\(' || true)"
+if [ "$NEW_UNWRAPS" -eq 0 ]; then
+    pass "no new unwrap()/expect() in security-critical files since 22a8011a"
+else
+    fail "unwrap/expect grep" "$NEW_UNWRAPS new occurrence(s) since 22a8011a"
+fi
+
+# 19. .security-baseline.sha256 strict match (P1-R12, Gemini §3.3#3: skip if absent)
+if [ -f .security-baseline.sha256 ]; then
+    if sha256sum --check --quiet .security-baseline.sha256 2>/dev/null; then
+        pass ".security-baseline.sha256: strict match"
+    else
+        fail ".security-baseline.sha256" "hash mismatch — see HANDOFF §1.7.3 baseline reconstruction protocol"
+    fi
+else
+    warn ".security-baseline.sha256 not yet present, skipping (init in P1 commit 3)"
+fi
+
+# 20. clippy #[allow(...)] rationale + Future plan (P1-X12 v2, diff-based)
+# Delegated to scripts/check_allow_rationale.sh which enforces rationale +
+# Future on NEW #[allow(...)] added since 22a8011a (diff-based, matches
+# P1-R10 unwrap pattern; pre-existing allows grandfathered).
+if [ -x scripts/check_allow_rationale.sh ]; then
+    if bash scripts/check_allow_rationale.sh >/dev/null 2>&1; then
+        pass "check_allow_rationale.sh: new #[allow(...)] have rationale + Future plan"
+    else
+        fail "check_allow_rationale.sh" "one or more new #[allow(...)] missing rationale or Future (re-run manually for details)"
+    fi
+else
+    fail "check_allow_rationale.sh" "missing or not executable"
+fi
+
+# ---- End Phase 5 P1 additions ----
+
 # Summary
 echo ""
 echo "[mandate] summary: PASS=$PASS_COUNT FAIL=$FAIL_COUNT WARN=$WARN_COUNT"
