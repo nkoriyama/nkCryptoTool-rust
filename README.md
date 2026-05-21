@@ -567,14 +567,48 @@ sequenceDiagram
 
 本ツールで暗号化されたファイル (`.nkct`) および署名ファイル (`.nkcs`) は、C++/Rust 間および全バックエンド間での完全な相互運用性を確保するため、以下の統一ヘッダー形式を採用しています。
 
-### **バイナリレイアウト (.nkct / 暗号化ファイル)**
+### **フォーマットバージョンの位置付け**
 
-最新の暗号化ファイルでは **Version 2** ヘッダーを採用しており、使用された AEAD アルゴリズム名がヘッダーに含まれます。これにより、AES-256-GCM と ChaCha20-Poly1305 を動的に切り替えて復号することが可能です。
+| Version | 状態 | 概要 |
+| :--- | :--- | :--- |
+| **v1** | 読み込みのみ (legacy) | AEAD 名を持たない初期形式。読み込み時は `AES-256-GCM` 固定として扱う。 |
+| **v2** | 読み込みのみ (後方互換) | 単一 AES-GCM メッセージ方式。AEAD 名をヘッダーに格納。 |
+| **v3** | **現行・新規暗号化の既定** | チャンク単位 AEAD (Streaming AEAD)。チャンクごとに独立した認証タグ。 |
+
+新規暗号化は既定で v3 を出力します。v1 / v2 のファイルはこれまで通り復号可能で、後方互換テストにより継続的に検証されています。テスト・互換性検証用途に限り、環境変数 `NKCT_FORCE_V2=1` で v2 出力を選択できます (本番ユースケースでは推奨しません)。
+
+### **v2 (LegacySingleMessage) の制限**
+
+v2 はファイル全体を 1 個の AES-GCM コンテキストで暗号化し、末尾に 16 バイトの認証タグを 1 つだけ付与する形式でした。シンプルですが以下の制限がありました。
+
+* **All-or-nothing 復号**: ファイル末尾の唯一のタグを検証するまで認証完了とならず、その間にストリーミング書き出した中間平文は「未認証」の状態でした。本ツールは 2-pass 復号 (Pass1 verify-only → Pass2 temp 書き込み) でこのリスクを緩和していますが、フォーマット自体としてはチャンクレベルの認証境界を持ちません。
+* **チャンク並べ替え (Reordering) を検知できない**: ファイル中盤の暗号文ブロックを入れ替えても末尾タグの検証は通る可能性があり、内部順序の改竄をフォーマット側で防ぐ手段がありませんでした。
+* **異なるファイルからのチャンク差し替え (Mix-and-match) を検知できない**: ヘッダー上の Salt/IV はファイル単位ですが、暗号本体に「このファイル固有」のバインドが入っていなかったため、別ファイルとの混合に対するフォーマット保証がありませんでした。
+* **末尾切り詰め (Truncation) を内容で検知できない**: 暗号文を末尾から切り取った状態が「自然な短いファイル」と区別できず、サイズ情報を別途持たない限りフォーマットだけでは検出できませんでした。
+* **大規模ファイルでの fail-late**: 数 GiB のファイルでも認証成功は末尾タグ検証時の 1 度だけ。途中での早期エラー検出は不可能でした。
+
+### **v3 (ChunkedAead) で実現されたこと**
+
+v3 は Tink STREAM / AWS Encryption SDK と同系統の **チャンク単位 AEAD** を採用し、上記の制限を仕様レベルで解消しました。
+
+* **チャンクごとの独立認証**: ファイルを `Chunk Size` (既定 1 MiB) 区切りで分割し、各チャンクを独立した AEAD 操作で暗号化。チャンクごとに 16 バイトのタグが付き、復号側はチャンク単位で順次認証できます。
+* **Reordering 攻撃の検知**: 各チャンクの AAD に **4 バイトのカウンタ** (big-endian) と **1 バイトの Flags** を含め、さらにノンスにも `[ 8B Prefix ] || [ 4B Counter (BE) ]` の形でカウンタを焼き込みます。任意の 2 チャンクを入れ替えると AAD とノンス両方が不一致になり、即座に `SignatureVerification` で失敗します。
+* **Mix-and-match 攻撃の検知**: AAD 先頭の **File Session ID = SHA-256(serialized header bytes)[..16]** が「このファイル固有」の値となるため、別ファイルから持ち込んだチャンクを差し込んでも復号できません。
+* **Truncation 攻撃の検知**: 最終チャンクのみ AAD の Flags = `0x01` (`V3_FLAG_FINAL`)。EOF に到達した時点でこのフラグが立っていなければ `CryptoError::TruncationDetected` を返してテンポラリファイルを破棄します。末尾チャンクを切り取った攻撃や、途中までしか書き込まれなかった破損ファイルが確実に弾かれます。
+* **チャンクサイズ改ざんの検知**: `Chunk Size` はヘッダーに含まれ、File Session ID = SHA-256(header) を経由して AAD にバインドされます。ヘッダー上の `Chunk Size` を 1 ビットでも書き換えると、すべてのチャンクの AAD が変化して `SignatureVerification` 失敗となります (ヘッダー全体の改ざん検知にもなります)。
+* **HKDF info ラベルによる鍵分離**: 共有秘密 (ECDH / ML-KEM / Hybrid) から HKDF-Expand を **異なる info ラベルで 2 回**派生させ、暗号鍵とノンス Prefix を独立化しています。
+    * `encryption_key = HKDF-Expand(prk, info="nkct-v3-enc-key",      32)`
+    * `nonce_prefix   = HKDF-Expand(prk, info="nkct-v3-nonce-prefix",  8)`
+* **チャンクカウンタのオーバーフロー対策**: 4 バイトカウンタは `checked_add` で管理。万一 2^32 チャンクを超えた場合は `CryptoError::CounterOverflow` で即座に処理を中断します (Chunk Size 1 MiB の場合、約 4 PiB のファイルが理論上限)。
+* **Fail-early 認証**: 大規模ファイルでも先頭から順にチャンク単位で検証されるため、改竄や破損は最初の影響チャンクで検出されます。
+* **AEAD 共通化**: ECC / PQC / Hybrid の対称暗号フェーズは `StreamingAeadProcessor` に集約され、3 つの strategy の `encrypt_into` / `decrypt_into` / `finalize_*` の重複実装は解消されました。
+
+### **バイナリレイアウト (.nkct / 暗号化ファイル)**
 
 ```mermaid
 packet-beta
 0-31: "Magic (NKCT)"
-32-47: "Version (2)"
+32-47: "Version (2 or 3)"
 48-55: "Strategy Type (1:ECC / 2:PQC / 3:Hybrid)"
 56-119: "Strategy Data (Variable Length ...)"
 ```
@@ -582,17 +616,38 @@ packet-beta
 | オフセット | サイズ | 内容 | 説明 |
 | :--- | :--- | :--- | :--- |
 | 0 | 4 bytes | マジック | `NKCT` |
-| 4 | 2 bytes | バージョン | `2` (uint16_t) |
-| 6 | 1 byte | 戦略タイプ | `0: ECC`, `1: PQC`, `2: Hybrid` |
+| 4 | 2 bytes | バージョン | `2` または `3` (uint16_t) |
+| 6 | 1 byte | 戦略タイプ | `1: ECC`, `2: PQC`, `3: Hybrid` |
 | 7〜 | 可変 | ストラテジーデータ | アルゴリズム名、Salt、IV、KEM 暗号文等 |
+| 末尾 (v3 のみ) | 4 bytes | Chunk Size | `uint32_t` LE (既定 `1048576` = 1 MiB) |
 
-**Strategy Data の構成 (Version 2):**
+**Strategy Data の構成 (Version 2 / 3 共通):**
 
 * **ECC**: `CurveName`, `DigestAlgo`, `EphemeralPubKey`, `Salt`, `IV`, `AEADAlgo`
 * **PQC**: `KEMAlgo`, `DSAAlgo`, `KEM-CT`, `Salt`, `IV`, `AEADAlgo`
-* **Hybrid**: `ECCHeaderLength`, `ECCHeader`, `PQCHeaderLength`, `PQCHeader` (Hybrid 自体の外枠バージョンは 1)
+* **Hybrid**: `ECCHeaderLength`, `ECCHeader`, `PQCHeaderLength`, `PQCHeader` (v2 では外枠バージョン `1` / v3 では外枠バージョン `3`、末尾に `Chunk Size` 追加)
 
-**後方互換性**: バージョン `1` のファイル (AEAD 名を含まない形式) を読み込む際は、自動的に `AES-256-GCM` と見なして処理されます。
+**ボディレイアウト (v3 のみ):**
+
+ヘッダー直後から EOF まで、以下を繰り返します。
+
+| 種別 | 暗号文長 | タグ長 | AAD Flags |
+| :--- | :--- | :--- | :--- |
+| 中間チャンク | `Chunk Size` バイト | 16 バイト | `0x00` |
+| 最終チャンク | 0〜`Chunk Size` バイト | 16 バイト | `0x01` |
+
+ファイルサイズが `Chunk Size` の整数倍ちょうどの場合、空の最終チャンクは作らず、**最後の実データチャンクに Flags=0x01** を付与します。空ファイル (サイズ 0) の場合のみ、平文 0 バイトの最終チャンクを 1 つだけ出力します。
+
+**チャンクごとの AEAD パラメータ (v3):**
+
+| 項目 | 値 |
+| :--- | :--- |
+| 鍵 | `encryption_key` (HKDF info=`nkct-v3-enc-key`, 32 B) |
+| ノンス | `nonce_prefix (8 B)` ‖ `counter (4 B big-endian)` (合計 12 B) |
+| AAD | `file_session_id (16 B)` ‖ `counter (4 B BE)` ‖ `flags (1 B)` |
+| `file_session_id` | `SHA-256(serialized header bytes)[..16]` |
+
+**後方互換性**: 復号側はマジック直後のバージョン番号で v1 / v2 / v3 を分岐します。v1 (AEAD 名なし) は `AES-256-GCM` 固定として扱い、v2 は単一メッセージ方式で復号、v3 はチャンク単位で復号します。テスト `tests/streaming_v3.rs` に v2 → v3 デコーダの後方互換テストを含みます。
 
 ### **バイナリレイアウト (.nkcs / 署名ファイル)**
 
@@ -638,7 +693,7 @@ packet-beta
 * **鍵の交換可能性 (Key Interchangeability)**: いかなるバックエンドで生成された鍵ペア (ECC/PQC/Hybrid) も、他のすべてのバックエンドで**変換なしにそのまま利用可能**です。
     * 例: C++ wolfSSL 版で生成した PQC 秘密鍵を、Rust 純 Rust (RustCrypto) 版でロードして復号できます。
 * **クロスバックエンド復号**: OpenSSL 版で暗号化したファイルを RustCrypto 版で復号 (およびその逆) が可能です。
-* **標準フォーマットの採用**: 鍵は PKCS#8/SPKI、署名は ASN.1 DER 形式、暗号化は標準的な AES-256-GCM (1 file, 1 tag) を採用しており、標準的な `openssl` コマンドラインツール等とも高い親和性があります。
+* **標準フォーマットの採用**: 鍵は PKCS#8/SPKI、署名は ASN.1 DER 形式、暗号化は標準的な AES-256-GCM / ChaCha20-Poly1305 を採用しています。v3 ではこれらを **Tink STREAM / AWS Encryption SDK 系のチャンク単位 AEAD** で運用し、Reordering / Mix-and-match / Truncation 攻撃をフォーマットレベルで検知します。標準的な `openssl` コマンドラインツールとは鍵交換 (PKCS#8/SPKI) の層で親和性があります。
 
 ## **ドキュメント**
 
