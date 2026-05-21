@@ -1,0 +1,485 @@
+Modified regular file src/network/iroh.rs:
+    ...
+ 774  774:                     Ok::<_, CryptoError>(keys)
+ 775  775:                 }).await.map_err(|_| CryptoError::Parameter("Handshake timed out".to_string()))??;
+ 776  776: 
+ 777  777:                 // s2c_iv is intentionally unused on the client-send path
+      778:                 // (chat_loop derives nonces from keys; file-send only uses
+      779:                 // the c2s direction). Matches the server-side destructuring
+      780:                 // at L536 which also prefixes the unused IV with `_`.
+ 777  781:                 let (s2c_key, s2c_iv_s2c_iv, c2s_key, c2s_iv) = handshake_result;
+ 778  782: 
+ 779  783:                 if let Some(cb) = on_handshake_done.take() {
+ 780  784:                     cb();
+    ...
+ 935  939:         let dir = tempdir().unwrap();
+ 936  940:         let s_key_path = dir.path().join("s.priv.pem");
+ 937  941:         let c_pub_path = dir.path().join("c.pub.pem");
+ 938  942:         // s_pub is not derived into a fingerprint here — the test deliberately
+      943:         // passes a hardcoded wrong fp (`[0u8; 32]` below) to verify mismatch
+      944:         // detection. Discard the public-key slot (cf. the success path at L895
+      945:         // which DOES hash s_pub to build the expected fp).
+ 938  946:         let (s_priv, s_pub_, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+ 939  947:         let (_, c_pub, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+ 940  948:         fs::write(&s_key_path, utils::wrap_to_pem(&utils::wrap_pqc_priv_to_pkcs8(&s_priv, "ML-DSA-65").unwrap(), "PRIVATE KEY")).unwrap();
+ 941  949:         fs::write(&c_pub_path, utils::wrap_to_pem(&utils::wrap_pqc_pub_to_spki(&c_pub, "ML-DSA-65").unwrap(), "PUBLIC KEY")).unwrap();
+    ...
+ 977  985:         let dir = tempdir().unwrap();
+ 978  986:         let s_key_path = dir.path().join("s.priv.pem");
+ 979  987:         let c_pub_path = dir.path().join("c.pub.pem");
+      988:         // c_pub is the "real" client pubkey but the test writes the *wrong*
+      989:         // pubkey (`wrong_c_pub`) to the server's expected-client-pubkey path
+      990:         // to simulate the server holding a stale/incorrect key for this
+      991:         // client — c_pub itself is intentionally never consumed.
+ 980  992:         let (s_priv, _, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+ 981  993:         let (_, c_pub_, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+ 982  994:         let (_, wrong_c_pub, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+ 983  995:         fs::write(&s_key_path, utils::wrap_to_pem(&utils::wrap_pqc_priv_to_pkcs8(&s_priv, "ML-DSA-65").unwrap(), "PRIVATE KEY")).unwrap();
+ 984  996:         fs::write(&c_pub_path, utils::wrap_to_pem(&utils::wrap_pqc_pub_to_spki(&wrong_c_pub, "ML-DSA-65").unwrap(), "PUBLIC KEY")).unwrap();
+    ...
+Modified regular file src/network/tcp.rs:
+    ...
+   5    5:  */
+   6    6: 
+   7    7: use crate::backend;
+   8     : use crate::backend::AeadBackend;
+   9    8: use crate::config::CryptoConfig;
+  10    9: use crate::error::{CryptoError, Result};
+  11   10: use super::{
+  12   11:     ChatActiveGuard, NetworkProcessor as CommonProcessor, PeerId, BUF_SIZE, CHAT_ACTIVE,
+  13   12:     CHAT_SESSION_TIMEOUT, CUMULATIVE_TIMEOUT, IDLE_TIMEOUT, MAX_FILE_SIZE, PEER_COOLDOWNS,
+  14   13:     IOProvider, DefaultIOProvider,
+  15   14: };
+  16   15: use std::sync::Arc;
+    ...
+Modified regular file src/processor.rs:
+    ...
+  10   10: use crate::strategy::ecc::EccStrategy;
+  11   11: use crate::strategy::hybrid::HybridStrategy;
+  12   12: use crate::strategy::pqc::PqcStrategy;
+       13: use crate::strategy::streaming_aead::{self as v3, StreamingMode};
+  13   14: use crate::strategy::CryptoStrategy;
+  14   15: use rand_core::RngCore;
+  15   16: use std::collections::HashMap;
+    ...
+ 314  315:         let mut strategy = self.strategy.take().ok_or(CryptoError::Parameter(
+ 315  316:             "Strategy already in use".to_string(),
+ 316  317:         ))?;
+      318: 
+      319:         // New encryptions default to v3 (chunked AEAD). Tests can request
+      320:         // the legacy v2 layout via NKCT_FORCE_V2=1.
+      321:         let use_v3 = std::env::var("NKCT_FORCE_V2")
+      322:             .map(|v| v.is_empty() || v == "0")
+      323:             .unwrap_or(true);
+      324:         if use_v3 {
+      325:             strategy.set_streaming_mode(StreamingMode::ChunkedAead);
+      326:             // NKCT_V3_CHUNK_SIZE lets tests pick a small chunk size so the
+      327:             // boundary cases (file size = chunk_size etc.) stay cheap.
+      328:             let chunk_size = std::env::var("NKCT_V3_CHUNK_SIZE")
+      329:                 .ok()
+      330:                 .and_then(|s| s.parse::<u32>().ok())
+      331:                 .filter(|&n| n > 0)
+      332:                 .unwrap_or(v3::V3_DEFAULT_CHUNK_SIZE);
+      333:             strategy.set_chunk_size(chunk_size);
+      334:         } else {
+      335:             strategy.set_streaming_mode(StreamingMode::LegacySingleMessage);
+      336:         }
+      337: 
+ 317  338:         strategy.prepare_encryption(&key_paths)?;
+ 318  339: 
+ 319  340:         let header = strategy.serialize_header();
+    ...
+ 322  343:         let input_path_str = input_path.to_string();
+ 323  344:         let output_path_str = output_path.to_string();
+ 324  345: 
+ 325  346:         let result = match strategy.streaming_mode() {
+      347:             StreamingMode::LegacySingleMessage => {
+ 325  348:                 self
+ 326  348:             .run_streaming_encrypt(
+ 327  349:                     strategy,
+ 328  350:                     input_path_str,
+ 329  351:                     output_path_str,
+ 330  352:                     header,
+ 331  353:                     total_input_size,
+ 332  354:                     config.force,
+ 333  355:                     progress_callback,
+ 334  356:                 )
+ 335  357:                 .await
+      358:             }
+      359:             StreamingMode::ChunkedAead => {
+      360:                 let sid = v3::compute_session_id(&header);
+      361:                 strategy.set_file_session_id(sid);
+      362:                 let chunk_size = strategy.chunk_size();
+      363:                 self.run_chunked_encrypt(
+      364:                     strategy,
+      365:                     input_path_str,
+      366:                     output_path_str,
+      367:                     header,
+      368:                     total_input_size,
+      369:                     chunk_size,
+      370:                     config.force,
+      371:                     progress_callback,
+      372:                 )
+      373:                 .await
+      374:             }
+ 335  375:         };
+ 336  376: 
+ 337  377:         match result {
+ 338  378:             Ok(s) => {
+    ...
+ 362  402:         let mut strategy = self.strategy.take().ok_or(CryptoError::Parameter(
+ 363  403:             "Strategy already in use".to_string(),
+ 364  404:         ))?;
+ 365     :         let tag_size = strategy.get_tag_size() as u64;
+ 366     : 
+ 367     :         if total_size < tag_size {
+ 368     :             return Err(CryptoError::FileRead("File too small".to_string()));
+ 369     :         }
+ 370  405: 
+ 371  406:         let mut input_file = File::open(input_path).await?;
+ 372  407:         let mut header_peek = vec![0u8; 16384];
+ 373  408:         let n = input_file.read(&mut header_peek).await?;
+ 374  409:         header_peek.truncate(n);
+ 375  410:         let header_sizeheader_size_usize = strategy.deserialize_header(&header_peek)?;
+ 375  411:         let header_size = header_size_usize as u64;
+ 376  412: 
+ 377     :         let mut tag = vec![0u8; tag_size as usize];
+ 378     :         input_file
+ 379     :             .seek(std::io::SeekFrom::End(-(tag_size as i64)))
+ 380     :             .await?;
+ 381     :         input_file.read_exact(&mut tag).await?;
+      413:         // Compute file session id from the exact header bytes (v3).
+      414:         let sid = v3::compute_session_id(&header_peek[..header_size_usize]);
+      415:         strategy.set_file_session_id(sid);
+ 382  416: 
+ 383  417:         let mut key_paths = HashMap::new();
+ 384  418:         if let Some(ref p) = config.user_privkey {
+    ...
+ 397  431: 
+ 398  432:         let input_path_str = input_path.to_string();
+ 399  433:         let output_path_str = output_path.to_string();
+ 400     :         let ciphertext_size = total_size
+ 401     :             .checked_sub(header_size)
+ 402     :             .and_then(|s| s.checked_sub(tag_size))
+ 403     :             .ok_or_else(|| {
+ 404     :                 CryptoError::FileRead("File too small for header and tag".to_string())
+ 405     :             })?;
+ 406  434: 
+ 407  435:         let result = match strategy.streaming_mode() {
+      436:             StreamingMode::LegacySingleMessage => {
+      437:                 let tag_size = strategy.get_tag_size() as u64;
+      438:                 if total_size < tag_size {
+      439:                     return Err(CryptoError::FileRead("File too small".to_string()));
+      440:                 }
+      441:                 let mut tag = vec![0u8; tag_size as usize];
+      442:                 input_file
+      443:                     .seek(std::io::SeekFrom::End(-(tag_size as i64)))
+      444:                     .await?;
+      445:                 input_file.read_exact(&mut tag).await?;
+      446:                 let ciphertext_size = total_size
+      447:                     .checked_sub(header_size)
+      448:                     .and_then(|s| s.checked_sub(tag_size))
+      449:                     .ok_or_else(|| {
+      450:                         CryptoError::FileRead("File too small for header and tag".to_string())
+      451:                     })?;
+ 407  452:                 self
+ 408  452:             .run_streaming_decrypt(
+ 409  453:                     strategy,
+ 410  454:                     input_path_str,
+ 411  455:                     output_path_str,
+ 412  456:                     header_size,
+ 413  457:                     ciphertext_size,
+ 414  458:                     tag,
+ 415  459:                     config.force,
+ 416  460:                     progress_callback,
+ 417  461:                 )
+ 418  462:                 .await
+      463:             }
+      464:             StreamingMode::ChunkedAead => {
+      465:                 let chunk_size = strategy.chunk_size();
+      466:                 let body_size = total_size.checked_sub(header_size).ok_or_else(|| {
+      467:                     CryptoError::FileRead("File too small for header".to_string())
+      468:                 })?;
+      469:                 self.run_chunked_decrypt(
+      470:                     strategy,
+      471:                     input_path_str,
+      472:                     output_path_str,
+      473:                     header_size,
+      474:                     body_size,
+      475:                     chunk_size,
+      476:                     config.force,
+      477:                     progress_callback,
+      478:                 )
+      479:                 .await
+      480:             }
+ 418  481:         };
+ 419  482: 
+ 420  483:         match result {
+ 421  484:             Ok(s) => {
+    ...
+ 638  701:         }
+ 639  702:     }
+ 640  703: 
+      704:     async fn run_chunked_encrypt(
+      705:         &self,
+      706:         mut strategy: Box<dyn CryptoStrategy>,
+      707:         input_path: String,
+      708:         output_path: String,
+      709:         header: Vec<u8>,
+      710:         total_input_size: u64,
+      711:         chunk_size: u32,
+      712:         force: bool,
+      713:         progress_callback: Option<ProgressCallback>,
+      714:     ) -> Result<Box<dyn CryptoStrategy>> {
+      715:         let cb_clone = progress_callback.clone();
+      716:         tokio::task::spawn_blocking(move || {
+      717:             use std::fs::OpenOptions;
+      718:             use std::io::{BufReader, BufWriter, Read, Write};
+      719: 
+      720:             if chunk_size == 0 {
+      721:                 return Err(CryptoError::Parameter("chunk_size must be > 0".to_string()));
+      722:             }
+      723:             let chunk_size_usize = chunk_size as usize;
+      724: 
+      725:             let in_file = std::fs::File::open(&input_path)
+      726:                 .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+      727:             let mut reader = BufReader::with_capacity(BUF_SIZE * 4, in_file);
+      728: 
+      729:             if force {
+      730:                 let _ = std::fs::remove_file(&output_path);
+      731:             }
+      732:             let out_file = OpenOptions::new()
+      733:                 .write(true)
+      734:                 .create_new(true)
+      735:                 .mode(0o600)
+      736:                 .custom_flags(libc::O_NOFOLLOW)
+      737:                 .open(&output_path)
+      738:                 .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+      739:             let mut writer = BufWriter::with_capacity(BUF_SIZE * 4, out_file);
+      740: 
+      741:             writer
+      742:                 .write_all(&header)
+      743:                 .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+      744: 
+      745:             // One-chunk lookahead: we always hold the most recently read
+      746:             // chunk in `pending` so we can flag it final once EOF is seen.
+      747:             // For empty input we still emit one empty final chunk.
+      748:             let mut pending: Zeroizing<Vec<u8>> =
+      749:                 Zeroizing::new(Vec::with_capacity(chunk_size_usize));
+      750:             let mut have_pending = false;
+      751:             let mut total_processed: u64 = 0;
+      752: 
+      753:             loop {
+      754:                 let mut next_chunk: Zeroizing<Vec<u8>> =
+      755:                     Zeroizing::new(vec![0u8; chunk_size_usize]);
+      756:                 let mut filled = 0usize;
+      757:                 while filled < chunk_size_usize {
+      758:                     let n = reader
+      759:                         .read(&mut next_chunk[filled..])
+      760:                         .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+      761:                     if n == 0 {
+      762:                         break;
+      763:                     }
+      764:                     filled += n;
+      765:                 }
+      766:                 next_chunk.truncate(filled);
+      767: 
+      768:                 if filled == 0 {
+      769:                     // EOF: the previously staged chunk (if any) is the final
+      770:                     // one. For empty input we never stage anything, so emit
+      771:                     // one empty final chunk to carry Flags=0x01.
+      772:                     let final_pt: &[u8] = if have_pending { &pending } else { &[] };
+      773:                     let ct = strategy.encrypt_chunk_v3(final_pt, true)?;
+      774:                     writer
+      775:                         .write_all(&ct)
+      776:                         .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+      777:                     break;
+      778:                 }
+      779: 
+      780:                 if have_pending {
+      781:                     // Another chunk follows, so the staged one is intermediate.
+      782:                     let ct = strategy.encrypt_chunk_v3(&pending, false)?;
+      783:                     writer
+      784:                         .write_all(&ct)
+      785:                         .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+      786:                 }
+      787:                 pending.clear();
+      788:                 pending.extend_from_slice(&next_chunk);
+      789:                 have_pending = true;
+      790: 
+      791:                 total_processed += filled as u64;
+      792:                 if let Some(ref cb) = cb_clone {
+      793:                     if total_input_size > 0 {
+      794:                         cb(total_processed as f64 / total_input_size as f64);
+      795:                     }
+      796:                 }
+      797:             }
+      798: 
+      799:             writer
+      800:                 .flush()
+      801:                 .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+      802:             Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
+      803:         })
+      804:         .await
+      805:         .map_err(|e| CryptoError::OpenSSL(format!("Blocking task failed: {}", e)))?
+      806:     }
+      807: 
+      808:     async fn run_chunked_decrypt(
+      809:         &self,
+      810:         mut strategy: Box<dyn CryptoStrategy>,
+      811:         input_path: String,
+      812:         output_path: String,
+      813:         header_size: u64,
+      814:         body_size: u64,
+      815:         chunk_size: u32,
+      816:         force: bool,
+      817:         progress_callback: Option<ProgressCallback>,
+      818:     ) -> Result<Box<dyn CryptoStrategy>> {
+      819:         let temp_output_path = format!("{}.tmp.{}", output_path, rand_core::OsRng.next_u64());
+      820:         let temp_output_path_clone = temp_output_path.clone();
+      821: 
+      822:         let cb_clone = progress_callback.clone();
+      823:         let res = tokio::task::spawn_blocking(move || {
+      824:             use std::fs::OpenOptions;
+      825:             use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+      826: 
+      827:             if chunk_size == 0 {
+      828:                 return Err(CryptoError::Parameter("chunk_size must be > 0".to_string()));
+      829:             }
+      830:             let chunk_size_usize = chunk_size as usize;
+      831:             let tag_len = v3::V3_TAG_LEN;
+      832:             let max_chunk_wire = chunk_size_usize.saturating_add(tag_len);
+      833:             if body_size < tag_len as u64 {
+      834:                 return Err(CryptoError::FileRead(
+      835:                     "v3 body too small for even one tag".to_string(),
+      836:                 ));
+      837:             }
+      838: 
+      839:             // Pass 1: verify every chunk, write nothing to disk.
+      840:             // Then Pass 2: re-derive, write decrypted plaintext to a temp
+      841:             // file under the AEAD authentication.
+      842:             let run_pass = |verify_only: bool,
+      843:                             strategy: &mut Box<dyn CryptoStrategy>,
+      844:                             cb_offset: f64|
+      845:              -> Result<()> {
+      846:                 let mut in_file = std::fs::File::open(&input_path)
+      847:                     .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+      848:                 in_file
+      849:                     .seek(SeekFrom::Start(header_size))
+      850:                     .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+      851:                 let mut reader = BufReader::with_capacity(BUF_SIZE * 4, in_file);
+      852: 
+      853:                 let mut writer: Option<BufWriter<std::fs::File>> = if verify_only {
+      854:                     None
+      855:                 } else {
+      856:                     let out_file = OpenOptions::new()
+      857:                         .write(true)
+      858:                         .create_new(true)
+      859:                         .mode(0o600)
+      860:                         .custom_flags(libc::O_NOFOLLOW)
+      861:                         .open(&temp_output_path_clone)
+      862:                         .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+      863:                     Some(BufWriter::with_capacity(BUF_SIZE * 4, out_file))
+      864:                 };
+      865: 
+      866:                 let mut buf: Vec<u8> = vec![0u8; max_chunk_wire];
+      867:                 let mut bytes_remaining = body_size;
+      868:                 let mut final_seen = false;
+      869:                 let mut total_read: u64 = 0;
+      870: 
+      871:                 while bytes_remaining > 0 {
+      872:                     let to_read =
+      873:                         std::cmp::min(bytes_remaining, max_chunk_wire as u64) as usize;
+      874:                     reader
+      875:                         .read_exact(&mut buf[..to_read])
+      876:                         .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+      877:                     bytes_remaining -= to_read as u64;
+      878: 
+      879:                     let is_final_chunk = bytes_remaining == 0;
+      880:                     if !is_final_chunk && to_read != max_chunk_wire {
+      881:                         return Err(CryptoError::FileRead(
+      882:                             "v3 intermediate chunk has wrong length".to_string(),
+      883:                         ));
+      884:                     }
+      885:                     if to_read < tag_len {
+      886:                         return Err(CryptoError::FileRead(
+      887:                             "v3 chunk shorter than AEAD tag".to_string(),
+      888:                         ));
+      889:                     }
+      890: 
+      891:                     let pt = strategy
+      892:                         .decrypt_chunk_v3(&buf[..to_read], is_final_chunk)?;
+      893:                     if is_final_chunk {
+      894:                         final_seen = true;
+      895:                     }
+      896:                     if let Some(w) = writer.as_mut() {
+      897:                         w.write_all(&pt)
+      898:                             .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+      899:                     }
+      900: 
+      901:                     total_read += to_read as u64;
+      902:                     if let Some(ref cb) = cb_clone {
+      903:                         if body_size > 0 {
+      904:                             let frac = total_read as f64 / body_size as f64;
+      905:                             cb(cb_offset + frac * 0.5);
+      906:                         }
+      907:                     }
+      908:                 }
+      909: 
+      910:                 if !final_seen {
+      911:                     return Err(CryptoError::TruncationDetected);
+      912:                 }
+      913:                 if let Some(mut w) = writer {
+      914:                     w.flush().map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+      915:                 }
+      916:                 Ok(())
+      917:             };
+      918: 
+      919:             // Pass 1: verify only (no temp file is created yet — this
+      920:             // preserves the THREAT 37-1 invariant that disk writes never
+      921:             // start before AEAD authentication has succeeded end-to-end).
+      922:             run_pass(true, &mut strategy, 0.0)?;
+      923:             // Pass 2: replay with chunk counter reset to 0, writing the
+      924:             // authenticated plaintext to the temporary output file.
+      925:             strategy.reset_chunk_counter();
+      926:             run_pass(false, &mut strategy, 0.5)?;
+      927: 
+      928:             Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
+      929:         })
+      930:         .await
+      931:         .map_err(|e| {
+      932:             let _ = std::fs::remove_file(&temp_output_path);
+      933:             CryptoError::OpenSSL(format!("Blocking task failed: {}", e))
+      934:         })?;
+      935: 
+      936:         match res {
+      937:             Ok(s) => {
+      938:                 if !force && Path::new(&output_path).exists() {
+      939:                     let _ = std::fs::remove_file(&temp_output_path);
+      940:                     return Err(CryptoError::FileWrite("File exists".to_string()));
+      941:                 }
+      942:                 std::fs::rename(&temp_output_path, &output_path).map_err(|e| {
+      943:                     let _ = std::fs::remove_file(&temp_output_path);
+      944:                     CryptoError::FileWrite(e.to_string())
+      945:                 })?;
+      946:                 Ok(s)
+      947:             }
+      948:             Err(e) => {
+      949:                 let _ = std::fs::remove_file(&temp_output_path);
+      950:                 Err(e)
+      951:             }
+      952:         }
+      953:     }
+      954: 
+ 641  955:     pub fn generate_encryption_key_pair(&self, config: &CryptoConfig) -> Result<()> {
+ 642  956:         let mut key_paths = HashMap::new();
+ 643  957:         if config.mode == CryptoMode::Hybrid {
+    ...
+ 761 1075:         key_paths.insert("public-key".to_string(), key_dir.join("public_enc_ecc.key").to_str().unwrap().to_string());
+ 762 1076:         key_paths.insert("private-key".to_string(), key_dir.join("private_enc_ecc.key").to_str().unwrap().to_string());
+ 763 1077:         
+ 764 1078:         let mut strategy = Box::new(EccStrategy::new());
+ 765 1079:         // Non-empty dummy bypasses prompt
+ 766 1080:         strategy.generate_encryption_key_pair(&key_paths, Some("test"), true).unwrap();
+ 767 1081: 
+    ...
