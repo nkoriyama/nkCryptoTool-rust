@@ -65,6 +65,23 @@ fn chrono_like_timestamp() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
+/// Parse a sender label from a message of the form `[name] body`.
+/// Returns `None` if either bracket is missing or `]` precedes `[`,
+/// so callers can substitute a safe default.
+///
+/// Uses checked slicing (`str::get`) so malformed remote input cannot
+/// trigger a panic. The `]` is searched only in the substring after
+/// `[`, which guarantees the absolute end offset is >= start + 1.
+#[cfg(feature = "gui")]
+fn extract_peer_id(msg: &str) -> Option<String> {
+    let start = msg.find('[')?;
+    let after_start = start + 1;
+    let tail = msg.get(after_start..)?;
+    let rel_end = tail.find(']')?;
+    let end = after_start + rel_end;
+    msg.get(after_start..end).map(|s| s.to_string())
+}
+
 /// F3: format the transfer-status string from (sent, total). Public so the
 /// test suite can verify the canonical format without driving a real
 /// transfer.
@@ -238,14 +255,7 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             let clean_msg = msg.trim_start_matches("\r[Peer]: ").trim_end_matches("\n> ").trim_start_matches("> ").to_string();
             if clean_msg.is_empty() || clean_msg == ">" { continue; }
             
-            let mut peer_id = "Peer".to_string();
-            if msg.contains("[") && msg.contains("]") {
-                 if let Some(start) = msg.find('[') {
-                     if let Some(end) = msg.find(']') {
-                         peer_id = msg[start+1..end].to_string();
-                     }
-                 }
-            }
+            let peer_id = extract_peer_id(&msg).unwrap_or_else(|| "Peer".to_string());
 
             #[cfg(feature = "gui-notifications")]
             {
@@ -824,4 +834,46 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
 
     ui.run()?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "gui"))]
+mod tests {
+    use super::extract_peer_id;
+
+    #[test]
+    fn normal_label_is_extracted() {
+        assert_eq!(extract_peer_id("[admin] hello"), Some("admin".to_string()));
+    }
+
+    #[test]
+    fn multibyte_label_is_extracted() {
+        assert_eq!(extract_peer_id("[あ]"), Some("あ".to_string()));
+    }
+
+    #[test]
+    fn empty_brackets_yield_empty_string() {
+        assert_eq!(extract_peer_id("[]"), Some(String::new()));
+    }
+
+    #[test]
+    fn no_brackets_returns_none() {
+        assert_eq!(extract_peer_id("no brackets"), None);
+    }
+
+    #[test]
+    fn closing_before_opening_does_not_panic() {
+        // Previously msg.find(']') < msg.find('[') triggered an
+        // out-of-bounds slice. Must now return None and never panic.
+        assert_eq!(extract_peer_id("] ["), None);
+    }
+
+    #[test]
+    fn only_opening_bracket_returns_none() {
+        assert_eq!(extract_peer_id("[unterminated"), None);
+    }
+
+    #[test]
+    fn only_closing_bracket_returns_none() {
+        assert_eq!(extract_peer_id("trailing]"), None);
+    }
 }
