@@ -10,9 +10,12 @@ use std::collections::HashMap;
 use std::path::Path;
 use zeroize::Zeroizing;
 
+pub use streaming_aead::StreamingMode;
+
 pub mod ecc;
 pub mod hybrid;
 pub mod pqc;
+pub mod streaming_aead;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrategyType {
@@ -112,4 +115,68 @@ pub trait CryptoStrategy: Send + Sync {
     fn get_shared_secret(&self) -> Zeroizing<Vec<u8>>;
     fn get_salt(&self) -> Vec<u8>;
     fn get_iv(&self) -> Vec<u8>;
+
+    // ---- v3 streaming-AEAD hooks (default to legacy v2 behavior) ----
+
+    /// Reports which streaming format the current header / state implies.
+    /// Default is the legacy single-message v2 layout.
+    fn streaming_mode(&self) -> StreamingMode {
+        StreamingMode::LegacySingleMessage
+    }
+
+    /// Selects the streaming format to use for upcoming encrypt operations.
+    /// No-op for strategies that only support legacy v2.
+    fn set_streaming_mode(&mut self, _mode: StreamingMode) {}
+
+    /// Chunk size that this strategy will use for v3 encrypt or has decoded
+    /// from a v3 header. Returns `streaming_aead::V3_DEFAULT_CHUNK_SIZE` by
+    /// default; only meaningful when `streaming_mode() == ChunkedAead`.
+    fn chunk_size(&self) -> u32 {
+        streaming_aead::V3_DEFAULT_CHUNK_SIZE
+    }
+
+    /// Sets the chunk size to use for v3 encrypt operations.
+    fn set_chunk_size(&mut self, _size: u32) {}
+
+    /// Returns the SHA-256(header_bytes)[..16] file session ID. Available
+    /// only after `prepare_encryption` (with `streaming_mode == ChunkedAead`)
+    /// or after `deserialize_header` has consumed a v3 header.
+    fn file_session_id(&self) -> Option<[u8; streaming_aead::V3_SESSION_ID_LEN]> {
+        None
+    }
+
+    /// Stores the SHA-256-derived file session ID. Processor calls this
+    /// after serialize_header (encrypt path) or deserialize_header (decrypt
+    /// path) with the SHA-256 of the exact header bytes.
+    fn set_file_session_id(&mut self, _sid: [u8; streaming_aead::V3_SESSION_ID_LEN]) {}
+
+    /// Returns the 8-byte HKDF-derived nonce prefix for v3.
+    fn nonce_prefix(&self) -> Option<[u8; streaming_aead::V3_NONCE_PREFIX_LEN]> {
+        None
+    }
+
+    /// Encrypts one v3 chunk. Returns ciphertext || tag.
+    /// `is_final` controls the AAD Flags byte.
+    fn encrypt_chunk_v3(&mut self, _plaintext: &[u8], _is_final: bool) -> Result<Vec<u8>> {
+        Err(crate::error::CryptoError::Parameter(
+            "v3 chunked encrypt not supported by this strategy".to_string(),
+        ))
+    }
+
+    /// Decrypts one v3 chunk. `ciphertext_and_tag` is the on-wire payload
+    /// for the chunk (ciphertext bytes followed by the 16-byte tag).
+    fn decrypt_chunk_v3(
+        &mut self,
+        _ciphertext_and_tag: &[u8],
+        _is_final: bool,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        Err(crate::error::CryptoError::Parameter(
+            "v3 chunked decrypt not supported by this strategy".to_string(),
+        ))
+    }
+
+    /// Resets the v3 chunk counter to zero. Used between the two-pass
+    /// decrypt passes so that the second pass replays the same chunk
+    /// counter sequence as the first pass.
+    fn reset_chunk_counter(&mut self) {}
 }

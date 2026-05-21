@@ -4,9 +4,12 @@
  * This file is part of nkCryptoTool.
  */
 
-use crate::backend::AeadBackend;
 use crate::error::{CryptoError, Result};
 use crate::key::SharedKeyProvider;
+use crate::strategy::streaming_aead::{
+    self as v3, StreamingAeadProcessor, StreamingMode, V3_DEFAULT_CHUNK_SIZE,
+    V3_NONCE_PREFIX_LEN, V3_SESSION_ID_LEN,
+};
 use crate::strategy::{ecc::EccStrategy, pqc::PqcStrategy, CryptoStrategy, StrategyType};
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,7 +23,20 @@ pub struct HybridStrategy {
     iv: Vec<u8>,
     salt: Vec<u8>,
     #[zeroize(skip)]
-    aead_ctx: Option<crate::backend::Aead>,
+    aead: Option<StreamingAeadProcessor>,
+
+    // ---- v3 chunked-AEAD state ----
+    #[zeroize(skip)]
+    streaming_mode: StreamingMode,
+    #[zeroize(skip)]
+    chunk_size: u32,
+    nonce_prefix: Zeroizing<Vec<u8>>,
+    #[zeroize(skip)]
+    file_session_id: Option<[u8; V3_SESSION_ID_LEN]>,
+    #[zeroize(skip)]
+    chunk_counter: u32,
+    #[zeroize(skip)]
+    aead_algo_v3: String,
 }
 
 impl HybridStrategy {
@@ -31,7 +47,13 @@ impl HybridStrategy {
             encryption_key: Zeroizing::new(Vec::new()),
             iv: Vec::new(),
             salt: Vec::new(),
-            aead_ctx: None,
+            aead: None,
+            streaming_mode: StreamingMode::LegacySingleMessage,
+            chunk_size: V3_DEFAULT_CHUNK_SIZE,
+            nonce_prefix: Zeroizing::new(Vec::new()),
+            file_session_id: None,
+            chunk_counter: 0,
+            aead_algo_v3: "AES-256-GCM".to_string(),
         }
     }
 }
@@ -150,17 +172,35 @@ impl CryptoStrategy for HybridStrategy {
         self.salt = self.ecc.get_salt();
         self.iv = self.ecc.get_iv();
 
-        use hkdf::Hkdf;
-        use sha3::Sha3_256;
-        let mut okm = Zeroizing::new(vec![0u8; 32]);
-        let hk = Hkdf::<Sha3_256>::new(Some(&self.salt), &combined_ss);
-        hk.expand(b"hybrid-encryption", &mut *okm)
-            .map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
-        drop(hk); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
-        self.encryption_key = okm;
-
-        let ctx = crate::backend::new_encrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
-        self.aead_ctx = Some(ctx);
+        match self.streaming_mode {
+            StreamingMode::LegacySingleMessage => {
+                use hkdf::Hkdf;
+                use sha3::Sha3_256;
+                let mut okm = Zeroizing::new(vec![0u8; 32]);
+                let hk = Hkdf::<Sha3_256>::new(Some(&self.salt), &combined_ss);
+                hk.expand(b"hybrid-encryption", &mut *okm)
+                    .map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
+                drop(hk);
+                self.encryption_key = okm;
+                self.aead = Some(StreamingAeadProcessor::new_encrypt(
+                    "AES-256-GCM",
+                    &self.encryption_key,
+                    &self.iv,
+                )?);
+            }
+            StreamingMode::ChunkedAead => {
+                self.encryption_key =
+                    v3::hkdf_expand(&combined_ss, &self.salt, v3::V3_INFO_ENC_KEY, 32)?;
+                self.nonce_prefix = v3::hkdf_expand(
+                    &combined_ss,
+                    &self.salt,
+                    v3::V3_INFO_NONCE_PREFIX,
+                    V3_NONCE_PREFIX_LEN,
+                )?;
+                self.aead = None;
+                self.chunk_counter = 0;
+            }
+        }
         Ok(())
     }
 
@@ -189,85 +229,91 @@ impl CryptoStrategy for HybridStrategy {
         combined_ss[..ss_ecc.len()].copy_from_slice(&ss_ecc);
         combined_ss[ss_ecc.len()..].copy_from_slice(&ss_pqc);
 
-        use hkdf::Hkdf;
-        use sha3::Sha3_256;
-        let mut okm = Zeroizing::new(vec![0u8; 32]);
-        let hk = Hkdf::<Sha3_256>::new(Some(&self.salt), &combined_ss);
-        hk.expand(b"hybrid-encryption", &mut *okm)
-            .map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
-        drop(hk); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
-        self.encryption_key = okm;
-
-        let ctx = crate::backend::new_decrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
-        self.aead_ctx = Some(ctx);
+        match self.streaming_mode {
+            StreamingMode::LegacySingleMessage => {
+                use hkdf::Hkdf;
+                use sha3::Sha3_256;
+                let mut okm = Zeroizing::new(vec![0u8; 32]);
+                let hk = Hkdf::<Sha3_256>::new(Some(&self.salt), &combined_ss);
+                hk.expand(b"hybrid-encryption", &mut *okm)
+                    .map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
+                drop(hk);
+                self.encryption_key = okm;
+                self.aead = Some(StreamingAeadProcessor::new_decrypt(
+                    "AES-256-GCM",
+                    &self.encryption_key,
+                    &self.iv,
+                )?);
+            }
+            StreamingMode::ChunkedAead => {
+                self.encryption_key =
+                    v3::hkdf_expand(&combined_ss, &self.salt, v3::V3_INFO_ENC_KEY, 32)?;
+                self.nonce_prefix = v3::hkdf_expand(
+                    &combined_ss,
+                    &self.salt,
+                    v3::V3_INFO_NONCE_PREFIX,
+                    V3_NONCE_PREFIX_LEN,
+                )?;
+                self.aead = None;
+                self.chunk_counter = 0;
+            }
+        }
         Ok(())
     }
 
     fn encrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter(
+        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
             "AEAD context not initialized".to_string(),
         ))?;
         let mut out = Zeroizing::new(vec![0u8; data.len()]);
-        let n = ctx.update(data, &mut out)?;
+        let n = aead.encrypt_into(data, &mut out)?;
         out.truncate(n);
         Ok(out)
     }
 
     fn decrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter(
+        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
             "AEAD context not initialized".to_string(),
         ))?;
         let mut out = Zeroizing::new(vec![0u8; data.len()]);
-        let n = ctx.update(data, &mut out)?;
+        let n = aead.decrypt_into(data, &mut out)?;
         out.truncate(n);
         Ok(out)
     }
 
     fn encrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
-        let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter(
+        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
             "AEAD context not initialized".to_string(),
         ))?;
-        ctx.update(input, output)
+        aead.encrypt_into(input, output)
     }
 
     fn decrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
-        let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter(
+        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
             "AEAD context not initialized".to_string(),
         ))?;
-        ctx.update(input, output)
+        aead.decrypt_into(input, output)
     }
 
     fn finalize_encryption(&mut self) -> Result<Vec<u8>> {
-        let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter(
+        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
             "AEAD context not initialized".to_string(),
         ))?;
-        let mut out = vec![0u8; 16];
-        let n = ctx.finalize(&mut out)?;
-        out.truncate(n);
-        let mut tag = vec![0u8; 16];
-        ctx.get_tag(&mut tag)?;
-        out.extend_from_slice(&tag);
-        Ok(out)
+        aead.finalize_encryption()
     }
 
     fn finalize_decryption(&mut self, tag: &[u8]) -> Result<()> {
-        let ctx = self.aead_ctx.as_mut().ok_or(CryptoError::Parameter(
+        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
             "AEAD context not initialized".to_string(),
         ))?;
-        ctx.set_tag(tag)?;
-        let mut out = vec![0u8; 16];
-        ctx.finalize(&mut out)
-            .map_err(|_| CryptoError::SignatureVerification)?;
-        Ok(())
+        aead.finalize_decryption(tag)
     }
 
     fn restart_decryption(&mut self) -> Result<()> {
-        if self.encryption_key.is_empty() {
-            return Err(CryptoError::Parameter("Key not set".to_string()));
-        }
-        let ctx = crate::backend::new_decrypt("AES-256-GCM", &self.encryption_key, &self.iv)?;
-        self.aead_ctx = Some(ctx);
-        Ok(())
+        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
+            "AEAD context not initialized".to_string(),
+        ))?;
+        aead.restart_decryption()
     }
 
     fn prepare_signing(
@@ -317,13 +363,22 @@ impl CryptoStrategy for HybridStrategy {
     }
 
     fn get_header_size(&self) -> usize {
-        4 + 2 + 1 + 4 + self.ecc.get_header_size() + 4 + self.pqc.get_header_size()
+        let mut size =
+            4 + 2 + 1 + 4 + self.ecc.get_header_size() + 4 + self.pqc.get_header_size();
+        if self.streaming_mode == StreamingMode::ChunkedAead {
+            size += 4;
+        }
+        size
     }
 
     fn serialize_header(&self) -> Vec<u8> {
         let mut header = Vec::new();
         header.extend_from_slice(b"NKCT");
-        header.extend_from_slice(&1u16.to_le_bytes());
+        let outer_version: u16 = match self.streaming_mode {
+            StreamingMode::LegacySingleMessage => 1,
+            StreamingMode::ChunkedAead => 3,
+        };
+        header.extend_from_slice(&outer_version.to_le_bytes());
         header.push(self.get_strategy_type() as u8);
 
         let ecc_h = self.ecc.serialize_header();
@@ -333,6 +388,10 @@ impl CryptoStrategy for HybridStrategy {
         let pqc_h = self.pqc.serialize_header();
         header.extend_from_slice(&(pqc_h.len() as u32).to_le_bytes());
         header.extend_from_slice(&pqc_h);
+
+        if self.streaming_mode == StreamingMode::ChunkedAead {
+            header.extend_from_slice(&self.chunk_size.to_le_bytes());
+        }
 
         header
     }
@@ -344,6 +403,12 @@ impl CryptoStrategy for HybridStrategy {
         if &data[0..4] != b"NKCT" {
             return Err(CryptoError::FileRead("Invalid magic".to_string()));
         }
+
+        let outer_version = u16::from_le_bytes(
+            data[4..6]
+                .try_into()
+                .map_err(|_| CryptoError::FileRead("Invalid version".to_string()))?,
+        );
 
         let mut pos = 7;
         if data.len() < pos + 4 {
@@ -386,6 +451,32 @@ impl CryptoStrategy for HybridStrategy {
         self.pqc.deserialize_header(&data[pos..pos + pqc_len])?;
         pos += pqc_len;
 
+        match outer_version {
+            1 => {
+                self.streaming_mode = StreamingMode::LegacySingleMessage;
+            }
+            3 => {
+                if data.len() < pos + 4 {
+                    return Err(CryptoError::FileRead(
+                        "v3 hybrid header missing chunk_size".to_string(),
+                    ));
+                }
+                self.chunk_size = u32::from_le_bytes(
+                    data[pos..pos + 4]
+                        .try_into()
+                        .map_err(|_| CryptoError::FileRead("Invalid chunk_size".to_string()))?,
+                );
+                pos += 4;
+                if self.chunk_size == 0 {
+                    return Err(CryptoError::FileRead(
+                        "v3 chunk_size must be > 0".to_string(),
+                    ));
+                }
+                self.streaming_mode = StreamingMode::ChunkedAead;
+            }
+            _ => return Err(CryptoError::InvalidVersion),
+        }
+
         self.salt = self.ecc.get_salt();
         self.iv = self.ecc.get_iv();
         Ok(pos)
@@ -403,6 +494,132 @@ impl CryptoStrategy for HybridStrategy {
     fn get_iv(&self) -> Vec<u8> {
         self.iv.clone()
     }
+
+    fn streaming_mode(&self) -> StreamingMode {
+        self.streaming_mode
+    }
+
+    fn set_streaming_mode(&mut self, mode: StreamingMode) {
+        self.streaming_mode = mode;
+    }
+
+    fn chunk_size(&self) -> u32 {
+        self.chunk_size
+    }
+
+    fn set_chunk_size(&mut self, size: u32) {
+        if size > 0 {
+            self.chunk_size = size;
+        }
+    }
+
+    fn file_session_id(&self) -> Option<[u8; V3_SESSION_ID_LEN]> {
+        self.file_session_id
+    }
+
+    fn set_file_session_id(&mut self, sid: [u8; V3_SESSION_ID_LEN]) {
+        self.file_session_id = Some(sid);
+    }
+
+    fn nonce_prefix(&self) -> Option<[u8; V3_NONCE_PREFIX_LEN]> {
+        if self.nonce_prefix.len() == V3_NONCE_PREFIX_LEN {
+            let mut out = [0u8; V3_NONCE_PREFIX_LEN];
+            out.copy_from_slice(&self.nonce_prefix);
+            Some(out)
+        } else {
+            None
+        }
+    }
+
+    fn encrypt_chunk_v3(&mut self, plaintext: &[u8], is_final: bool) -> Result<Vec<u8>> {
+        hybrid_v3_encrypt_chunk(
+            &self.aead_algo_v3,
+            &self.encryption_key,
+            &self.nonce_prefix,
+            self.file_session_id.as_ref(),
+            &mut self.chunk_counter,
+            plaintext,
+            is_final,
+        )
+    }
+
+    fn decrypt_chunk_v3(
+        &mut self,
+        ciphertext_and_tag: &[u8],
+        is_final: bool,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        hybrid_v3_decrypt_chunk(
+            &self.aead_algo_v3,
+            &self.encryption_key,
+            &self.nonce_prefix,
+            self.file_session_id.as_ref(),
+            &mut self.chunk_counter,
+            ciphertext_and_tag,
+            is_final,
+        )
+    }
+
+    fn reset_chunk_counter(&mut self) {
+        self.chunk_counter = 0;
+    }
+}
+
+fn hybrid_v3_encrypt_chunk(
+    aead_algo: &str,
+    key: &[u8],
+    nonce_prefix: &[u8],
+    sid: Option<&[u8; V3_SESSION_ID_LEN]>,
+    counter: &mut u32,
+    plaintext: &[u8],
+    is_final: bool,
+) -> Result<Vec<u8>> {
+    if nonce_prefix.len() != V3_NONCE_PREFIX_LEN {
+        return Err(CryptoError::Parameter(
+            "v3 nonce prefix not initialized".to_string(),
+        ));
+    }
+    let sid = sid.ok_or(CryptoError::Parameter(
+        "v3 file session id not set".to_string(),
+    ))?;
+    let nonce = v3::build_nonce(nonce_prefix, *counter);
+    let flags = if is_final {
+        v3::V3_FLAG_FINAL
+    } else {
+        v3::V3_FLAG_INTERMEDIATE
+    };
+    let aad = v3::build_aad(sid, *counter, flags);
+    let out = v3::aead_encrypt_chunk(aead_algo, key, &nonce, &aad, plaintext)?;
+    *counter = counter.checked_add(1).ok_or(CryptoError::CounterOverflow)?;
+    Ok(out)
+}
+
+fn hybrid_v3_decrypt_chunk(
+    aead_algo: &str,
+    key: &[u8],
+    nonce_prefix: &[u8],
+    sid: Option<&[u8; V3_SESSION_ID_LEN]>,
+    counter: &mut u32,
+    ciphertext_and_tag: &[u8],
+    is_final: bool,
+) -> Result<Zeroizing<Vec<u8>>> {
+    if nonce_prefix.len() != V3_NONCE_PREFIX_LEN {
+        return Err(CryptoError::Parameter(
+            "v3 nonce prefix not initialized".to_string(),
+        ));
+    }
+    let sid = sid.ok_or(CryptoError::Parameter(
+        "v3 file session id not set".to_string(),
+    ))?;
+    let nonce = v3::build_nonce(nonce_prefix, *counter);
+    let flags = if is_final {
+        v3::V3_FLAG_FINAL
+    } else {
+        v3::V3_FLAG_INTERMEDIATE
+    };
+    let aad = v3::build_aad(sid, *counter, flags);
+    let pt = v3::aead_decrypt_chunk(aead_algo, key, &nonce, &aad, ciphertext_and_tag)?;
+    *counter = counter.checked_add(1).ok_or(CryptoError::CounterOverflow)?;
+    Ok(pt)
 }
 
 #[cfg(test)]

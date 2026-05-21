@@ -59,6 +59,15 @@ pub enum CryptoError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
+    #[error("Truncation detected: final chunk flag not set at EOF")]
+    TruncationDetected,
+
+    #[error("Counter overflow: maximum chunk count exceeded")]
+    CounterOverflow,
+
+    #[error("Unsupported file format version")]
+    InvalidVersion,
+
     #[error("Unknown error")]
     Unknown,
 }
