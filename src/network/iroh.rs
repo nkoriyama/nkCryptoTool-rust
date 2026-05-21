@@ -939,7 +939,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let s_key_path = dir.path().join("s.priv.pem");
         let c_pub_path = dir.path().join("c.pub.pem");
-        let (s_priv, s_pub, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+        // s_pub is not derived into a fingerprint here — the test deliberately
+        // passes a hardcoded wrong fp (`[0u8; 32]` below) to verify mismatch
+        // detection. Discard the public-key slot (cf. the success path at L895
+        // which DOES hash s_pub to build the expected fp).
+        let (s_priv, _, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
         let (_, c_pub, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
         fs::write(&s_key_path, utils::wrap_to_pem(&utils::wrap_pqc_priv_to_pkcs8(&s_priv, "ML-DSA-65").unwrap(), "PRIVATE KEY")).unwrap();
         fs::write(&c_pub_path, utils::wrap_to_pem(&utils::wrap_pqc_pub_to_spki(&c_pub, "ML-DSA-65").unwrap(), "PUBLIC KEY")).unwrap();
@@ -981,8 +985,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let s_key_path = dir.path().join("s.priv.pem");
         let c_pub_path = dir.path().join("c.pub.pem");
+        // c_pub is the "real" client pubkey but the test writes the *wrong*
+        // pubkey (`wrong_c_pub`) to the server's expected-client-pubkey path
+        // to simulate the server holding a stale/incorrect key for this
+        // client — c_pub itself is intentionally never consumed.
         let (s_priv, _, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
-        let (_, c_pub, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+        let (_, _, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
         let (_, wrong_c_pub, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
         fs::write(&s_key_path, utils::wrap_to_pem(&utils::wrap_pqc_priv_to_pkcs8(&s_priv, "ML-DSA-65").unwrap(), "PRIVATE KEY")).unwrap();
         fs::write(&c_pub_path, utils::wrap_to_pem(&utils::wrap_pqc_pub_to_spki(&wrong_c_pub, "ML-DSA-65").unwrap(), "PUBLIC KEY")).unwrap();
