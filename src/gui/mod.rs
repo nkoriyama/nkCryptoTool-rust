@@ -9,6 +9,9 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 #[cfg(feature = "gui")]
 use slint::Model;
+// FromStr is used only by the gui-camera QR-scanning path
+// (`Ticket::from_str(&decoded)`), so gate it to that feature.
+#[cfg(feature = "gui-camera")]
 use std::str::FromStr;
 #[cfg(feature = "gui")]
 use crate::network::GuiIOProvider;

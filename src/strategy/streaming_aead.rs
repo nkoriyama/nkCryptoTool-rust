@@ -21,10 +21,15 @@ use aes_gcm::{
     aead::{Aead as AesAead, KeyInit as AesKeyInit, Payload as AesPayload},
     Aes256Gcm,
 };
-use chacha20poly1305::{
-    aead::{Aead as ChaChaAead, KeyInit as ChaChaKeyInit, Payload as ChaChaPayload},
-    ChaCha20Poly1305,
-};
+// On backend-rustcrypto the Aead/KeyInit traits are already in scope via
+// the aes-gcm re-exports above (they all come from the same upstream
+// `aead` crate). Re-importing the same traits under a ChaCha-prefixed
+// alias just triggers an unused-import warning, so the trait imports are
+// gated to non-rustcrypto builds where aes-gcm is absent. Payload and
+// ChaCha20Poly1305 are distinct types and stay unconditional.
+#[cfg(not(feature = "backend-rustcrypto"))]
+use chacha20poly1305::aead::{Aead as ChaChaAead, KeyInit as ChaChaKeyInit};
+use chacha20poly1305::{aead::Payload as ChaChaPayload, ChaCha20Poly1305};
 
 #[cfg(feature = "backend-rustcrypto")]
 use aes_gcm::aead::generic_array::GenericArray as AesGenericArray;

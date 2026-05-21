@@ -1075,7 +1075,7 @@ mod tests {
         key_paths.insert("public-key".to_string(), key_dir.join("public_enc_ecc.key").to_str().unwrap().to_string());
         key_paths.insert("private-key".to_string(), key_dir.join("private_enc_ecc.key").to_str().unwrap().to_string());
         
-        let mut strategy = Box::new(EccStrategy::new());
+        let strategy = Box::new(EccStrategy::new());
         // Non-empty dummy bypasses prompt
         strategy.generate_encryption_key_pair(&key_paths, Some("test"), true).unwrap();
 

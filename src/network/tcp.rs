@@ -5,12 +5,11 @@
  */
 
 use crate::backend;
-use crate::backend::AeadBackend;
 use crate::config::CryptoConfig;
 use crate::error::{CryptoError, Result};
 use super::{
-    ChatActiveGuard, NetworkProcessor as CommonProcessor, PeerId, BUF_SIZE, CHAT_ACTIVE,
-    CHAT_SESSION_TIMEOUT, CUMULATIVE_TIMEOUT, IDLE_TIMEOUT, MAX_FILE_SIZE, PEER_COOLDOWNS,
+    ChatActiveGuard, NetworkProcessor as CommonProcessor, PeerId, CHAT_ACTIVE,
+    CHAT_SESSION_TIMEOUT, CUMULATIVE_TIMEOUT, PEER_COOLDOWNS,
     IOProvider, DefaultIOProvider,
 };
 use std::sync::Arc;

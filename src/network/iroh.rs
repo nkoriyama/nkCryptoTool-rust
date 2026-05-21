@@ -774,7 +774,11 @@ impl NetworkProcessor {
                     Ok::<_, CryptoError>(keys)
                 }).await.map_err(|_| CryptoError::Parameter("Handshake timed out".to_string()))??;
 
-                let (s2c_key, s2c_iv, c2s_key, c2s_iv) = handshake_result;
+                // s2c_iv is intentionally unused on the client-send path
+                // (chat_loop derives nonces from keys; file-send only uses
+                // the c2s direction). Matches the server-side destructuring
+                // at L536 which also prefixes the unused IV with `_`.
+                let (s2c_key, _s2c_iv, c2s_key, c2s_iv) = handshake_result;
 
                 if let Some(cb) = on_handshake_done.take() {
                     cb();
