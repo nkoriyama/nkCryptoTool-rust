@@ -1,8 +1,104 @@
 use nk_crypto_tool::strategy::CryptoStrategy;
-use nk_crypto_tool::utils::secure_write;
+use nk_crypto_tool::utils::{secure_erase_file, secure_write, SecureBuffer};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+
+// VmLck-observing tests serialise through this mutex because unit tests
+// in a single binary run on threads, and concurrent mlock activity on
+// other threads would race with the absolute-value assertions below.
+static MEMLOCK_OBS_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn read_vm_lck_kb() -> Option<usize> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmLck:") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+#[test]
+fn secure_buffer_drop_releases_mlock() {
+    let _guard = MEMLOCK_OBS_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let Some(baseline) = read_vm_lck_kb() else {
+        return;
+    };
+
+    let buf = SecureBuffer::new(8192).expect("alloc");
+    let during = read_vm_lck_kb().unwrap_or(baseline);
+    if during == baseline {
+        // mlock failed (likely RLIMIT_MEMLOCK = 0 on this host).
+        // Without an actual lock acquired, the release path cannot
+        // be observed; skip rather than pass on a false negative.
+        return;
+    }
+    drop(buf);
+    let after = read_vm_lck_kb().expect("read /proc/self/status after drop");
+    assert_eq!(
+        after, baseline,
+        "munlock did not release the lock (baseline={} during={} after={})",
+        baseline, during, after
+    );
+}
+
+#[test]
+fn secure_buffer_repeated_alloc_does_not_accumulate_locks() {
+    let _guard = MEMLOCK_OBS_MUTEX
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let Some(baseline) = read_vm_lck_kb() else {
+        return;
+    };
+
+    for _ in 0..64 {
+        let buf = SecureBuffer::new(8192).expect("alloc");
+        assert_eq!(buf.as_slice().len(), 8192);
+    }
+
+    let after = read_vm_lck_kb().expect("read /proc/self/status after loop");
+    assert_eq!(
+        after, baseline,
+        "locked memory accumulated across alloc/drop cycles: baseline={} after={}",
+        baseline, after
+    );
+}
+
+#[test]
+fn secure_erase_file_overwrites_with_zeros() {
+    use std::io::Write as _;
+    let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    let secret = b"plaintext-aes-key-material-abcdef0123456789";
+    tmp.write_all(secret).expect("write");
+    tmp.as_file_mut().sync_all().expect("fsync");
+    let path = tmp.path().to_path_buf();
+
+    secure_erase_file(&path);
+
+    let after = std::fs::read(&path).expect("read after erase");
+    assert_eq!(after.len(), secret.len(), "file length must be preserved");
+    assert!(
+        after.iter().all(|&b| b == 0),
+        "file contents must be all zeros after secure_erase_file"
+    );
+}
+
+#[test]
+fn secure_erase_file_handles_missing_path() {
+    // Must not panic when the path does not exist.
+    secure_erase_file("/nonexistent/secure-erase-target");
+}
+
+#[test]
+fn secure_erase_file_handles_empty_file() {
+    let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+    secure_erase_file(tmp.path());
+    let after = std::fs::read(tmp.path()).expect("read");
+    assert!(after.is_empty());
+}
 
 #[tokio::test]
 async fn test_secure_write_atomic_force() {

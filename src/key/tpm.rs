@@ -169,6 +169,10 @@ impl KeyProvider for TpmKeyProvider {
             .status()
             .ok();
 
+        // Overwrite the plaintext AES key staged in aes_file before the
+        // NamedTempFile is unlinked, so the bytes do not linger on disk.
+        crate::utils::secure_erase_file(aes_file.path());
+
         Ok(String::from_utf8_lossy(&out_data).to_string())
     }
 
@@ -315,6 +319,12 @@ impl KeyProvider for TpmKeyProvider {
             .ok();
 
         let aes_key = fs::read(aes_path_str).map_err(|e| CryptoError::FileRead(e.to_string()))?;
+
+        // Overwrite the unsealed AES key on disk before aes_file is
+        // unlinked, so the plaintext does not survive in unallocated
+        // sectors after the tempfile is dropped.
+        crate::utils::secure_erase_file(aes_file.path());
+
         Ok(Zeroizing::new(aes_key))
     }
 }

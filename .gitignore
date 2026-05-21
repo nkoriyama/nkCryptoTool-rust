@@ -8,6 +8,8 @@ archive/
 # Issue/process documents (canonical copies live at /src/issue/nkCryptoTool-rust/)
 issue/
 
+.agents/
+
 # Test/runtime artifacts
 test_keys/
 pqc_keys/

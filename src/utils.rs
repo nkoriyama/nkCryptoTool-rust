@@ -113,20 +113,64 @@ pub fn secure_write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C, force:
     Ok(())
 }
 
+/// Best-effort secure erase of a file's contents: overwrite with zeros
+/// in place, then fsync. Intended for short-lived plaintext key material
+/// staged in a tempfile — the subsequent unlink alone does not clear
+/// SSD/flash cells, so the contents are explicitly zeroed first.
+///
+/// All errors are swallowed: this is defense-in-depth layered on top of
+/// the caller's existing cleanup (e.g. NamedTempFile auto-delete), not
+/// a primary guarantee. On copy-on-write filesystems (btrfs, ZFS) and
+/// wear-levelled SSDs the overwrite may land on a different physical
+/// location than the original write; that limitation is inherent to
+/// userspace and cannot be eliminated here.
+pub fn secure_erase_file<P: AsRef<std::path::Path>>(path: P) {
+    use std::io::Write;
+    let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(path.as_ref()) else {
+        return;
+    };
+    let Ok(metadata) = file.metadata() else { return };
+    let len = metadata.len() as usize;
+    if len == 0 {
+        return;
+    }
+    let zero_buf = vec![0u8; len];
+    let _ = file.write_all(&zero_buf);
+    let _ = file.sync_all();
+}
+
 #[derive(Zeroize)]
-#[zeroize(drop)]
 pub struct SecureBuffer(Vec<u8>);
+
+impl Drop for SecureBuffer {
+    fn drop(&mut self) {
+        // 1. Zero the live buffer contents before releasing the lock.
+        self.0.zeroize();
+
+        // 2. Unlock the full capacity that was mlock'd, so long-lived
+        //    processes do not exhaust RLIMIT_MEMLOCK over many
+        //    allocate/drop cycles. munlock on a partially-locked range
+        //    is a no-op for the unlocked portion, so using capacity
+        //    covers ranges locked via new()/with_capacity()/extend.
+        let cap = self.0.capacity();
+        if cap > 0 {
+            unsafe {
+                let _ = libc::munlock(self.0.as_ptr() as *const libc::c_void, cap);
+            }
+        }
+    }
+}
 
 impl SecureBuffer {
     pub fn new(size: usize) -> Result<Self> {
         let mut buf = Vec::with_capacity(size);
         buf.resize(size, 0);
 
-        // Lock memory to prevent swapping
+        // Lock memory to prevent swapping. munlock is paired in Drop.
         unsafe {
             if libc::mlock(buf.as_ptr() as *const libc::c_void, buf.len()) != 0 {
-                // We ignore mlock failure as in the C++ version,
-                // but zeroize(drop) ensures it's cleared on drop.
+                // Ignore mlock failure as in the C++ version;
+                // the Drop impl still zeroizes on release.
             }
         }
 
