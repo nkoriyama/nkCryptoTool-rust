@@ -9,6 +9,8 @@ archive/
 issue/
 
 .agents/
+CLAUDE.md
+.claude/
 
 # Test/runtime artifacts
 test_keys/
