@@ -620,8 +620,13 @@ impl NetworkProcessor {
                     let final_n = rx_aead.finalize(&mut out_buf[n..])?;
                     let used = n + final_n;
 
-                    let msg_content =
-                        std::str::from_utf8(&out_buf[..used]).unwrap_or("[Invalid UTF-8 Message]");
+                    // Lossy decode: preserve valid UTF-8 portions and mark
+                    // bad bytes with U+FFFD instead of dropping the entire
+                    // message. Some peers' terminals/IMEs occasionally emit
+                    // non-UTF-8 bytes, and showing a partial-but-readable
+                    // message is more useful than a single placeholder line.
+                    let msg_content: String =
+                        String::from_utf8_lossy(&out_buf[..used]).into_owned();
                     let msg = Zeroizing::new(
                         msg_content
                             .chars()
@@ -689,10 +694,14 @@ impl NetworkProcessor {
                         let _ = out.flush().await;
                         continue;
                     }
+                    // Lossy decode of local keyboard bytes: if the user's
+                    // terminal/IME emits non-UTF-8 bytes (e.g. Shift-JIS or a
+                    // partial multibyte read), preserve the valid characters
+                    // and replace bad bytes with U+FFFD instead of sending
+                    // the literal placeholder "[Invalid UTF-8]" over the
+                    // wire. The peer at least sees what we typed.
                     let line = Zeroizing::new(
-                        std::str::from_utf8(&line_buf)
-                            .unwrap_or("[Invalid UTF-8]")
-                            .to_string()
+                        String::from_utf8_lossy(&line_buf).into_owned()
                     );
                     line_buf.zeroize();
                     line_buf.clear();
