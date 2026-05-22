@@ -165,6 +165,8 @@ impl StreamingAeadProcessor {
     }
 }
 
+
+
 /// One-shot AEAD encryption with AAD for v3 chunks. Returns ciphertext || tag.
 pub fn aead_encrypt_chunk(
     aead_algo: &str,
@@ -195,6 +197,7 @@ pub fn aead_encrypt_chunk(
         ))),
     }
 }
+
 
 /// One-shot AEAD decryption with AAD for v3 chunks. Input is ciphertext || tag.
 pub fn aead_decrypt_chunk(
@@ -241,6 +244,7 @@ pub fn aead_decrypt_chunk(
     Ok(Zeroizing::new(pt))
 }
 
+
 /// Like `aead_decrypt_chunk` but writes the plaintext into `out` (reusing its
 /// allocation) instead of returning a fresh buffer. The default AES-256-GCM
 /// (OpenSSL) path decrypts straight into `out` with no per-chunk allocation;
@@ -272,13 +276,20 @@ pub fn aead_decrypt_chunk_into(
             return aes_gcm_decrypt_into(key, nonce, aad, ciphertext_and_tag, out);
         }
     }
-    // Fallback (ChaCha20-Poly1305, RustCrypto backend, etc.): use the
-    // allocating primitive then move the bytes into `out`.
+    #[cfg(feature = "backend-rustcrypto")]
+    {
+        if aead_algo.eq_ignore_ascii_case("aes-256-gcm") {
+            return aes_gcm_decrypt_into(key, nonce, aad, ciphertext_and_tag, out);
+        }
+    }
+    // Fallback (ChaCha20-Poly1305, or any algorithm without an in-place
+    // path): use the allocating primitive then move the bytes into `out`.
     let pt = aead_decrypt_chunk(aead_algo, key, nonce, aad, ciphertext_and_tag)?;
     out.clear();
     out.extend_from_slice(&pt);
     Ok(())
 }
+
 
 /// Builds the nonce/AAD for chunk `*counter`, decrypts into `out`, then bumps
 /// the counter. Buffer-reusing counterpart of the per-strategy
@@ -332,6 +343,31 @@ fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], aad: &[u8], ct_tag: &[u8]) -> Resul
     cipher
         .decrypt(nonce_arr, AesPayload { msg: ct_tag, aad })
         .map_err(|_| CryptoError::SignatureVerification)
+}
+
+// Cause 1: in-place decrypt into the reused `out` buffer, avoiding the
+// per-chunk plaintext allocation. aes-gcm verifies the GHASH tag before
+// applying the keystream, so on tag failure no plaintext is produced; on
+// success the buffer is truncated to the plaintext length. `out` is wrapped
+// in `Zeroizing` at the call site, so any plaintext is wiped on drop.
+#[cfg(feature = "backend-rustcrypto")]
+fn aes_gcm_decrypt_into(
+    key: &[u8],
+    nonce: &[u8],
+    aad: &[u8],
+    ct_tag: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    use aes_gcm::aead::AeadInPlace;
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|e| CryptoError::OpenSSL(format!("AES-256-GCM key: {}", e)))?;
+    let nonce_arr = AesGenericArray::from_slice(nonce);
+    out.clear();
+    out.extend_from_slice(ct_tag);
+    cipher
+        .decrypt_in_place(nonce_arr, aad, out)
+        .map_err(|_| CryptoError::SignatureVerification)?;
+    Ok(())
 }
 
 #[cfg(all(not(feature = "backend-rustcrypto"), feature = "backend-openssl"))]
