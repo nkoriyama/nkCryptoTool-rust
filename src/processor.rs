@@ -715,7 +715,7 @@ impl CryptoProcessor {
         let cb_clone = progress_callback.clone();
         tokio::task::spawn_blocking(move || {
             use std::fs::OpenOptions;
-            use std::io::{BufReader, BufWriter, Read, Write};
+            use std::io::{BufReader, BufWriter, Write};
 
             if chunk_size == 0 {
                 return Err(CryptoError::Parameter("chunk_size must be > 0".to_string()));
@@ -742,58 +742,55 @@ impl CryptoProcessor {
                 .write_all(&header)
                 .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
 
-            // One-chunk lookahead: we always hold the most recently read
-            // chunk in `pending` so we can flag it final once EOF is seen.
-            // For empty input we still emit one empty final chunk.
-            let mut pending: Zeroizing<Vec<u8>> =
-                Zeroizing::new(Vec::with_capacity(chunk_size_usize));
-            let mut have_pending = false;
+            // One-chunk lookahead with two reusable buffers: we read the
+            // *next* chunk to learn whether the current one is final, then
+            // swap the buffers instead of copying. This avoids a per-chunk
+            // heap allocation and a per-chunk plaintext memcpy/zeroize, which
+            // dominate v3's overhead on large files. Both buffers are
+            // `Zeroizing`, so any plaintext tail left in spare capacity is
+            // wiped on drop. For empty input we emit one empty final chunk.
+            let mut cur: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; chunk_size_usize]);
+            let mut nxt: Zeroizing<Vec<u8>> = Zeroizing::new(vec![0u8; chunk_size_usize]);
             let mut total_processed: u64 = 0;
 
-            loop {
-                let mut next_chunk: Zeroizing<Vec<u8>> =
-                    Zeroizing::new(vec![0u8; chunk_size_usize]);
+            // Fills `buf` from `reader` up to its length, returning the number
+            // of bytes read (short only at EOF).
+            fn fill_chunk<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
                 let mut filled = 0usize;
-                while filled < chunk_size_usize {
+                while filled < buf.len() {
                     let n = reader
-                        .read(&mut next_chunk[filled..])
+                        .read(&mut buf[filled..])
                         .map_err(|e| CryptoError::FileRead(e.to_string()))?;
                     if n == 0 {
                         break;
                     }
                     filled += n;
                 }
-                next_chunk.truncate(filled);
+                Ok(filled)
+            }
 
-                if filled == 0 {
-                    // EOF: the previously staged chunk (if any) is the final
-                    // one. For empty input we never stage anything, so emit
-                    // one empty final chunk to carry Flags=0x01.
-                    let final_pt: &[u8] = if have_pending { &pending } else { &[] };
-                    let ct = strategy.encrypt_chunk_v3(final_pt, true)?;
-                    writer
-                        .write_all(&ct)
-                        .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-                    break;
-                }
+            let mut cur_len = fill_chunk(&mut reader, &mut cur)?;
+            loop {
+                let nxt_len = fill_chunk(&mut reader, &mut nxt)?;
+                let is_final = nxt_len == 0;
 
-                if have_pending {
-                    // Another chunk follows, so the staged one is intermediate.
-                    let ct = strategy.encrypt_chunk_v3(&pending, false)?;
-                    writer
-                        .write_all(&ct)
-                        .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-                }
-                pending.clear();
-                pending.extend_from_slice(&next_chunk);
-                have_pending = true;
+                let ct = strategy.encrypt_chunk_v3(&cur[..cur_len], is_final)?;
+                writer
+                    .write_all(&ct)
+                    .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
 
-                total_processed += filled as u64;
+                total_processed += cur_len as u64;
                 if let Some(ref cb) = cb_clone {
                     if total_input_size > 0 {
                         cb(total_processed as f64 / total_input_size as f64);
                     }
                 }
+
+                if is_final {
+                    break;
+                }
+                std::mem::swap(&mut cur, &mut nxt);
+                cur_len = nxt_len;
             }
 
             writer
@@ -839,16 +836,24 @@ impl CryptoProcessor {
             // Pass 1: verify every chunk, write nothing to disk.
             // Then Pass 2: re-derive, write decrypted plaintext to a temp
             // file under the AEAD authentication.
+            // Open the input exactly once and rewind between passes. Reusing a
+            // single file descriptor guarantees Pass 2 decrypts the very bytes
+            // Pass 1 authenticated: a file swapped on disk between the passes
+            // cannot affect an already-open fd (it keeps referencing the
+            // original inode), so the TOCTOU window a second open() would
+            // create is eliminated.
+            let mut in_file = std::fs::File::open(&input_path)
+                .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+
             let run_pass = |verify_only: bool,
                             strategy: &mut Box<dyn CryptoStrategy>,
-                            cb_offset: f64|
+                            cb_offset: f64,
+                            in_file: &mut std::fs::File|
              -> Result<()> {
-                let mut in_file = std::fs::File::open(&input_path)
-                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
                 in_file
                     .seek(SeekFrom::Start(header_size))
                     .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                let mut reader = BufReader::with_capacity(BUF_SIZE * 4, in_file);
+                let mut reader = BufReader::with_capacity(BUF_SIZE * 4, &*in_file);
 
                 let mut writer: Option<BufWriter<std::fs::File>> = if verify_only {
                     None
@@ -919,11 +924,11 @@ impl CryptoProcessor {
             // Pass 1: verify only (no temp file is created yet — this
             // preserves the THREAT 37-1 invariant that disk writes never
             // start before AEAD authentication has succeeded end-to-end).
-            run_pass(true, &mut strategy, 0.0)?;
+            run_pass(true, &mut strategy, 0.0, &mut in_file)?;
             // Pass 2: replay with chunk counter reset to 0, writing the
             // authenticated plaintext to the temporary output file.
             strategy.reset_chunk_counter();
-            run_pass(false, &mut strategy, 0.5)?;
+            run_pass(false, &mut strategy, 0.5, &mut in_file)?;
 
             Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
         })
