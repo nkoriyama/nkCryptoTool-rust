@@ -737,6 +737,24 @@ impl CryptoStrategy for PqcStrategy {
         )
     }
 
+    fn decrypt_chunk_v3_into(
+        &mut self,
+        ciphertext_and_tag: &[u8],
+        is_final: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        v3::decrypt_chunk_v3_into(
+            &self.aead_algo,
+            &self.encryption_key,
+            &self.nonce_prefix,
+            self.file_session_id.as_ref(),
+            &mut self.chunk_counter,
+            ciphertext_and_tag,
+            is_final,
+            out,
+        )
+    }
+
     fn reset_chunk_counter(&mut self) {
         self.chunk_counter = 0;
     }

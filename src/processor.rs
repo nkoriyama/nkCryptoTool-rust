@@ -869,6 +869,11 @@ impl CryptoProcessor {
                 };
 
                 let mut buf: Vec<u8> = vec![0u8; max_chunk_wire];
+                // Reused across chunks so we pay one allocation + one
+                // drop-time zeroize per pass instead of per chunk. Holds the
+                // decrypted plaintext of the current chunk only.
+                let mut pt: Zeroizing<Vec<u8>> =
+                    Zeroizing::new(Vec::with_capacity(chunk_size_usize));
                 let mut bytes_remaining = body_size;
                 let mut final_seen = false;
                 let mut total_read: u64 = 0;
@@ -893,8 +898,8 @@ impl CryptoProcessor {
                         ));
                     }
 
-                    let pt = strategy
-                        .decrypt_chunk_v3(&buf[..to_read], is_final_chunk)?;
+                    strategy
+                        .decrypt_chunk_v3_into(&buf[..to_read], is_final_chunk, &mut pt)?;
                     if is_final_chunk {
                         final_seen = true;
                     }

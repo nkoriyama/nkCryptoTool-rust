@@ -175,6 +175,23 @@ pub trait CryptoStrategy: Send + Sync {
         ))
     }
 
+    /// Decrypts one v3 chunk into the caller-provided `out` buffer (reusing
+    /// its allocation across chunks) instead of returning a fresh buffer.
+    /// The default falls back to the allocating `decrypt_chunk_v3`; strategies
+    /// that support v3 override this to avoid the per-chunk allocation and the
+    /// per-chunk drop-time zeroize that dominate decrypt on large files.
+    fn decrypt_chunk_v3_into(
+        &mut self,
+        ciphertext_and_tag: &[u8],
+        is_final: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let pt = self.decrypt_chunk_v3(ciphertext_and_tag, is_final)?;
+        out.clear();
+        out.extend_from_slice(&pt);
+        Ok(())
+    }
+
     /// Resets the v3 chunk counter to zero. Used between the two-pass
     /// decrypt passes so that the second pass replays the same chunk
     /// counter sequence as the first pass.

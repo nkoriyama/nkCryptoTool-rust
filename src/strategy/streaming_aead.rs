@@ -241,6 +241,79 @@ pub fn aead_decrypt_chunk(
     Ok(Zeroizing::new(pt))
 }
 
+/// Like `aead_decrypt_chunk` but writes the plaintext into `out` (reusing its
+/// allocation) instead of returning a fresh buffer. The default AES-256-GCM
+/// (OpenSSL) path decrypts straight into `out` with no per-chunk allocation;
+/// other ciphers fall back to the allocating path plus a copy. `out` must be
+/// owned by a `Zeroizing` buffer at the call site so its capacity is wiped on
+/// drop — this function does not zeroize it.
+pub fn aead_decrypt_chunk_into(
+    aead_algo: &str,
+    key: &[u8],
+    nonce: &[u8],
+    aad: &[u8],
+    ciphertext_and_tag: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if nonce.len() != V3_NONCE_LEN {
+        return Err(CryptoError::Parameter(format!(
+            "v3 nonce must be {} bytes",
+            V3_NONCE_LEN
+        )));
+    }
+    if ciphertext_and_tag.len() < V3_TAG_LEN {
+        return Err(CryptoError::FileRead(
+            "v3 chunk shorter than tag length".to_string(),
+        ));
+    }
+    #[cfg(all(not(feature = "backend-rustcrypto"), feature = "backend-openssl"))]
+    {
+        if aead_algo.eq_ignore_ascii_case("aes-256-gcm") {
+            return aes_gcm_decrypt_into(key, nonce, aad, ciphertext_and_tag, out);
+        }
+    }
+    // Fallback (ChaCha20-Poly1305, RustCrypto backend, etc.): use the
+    // allocating primitive then move the bytes into `out`.
+    let pt = aead_decrypt_chunk(aead_algo, key, nonce, aad, ciphertext_and_tag)?;
+    out.clear();
+    out.extend_from_slice(&pt);
+    Ok(())
+}
+
+/// Builds the nonce/AAD for chunk `*counter`, decrypts into `out`, then bumps
+/// the counter. Buffer-reusing counterpart of the per-strategy
+/// `*_decrypt_chunk` helpers; shared by ECC / PQC / Hybrid.
+#[allow(clippy::too_many_arguments)]
+pub fn decrypt_chunk_v3_into(
+    aead_algo: &str,
+    key: &[u8],
+    nonce_prefix: &[u8],
+    sid: Option<&[u8; V3_SESSION_ID_LEN]>,
+    counter: &mut u32,
+    ciphertext_and_tag: &[u8],
+    is_final: bool,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    if nonce_prefix.len() != V3_NONCE_PREFIX_LEN {
+        return Err(CryptoError::Parameter(
+            "v3 nonce prefix not initialized".to_string(),
+        ));
+    }
+    let sid = sid.ok_or(CryptoError::Parameter(
+        "v3 file session id not set".to_string(),
+    ))?;
+    let nonce = build_nonce(nonce_prefix, *counter);
+    let flags = if is_final {
+        V3_FLAG_FINAL
+    } else {
+        V3_FLAG_INTERMEDIATE
+    };
+    let aad = build_aad(sid, *counter, flags);
+    aead_decrypt_chunk_into(aead_algo, key, &nonce, &aad, ciphertext_and_tag, out)?;
+    *counter = counter.checked_add(1).ok_or(CryptoError::CounterOverflow)?;
+    Ok(())
+}
+
 #[cfg(feature = "backend-rustcrypto")]
 fn aes_gcm_encrypt(key: &[u8], nonce: &[u8], aad: &[u8], pt: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(key)
@@ -320,6 +393,49 @@ fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], aad: &[u8], ct_tag: &[u8]) -> Resul
         .map_err(|_| CryptoError::SignatureVerification)?;
     out.truncate(n + m);
     Ok(out)
+}
+
+#[cfg(all(not(feature = "backend-rustcrypto"), feature = "backend-openssl"))]
+fn aes_gcm_decrypt_into(
+    key: &[u8],
+    nonce: &[u8],
+    aad: &[u8],
+    ct_tag: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    use openssl::cipher::Cipher;
+    use openssl::cipher_ctx::CipherCtx;
+    let split = ct_tag.len() - V3_TAG_LEN;
+    let ct = &ct_tag[..split];
+    let tag = &ct_tag[split..];
+    let mut ctx = CipherCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+    ctx.decrypt_init(Some(Cipher::aes_256_gcm()), None, None)
+        .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+    ctx.set_iv_length(nonce.len())
+        .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+    ctx.decrypt_init(None, Some(key), Some(nonce))
+        .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+    if !aad.is_empty() {
+        ctx.cipher_update(aad, None)
+            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+    }
+    ctx.set_tag(tag)
+        .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+    // GCM output length equals the ciphertext length; grow `out` only when a
+    // chunk is larger than any seen so far (the newly grown tail is the only
+    // region zero-filled, the rest is overwritten by cipher_update below).
+    let needed = ct.len() + V3_TAG_LEN;
+    if out.len() < needed {
+        out.resize(needed, 0);
+    }
+    let n = ctx
+        .cipher_update(ct, Some(&mut out[..]))
+        .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+    let m = ctx
+        .cipher_final(&mut out[n..])
+        .map_err(|_| CryptoError::SignatureVerification)?;
+    out.truncate(n + m);
+    Ok(())
 }
 
 #[cfg(not(any(feature = "backend-rustcrypto", feature = "backend-openssl")))]
