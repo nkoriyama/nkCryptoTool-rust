@@ -2,7 +2,7 @@
 
 > ## **📌 本実装の位置付け**
 >
-> **本 Rust 版が nkCryptoTool プロジェクトのプライマリ実装です**。新機能・性能改善・運用機能の追加は本版で行われます。CLI のみ対応。[C++ 版](../nkCryptoTool/) とバイナリレベルの相互互換性を維持しています。
+> **本 Rust 版が nkCryptoTool プロジェクトのプライマリ実装です**。新機能・性能改善・運用機能の追加は本版で行われます。CLI だけでなく、Slint による GUI にも対応。[C++ 版](../nkCryptoTool/) とバイナリレベルの相互互換性を維持しています。
 >
 > ### 開発・保守ポリシー
 >
@@ -41,6 +41,7 @@ Rust版は、C++版の設計思想を継承しつつ、Rustのメモリ安全性
     * **PQC ハンドシェイク (V3.1)**: ML-KEM + ML-DSA による量子耐性。
     * **MITM 対策**: Ticket 形式に PQC 鍵指紋を統合し、中間者攻撃を検知。
     * **プロトコル分離**: ALPN によるチャットとファイル転送の安全な共存。
+* **グラフィカルユーザーインターフェース (GUI) のサポート**: Slint を用いた直感的な GUI を搭載。`--gui` オプションで起動可能で、QR コードのスキャンやチャット機能、ファイル転送をグラフィカルに実行できます。
 
 ## **セキュリティ (Security)**
 
@@ -149,6 +150,15 @@ cargo build --release --no-default-features --features backend-rustcrypto
 ```
 
 ビルド成果物: `target/release/nk-crypto-tool` (RustCrypto バックエンド版)
+
+#### **4. GUI 機能の有効化**
+GUI 機能（Slint）を有効にしてビルドする場合は、`gui` フィーチャを指定します。
+
+```bash
+cargo build --release --features gui
+```
+
+また、OSの通知機能やカメラによるQRコードスキャン、画面保護などの機能も個別にフィーチャ（`gui-camera`, `gui-notifications`, `gui-screen-protection`, `gui-file-transfer`）として提供されており、`--all-features` で全て有効化できます。
 
 ## **鍵管理アーキテクチャ**
 

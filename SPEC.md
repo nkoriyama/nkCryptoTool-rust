@@ -7,12 +7,13 @@ This document provides a detailed technical specification of the `nkCryptoTool` 
 `nkCryptoTool` is a high-performance, security-focused cryptographic utility designed for local file protection and secure network communication.
 
 ### 1.1 Components
-- **CLI Wrapper**: Handles command-line arguments and configuration (`main.rs`, `config.rs`).
+- **CLI / GUI Wrapper**: Handles command-line arguments, GUI invocation, and configuration (`main.rs`, `config.rs`, `src/gui/`).
 - **Core Processor**: Manages high-level cryptographic workflows (`processor.rs`).
+- **Cryptographic Strategies**: Implements specific cryptographic operations (ECC, PQC, Hybrid, Streaming AEAD) (`src/strategy/`).
 - **Cryptographic Backends**: Abstracted interface for different implementations (`src/backend/`).
     - **OpenSSL Backend**: High-performance, FIPS-compliant operations.
     - **RustCrypto Backend**: Pure-Rust alternative for portability.
-- **Network Processor**: Implements the NKCT protocol for secure file transfer and chat (`network.rs`).
+- **Network Processor**: Implements the NKCT protocol for secure file transfer and chat (`src/network/`, `src/ticket.rs`).
 - **Key Management**: Handles key generation, storage, and TPM integration (`src/key/`, `utils.rs`).
 
 ---
