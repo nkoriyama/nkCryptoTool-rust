@@ -200,6 +200,79 @@ For deployments requiring strict access control, an explicit allowlist can be co
 
 ---
 
+## 16. File Container Format (NKCT v1 / v2 / v3)
+
+The on-disk encrypted file format frames cryptographic primitives with a versioned header. **New encryptions emit v3 `ChunkedAead`** by default; v1 and v2 remain readable for backward compatibility. v3 is the normative format for new implementations.
+
+### 16.1 Header Skeleton
+All versions share the leading layout:
+
+| Offset | Field | Size | Notes |
+| :--- | :--- | :--- | :--- |
+| 0 | Magic | 4 B | ASCII `"NKCT"` |
+| 4 | Version | 2 B (LE) | `0x0001` / `0x0002` / `0x0003` |
+| 6 | Strategy | 1 B | `1 = ECC`, `2 = PQC`, `3 = Hybrid` (`enum StrategyType`) |
+| 7+ | Strategy-specific fields | variable | Each preceded by a `uint32_t` LE length: curve name, digest algo, ephemeral pubkey, salt, IV, AEAD algo string |
+| end | (v3 only) `chunk_size` | 4 B (LE) | Default `1_048_576` = 1 MiB |
+
+The fully serialized header bytes (everything above) are also the input to the v3 File Session ID derivation (§16.3).
+
+### 16.2 Body Layout
+
+- **v1**: single AES-256-GCM message; `ciphertext || 16-byte tag` at EOF. AEAD algorithm name is **not** stored (fixed AES-256-GCM).
+- **v2** (`LegacySingleMessage`): identical to v1 but the AEAD algorithm name **is** stored in the header (`ChaCha20-Poly1305` becomes selectable).
+- **v3** (`ChunkedAead`): concatenation of independently authenticated chunks. Each chunk on the wire is `ciphertext || 16-byte tag`, of length `chunk_size + 16` except possibly the final chunk (≤ `chunk_size + 16`).
+
+### 16.3 v3 ChunkedAead Per-Chunk Parameters
+
+| Element | Value |
+| :--- | :--- |
+| Encryption key | `HKDF-SHA3-256(PRK, salt, info="nkct-v3-enc-key", len=32)` |
+| Nonce prefix | `HKDF-SHA3-256(PRK, salt, info="nkct-v3-nonce-prefix", len=8)` |
+| File Session ID (SID) | `SHA-256(serialized header bytes)[..16]` (16 B) |
+| Per-chunk nonce | `nonce_prefix(8 B) ‖ counter(4 B BE)` → 12 B |
+| Per-chunk AAD | `SID(16 B) ‖ counter(4 B BE) ‖ flags(1 B)` → 21 B |
+| Flags | `0x00 = INTERMEDIATE`, `0x01 = FINAL` (last chunk only) |
+| Tag | 16-byte AEAD tag appended to each chunk |
+
+The chunk counter starts at `0` and increments by `1` per chunk. Arithmetic overflow returns `CryptoError::CounterOverflow`.
+
+### 16.4 Integrity Detection Matrix (v3)
+
+| Attack class | Detection mechanism |
+| :--- | :--- |
+| Single-chunk tampering | Per-chunk AEAD tag mismatch → `Err` at the offending chunk |
+| Chunk reordering | AAD `counter` mismatch → tag fails |
+| Mix-and-match across files | AAD `SID` mismatch → tag fails |
+| Final-chunk truncation | EOF reached without `FLAG_FINAL` observed → `CryptoError::TruncationDetected` |
+
+### 16.5 Two-Pass Decrypt Invariant (THREAT 37-1)
+
+v3 file decrypt is performed in **two passes** over a single open input file descriptor:
+
+- **Pass 1 (verify-only)**: each chunk is read and decrypted into a reusable buffer for authentication; the plaintext is **discarded**. No file is created at the destination.
+- **Pass 2 (write)**: after Pass 1 succeeds end-to-end, the chunk counter is reset to `0` (`reset_chunk_counter`) and each chunk is re-decrypted, this time written to `<output>.tmp.<rand>` opened with `O_NOFOLLOW`, mode `0o600`, `create_new(true)`. On full success the temp file is atomically `rename(2)`'d to the destination; on any error the temp file is removed.
+
+This guarantees that **no plaintext byte reaches the destination unless every chunk has been authenticated end-to-end**. Reusing one file descriptor between passes (`seek(SeekFrom::Start(header_size))` to rewind) eliminates the TOCTOU window a second `open()` would otherwise introduce.
+
+### 16.6 Chunk Size
+
+- Default: `V3_DEFAULT_CHUNK_SIZE = 1_048_576` (1 MiB).
+- Tunable via the `NKCT_V3_CHUNK_SIZE=<bytes>` environment variable. Intended for tests / interop only; larger values trade per-chunk fixed cost for higher transient memory residency (measurement: 1 MiB is near-optimal on AES-NI hardware, larger values regress).
+
+### 16.7 Backward Compatibility
+
+- Decoders dispatch on the 2-byte version word: `1` → v1, `2` → v2, `3` → v3. Other values return `CryptoError::InvalidVersion`.
+- v1 files (no AEAD name in header) are decoded as `AES-256-GCM`.
+- New encryptions always emit v3. The `NKCT_FORCE_V2=1` environment variable forces v2 output for round-trip / interop testing only; there is no CLI flag for it.
+
+### 16.8 Cross-References
+
+- See §13.1 for the historical "verify-before-write" trade-off this design resolves.
+- The 2-pass design fulfils threat model item THREAT 37-1 (§12).
+
+---
+
 ## 4. Security Mechanisms
 
 ### 4.1 Memory Protection
@@ -442,10 +515,11 @@ Sensitive material is treated with the same level of security rigor regardless o
 
 While `nkCryptoTool` is designed with high security standards, certain technical trade-offs and theoretical vulnerabilities exist.
 
-### 13.1 Streaming AEAD "Verify-Before-Write" Trade-off
-In Streaming AEAD mode (File Transfer), the tool processes data in chunks.
-- **Limitation**: It is impossible to perform a full authentication check on a multi-gigabyte stream before writing the initial bytes to a destination (disk or stdout) without buffering the entire stream in memory, which is impractical.
-- **Mitigation**: The server implementation uses a temporary file to store incoming data and only releases it to stdout after the final AEAD tag is successfully verified. However, on the client-side or in direct pipe scenarios, partial data may be written before the authentication failure is detected at the end of the stream.
+### 13.1 Pre-v3 "Verify-Before-Write" Trade-off (historical note)
+This subsection documents a property of the **v1 / v2 single-message AEAD** layout that is no longer a limitation under the default **v3 `ChunkedAead`** format (§16).
+- **v1 / v2 layout**: a single AES-GCM tag at end-of-stream. Full authentication can only be confirmed after processing the entire ciphertext.
+- **v1 / v2 mitigation**: the file decrypt path uses a 2-pass design (Pass 1: stream-decrypt into a discard buffer purely to verify; Pass 2: re-derive and write to a `*.tmp.<rand>` temp file, atomically `rename(2)`'d only after the final tag verifies). Direct-pipe scenarios that bypass the temp file remained affected.
+- **Resolved in v3 (§16.5)**: v3 keeps the same 2-pass design but each chunk carries its own AEAD tag, so tampering is detected at the offending chunk instead of only at end-of-stream. The "no plaintext byte reaches the destination unless every chunk is authenticated" guarantee applies universally to file decrypt; the file path does not use direct-pipe modes.
 
 ### 13.2 Very Low Bandwidth DoS
 The tool implements multiple timeouts to prevent resource exhaustion.
