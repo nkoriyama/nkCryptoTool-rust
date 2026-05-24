@@ -11,3 +11,4 @@
 //!   deterministic unit tests of application protocols.
 
 pub mod iroh;
+pub mod mock;

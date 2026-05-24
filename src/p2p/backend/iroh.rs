@@ -50,29 +50,96 @@ fn iroh_node_addr_from_peer(addr: &crate::p2p::PeerAddr) -> Result<iroh::NodeAdd
 }
 
 // ---------------------------------------------------------------------------
-// IrohEndpoint — thin wrapper that implements the application's
-// `crate::p2p::P2pEndpoint` trait. This is the surface step 4 will migrate
-// `NetworkProcessor` to consume so the legacy direct iroh::Endpoint usage
-// can be replaced by trait dispatch (enabling the mock backend in step 5).
+// IrohEndpoint — full `crate::p2p::P2pEndpoint` implementation backed by an
+// `iroh::Endpoint`. Coexists with the legacy `NetworkProcessor` in this file:
+// the trait surface is what the mock backend (step 5) and any future
+// alternative transport (e.g. libp2p) need to match; `NetworkProcessor`
+// still uses iroh directly via its own `create_endpoint`.
 //
-// The skeleton below compiles and types correctly; `connect`/`accept` are
-// stubbed and will be filled in alongside the NetworkProcessor refactor.
-// `local_id` and `close` are functional.
+// A `MigrationContext` migration of `NetworkProcessor` to consume
+// `IrohEndpoint` through the trait is intentionally deferred — it touches
+// ~1000 lines of NKCT protocol code and benefits from its own focused PR.
 // ---------------------------------------------------------------------------
 
+/// `AsyncRead + AsyncWrite` adapter joining iroh's split bi-stream halves
+/// (`SendStream` + `RecvStream`) into a single object so it satisfies
+/// the application's `crate::p2p::P2pStream` trait.
+pub struct IrohBiStream {
+    send: iroh::endpoint::SendStream,
+    recv: iroh::endpoint::RecvStream,
+}
+
+// iroh's SendStream / RecvStream expose inherent `poll_*` methods whose
+// error type is iroh's own (quinn-derived) WriteError/ReadError. tokio's
+// AsyncRead/AsyncWrite traits require `io::Error`, so we convert at the
+// boundary via `Poll::map`.
+fn map_io<T, E: std::error::Error + Send + Sync + 'static>(
+    p: std::task::Poll<std::result::Result<T, E>>,
+) -> std::task::Poll<std::io::Result<T>> {
+    p.map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)))
+}
+
+impl tokio::io::AsyncRead for IrohBiStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.recv).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for IrohBiStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        map_io(std::pin::Pin::new(&mut self.send).poll_write(cx, buf))
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        map_io(std::pin::Pin::new(&mut self.send).poll_flush(cx))
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        map_io(std::pin::Pin::new(&mut self.send).poll_shutdown(cx))
+    }
+}
+
 /// `P2pEndpoint` implementation backed by an `iroh::Endpoint`.
+///
+/// The set of supported application protocols (ALPNs) is fixed at
+/// construction; the same set MUST also have been registered on the
+/// wrapped `iroh::Endpoint` via `Endpoint::builder().alpns(...)` so the
+/// QUIC layer can negotiate them. `accept` rejects any peer whose
+/// negotiated ALPN is not in this set so the caller never sees an
+/// unknown protocol.
 pub struct IrohEndpoint {
     endpoint: iroh::Endpoint,
     local_id: crate::p2p::PeerId,
+    protocols: Vec<crate::p2p::P2pProtocol>,
 }
 
 impl IrohEndpoint {
-    /// Wrap an already-built `iroh::Endpoint`. Caches the local node id
-    /// so `P2pEndpoint::local_id` can stay synchronous.
-    pub async fn from_endpoint(endpoint: iroh::Endpoint) -> Self {
-        let node_addr = endpoint.node_addr().initialized().await;
-        let local_id = crate::p2p::PeerId::new(*node_addr.node_id.as_bytes());
-        Self { endpoint, local_id }
+    /// Wrap an already-built `iroh::Endpoint`. `protocols` must match
+    /// the ALPNs the endpoint was built with.
+    pub fn from_endpoint(
+        endpoint: iroh::Endpoint,
+        protocols: Vec<crate::p2p::P2pProtocol>,
+    ) -> Self {
+        let local_id = crate::p2p::PeerId::new(*endpoint.node_id().as_bytes());
+        Self {
+            endpoint,
+            local_id,
+            protocols,
+        }
     }
 
     /// Direct access to the underlying iroh endpoint. Intended for the
@@ -91,24 +158,65 @@ impl crate::p2p::P2pEndpoint for IrohEndpoint {
 
     async fn connect(
         &self,
-        _addr: &crate::p2p::PeerAddr,
-        _protocol: crate::p2p::P2pProtocol,
+        addr: &crate::p2p::PeerAddr,
+        protocol: crate::p2p::P2pProtocol,
     ) -> std::result::Result<Box<dyn crate::p2p::P2pStream>, crate::p2p::P2pError> {
-        Err(crate::p2p::P2pError::Backend(
-            "IrohEndpoint::connect: NetworkProcessor still owns this path; \
-             scheduled for step-4 migration"
-                .to_string(),
-        ))
+        let node_addr = iroh_node_addr_from_peer(addr)
+            .map_err(|e| crate::p2p::P2pError::Backend(e.to_string()))?;
+        let connection = self
+            .endpoint
+            .connect(node_addr, protocol.0)
+            .await
+            .map_err(|e| crate::p2p::P2pError::Connect(e.to_string()))?;
+        let (send, recv) = connection
+            .open_bi()
+            .await
+            .map_err(|e| crate::p2p::P2pError::Connect(format!("open_bi: {}", e)))?;
+        Ok(Box::new(IrohBiStream { send, recv }))
     }
 
     async fn accept(
         &self,
     ) -> std::result::Result<crate::p2p::P2pIncoming, crate::p2p::P2pError> {
-        Err(crate::p2p::P2pError::Backend(
-            "IrohEndpoint::accept: NetworkProcessor still owns this path; \
-             scheduled for step-4 migration"
-                .to_string(),
-        ))
+        let incoming = self
+            .endpoint
+            .accept()
+            .await
+            .ok_or(crate::p2p::P2pError::Closed)?;
+        let mut connecting = incoming
+            .accept()
+            .map_err(|e| crate::p2p::P2pError::Accept(e.to_string()))?;
+        let alpn_bytes = connecting
+            .alpn()
+            .await
+            .map_err(|e| crate::p2p::P2pError::Accept(format!("ALPN detection: {}", e)))?;
+        let protocol = self
+            .protocols
+            .iter()
+            .find(|p| p.0 == alpn_bytes.as_slice())
+            .copied()
+            .ok_or_else(|| {
+                crate::p2p::P2pError::Accept(format!(
+                    "Unknown ALPN: {:?}",
+                    String::from_utf8_lossy(alpn_bytes.as_slice())
+                ))
+            })?;
+        let connection = connecting
+            .await
+            .map_err(|e| crate::p2p::P2pError::Accept(e.to_string()))?;
+        let remote_node_id = connection
+            .remote_node_id()
+            .map_err(|e| crate::p2p::P2pError::Accept(format!("Remote NodeId: {}", e)))?;
+        let peer_id = crate::p2p::PeerId::new(*remote_node_id.as_bytes());
+        let (send, recv) = connection
+            .accept_bi()
+            .await
+            .map_err(|e| crate::p2p::P2pError::Accept(format!("accept_bi: {}", e)))?;
+        Ok(crate::p2p::P2pIncoming {
+            peer_id,
+            protocol,
+            stream: Box::new(IrohBiStream { send, recv }),
+        })
     }
 
     async fn close(&self) -> std::result::Result<(), crate::p2p::P2pError> {
