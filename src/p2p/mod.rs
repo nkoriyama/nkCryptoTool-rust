@@ -17,8 +17,10 @@
 //!   never propagated to callers.
 
 pub mod backend;
+mod processor;
 mod traits;
 mod types;
 
+pub use processor::NetworkProcessor;
 pub use traits::{P2pEndpoint, P2pIncoming, P2pStream};
 pub use types::{P2pError, P2pProtocol, PeerAddr, PeerId};

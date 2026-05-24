@@ -33,7 +33,7 @@ use nk_crypto_tool::config::{CryptoConfig, TransportKind};
 use nk_crypto_tool::network::{
     FileIOProvider, IOProvider, ProgressCallback, PROGRESS_CHUNK_BYTES,
 };
-use nk_crypto_tool::network::iroh::NetworkProcessor;
+use nk_crypto_tool::p2p::NetworkProcessor;
 use nk_crypto_tool::ticket::Ticket;
 
 const E2E_TIMEOUT: Duration = Duration::from_secs(60);
@@ -48,7 +48,7 @@ fn build_payload(size: usize) -> Vec<u8> {
     v
 }
 
-fn make_processor_with_file_io(
+async fn make_processor_with_file_io(
     file_io: Arc<dyn IOProvider>,
     connect_addr: Option<String>,
 ) -> NetworkProcessor {
@@ -58,7 +58,8 @@ fn make_processor_with_file_io(
     config.allow_unauth = true;
     config.transport = TransportKind::Iroh;
     config.connect_addr = connect_addr;
-    NetworkProcessor::with_io(config, file_io)
+    let endpoint = Arc::new(nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&config, false).await.unwrap());
+    NetworkProcessor::new(config, endpoint, file_io)
 }
 
 async fn run_e2e_transfer(payload_size: usize) {
@@ -76,7 +77,7 @@ async fn run_e2e_transfer(payload_size: usize) {
             .await
             .expect("recv io"),
     );
-    let listener = make_processor_with_file_io(listener_io, None);
+    let listener = make_processor_with_file_io(listener_io, None).await;
 
     // Bridge ticket from listener to connector via oneshot
     let (ticket_tx, ticket_rx) = tokio::sync::oneshot::channel::<String>();
@@ -108,7 +109,7 @@ async fn run_e2e_transfer(payload_size: usize) {
             .await
             .expect("send io"),
     );
-    let connector = make_processor_with_file_io(connector_io, Some(ticket_str));
+    let connector = make_processor_with_file_io(connector_io, Some(ticket_str)).await;
 
     let progress_count = Arc::new(AtomicU64::new(0));
     let last_sent = Arc::new(AtomicU64::new(0));
