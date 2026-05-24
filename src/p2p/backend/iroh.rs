@@ -268,6 +268,12 @@ impl crate::p2p::P2pEndpoint for IrohEndpoint {
 
 pub struct NetworkProcessor {
     config: CryptoConfig,
+    /// Transport-abstracted endpoint. Held even while the legacy
+    /// methods still drive iroh directly via `create_endpoint`, so the
+    /// DI hook is in place for callers that already construct an
+    /// `IrohEndpoint` (and, later, a `MockEndpoint` for tests).
+    #[allow(dead_code)] // wired up incrementally; full use lands in Step 3b.
+    endpoint: Arc<dyn crate::p2p::P2pEndpoint>,
     semaphore: Arc<Semaphore>,
     cached_allowlist: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
     io_provider: Arc<dyn IOProvider>,
@@ -287,22 +293,51 @@ impl Drop for EndpointGuard {
 }
 
 impl NetworkProcessor {
-    pub fn new(config: CryptoConfig) -> Self {
+    /// Construct with an explicit transport endpoint and IO provider.
+    /// This is the trait-friendly constructor; tests inject a
+    /// `MockEndpoint` here, production builds an `IrohEndpoint`.
+    pub fn new(
+        config: CryptoConfig,
+        endpoint: Arc<dyn crate::p2p::P2pEndpoint>,
+        io_provider: Arc<dyn IOProvider>,
+    ) -> Self {
         Self {
             config,
-            semaphore: Arc::new(Semaphore::new(10)),
-            cached_allowlist: None,
-            io_provider: Arc::new(DefaultIOProvider),
-        }
-    }
-
-    pub fn with_io(config: CryptoConfig, io_provider: Arc<dyn IOProvider>) -> Self {
-        Self {
-            config,
+            endpoint,
             semaphore: Arc::new(Semaphore::new(10)),
             cached_allowlist: None,
             io_provider,
         }
+    }
+
+    /// Convenience constructor that builds an `IrohEndpoint` from
+    /// `config` and uses the default IO provider. Equivalent to
+    /// `new(config, IrohEndpoint::new(&config, false).await?, DefaultIOProvider)`.
+    pub async fn new_iroh(config: CryptoConfig) -> Result<Self> {
+        let endpoint = Arc::new(IrohEndpoint::new(&config, false).await?);
+        Ok(Self::new(config, endpoint, Arc::new(DefaultIOProvider)))
+    }
+
+    /// Convenience constructor: explicit IO provider, IrohEndpoint
+    /// built internally. Used by GUI integrations.
+    pub async fn new_iroh_with_io(
+        config: CryptoConfig,
+        io_provider: Arc<dyn IOProvider>,
+    ) -> Result<Self> {
+        let endpoint = Arc::new(IrohEndpoint::new(&config, false).await?);
+        Ok(Self::new(config, endpoint, io_provider))
+    }
+
+    /// Test-only constructor: like `new_iroh_with_io` but with
+    /// `is_test=true` so the underlying iroh::Endpoint runs without
+    /// any relay (no dependency on the public relay network).
+    #[cfg(test)]
+    pub async fn new_iroh_with_io_for_test(
+        config: CryptoConfig,
+        io_provider: Arc<dyn IOProvider>,
+    ) -> Result<Self> {
+        let endpoint = Arc::new(IrohEndpoint::new(&config, true).await?);
+        Ok(Self::new(config, endpoint, io_provider))
     }
 
     pub async fn preload_allowlist(&mut self) -> Result<()> {
@@ -330,13 +365,13 @@ impl NetworkProcessor {
     }
 
     pub async fn listen(config: &CryptoConfig) -> Result<()> {
-        let mut processor = Self::new(config.clone());
+        let mut processor = Self::new_iroh(config.clone()).await?;
         processor.preload_allowlist().await?;
         processor.start().await
     }
 
     pub async fn connect(config: &CryptoConfig) -> Result<()> {
-        let mut processor = Self::new(config.clone());
+        let mut processor = Self::new_iroh(config.clone()).await?;
         processor.preload_allowlist().await?;
         processor.run_connect().await
     }
@@ -1111,7 +1146,7 @@ mod tests {
         server_config.allow_unauth = true;
         server_config.handshake_timeout = 2;
         let server_task = tokio::spawn(async move {
-            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            let mut processor = NetworkProcessor::new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.preload_allowlist().await.unwrap();
             let endpoint = processor.create_endpoint(true).await.unwrap();
             let _guard = EndpointGuard(endpoint.clone());
@@ -1126,7 +1161,7 @@ mod tests {
         client_config.allow_unauth = true;
         client_config.handshake_timeout = 2;
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
+            let processor = NetworkProcessor::new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.run_connect().await
         }).await;
         server_task.abort();
@@ -1159,7 +1194,7 @@ mod tests {
         server_config.signing_pubkey = Some(c_pub_path.to_str().unwrap().to_string());
         server_config.handshake_timeout = 2;
         let _server_task = tokio::spawn(async move {
-            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            let mut processor = NetworkProcessor::new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.preload_allowlist().await.unwrap();
             let endpoint = processor.create_endpoint(true).await.unwrap();
             let _guard = EndpointGuard(endpoint.clone());
@@ -1176,7 +1211,7 @@ mod tests {
         client_config.signing_pubkey = Some(s_pub_path.to_str().unwrap().to_string());
         client_config.handshake_timeout = 2;
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
+            let processor = NetworkProcessor::new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_ok());
@@ -1207,7 +1242,7 @@ mod tests {
         server_config.signing_privkey = Some(s_key_path.to_str().unwrap().to_string());
         server_config.handshake_timeout = 2;
         let _server_task = tokio::spawn(async move {
-            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            let mut processor = NetworkProcessor::new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.preload_allowlist().await.unwrap();
             let endpoint = processor.create_endpoint(true).await.unwrap();
             let _guard = EndpointGuard(endpoint.clone());
@@ -1222,7 +1257,7 @@ mod tests {
         client_config.allow_unauth = true;
         client_config.handshake_timeout = 2;
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
+            let processor = NetworkProcessor::new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_err());
@@ -1254,7 +1289,7 @@ mod tests {
         server_config.signing_pubkey = Some(c_pub_path.to_str().unwrap().to_string());
         server_config.handshake_timeout = 2;
         let _server_task = tokio::spawn(async move {
-            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            let mut processor = NetworkProcessor::new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.preload_allowlist().await.unwrap();
             let endpoint = processor.create_endpoint(true).await.unwrap();
             let _guard = EndpointGuard(endpoint.clone());
@@ -1268,7 +1303,7 @@ mod tests {
         client_config.chat_mode = false;
         client_config.allow_unauth = true;
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
+            let processor = NetworkProcessor::new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_err());
@@ -1290,7 +1325,7 @@ mod tests {
         server_config.peer_allowlist = Some(allowlist_path.to_str().unwrap().to_string());
         server_config.handshake_timeout = 2;
         let _server_task = tokio::spawn(async move {
-            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            let mut processor = NetworkProcessor::new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.preload_allowlist().await.unwrap();
             let endpoint = processor.create_endpoint(true).await.unwrap();
             let _guard = EndpointGuard(endpoint.clone());
@@ -1304,7 +1339,7 @@ mod tests {
         client_config.chat_mode = false;
         client_config.allow_unauth = true;
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
+            let processor = NetworkProcessor::new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_err());
@@ -1333,7 +1368,7 @@ mod tests {
         server_config.peer_allowlist = Some(allowlist_path.to_str().unwrap().to_string());
         server_config.handshake_timeout = 2;
         let _server_task = tokio::spawn(async move {
-            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            let mut processor = NetworkProcessor::new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.preload_allowlist().await.unwrap();
             let endpoint = processor.create_endpoint(true).await.unwrap();
             let _guard = EndpointGuard(endpoint.clone());
@@ -1348,7 +1383,7 @@ mod tests {
         client_config.allow_unauth = false;
         client_config.signing_privkey = Some(c_key_path.to_str().unwrap().to_string());
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
+            let processor = NetworkProcessor::new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_ok());
@@ -1365,7 +1400,7 @@ mod tests {
         server_config.chat_mode = true;
         server_config.allow_unauth = true;
         let _server_task = tokio::spawn(async move {
-            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            let mut processor = NetworkProcessor::new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.preload_allowlist().await.unwrap();
             let endpoint = processor.create_endpoint(true).await.unwrap();
             let _guard = EndpointGuard(endpoint.clone());
@@ -1379,7 +1414,7 @@ mod tests {
         client_config.chat_mode = true;
         client_config.allow_unauth = true;
         let client_res = tokio::time::timeout(Duration::from_secs(5), async {
-            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
+            let processor = NetworkProcessor::new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.run_connect().await
         }).await;
         // After F-IROH-39 fix, stdin EOF should lead to a clean exit, not a timeout.
@@ -1400,7 +1435,7 @@ mod tests {
         server_config.chat_mode = false;
         server_config.allow_unauth = true;
         let _server_task = tokio::spawn(async move {
-            let mut processor = NetworkProcessor::with_io(server_config, Arc::new(TestIOProvider));
+            let mut processor = NetworkProcessor::new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.preload_allowlist().await.unwrap();
             let endpoint = processor.create_endpoint(true).await.unwrap();
             let _guard = EndpointGuard(endpoint.clone());
@@ -1414,7 +1449,7 @@ mod tests {
         client_config.chat_mode = false;
         client_config.allow_unauth = true;
         let client_res = tokio::time::timeout(Duration::from_secs(2), async {
-            let processor = NetworkProcessor::with_io(client_config, Arc::new(TestIOProvider));
+            let processor = NetworkProcessor::new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await.unwrap();
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_ok());
