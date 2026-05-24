@@ -10,6 +10,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  p2p-abstraction-check:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Enforce iroh-crate imports only live in src/p2p/backend/iroh.rs
+      run: bash scripts/check_p2p_abstraction.sh
+
   build:
     runs-on: ubuntu-latest
     strategy:
