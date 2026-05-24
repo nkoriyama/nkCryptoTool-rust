@@ -4853,6 +4853,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "arboard",
+ "async-trait",
  "base64 0.21.7",
  "chacha20",
  "chacha20poly1305",

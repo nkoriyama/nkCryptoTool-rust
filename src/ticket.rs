@@ -1,7 +1,7 @@
-use iroh::{NodeId, NodeAddr, RelayUrl};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use crate::error::{CryptoError, Result};
+use crate::p2p::{PeerAddr, PeerId};
 use data_encoding::BASE32_NOPAD;
 use crc::{Crc, CRC_32_ISO_HDLC};
 use serde::{Deserialize, Serialize};
@@ -20,7 +20,10 @@ pub struct Ticket {
 }
 
 impl Ticket {
-    pub fn new(node_addr: NodeAddr, pqc_sign_fp: Option<[u8; 32]>, pqc_enc_fp: Option<[u8; 32]>) -> Self {
+    /// Build a ticket from a transport-agnostic [`PeerAddr`]. Backends
+    /// (currently iroh) are responsible for converting their native
+    /// address type to [`PeerAddr`] before calling this.
+    pub fn new(addr: PeerAddr, pqc_sign_fp: Option<[u8; 32]>, pqc_enc_fp: Option<[u8; 32]>) -> Self {
         let mut algo = 0u8;
         let mut sign_fp = [0u8; 32];
         let mut enc_fp = [0u8; 32];
@@ -36,26 +39,24 @@ impl Ticket {
 
         Self {
             version: 1,
-            node_id: *node_addr.node_id.as_bytes(),
-            relay_url: node_addr.relay_url.map(|u| u.to_string()),
-            direct_addrs: node_addr.direct_addresses.into_iter().collect(),
+            node_id: addr.peer_id.to_bytes(),
+            relay_url: addr.relay_url,
+            direct_addrs: addr.direct_addrs,
             pqc_fp_algo: algo,
             pqc_sign_fp: sign_fp,
             pqc_enc_fp: enc_fp,
         }
     }
 
-    pub fn node_addr(&self) -> Result<NodeAddr> {
-        let node_id = NodeId::from_bytes(&self.node_id).map_err(|e| CryptoError::Parameter(format!("Invalid NodeId: {}", e)))?;
-        let relay_url = self.relay_url.as_ref()
-            .map(|s| RelayUrl::from_str(s).map_err(|e| CryptoError::Parameter(format!("Invalid RelayUrl: {}", e))))
-            .transpose()?;
-        
-        Ok(NodeAddr {
-            node_id,
-            relay_url,
-            direct_addresses: self.direct_addrs.iter().cloned().collect(),
-        })
+    /// Extract the transport-agnostic address. Infallible — the ticket
+    /// already stores the address in its canonical wire form. Backends
+    /// convert this to their native address type at use time.
+    pub fn peer_addr(&self) -> PeerAddr {
+        PeerAddr {
+            peer_id: PeerId::new(self.node_id),
+            relay_url: self.relay_url.clone(),
+            direct_addrs: self.direct_addrs.clone(),
+        }
     }
 
     pub fn to_string(&self) -> String {
