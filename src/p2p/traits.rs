@@ -35,6 +35,12 @@ pub trait P2pEndpoint: Send + Sync {
     /// This node's stable identifier.
     fn local_id(&self) -> PeerId;
 
+    /// This node's reachable address (PeerId + optional relay URL +
+    /// known direct socket addresses). Used by listener-side code to
+    /// build connection tickets without exposing a backend type. May
+    /// involve awaiting backend reachability initialisation.
+    async fn local_addr(&self) -> Result<PeerAddr, P2pError>;
+
     /// Open a new bidirectional stream to `addr` under `protocol`.
     /// Backends are responsible for NAT traversal, discovery, and relay
     /// fallback as configured at construction time.

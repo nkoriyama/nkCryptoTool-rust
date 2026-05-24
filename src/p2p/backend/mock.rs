@@ -90,6 +90,12 @@ impl P2pEndpoint for MockEndpoint {
         self.peer_id
     }
 
+    async fn local_addr(&self) -> Result<PeerAddr, P2pError> {
+        // Mock has no transport, so the reachable address is just the
+        // PeerId — direct_addrs / relay_url are not meaningful here.
+        Ok(PeerAddr::new(self.peer_id))
+    }
+
     async fn connect(
         &self,
         addr: &PeerAddr,

@@ -142,6 +142,40 @@ impl IrohEndpoint {
         }
     }
 
+    /// Convenience constructor: builds an `iroh::Endpoint` configured
+    /// from `config` (relay mode honours `no_relay` / `relay_url`),
+    /// registers the application's two ALPNs (`ALPN_CHAT`, `ALPN_FILE`),
+    /// and wraps the result.
+    ///
+    /// `is_test=true` forces `RelayMode::Disabled` regardless of config
+    /// so the integration test suite does not depend on the public
+    /// relay network.
+    pub async fn new(config: &CryptoConfig, is_test: bool) -> Result<Self> {
+        let mut builder = Endpoint::builder()
+            .alpns(vec![ALPN_CHAT.to_vec(), ALPN_FILE.to_vec()]);
+
+        if is_test || config.no_relay {
+            builder = builder.relay_mode(iroh::RelayMode::Disabled);
+        } else if let Some(ref url) = config.relay_url {
+            let relay_url = iroh::RelayUrl::from_str(url)
+                .map_err(|e| CryptoError::Parameter(format!("Invalid RelayUrl: {}", e)))?;
+            builder = builder.relay_mode(iroh::RelayMode::Custom(
+                iroh_relay::RelayMap::from(relay_url),
+            ));
+        }
+
+        let endpoint = builder
+            .bind()
+            .await
+            .map_err(|e| CryptoError::Parameter(e.to_string()))?;
+
+        let protocols = vec![
+            crate::p2p::P2pProtocol(ALPN_CHAT),
+            crate::p2p::P2pProtocol(ALPN_FILE),
+        ];
+        Ok(Self::from_endpoint(endpoint, protocols))
+    }
+
     /// Direct access to the underlying iroh endpoint. Intended for the
     /// transitional period only — application code should reach for the
     /// trait, not this method.
@@ -154,6 +188,13 @@ impl IrohEndpoint {
 impl crate::p2p::P2pEndpoint for IrohEndpoint {
     fn local_id(&self) -> crate::p2p::PeerId {
         self.local_id
+    }
+
+    async fn local_addr(
+        &self,
+    ) -> std::result::Result<crate::p2p::PeerAddr, crate::p2p::P2pError> {
+        let node_addr = self.endpoint.node_addr().initialized().await;
+        Ok(peer_addr_from_iroh(&node_addr))
     }
 
     async fn connect(
