@@ -210,46 +210,59 @@ FORBIDDEN=$(grep -rEn "$PATTERN" src/ --include='*.rs' | grep -v "^src/p2p/backe
 | `src/p2p/` に trait と型が定義、公開 API として re-export | ✅ | `mod.rs` で集約 |
 | 既存 iroh コードが `backend/iroh.rs` に移送、振る舞い不変 | ✅ | ファイル移動 + path 更新のみ |
 | `backend/iroh.rs` 以外に `iroh::` 出現なし (grep 通過) | ✅ | doc/自前パスは正常に除外 |
-| モック実装と決定的ユニットテスト少なくとも1つ green | ✅ | **4 件 green** |
-| アプリ本体が trait 越しにのみ P2P を利用 | △ **部分達成** | `IrohEndpoint` は完全実装。`NetworkProcessor` 本体の trait 化は別 PR (§9 参照) |
+| モック実装と決定的ユニットテスト少なくとも1つ green | ✅ | **5 件 green**（mock 4 + processor handshake 1）|
+| アプリ本体が trait 越しにのみ P2P を利用 | ✅ | `NetworkProcessor` は `src/p2p/processor.rs` に移送され、内部処理は `self.endpoint: Arc<dyn P2pEndpoint>` 経由のみ |
 | iroh エラーが `P2pError` に変換、生のまま漏れない | ✅ | `IrohEndpoint` 実装ですべて map |
 | CI に 3 系統 (grep / mock / 実ネット分離) | ✅ | grep 新規, mock は通常 `cargo test`, 実ネットは既存 `#[ignore]` |
 
----
-
-## 9. 残作業 (別 PR 推奨)
-
-### 9.1 NetworkProcessor の trait 化
-現在 `NetworkProcessor` (約 1000 行の NKCT プロトコル実装) は `iroh::Endpoint::accept_bi()` / `open_bi()` を 3 箇所で直接呼んでいる:
-
-| 行 | 場所 | 目的 |
-|---|---|---|
-| `accept_bi` 327 | listen_loop の通常 accept | サーバ受信 |
-| `accept_bi` 457 | run_listen_once の単発 accept | GUI 連携 |
-| `open_bi` 742 | run_connect の client 接続 | クライアント送信 |
-
-これらを `Box<dyn P2pEndpoint>::accept()` / `connect()` 経由に書き換えれば、NKCT ハンドシェイク / chat / file transfer のプロトコル単体テストを mock 上で記述可能になる。現状 `#[ignore]` 化されている flaky な e2e の決定的代替が成立し、CI 安定化に直接寄与する。
-
-### 9.2 推奨される変更スコープ
-- `NetworkProcessor::start` などの関数群が `IrohEndpoint` (または `Box<dyn P2pEndpoint>`) を受け取るよう構築時 DI 化
-- 内部の `endpoint.connect/accept_bi/open_bi/node_id/node_addr` 直接呼び出しを trait 越しに
-- 既存テスト全通過の確認 + mock 上の新規プロトコルテスト追加
-
-### 9.3 リスクと対応
-- **ライブの secure transport** なので注意深い差分レビューが必要 → 単一 PR で完結させ、レビュー粒度を確保
-- 振る舞い不変リファクタに徹し、機能追加・最適化は別 PR (仕様書§9 アンチパターン)
+**DoD 全項目達成。**
 
 ---
 
-## 10. 結論
+## 9. 経過 (フェーズ別)
+
+実装は 6 フェーズに分割して進めた。各フェーズで個別にコミットし、検証を挟みつつ段階的に到達。
+
+| フェーズ | 内容 | 主担当 | コミット |
+|---|---|---|---|
+| Phase 1 | `local_addr` を trait に追加 + 各 backend 実装 | この session | `3b5c2377` |
+| Phase 2 | `IrohEndpoint::new(config, is_test)` ファクトリ追加 | 同上 | (同コミット) |
+| Phase 3a | NetworkProcessor 構造体 DI 化 (`endpoint: Arc<dyn P2pEndpoint>` 保持, コンストラクタ統合, GUI/tests 全更新) | この session | `8355c134` |
+| Phase 3b | NetworkProcessor 内部メソッドの本格 trait 化 (create_endpoint/EndpointGuard 廃止, accept_bi/open_bi → trait.accept/connect, NodeId → PeerId, tokio::io::split で stream を半割り) | Antigravity 経由 | `a49cbb4a` |
+| Phase 4 | NetworkProcessor を `src/p2p/processor.rs` に移送 (transport 非依存層へ昇格) | 同上 (Phase 3b と同コミット) | (同) |
+| Phase 5 | `network/mod.rs` / `gui/mod.rs` / `tests/e2e_file_transfer.rs` を新 API に追従 | 同上 | (同) |
+| Phase 6 | mock backend 上の決定的プロトコルテスト追加 | 同上 | (同) |
+
+Phase 3b 〜 6 は外部実装 (Google Antigravity) により1コミットで完結。内部メソッド refactor は約 1000 行に及び、リスクの高い「ライブ secure transport」を扱うため、振る舞い不変リファクタに徹する原則を守って遂行された。
+
+---
+
+## 10. 検証結果 (最終)
+
+| チェック | 結果 |
+|---|---|
+| OpenSSL backend build (release) | ✅ |
+| RustCrypto backend build (release) | ✅ |
+| 全テスト (`cargo test`) | **53 passed, 14 ignored**（11 suites）|
+| lib 単体テスト | 23 passed |
+| `scripts/check_p2p_abstraction.sh` | ✅ クリーン |
+| `src/p2p/backend/iroh.rs` 行数 | 1300+ → **609** (NetworkProcessor 抽出で大幅縮小) |
+| `src/p2p/processor.rs` (新規, 抽象 NetworkProcessor) | 755 行 |
+
+---
+
+## 11. 結論
+
+**P2P 抽象化は完成した。**
 
 | 項目 | 状態 |
 |---|---|
 | 抽象化の基盤 (trait / 型 / エラー正規化) | ✅ 完成 |
 | iroh-crate の局所化 | ✅ 完全 (`backend/iroh.rs` 内のみ) |
 | CI による自動検出 | ✅ 稼働 |
-| mock backend と決定的テスト | ✅ 4 件 |
+| mock backend と決定的テスト | ✅ 5 件 (mock 4 + processor handshake 1) |
 | `IrohEndpoint` 完全実装 | ✅ |
-| `NetworkProcessor` の trait 経由化 | ⏳ 別 PR |
+| **`NetworkProcessor` の trait 経由化** | ✅ **完了**（`src/p2p/processor.rs`、transport 非依存）|
+| アプリ全体が trait 越しにのみ P2P を利用 | ✅ |
 
-仕様書§7 DoD のうち 6/7 を達成。残る 1 項 (アプリ本体の trait 化) は焦点を絞った別 PR が望ましいサイズ・リスクである。**抽象化の契約・基盤・テスト土台・CI 自動検出は今回ですべて揃ったので、次の PR の足場は完成している。**
+仕様書 §7 DoD 全項目を満たし、§0 の便益（テスト容易性・関心の分離・依存の局所化・要件の明文化）はすべて確保された。将来的な `libp2p` 等への差し替え (副次目的) も、`backend/` 下に並列実装を追加するだけで成立する設計に到達している。
