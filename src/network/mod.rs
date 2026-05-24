@@ -1,4 +1,3 @@
-pub mod iroh;
 pub mod tcp;
 
 use crate::backend;
@@ -249,14 +248,14 @@ impl NetworkProcessor {
     pub async fn listen(config: &CryptoConfig) -> Result<()> {
         match config.transport {
             TransportKind::Tcp => tcp::NetworkProcessor::listen(config).await,
-            TransportKind::Iroh => iroh::NetworkProcessor::listen(config).await,
+            TransportKind::Iroh => crate::p2p::backend::iroh::NetworkProcessor::listen(config).await,
         }
     }
 
     pub async fn connect(config: &CryptoConfig) -> Result<()> {
         match config.transport {
             TransportKind::Tcp => tcp::NetworkProcessor::connect(config).await,
-            TransportKind::Iroh => iroh::NetworkProcessor::connect(config).await,
+            TransportKind::Iroh => crate::p2p::backend::iroh::NetworkProcessor::connect(config).await,
         }
     }
 

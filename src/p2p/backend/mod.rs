@@ -4,7 +4,10 @@
 //! CI (`! grep -rn 'iroh::' src/ ...`) is that iroh-specific types
 //! appear only under `backend/iroh.rs` and nowhere else in the crate.
 //!
-//! Submodules will be populated in subsequent steps:
-//! - `iroh`: moved from `crate::network::iroh`, wraps `iroh::Endpoint`.
-//! - `mock`: in-memory `tokio::io::duplex` backend for deterministic
-//!   unit tests of application protocols (chat, file transfer).
+//! - `iroh`: wraps `iroh::Endpoint`. The `IrohEndpoint` skeleton
+//!   implements the `P2pEndpoint` trait; the legacy `NetworkProcessor`
+//!   still lives here pending its own transport-level refactor.
+//! - `mock`: (planned) in-memory `tokio::io::duplex` backend for
+//!   deterministic unit tests of application protocols.
+
+pub mod iroh;
