@@ -19,6 +19,11 @@ pub const CHAT_SESSION_TIMEOUT: Duration = Duration::from_secs(7200); // 2 hours
 
 pub const ALPN_CHAT: &[u8] = b"nkct/chat/1";
 pub const ALPN_FILE: &[u8] = b"nkct/file/1";
+/// MLS group chat ALPN (P4). Each accepted stream under this protocol
+/// carries exactly one length-prefixed `mls_rs::MlsMessage` per the
+/// [`crate::group::transport`] framing helpers — Welcome / Commit /
+/// Application / Proposal as discriminated by `MlsMessage::wire_format`.
+pub const ALPN_MLS: &[u8] = b"nkct/mls/1";
 
 /// F3: 64 KiB chunk threshold for progress callback emission. Progress is
 /// emitted at most once per `PROGRESS_CHUNK_BYTES` bytes plus a final emission

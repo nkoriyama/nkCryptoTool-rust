@@ -127,8 +127,12 @@ pub enum GroupError {
     NotFound,
     #[error("not a member of this group")]
     NotMember,
-    #[error("invalid welcome / key package")]
-    InvalidWelcome,
+    /// The caller-provided byte buffer was not the expected MLS
+    /// message type (Welcome / KeyPackage) or failed wire decode.
+    /// String carries the underlying detail for logging — callers
+    /// match on the variant, not the string content.
+    #[error("invalid welcome / key package: {0}")]
+    InvalidWelcome(String),
     #[error("transport: {0}")]
     Transport(#[from] crate::p2p::P2pError),
     #[error("storage: {0}")]

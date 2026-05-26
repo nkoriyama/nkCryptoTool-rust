@@ -1,6 +1,6 @@
 use crate::config::CryptoConfig;
 use crate::error::{CryptoError, Result};
-use crate::network::{ALPN_CHAT, ALPN_FILE};
+use crate::network::{ALPN_CHAT, ALPN_FILE, ALPN_MLS};
 use iroh::{Endpoint, Watcher};
 use std::str::FromStr;
 
@@ -133,15 +133,18 @@ impl IrohEndpoint {
 
     /// Convenience constructor: builds an `iroh::Endpoint` configured
     /// from `config` (relay mode honours `no_relay` / `relay_url`),
-    /// registers the application's two ALPNs (`ALPN_CHAT`, `ALPN_FILE`),
-    /// and wraps the result.
+    /// registers the application's ALPNs (`ALPN_CHAT`, `ALPN_FILE`,
+    /// `ALPN_MLS`), and wraps the result.
     ///
     /// `is_test=true` forces `RelayMode::Disabled` regardless of config
     /// so the integration test suite does not depend on the public
     /// relay network.
     pub async fn new(config: &CryptoConfig, is_test: bool) -> Result<Self> {
-        let mut builder = Endpoint::builder()
-            .alpns(vec![ALPN_CHAT.to_vec(), ALPN_FILE.to_vec()]);
+        let mut builder = Endpoint::builder().alpns(vec![
+            ALPN_CHAT.to_vec(),
+            ALPN_FILE.to_vec(),
+            ALPN_MLS.to_vec(),
+        ]);
 
         if is_test || config.no_relay {
             builder = builder.relay_mode(iroh::RelayMode::Disabled);
@@ -161,6 +164,7 @@ impl IrohEndpoint {
         let protocols = vec![
             crate::p2p::P2pProtocol(ALPN_CHAT),
             crate::p2p::P2pProtocol(ALPN_FILE),
+            crate::p2p::P2pProtocol(ALPN_MLS),
         ];
         Ok(Self::from_endpoint(endpoint, protocols))
     }

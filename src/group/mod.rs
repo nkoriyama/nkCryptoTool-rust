@@ -21,6 +21,7 @@
 pub mod crypto_adapter;
 pub mod processor;
 pub mod storage;
+pub mod transport;
 pub mod types;
 
 pub use crypto_adapter::{hybrid_cipher_suite, HYBRID_SUITE_ID};
