@@ -27,4 +27,7 @@ pub mod types;
 pub use crypto_adapter::{hybrid_cipher_suite, HYBRID_SUITE_ID};
 pub use processor::GroupChatProcessor;
 pub use storage::{GroupStorage, TunedFileStrategy};
-pub use types::{GroupError, GroupId, GroupMessage, GroupSummary, MemberId, Welcome};
+pub use types::{
+    AddMemberOutput, GroupError, GroupId, GroupMessage, GroupSummary, IncomingGroupEvent,
+    MemberId, Welcome,
+};

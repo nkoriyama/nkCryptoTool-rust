@@ -102,6 +102,76 @@ impl fmt::Debug for Welcome {
     }
 }
 
+/// Both sides of an `add_member` operation.
+///
+/// `welcome` is the per-new-member MLS Welcome to be delivered to the
+/// admitted peer (see [`crate::group::GroupChatProcessor::send_welcome_to`]).
+/// `commit` is the MLS Commit message that *existing* members of the
+/// group need to process so they advance to the new epoch — broadcast
+/// to every current member except the new joiner via
+/// [`crate::group::GroupChatProcessor::broadcast_commit`].
+///
+/// For a 2-member-after case (group of 1 → 2) the commit has nothing
+/// to do downstream because there are no pre-existing members besides
+/// the committer; the field is still populated for shape uniformity.
+///
+/// Both fields are `Zeroizing` because their contents include
+/// HPKE-protected secrets bound to the new epoch's key schedule —
+/// defense-in-depth wipes them from process memory when callers drop
+/// the struct.
+pub struct AddMemberOutput {
+    pub welcome: Zeroizing<Vec<u8>>,
+    pub commit: Zeroizing<Vec<u8>>,
+}
+
+impl fmt::Debug for AddMemberOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Don't print the bytes — they include encrypted key material.
+        f.debug_struct("AddMemberOutput")
+            .field("welcome_len", &self.welcome.len())
+            .field("commit_len", &self.commit.len())
+            .finish()
+    }
+}
+
+/// One event surfaced by
+/// [`crate::group::GroupChatProcessor::accept_next`].
+///
+/// Variants correspond to the MLS message types the application has to
+/// react to. P3+P4 added the [`NewGroup`](Self::NewGroup) and basic
+/// per-frame ingest; P5 (this revision) extends the dispatcher with
+/// [`Message`](Self::Message) (decrypted application body) and
+/// [`EpochAdvanced`](Self::EpochAdvanced) (an existing group moved to
+/// a new epoch because someone else committed an Add or Remove).
+#[derive(Clone, Debug)]
+pub enum IncomingGroupEvent {
+    /// A `Welcome` was received and processed; we are now a member of
+    /// a new group.
+    NewGroup {
+        id: GroupId,
+    },
+    /// An application message was received and decrypted.
+    Message {
+        group_id: GroupId,
+        /// Sender's leaf index in the group's TreeKEM. Stable across
+        /// the lifetime of a member; combined with the roster (looked
+        /// up separately) it identifies who sent the message.
+        sender_index: u32,
+        /// Decoded body. UTF-8 lossy decoding is the responsibility of
+        /// the *display* layer, not this layer — the raw bytes are
+        /// returned verbatim so non-text payloads (file metadata,
+        /// future binary extensions) remain usable.
+        body: Vec<u8>,
+    },
+    /// An existing group advanced by one epoch because a Commit was
+    /// processed. The group state has already been persisted by the
+    /// time this event surfaces.
+    EpochAdvanced {
+        group_id: GroupId,
+        new_epoch: u64,
+    },
+}
+
 /// Snapshot of a group's state suitable for read-only display.
 ///
 /// Returned by [`crate::group::GroupChatProcessor::load_group_summary`]

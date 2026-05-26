@@ -48,7 +48,9 @@ use zeroize::Zeroizing;
 
 use crate::group::crypto_adapter::{hybrid_cipher_suite, HybridCryptoProvider};
 use crate::group::storage::GroupStorage;
-use crate::group::types::{GroupError, GroupId, GroupSummary};
+use crate::group::types::{
+    AddMemberOutput, GroupError, GroupId, GroupSummary, IncomingGroupEvent,
+};
 use crate::p2p::P2pEndpoint;
 
 /// MLS-RS `Config` shape after stacking our storage providers and
@@ -246,8 +248,8 @@ impl GroupChatProcessor {
         Ok(Zeroizing::new(bytes))
     }
 
-    /// Add a member to an existing group and return the `Welcome` blob
-    /// to hand to that new member.
+    /// Add a member to an existing group and return both the `Welcome`
+    /// (for the new joiner) and the `Commit` (for existing members).
     ///
     /// `gid` identifies a group this processor already owns (per
     /// [`list_groups`](Self::list_groups)). `key_package_bytes` is a
@@ -255,14 +257,19 @@ impl GroupChatProcessor {
     /// [`export_key_package`]).
     ///
     /// On success, the group state on this side has advanced by one
-    /// epoch (the Add commit is applied and persisted) and the returned
-    /// bytes are the `Welcome` MLS message that the new member needs
-    /// to call [`join_group_from_welcome`].
+    /// epoch (the Add commit is applied and persisted). The returned
+    /// [`AddMemberOutput`] carries:
     ///
-    /// A `Commit` message bound for *existing* members is NOT returned
-    /// here — for the 2-member case there are no existing-member
-    /// recipients, and for ≥ 3 it's the caller's job to broadcast the
-    /// commit (P5 work). The plan §7.2 covers this split.
+    /// - `welcome` — pass to the new joiner via
+    ///   [`send_welcome_to`](Self::send_welcome_to). They then call
+    ///   [`join_group_from_welcome`] (or react to a
+    ///   [`IncomingGroupEvent::NewGroup`](crate::group::IncomingGroupEvent)
+    ///   from [`accept_next`](Self::accept_next)).
+    /// - `commit` — broadcast to every *existing* member except the
+    ///   new joiner via [`broadcast_commit`](Self::broadcast_commit).
+    ///   For the 2-member-after case (group of 1 → 2) there are no
+    ///   existing members and the commit is effectively a no-op, but
+    ///   it is still produced so the field is meaningful for callers.
     ///
     /// Failure modes:
     /// - `GroupError::NotFound` — `gid` is not present in storage.
@@ -279,7 +286,7 @@ impl GroupChatProcessor {
         &self,
         gid: &GroupId,
         key_package_bytes: &[u8],
-    ) -> Result<Zeroizing<Vec<u8>>, GroupError> {
+    ) -> Result<AddMemberOutput, GroupError> {
         // Parse the caller's bytes back into a typed MlsMessage and
         // confirm it's actually a KeyPackage (otherwise mls-rs's
         // commit_builder gives a confusing error).
@@ -330,7 +337,14 @@ impl GroupChatProcessor {
         let welcome_bytes = commit_output.welcome_messages[0]
             .to_bytes()
             .map_err(|e| GroupError::Backend(format!("Welcome encode: {e}")))?;
-        Ok(Zeroizing::new(welcome_bytes))
+        let commit_bytes = commit_output
+            .commit_message
+            .to_bytes()
+            .map_err(|e| GroupError::Backend(format!("Commit encode: {e}")))?;
+        Ok(AddMemberOutput {
+            welcome: Zeroizing::new(welcome_bytes),
+            commit: Zeroizing::new(commit_bytes),
+        })
     }
 
     /// Accept a `Welcome` blob and join the group it admits us to.
@@ -486,6 +500,237 @@ impl GroupChatProcessor {
             )));
         }
         self.join_group_from_welcome(&raw).await
+    }
+
+    /// Encrypt an application message and broadcast it to a list of
+    /// recipients over `nkct/mls/1` (P5).
+    ///
+    /// `body` is the plaintext payload (raw bytes — the UI layer is
+    /// responsible for character-set decisions). `recipients` is the
+    /// **N − 1** peer addresses that should receive the message — the
+    /// caller maintains the `MemberId → PeerAddr` mapping outside this
+    /// module (mls-rs only knows the SigningIdentity, not the network
+    /// address).
+    ///
+    /// MLS Private messages are *not* self-decryptable by design
+    /// (RFC 9420 §15.1 — only counterparties can derive the per-sender
+    /// secret needed to open the AEAD). The caller is therefore
+    /// expected to echo `body` to its own UI separately; this method
+    /// also returns the encrypted bytes so callers wanting an exact
+    /// record-of-send can persist the wire form.
+    ///
+    /// The group state advances by one ratchet generation per
+    /// `encrypt_application_message`. The state is flushed to sqlite
+    /// before the broadcast starts so a crash mid-send doesn't leave
+    /// our key schedule out of sync with what peers will see.
+    pub async fn send_application_message(
+        &self,
+        gid: &GroupId,
+        body: &[u8],
+        recipients: &[crate::p2p::PeerAddr],
+    ) -> Result<Zeroizing<Vec<u8>>, GroupError> {
+        let mut group = self.client.load_group(gid.as_bytes()).map_err(|e| {
+            let msg = format!("{e}");
+            if msg.contains("GroupNotFound") || msg.contains("group not found") {
+                GroupError::NotFound
+            } else {
+                GroupError::Backend(format!("load_group for send: {e}"))
+            }
+        })?;
+
+        let msg = group
+            .encrypt_application_message(body, Vec::new())
+            .map_err(|e| GroupError::Backend(format!("encrypt_application_message: {e}")))?;
+        // Persist the advanced key schedule before fanning out — if a
+        // recipient receives the encrypted message but our state was
+        // never written, a subsequent re-encrypt could reuse a nonce.
+        // sqlite WAL + busy_timeout makes this a single quick write.
+        group
+            .write_to_storage()
+            .map_err(|e| GroupError::Storage(format!("write_to_storage after encrypt: {e}")))?;
+
+        let wire_bytes = msg
+            .to_bytes()
+            .map_err(|e| GroupError::Backend(format!("PrivateMessage encode: {e}")))?;
+
+        // Fan-out. We send one stream per recipient (1 frame = 1
+        // MlsMessage per the §5.4 contract). Any failure surfaces;
+        // partial fan-out is reported as the first error so the caller
+        // can choose to retry or compensate. We continue past a single
+        // failure on best-effort transports, but here we stop early —
+        // peer dropouts are visible in `endpoint.connect` errors.
+        for addr in recipients {
+            crate::group::transport::send_one(self.endpoint.as_ref(), addr, &msg)
+                .await
+                .map_err(|e| match e {
+                    crate::group::transport::FramingError::Transport(p) => {
+                        GroupError::Transport(p)
+                    }
+                    other => {
+                        GroupError::Backend(format!("send_application_message: {other}"))
+                    }
+                })?;
+        }
+
+        Ok(Zeroizing::new(wire_bytes))
+    }
+
+    /// Broadcast a previously-built Commit message to a list of
+    /// existing-member recipients (P5).
+    ///
+    /// `commit_bytes` is the [`AddMemberOutput::commit`] returned by
+    /// [`add_member`]. Recipients receive it via `accept_next` and
+    /// surface it as
+    /// [`IncomingGroupEvent::EpochAdvanced`](crate::group::IncomingGroupEvent::EpochAdvanced).
+    ///
+    /// For a 1 → 2 group transition there are no existing-member
+    /// recipients; the caller should pass an empty slice. The function
+    /// does not touch the local group state — that was already
+    /// advanced by `add_member` before the bytes were handed back.
+    ///
+    /// [`add_member`]: Self::add_member
+    pub async fn broadcast_commit(
+        &self,
+        commit_bytes: &[u8],
+        recipients: &[crate::p2p::PeerAddr],
+    ) -> Result<(), GroupError> {
+        if recipients.is_empty() {
+            // Nothing to do; avoid decoding the commit unnecessarily.
+            return Ok(());
+        }
+        let msg = MlsMessage::from_bytes(commit_bytes).map_err(|e| {
+            GroupError::InvalidWelcome(format!("Commit decode for broadcast: {e}"))
+        })?;
+        // We accept either PublicMessage or PrivateMessage Commits.
+        // mls-rs defaults to PrivateMessage; PublicMessage is opt-in.
+        // We don't restrict here — recipients will revalidate.
+        for addr in recipients {
+            crate::group::transport::send_one(self.endpoint.as_ref(), addr, &msg)
+                .await
+                .map_err(|e| match e {
+                    crate::group::transport::FramingError::Transport(p) => {
+                        GroupError::Transport(p)
+                    }
+                    other => {
+                        GroupError::Backend(format!("broadcast_commit: {other}"))
+                    }
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Accept the next inbound MLS stream and dispatch by wire format
+    /// (P5; the general-purpose successor to P4's [`accept_welcome`]).
+    ///
+    /// Returns one [`IncomingGroupEvent`] per accepted stream:
+    /// - [`NewGroup`](IncomingGroupEvent::NewGroup) — a `Welcome` was
+    ///   processed and the group state persisted.
+    /// - [`Message`](IncomingGroupEvent::Message) — a `PrivateMessage`
+    ///   (or `PublicMessage`) carrying application data was decrypted.
+    ///   The body is returned verbatim; UTF-8 decisions are deferred
+    ///   to the UI.
+    /// - [`EpochAdvanced`](IncomingGroupEvent::EpochAdvanced) — a
+    ///   Commit was processed; the group is now at a new epoch and
+    ///   the state has been persisted.
+    ///
+    /// Frames whose `wire_format` doesn't fit any of these (KeyPackage,
+    /// GroupInfo) are rejected as `InvalidWelcome` for now — there is
+    /// no use case in the current processor for receiving them over
+    /// `nkct/mls/1`. P3 sneakernet flows hand KeyPackages around
+    /// out-of-band.
+    ///
+    /// [`accept_welcome`]: Self::accept_welcome
+    pub async fn accept_next(&self) -> Result<IncomingGroupEvent, GroupError> {
+        let inc = self
+            .endpoint
+            .accept()
+            .await
+            .map_err(GroupError::Transport)?;
+        if inc.protocol != crate::group::transport::ALPN_MLS_PROTOCOL {
+            return Err(GroupError::Transport(crate::p2p::P2pError::Accept(format!(
+                "accept_next: unexpected ALPN {:?}",
+                inc.protocol
+            ))));
+        }
+        let (msg, raw) = crate::group::transport::recv_mls_message(inc.stream)
+            .await
+            .map_err(|e| match e {
+                crate::group::transport::FramingError::Transport(p) => {
+                    GroupError::Transport(p)
+                }
+                other => GroupError::InvalidWelcome(format!("recv_mls_message: {other}")),
+            })?;
+
+        match msg.wire_format() {
+            WireFormat::Welcome => {
+                let gid = self.join_group_from_welcome(&raw).await?;
+                Ok(IncomingGroupEvent::NewGroup { id: gid })
+            }
+            WireFormat::PrivateMessage | WireFormat::PublicMessage => {
+                // PrivateMessage/PublicMessage carry the group_id in
+                // their header (peekable without decryption); we use
+                // it to route the message to the right local group.
+                let gid_bytes = msg.group_id().ok_or_else(|| {
+                    GroupError::InvalidWelcome(format!(
+                        "accept_next: {:?} carries no group_id",
+                        msg.wire_format()
+                    ))
+                })?;
+                if gid_bytes.len() != 32 {
+                    return Err(GroupError::Backend(format!(
+                        "accept_next: incoming group_id has length {} (expected 32)",
+                        gid_bytes.len()
+                    )));
+                }
+                let mut gid_arr = [0u8; 32];
+                gid_arr.copy_from_slice(gid_bytes);
+                let group_id = GroupId::new(gid_arr);
+
+                let mut group = self.client.load_group(gid_bytes).map_err(|e| {
+                    let m = format!("{e}");
+                    if m.contains("GroupNotFound") || m.contains("group not found") {
+                        GroupError::NotFound
+                    } else {
+                        GroupError::Backend(format!("load_group for incoming: {e}"))
+                    }
+                })?;
+
+                let received = group
+                    .process_incoming_message(msg)
+                    .map_err(|e| GroupError::Backend(format!("process_incoming_message: {e}")))?;
+
+                // Always persist after processing — Application
+                // messages advance the per-sender ratchet, Commits
+                // advance the epoch, both must survive a restart.
+                group.write_to_storage().map_err(|e| {
+                    GroupError::Storage(format!("write_to_storage after process: {e}"))
+                })?;
+
+                use mls_rs::group::ReceivedMessage;
+                match received {
+                    ReceivedMessage::ApplicationMessage(desc) => {
+                        Ok(IncomingGroupEvent::Message {
+                            group_id,
+                            sender_index: desc.sender_index,
+                            body: desc.data().to_vec(),
+                        })
+                    }
+                    ReceivedMessage::Commit(_) => {
+                        let new_epoch = group.current_epoch();
+                        Ok(IncomingGroupEvent::EpochAdvanced {
+                            group_id,
+                            new_epoch,
+                        })
+                    }
+                    other => Err(GroupError::Backend(format!(
+                        "unexpected ReceivedMessage variant after PrivateMessage decode: {other:?}"
+                    ))),
+                }
+            }
+            other => Err(GroupError::InvalidWelcome(format!(
+                "accept_next: unsupported WireFormat {other:?}"
+            ))),
+        }
     }
 
     /// Return this processor's own reachable address — typically what
@@ -718,7 +963,7 @@ mod tests {
 
         // Alice creates a group and admits Bob.
         let gid = alice.create_group().await.expect("alice create_group");
-        let welcome = alice
+        let added = alice
             .add_member(&gid, &bob_kp)
             .await
             .expect("alice add_member");
@@ -732,9 +977,11 @@ mod tests {
         assert_eq!(alice_summary.epoch, 1);
         assert_eq!(alice_summary.member_count, 2);
 
-        // Bob joins via the Welcome blob.
+        // Bob joins via the Welcome blob. Commit is not delivered here
+        // because there are no pre-existing members to inform (this is
+        // a group of 1 → 2).
         let bob_gid = bob
-            .join_group_from_welcome(&welcome)
+            .join_group_from_welcome(&added.welcome)
             .await
             .expect("bob join_group_from_welcome");
         assert_eq!(bob_gid, gid, "both peers must agree on GroupId");
@@ -844,7 +1091,7 @@ mod tests {
         // Alice creates a group and admits Bob, then sends the Welcome
         // over the `nkct/mls/1` ALPN.
         let gid = alice.create_group().await.expect("create_group");
-        let welcome_bytes = alice
+        let added = alice
             .add_member(&gid, &bob_kp)
             .await
             .expect("add_member");
@@ -866,7 +1113,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         alice
-            .send_welcome_to(&bob_addr, &welcome_bytes)
+            .send_welcome_to(&bob_addr, &added.welcome)
             .await
             .expect("send_welcome_to");
 
@@ -888,6 +1135,325 @@ mod tests {
             .expect("alice summary");
         assert_eq!(alice_summary.epoch, 1);
         assert_eq!(alice_summary.member_count, 2);
+    }
+
+    /// P5 acceptance: 3-member application message round-trip.
+    ///
+    /// Builds a 3-member group (Alice creates, adds Bob, then Carol —
+    /// with the second add's Commit broadcast to Bob so all peers reach
+    /// epoch 2). Then Alice broadcasts an application message and both
+    /// recipients decrypt it; finally Bob sends one in the other
+    /// direction and Alice + Carol both decrypt that too.
+    ///
+    /// This exercises the whole P5 surface end-to-end:
+    /// - `add_member` returning both Welcome and Commit
+    /// - `broadcast_commit` advancing existing members
+    /// - `accept_next` dispatching `NewGroup` / `EpochAdvanced` /
+    ///   `Message` events
+    /// - `send_application_message` fanning out N-1 unicast streams
+    ///
+    /// Each peer's accept calls run on a spawned task that returns
+    /// the peer's processor back; tests serialize the dispatch by
+    /// joining-then-respawning rather than running multiple accepts
+    /// in parallel (MockEndpoint's inbox is a single-consumer mpsc).
+    #[tokio::test]
+    async fn three_member_message_roundtrip() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_proc_on_net(&net, "alice", 1);
+        let (bob, _dir_b) = build_proc_on_net(&net, "bob", 2);
+        let (carol, _dir_c) = build_proc_on_net(&net, "carol", 3);
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+
+        let bob_kp = bob.export_key_package().await.expect("bob export");
+        let carol_kp = carol.export_key_package().await.expect("carol export");
+
+        // ---- 1) Alice creates and admits Bob (1 → 2) -------------------
+        let gid = alice.create_group().await.expect("create_group");
+        let add_bob = alice
+            .add_member(&gid, &bob_kp)
+            .await
+            .expect("alice add bob");
+
+        // Bob accepts the Welcome.
+        let bob = {
+            let bob_task = tokio::spawn(async move {
+                let evt = bob.accept_next().await.expect("bob accept welcome");
+                (evt, bob)
+            });
+            tokio::task::yield_now().await;
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("send welcome to bob");
+            let (evt, bob) = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                bob_task,
+            )
+            .await
+            .expect("bob welcome timed out")
+            .expect("bob task joined");
+            match evt {
+                IncomingGroupEvent::NewGroup { id } => assert_eq!(id, gid),
+                other => panic!("bob expected NewGroup, got {other:?}"),
+            }
+            bob
+        };
+        // 1 → 2 transition: no existing members to inform; commit
+        // broadcast is a no-op. Verify the API tolerates an empty
+        // recipient slice.
+        alice
+            .broadcast_commit(&add_bob.commit, &[])
+            .await
+            .expect("empty broadcast");
+
+        // ---- 2) Alice admits Carol (2 → 3) -----------------------------
+        let add_carol = alice
+            .add_member(&gid, &carol_kp)
+            .await
+            .expect("alice add carol");
+
+        // Bob processes the Commit (so he advances to epoch 2) while
+        // Carol processes the Welcome (so she joins at epoch 2).
+        let bob_task = tokio::spawn(async move {
+            let evt = bob.accept_next().await.expect("bob accept commit");
+            (evt, bob)
+        });
+        let carol_task = tokio::spawn(async move {
+            let evt = carol.accept_next().await.expect("carol accept welcome");
+            (evt, carol)
+        });
+        tokio::task::yield_now().await;
+
+        // Fire both Welcome (to Carol) and Commit (to Bob) — order
+        // doesn't matter for these two recipients, but we send the
+        // Welcome first to match the plan §7.5 sequence diagram.
+        alice
+            .send_welcome_to(&carol_addr, &add_carol.welcome)
+            .await
+            .expect("send welcome to carol");
+        alice
+            .broadcast_commit(&add_carol.commit, &[bob_addr.clone()])
+            .await
+            .expect("broadcast commit to bob");
+
+        let (bob_evt, bob) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bob_task,
+        )
+        .await
+        .expect("bob commit timed out")
+        .expect("bob task joined");
+        let (carol_evt, carol) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            carol_task,
+        )
+        .await
+        .expect("carol welcome timed out")
+        .expect("carol task joined");
+
+        match bob_evt {
+            IncomingGroupEvent::EpochAdvanced { group_id, new_epoch } => {
+                assert_eq!(group_id, gid);
+                assert_eq!(new_epoch, 2);
+            }
+            other => panic!("bob expected EpochAdvanced(2), got {other:?}"),
+        }
+        match carol_evt {
+            IncomingGroupEvent::NewGroup { id } => assert_eq!(id, gid),
+            other => panic!("carol expected NewGroup, got {other:?}"),
+        }
+
+        // All three peers should agree on epoch 2 / 3 members.
+        for (name, proc) in [("alice", &alice), ("bob", &bob), ("carol", &carol)] {
+            let s = proc.load_group_summary(&gid).await.expect("summary");
+            assert_eq!(s.epoch, 2, "{name} epoch mismatch");
+            assert_eq!(s.member_count, 3, "{name} member_count mismatch");
+        }
+
+        // ---- 3) Alice sends an application message -----------------
+        let bob_task = tokio::spawn(async move {
+            let evt = bob.accept_next().await.expect("bob accept alice's msg");
+            (evt, bob)
+        });
+        let carol_task = tokio::spawn(async move {
+            let evt = carol.accept_next().await.expect("carol accept alice's msg");
+            (evt, carol)
+        });
+        tokio::task::yield_now().await;
+
+        let body_from_alice = b"hello from alice".to_vec();
+        let _wire = alice
+            .send_application_message(
+                &gid,
+                &body_from_alice,
+                &[bob_addr.clone(), carol_addr.clone()],
+            )
+            .await
+            .expect("alice send app msg");
+
+        let (bob_evt, bob) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bob_task,
+        )
+        .await
+        .expect("bob app msg timed out")
+        .expect("bob task joined");
+        let (carol_evt, carol) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            carol_task,
+        )
+        .await
+        .expect("carol app msg timed out")
+        .expect("carol task joined");
+
+        for (name, evt) in [("bob", bob_evt), ("carol", carol_evt)] {
+            match evt {
+                IncomingGroupEvent::Message {
+                    group_id,
+                    body,
+                    sender_index: _,
+                } => {
+                    assert_eq!(group_id, gid, "{name} group_id mismatch");
+                    assert_eq!(body, body_from_alice, "{name} body mismatch");
+                }
+                other => panic!("{name} expected Message, got {other:?}"),
+            }
+        }
+
+        // ---- 4) Bob sends in reverse direction ---------------------
+        let alice_task = tokio::spawn(async move {
+            let evt = alice.accept_next().await.expect("alice accept bob's msg");
+            (evt, alice)
+        });
+        let carol_task = tokio::spawn(async move {
+            let evt = carol.accept_next().await.expect("carol accept bob's msg");
+            (evt, carol)
+        });
+        tokio::task::yield_now().await;
+
+        let body_from_bob = b"reply from bob".to_vec();
+        let _wire = bob
+            .send_application_message(
+                &gid,
+                &body_from_bob,
+                &[alice_addr.clone(), carol_addr.clone()],
+            )
+            .await
+            .expect("bob send app msg");
+
+        let (alice_evt, _alice) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            alice_task,
+        )
+        .await
+        .expect("alice app msg timed out")
+        .expect("alice task joined");
+        let (carol_evt, _carol) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            carol_task,
+        )
+        .await
+        .expect("carol app msg timed out")
+        .expect("carol task joined");
+
+        for (name, evt) in [("alice", alice_evt), ("carol", carol_evt)] {
+            match evt {
+                IncomingGroupEvent::Message { body, .. } => {
+                    assert_eq!(body, body_from_bob, "{name} body mismatch");
+                }
+                other => panic!("{name} expected Message, got {other:?}"),
+            }
+        }
+    }
+
+    /// MLS PrivateMessages are NOT self-decryptable. Sending an
+    /// application message from Alice to herself (via her own loopback
+    /// PeerAddr) must surface as a Backend error from
+    /// `process_incoming_message` — RFC 9420 §15.1. The point of this
+    /// test is to pin that property so the caller knows it must echo
+    /// to its own UI separately, not via the MLS pipeline.
+    #[tokio::test]
+    async fn self_send_does_not_self_decrypt() {
+        // 2-member group: Alice + Bob. Alice tries to receive what she
+        // just encrypted by feeding her own address into the recipient
+        // list. mls-rs raises a decrypt error.
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_proc_on_net(&net, "alice", 1);
+        let (bob, _dir_b) = build_proc_on_net(&net, "bob", 2);
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+
+        let bob_kp = bob.export_key_package().await.expect("bob export");
+        let gid = alice.create_group().await.expect("create_group");
+        let added = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+
+        // Drive Bob's join through the wire.
+        let bob_task = tokio::spawn(async move {
+            let evt = bob.accept_next().await.expect("bob accept welcome");
+            (evt, bob)
+        });
+        tokio::task::yield_now().await;
+        alice
+            .send_welcome_to(&bob_addr, &added.welcome)
+            .await
+            .expect("welcome send");
+        let (_bob_evt, _bob) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bob_task,
+        )
+        .await
+        .expect("bob welcome timed out")
+        .expect("bob task joined");
+
+        // Alice sends to herself (in addition to bob, who can decrypt).
+        // Spawn an Alice-acceptor task so the self-stream lands.
+        let alice_acceptor = {
+            // Move alice into the task — we'll get it back via the join.
+            // Note: we can't borrow alice for both send and accept
+            // simultaneously because accept_next takes &self.
+            // Workaround: make accept a separate handle. But our
+            // `accept_next` takes &self, so we can spawn alice's accept
+            // by Arc<Self> ... however, alice is not Arc-wrapped.
+            //
+            // Instead: clone the underlying endpoint Arc for a parallel
+            // accept call. The processor doesn't currently expose
+            // raw-endpoint access, so accept directly from the
+            // endpoint and verify the frame decode happens — we don't
+            // need full processor dispatch for this assertion.
+            None::<()>
+        };
+        let _ = alice_acceptor;
+
+        // Simpler approach: use `send_application_message` with both
+        // addresses (alice + bob). The send_application_message
+        // returns the wire bytes — we can then try to feed those bytes
+        // into Alice's *own* process_incoming_message by going around
+        // the network. But our public API doesn't expose
+        // `process_bytes_directly`. So instead, just send to bob (who
+        // can decode) and use the returned wire bytes locally.
+        let wire = alice
+            .send_application_message(&gid, b"echo to me", &[bob_addr.clone()])
+            .await
+            .expect("alice send");
+
+        // Now try to feed `wire` back into alice via mls-rs directly.
+        // We reach into the internal client; this is a test-only check.
+        let msg = MlsMessage::from_bytes(&wire).expect("decode self msg");
+        let mut alice_group = alice
+            .client
+            .load_group(gid.as_bytes())
+            .expect("alice load group");
+        // mls-rs raises `CantProcessMessageFromSelf` (or equivalent).
+        let res = alice_group.process_incoming_message(msg);
+        assert!(
+            res.is_err(),
+            "self-decrypt MUST fail, got Ok({:?})",
+            res.unwrap()
+        );
+        // Silence unused.
+        let _ = alice_addr;
     }
 
     /// P1.5.b round-trip: exercise the full MLS Add flow with the
