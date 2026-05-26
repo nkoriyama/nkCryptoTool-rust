@@ -49,7 +49,7 @@ use zeroize::Zeroizing;
 use crate::group::crypto_adapter::{hybrid_cipher_suite, HybridCryptoProvider};
 use crate::group::storage::GroupStorage;
 use crate::group::types::{
-    AddMemberOutput, GroupError, GroupId, GroupSummary, IncomingGroupEvent,
+    AddMemberOutput, GroupError, GroupId, GroupSummary, IncomingGroupEvent, MemberInfo,
 };
 use crate::p2p::P2pEndpoint;
 
@@ -706,7 +706,7 @@ impl GroupChatProcessor {
                     GroupError::Storage(format!("write_to_storage after process: {e}"))
                 })?;
 
-                use mls_rs::group::ReceivedMessage;
+                use mls_rs::group::{CommitEffect, ReceivedMessage};
                 match received {
                     ReceivedMessage::ApplicationMessage(desc) => {
                         Ok(IncomingGroupEvent::Message {
@@ -715,12 +715,36 @@ impl GroupChatProcessor {
                             body: desc.data().to_vec(),
                         })
                     }
-                    ReceivedMessage::Commit(_) => {
-                        let new_epoch = group.current_epoch();
-                        Ok(IncomingGroupEvent::EpochAdvanced {
-                            group_id,
-                            new_epoch,
-                        })
+                    ReceivedMessage::Commit(desc) => {
+                        // CommitEffect::Removed is the load-bearing
+                        // PCS signal: this commit's effect on the
+                        // local member was "you are no longer in
+                        // the group". Surface it as a dedicated
+                        // event so the caller can stop polling this
+                        // group's stream.
+                        match desc.effect {
+                            CommitEffect::Removed { remover, .. } => {
+                                let remover_index = match remover {
+                                    mls_rs::group::Sender::Member(i) => i,
+                                    // External-sender Removes are
+                                    // possible per RFC 9420 §12.1.7
+                                    // but not used by this project;
+                                    // report the wrapper variant's
+                                    // raw discriminator as 0 so the
+                                    // event still has *some* value
+                                    // for the caller.
+                                    _ => 0,
+                                };
+                                Ok(IncomingGroupEvent::RemovedFromGroup {
+                                    group_id,
+                                    remover_index,
+                                })
+                            }
+                            _ => Ok(IncomingGroupEvent::EpochAdvanced {
+                                group_id,
+                                new_epoch: group.current_epoch(),
+                            }),
+                        }
                     }
                     other => Err(GroupError::Backend(format!(
                         "unexpected ReceivedMessage variant after PrivateMessage decode: {other:?}"
@@ -744,6 +768,112 @@ impl GroupChatProcessor {
             .local_addr()
             .await
             .map_err(GroupError::Transport)
+    }
+
+    /// List the current members of a group (P6).
+    ///
+    /// Returns one [`MemberInfo`] per live leaf in the group's TreeKEM,
+    /// in ascending leaf-index order. The leaf index is the only
+    /// identity surfaced for now — sufficient for the `remove_member`
+    /// caller to address a removal target; richer identity (display
+    /// name from the BasicCredential, signing-key fingerprint) is
+    /// deferred to the UI layer (P7+).
+    ///
+    /// Errors:
+    /// - `GroupError::NotFound` — `gid` is not present in storage.
+    /// - `GroupError::Backend(_)` — mls-rs rejected the load.
+    pub async fn list_members(
+        &self,
+        gid: &GroupId,
+    ) -> Result<Vec<MemberInfo>, GroupError> {
+        let group = self.client.load_group(gid.as_bytes()).map_err(|e| {
+            let m = format!("{e}");
+            if m.contains("GroupNotFound") || m.contains("group not found") {
+                GroupError::NotFound
+            } else {
+                GroupError::Backend(format!("load_group for list_members: {e}"))
+            }
+        })?;
+        let mut out: Vec<MemberInfo> = group
+            .roster()
+            .members_iter()
+            .map(|m| MemberInfo { index: m.index })
+            .collect();
+        // mls-rs already yields leaves in ascending index order, but
+        // sort defensively in case the iterator's guarantee changes.
+        out.sort_by_key(|m| m.index);
+        Ok(out)
+    }
+
+    /// Remove a member from a group and return the Commit bytes to
+    /// broadcast (P6).
+    ///
+    /// `index` is the leaf index of the member to remove — as listed
+    /// by [`list_members`](Self::list_members) or carried in an
+    /// [`IncomingGroupEvent::Message::sender_index`].
+    ///
+    /// Unlike [`add_member`](Self::add_member), removal produces no
+    /// Welcome — there is no new member to admit. The returned Commit
+    /// must be broadcast to **all remaining members** (which includes
+    /// the removed member if you want them to learn they've been
+    /// kicked; otherwise omit them and they will simply observe their
+    /// next inbound message fail to decrypt). Per the plan §7.4 the
+    /// project broadcasts to the removed member too so they get a
+    /// clean
+    /// [`IncomingGroupEvent::RemovedFromGroup`](crate::group::IncomingGroupEvent::RemovedFromGroup)
+    /// event.
+    ///
+    /// Forward / post-compromise security: after this Commit is
+    /// applied, the group transitions to a new epoch with a fresh key
+    /// schedule. The removed member's previous keys decrypt nothing
+    /// at the new epoch — RFC 9420 §16. The PCS test
+    /// `remove_member_blocks_new_epoch_decrypt` pins this property.
+    ///
+    /// Errors:
+    /// - `GroupError::NotFound` — `gid` is not present in storage.
+    /// - `GroupError::Backend(_)` — mls-rs rejected the removal (e.g.
+    ///   index out of range, or trying to remove ourselves — mls-rs
+    ///   surfaces both as `MlsError` variants).
+    pub async fn remove_member(
+        &self,
+        gid: &GroupId,
+        index: u32,
+    ) -> Result<Zeroizing<Vec<u8>>, GroupError> {
+        let mut group = self.client.load_group(gid.as_bytes()).map_err(|e| {
+            let m = format!("{e}");
+            if m.contains("GroupNotFound") || m.contains("group not found") {
+                GroupError::NotFound
+            } else {
+                GroupError::Backend(format!("load_group for remove_member: {e}"))
+            }
+        })?;
+
+        let commit_output = group
+            .commit_builder()
+            .remove_member(index)
+            .map_err(|e| GroupError::Backend(format!("remove_member proposal: {e}")))?
+            .build()
+            .map_err(|e| GroupError::Backend(format!("remove commit build: {e}")))?;
+        // Remove must not produce a Welcome (no one is being added).
+        if !commit_output.welcome_messages.is_empty() {
+            return Err(GroupError::Backend(format!(
+                "remove_member yielded {} Welcomes (expected 0)",
+                commit_output.welcome_messages.len()
+            )));
+        }
+
+        group
+            .apply_pending_commit()
+            .map_err(|e| GroupError::Backend(format!("apply_pending_commit after remove: {e}")))?;
+        group
+            .write_to_storage()
+            .map_err(|e| GroupError::Storage(format!("write_to_storage after remove: {e}")))?;
+
+        let commit_bytes = commit_output
+            .commit_message
+            .to_bytes()
+            .map_err(|e| GroupError::Backend(format!("Commit encode after remove: {e}")))?;
+        Ok(Zeroizing::new(commit_bytes))
     }
 
     /// Load a group from storage and return a read-only summary of its
@@ -1454,6 +1584,263 @@ mod tests {
         );
         // Silence unused.
         let _ = alice_addr;
+    }
+
+    /// P6 acceptance: remove a member and verify
+    /// post-compromise-security holds — the removed member cannot
+    /// decrypt application messages at the new epoch.
+    ///
+    /// Sequence:
+    /// 1. 3-member group (Alice creates, adds Bob, adds Carol → epoch 2)
+    /// 2. Alice removes Bob — Commit broadcast to BOTH Bob (so he
+    ///    learns he's been kicked) and Carol (so she advances epoch)
+    /// 3. Bob's `accept_next` returns
+    ///    [`IncomingGroupEvent::RemovedFromGroup`]; Carol's returns
+    ///    [`IncomingGroupEvent::EpochAdvanced`]
+    /// 4. Alice sends an application message addressed to Carol only
+    /// 5. Carol decrypts successfully (epoch 3)
+    /// 6. Feed the *same wire bytes* into Bob's group state — must
+    ///    fail. This is the PCS property: Bob, who held the epoch-2
+    ///    key schedule and was admitted to the post-removal
+    ///    membership-change commit, gets no useful key material for
+    ///    epoch 3.
+    #[tokio::test]
+    async fn remove_member_blocks_new_epoch_decrypt() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_proc_on_net(&net, "alice", 1);
+        let (bob, _dir_b) = build_proc_on_net(&net, "bob", 2);
+        let (carol, _dir_c) = build_proc_on_net(&net, "carol", 3);
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+
+        // ---- build 3-member group --------------------------------------
+        let gid = alice.create_group().await.expect("create_group");
+
+        // Add Bob (1 → 2).
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            tokio::task::yield_now().await;
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome→bob");
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .expect("bob welcome timeout")
+                .expect("bob task")
+        };
+
+        // Add Carol (2 → 3). Commit goes to Bob, Welcome to Carol.
+        let add_carol = alice
+            .add_member(&gid, &carol_kp)
+            .await
+            .expect("add carol");
+        let bob_task = tokio::spawn(async move {
+            bob.accept_next().await.expect("bob accepts commit");
+            bob
+        });
+        let carol_task = tokio::spawn(async move {
+            carol.accept_next().await.expect("carol accepts welcome");
+            carol
+        });
+        tokio::task::yield_now().await;
+        alice
+            .send_welcome_to(&carol_addr, &add_carol.welcome)
+            .await
+            .expect("welcome→carol");
+        alice
+            .broadcast_commit(&add_carol.commit, &[bob_addr.clone()])
+            .await
+            .expect("commit→bob");
+        let bob = tokio::time::timeout(std::time::Duration::from_secs(5), bob_task)
+            .await
+            .expect("bob commit timeout")
+            .expect("bob task");
+        let carol = tokio::time::timeout(std::time::Duration::from_secs(5), carol_task)
+            .await
+            .expect("carol welcome timeout")
+            .expect("carol task");
+
+        // ---- identify Bob's leaf index from Alice's roster -------------
+        let alice_members = alice.list_members(&gid).await.expect("alice roster");
+        assert_eq!(
+            alice_members.len(),
+            3,
+            "Alice's roster should be 3 members"
+        );
+        // Alice is leaf 0 (she created the group). Bob is leaf 1
+        // (added first). Carol is leaf 2 (added second). Pin those
+        // expectations so a mls-rs leaf-allocation change shows up
+        // here clearly.
+        assert_eq!(
+            alice_members.iter().map(|m| m.index).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+        );
+        let bob_leaf = 1u32;
+
+        // ---- remove Bob (epoch 2 → 3) ----------------------------------
+        let remove_commit = alice
+            .remove_member(&gid, bob_leaf)
+            .await
+            .expect("alice remove bob");
+
+        // Broadcast the Remove commit to BOTH the removed member (Bob,
+        // so he learns) and the surviving members (Carol, so she
+        // advances). Plan §7.4 calls out this delivery shape.
+        let bob_task = tokio::spawn(async move {
+            let evt = bob.accept_next().await.expect("bob accepts remove");
+            (evt, bob)
+        });
+        let carol_task = tokio::spawn(async move {
+            let evt = carol.accept_next().await.expect("carol accepts remove commit");
+            (evt, carol)
+        });
+        tokio::task::yield_now().await;
+        alice
+            .broadcast_commit(&remove_commit, &[bob_addr.clone(), carol_addr.clone()])
+            .await
+            .expect("remove commit broadcast");
+
+        let (bob_evt, bob) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bob_task,
+        )
+        .await
+        .expect("bob remove timeout")
+        .expect("bob task");
+        let (carol_evt, carol) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            carol_task,
+        )
+        .await
+        .expect("carol remove-commit timeout")
+        .expect("carol task");
+
+        // Bob sees RemovedFromGroup; Carol sees EpochAdvanced.
+        match bob_evt {
+            IncomingGroupEvent::RemovedFromGroup {
+                group_id,
+                remover_index,
+            } => {
+                assert_eq!(group_id, gid);
+                assert_eq!(remover_index, 0, "Alice is leaf 0");
+            }
+            other => panic!("bob expected RemovedFromGroup, got {other:?}"),
+        }
+        match carol_evt {
+            IncomingGroupEvent::EpochAdvanced {
+                group_id,
+                new_epoch,
+            } => {
+                assert_eq!(group_id, gid);
+                assert_eq!(new_epoch, 3, "epoch advances to 3 on remove");
+            }
+            other => panic!("carol expected EpochAdvanced(3), got {other:?}"),
+        }
+        // Alice is also at epoch 3 (her own remove_member advanced
+        // her state).
+        let alice_summary = alice
+            .load_group_summary(&gid)
+            .await
+            .expect("alice summary");
+        assert_eq!(alice_summary.epoch, 3);
+        assert_eq!(alice_summary.member_count, 2);
+
+        // ---- Alice sends an application message to Carol ----------------
+        let carol_task = tokio::spawn(async move {
+            let evt = carol
+                .accept_next()
+                .await
+                .expect("carol accepts alice app msg");
+            (evt, carol)
+        });
+        tokio::task::yield_now().await;
+
+        let body = b"post-remove message".to_vec();
+        let wire = alice
+            .send_application_message(&gid, &body, &[carol_addr.clone()])
+            .await
+            .expect("alice send post-remove");
+
+        // Carol decrypts cleanly.
+        let (carol_evt, _carol) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            carol_task,
+        )
+        .await
+        .expect("carol app msg timeout")
+        .expect("carol task");
+        match carol_evt {
+            IncomingGroupEvent::Message {
+                body: got_body, ..
+            } => {
+                assert_eq!(got_body, body, "carol should decrypt cleanly");
+            }
+            other => panic!("carol expected Message, got {other:?}"),
+        }
+
+        // ---- PCS: Bob fed the same bytes must NOT decrypt ----------------
+        // We can't go through Bob's `accept_next` here because the
+        // group state is in a removed-from state — `accept_next`
+        // expects the group to still be live for Application messages.
+        // Test the property directly: feed the bytes into Bob's
+        // loaded group's process_incoming_message and confirm it
+        // errors out.
+        let msg = MlsMessage::from_bytes(&wire).expect("decode wire");
+        // Bob may or may not be able to even load the group anymore
+        // (mls-rs's behavior post-removal varies). Both outcomes are
+        // acceptable PCS demonstrations — what we MUST NOT see is a
+        // successful ApplicationMessage decrypt.
+        match bob.client.load_group(gid.as_bytes()) {
+            Ok(mut bob_group) => {
+                let res = bob_group.process_incoming_message(msg);
+                assert!(
+                    res.is_err(),
+                    "PCS violated: Bob decrypted a post-removal message"
+                );
+            }
+            Err(_) => {
+                // mls-rs marked the group unrecoverable on Bob's side;
+                // this is the strongest PCS signal — there's no path
+                // to even attempt decryption.
+            }
+        }
+    }
+
+    /// `remove_member` rejects an invalid leaf index. The exact error
+    /// shape from mls-rs varies (out-of-range, removing self), so we
+    /// only assert that it surfaces as a non-NotFound error — i.e.,
+    /// it's not silently a no-op.
+    #[tokio::test]
+    async fn remove_member_rejects_out_of_range_index() {
+        let (alice, _dir) = build_proc("alice", 1);
+        let gid = alice.create_group().await.expect("create_group");
+        // Group has one member (Alice at leaf 0); leaf 99 is unused.
+        let err = alice.remove_member(&gid, 99).await.unwrap_err();
+        assert!(
+            !matches!(err, GroupError::NotFound),
+            "out-of-range remove must error (got NotFound for unknown reason): {err:?}"
+        );
+    }
+
+    /// `list_members` on a 1-member group returns just the creator
+    /// (Alice at index 0). Pin the leaf-index allocation order so a
+    /// future mls-rs change doesn't silently shift our removal API
+    /// semantics.
+    #[tokio::test]
+    async fn list_members_yields_creator_at_index_zero() {
+        let (alice, _dir) = build_proc("alice", 1);
+        let gid = alice.create_group().await.expect("create_group");
+        let members = alice.list_members(&gid).await.expect("list");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].index, 0);
     }
 
     /// P1.5.b round-trip: exercise the full MLS Add flow with the

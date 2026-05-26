@@ -134,6 +134,23 @@ impl fmt::Debug for AddMemberOutput {
     }
 }
 
+/// Lightweight description of one group member as returned by
+/// [`crate::group::GroupChatProcessor::list_members`].
+///
+/// Carries only the leaf index for now — the index is the value
+/// `commit_builder().remove_member` and
+/// `IncomingGroupEvent::Message::sender_index` use to identify
+/// members. Display-side identity (name, fingerprint of the
+/// SigningIdentity) is intentionally left for P7 (CLI polish) when
+/// the UI layer wires up roster rendering.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MemberInfo {
+    /// Leaf index in the group's TreeKEM. Stable for the lifetime of
+    /// the member; matches the value embedded in incoming MLS messages
+    /// and accepted by `remove_member`.
+    pub index: u32,
+}
+
 /// One event surfaced by
 /// [`crate::group::GroupChatProcessor::accept_next`].
 ///
@@ -169,6 +186,17 @@ pub enum IncomingGroupEvent {
     EpochAdvanced {
         group_id: GroupId,
         new_epoch: u64,
+    },
+    /// A Commit was processed and its effect was that *we* were
+    /// removed from the group (P6). The group state on this side
+    /// transitions to a frozen, post-removal state — further
+    /// `accept_next` calls for messages in this group will fail,
+    /// which is the load-bearing post-compromise-security guarantee:
+    /// from this epoch onward we hold no keys that decrypt new traffic.
+    RemovedFromGroup {
+        group_id: GroupId,
+        /// Leaf index of the member who issued the removing commit.
+        remover_index: u32,
     },
 }
 

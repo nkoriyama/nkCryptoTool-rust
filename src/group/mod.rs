@@ -29,5 +29,5 @@ pub use processor::GroupChatProcessor;
 pub use storage::{GroupStorage, TunedFileStrategy};
 pub use types::{
     AddMemberOutput, GroupError, GroupId, GroupMessage, GroupSummary, IncomingGroupEvent,
-    MemberId, Welcome,
+    MemberId, MemberInfo, Welcome,
 };
