@@ -22,5 +22,6 @@ pub mod crypto_adapter;
 pub mod processor;
 pub mod types;
 
-pub use processor::{GroupChatProcessor, CIPHER_SUITE_P1};
+pub use crypto_adapter::{hybrid_cipher_suite, HYBRID_SUITE_ID};
+pub use processor::GroupChatProcessor;
 pub use types::{GroupError, GroupId, GroupMessage, MemberId, Welcome};

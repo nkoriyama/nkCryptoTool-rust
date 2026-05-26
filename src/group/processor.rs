@@ -11,12 +11,12 @@ use std::sync::Arc;
 use mls_rs::client_builder::{BaseConfig, WithCryptoProvider, WithIdentityProvider};
 use mls_rs::identity::SigningIdentity;
 use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
-use mls_rs::{CipherSuite, Client, ExtensionList};
+use mls_rs::{Client, ExtensionList};
 use mls_rs_core::crypto::{CipherSuiteProvider, CryptoProvider};
 use mls_rs_crypto_openssl::OpensslCryptoProvider;
 use zeroize::Zeroizing;
 
-use crate::group::crypto_adapter::HybridCryptoProvider;
+use crate::group::crypto_adapter::{hybrid_cipher_suite, HybridCryptoProvider};
 use crate::group::types::{GroupError, GroupId};
 use crate::p2p::P2pEndpoint;
 
@@ -34,9 +34,11 @@ type MlsClient = Client<
     >,
 >;
 
-/// P1 ciphersuite: non-PQC, default-shipped by the OpenSSL crypto
-/// provider. The full hybrid PQC suite lands in P1.5.
-pub const CIPHER_SUITE_P1: CipherSuite = CipherSuite::CURVE25519_AES128;
+// P1.5.a: the cipher suite used here is the hybrid (Ed25519 + ML-DSA-65
+// signatures, classical X25519/AES128 KEM/AEAD via base). It is exposed
+// through `crate::group::crypto_adapter::hybrid_cipher_suite()` because
+// the underlying `CipherSuite` type has no `const fn` constructor for
+// private-use IDs. P1.5.b adds the hybrid KEM half.
 
 /// Transport-agnostic MLS group chat orchestrator.
 ///
@@ -60,12 +62,13 @@ impl GroupChatProcessor {
         display_name: &str,
         endpoint: Arc<dyn P2pEndpoint>,
     ) -> Result<Self, GroupError> {
-        let crypto = HybridCryptoProvider::new(OpensslCryptoProvider::new());
-        let suite = crypto
-            .cipher_suite_provider(CIPHER_SUITE_P1)
-            .ok_or_else(|| {
-                GroupError::Backend("CURVE25519_AES128 not supported by base provider".to_string())
-            })?;
+        let crypto = HybridCryptoProvider::new(OpensslCryptoProvider::default());
+        let suite_id = hybrid_cipher_suite();
+        let suite = crypto.cipher_suite_provider(suite_id).ok_or_else(|| {
+            GroupError::Backend(
+                "hybrid cipher suite (0xF101) not supported by the base provider".to_string(),
+            )
+        })?;
 
         let (signing_key, signing_pub) = suite
             .signature_key_generate()
@@ -77,7 +80,7 @@ impl GroupChatProcessor {
         let client = Client::builder()
             .identity_provider(BasicIdentityProvider)
             .crypto_provider(crypto)
-            .signing_identity(identity, signing_key, CIPHER_SUITE_P1)
+            .signing_identity(identity, signing_key, suite_id)
             .build();
 
         Ok(Self { client, endpoint })
