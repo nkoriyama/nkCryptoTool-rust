@@ -10,7 +10,15 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  repo-integrity:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Verify critical source files exist in the tracked tree
+      run: bash scripts/check_repo_integrity.sh
+
   p2p-abstraction-check:
+    needs: repo-integrity
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
