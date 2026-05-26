@@ -626,7 +626,10 @@ jobs:
 | Phase | 内容 | 完了条件 |
 |---|---|---|
 | **P1** | Cargo.toml に mls-rs + `mls-rs-crypto-openssl` 依存追加、feature flag `mls` 整備、`src/group/` 骨格作成、**`crypto_adapter` 雛形**(`mls-rs-crypto-openssl` を base にした passthrough)| `cargo build --features mls` が通る、簡単な non-PQC ciphersuite で create_group が動く |
-| **P1.5** | `crypto_adapter` の **PQC 部分実装** (X25519+ML-KEM-768 結合 KEM、ML-DSA-65+Ed25519 結合署名)。RustCrypto/OpenSSL backend の `pqc_*` を再利用 | ハイブリッド ciphersuite で MLS の `create_group` → `add_member` のローカル round-trip が成立 |
+| **P1.5.a** | `crypto_adapter` に **ハイブリッド署名のみ**を実装 (ML-DSA-65 + Ed25519 concat)。KEM は base 委譲のまま。新ハイブリッド ciphersuite ID をプライベート使用域 (例: 0xF101) で導入し、`HybridCipherSuiteProvider` が `cipher_suite()` でそれを返す | ハイブリッド suite で `create_group` が動く (署名のみ要求するため KEM 未対応でも到達可能) |
+| **P1.5.b** | `crypto_adapter` に **ハイブリッド KEM/HPKE** を実装 (X25519 + ML-KEM-768 concat KEM、shared secret は HKDF-Combine、draft-ietf-hpke-pq 準拠の構造を採用)。`hpke_setup_s/r`、`kem_generate/derive`、`hpke_seal/open` 系を override | ハイブリッド suite で `create_group → add_member` のローカル round-trip が成立 |
+
+(P1.5 を a/b に分割した理由: 28 メソッドある `CipherSuiteProvider` trait のうち、署名関連 4 メソッドの override は局所的で安全に切れる。一方 KEM/HPKE 関連は HpkeContext の構築や draft 仕様の concat 結合 KEM など独立した重い実装が要るため、リスクと工数の切り分けとして別フェーズにする。)
 | **P2** | `GroupState` + sqlite 永続化 (WAL/busy_timeout 設定込み)、create-group / list-groups 実装 | mock 上で create→drop→reload テスト green |
 | **P3** | KeyPackage 生成 + 書き出し、Welcome 受信ロジック、署名鍵の in-memory cache | export-key-package → join-group のローカル往復 |
 | **P4** | `nkct/mls/1` ALPN 統合、Iroh 経由 Welcome / Commit / Application の routing (受信時の MlsMessage type 分岐) | 2 ノード間で実際に Welcome 配信成功 |
