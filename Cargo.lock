@@ -5069,6 +5069,7 @@ dependencies = [
  "mls-rs",
  "mls-rs-codec",
  "mls-rs-core",
+ "mls-rs-crypto-hpke",
  "mls-rs-crypto-openssl",
  "mls-rs-crypto-traits",
  "nokhwa",

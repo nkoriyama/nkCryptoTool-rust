@@ -2,43 +2,67 @@
 //!
 //! ## Phases
 //! - **P1**: passthrough only — every method delegated to base.
-//! - **P1.5.a (this revision)**: signature methods overridden to use
-//!   `Ed25519 || ML-DSA-65` concatenated keys/signatures. KEM / HPKE
-//!   still delegate to the base (`CURVE25519_AES128`), so HPKE
-//!   operations remain classical for now.
-//! - **P1.5.b (TODO)**: KEM/HPKE override with the X25519 + ML-KEM-768
-//!   concatenated KEM and shared-secret combining per
-//!   draft-ietf-hpke-pq.
+//! - **P1.5.a**: signature methods overridden to use
+//!   `Ed25519 || ML-DSA-65` concatenated keys/signatures.
+//! - **P1.5.b (this revision)**: KEM/HPKE override via a
+//!   `CombinedKem<X25519 DhKem, ML-KEM-768, SHA-256, SHAKE-256>` plugged
+//!   into a freshly-built `OpensslCipherSuite`. The hybrid cipher suite
+//!   is now a fully-self-standing cipher suite — not a thin wrapper
+//!   around the classical one.
 //!
 //! ## Hybrid Cipher Suite
 //!
 //! A private-use identifier `0xF101` (RFC 9420 reserves the
 //! `0xF000..=0xFFFF` range for private experiments) is used to
-//! distinguish the hybrid suite from any base IANA-assigned suite.
-//! When the wrapped provider is asked for it, we wrap the base's
-//! `CURVE25519_AES128` provider (so AEAD / KDF / hash / HPKE all
-//! continue to work) and override only the signature surface.
+//! distinguish the hybrid suite. The provider supports *only* this
+//! suite — `supported_cipher_suites()` returns `[0xF101]` and any other
+//! `CipherSuite` value yields `None` from `cipher_suite_provider()`.
 //!
-//! ## Composite Signature Layout
+//! ## Construction
 //!
+//! `cipher_suite_provider(0xF101)` builds:
+//!
+//! ```text
+//! OpensslCipherSuite<
+//!     CombinedKem<
+//!         DhKem<Ecdh, Kdf>,         // X25519 (from base)
+//!         MlKem768Kem,              // ML-KEM-768 (fips203)
+//!         Sha256Hasher,             // SHA-256 (sha2)
+//!         Shake256Vlh,              // SHAKE-256 (sha3)
+//!         XWingSharedSecretHashInput, // X-Wing combiner SS mixing
+//!     >,
+//!     Kdf,                          // SHA-256 HKDF (from base)
+//!     Aead,                         // AES-128-GCM (from base)
+//! >
+//! ```
+//!
+//! and wraps it in [`HybridCipherSuiteProvider`] which overrides the
+//! four signature trait methods to perform `Ed25519 || ML-DSA-65`.
+//!
+//! ## Composite Layout Reference
+//!
+//! ### Signatures (P1.5.a)
 //! | Field | Bytes |
 //! |---|---|
-//! | Hybrid SK | `Ed25519 SK (32)` ‖ `ML-DSA-65 SK (4032)` = 4064 |
+//! | Hybrid SK | `Ed25519 SK (64)` ‖ `ML-DSA-65 SK (4032)` = 4096 |
 //! | Hybrid PK | `Ed25519 PK (32)` ‖ `ML-DSA-65 PK (1952)` = 1984 |
 //! | Hybrid signature | `Ed25519 sig (64)` ‖ `ML-DSA-65 sig (3309)` = 3373 |
 //!
-//! Verification requires *both* primitives to succeed. The structure
-//! follows the draft-ietf-tls-hybrid-design pattern: independent
-//! signatures, combined by concatenation.
+//! ### KEM (P1.5.b)
+//! | Field | Bytes |
+//! |---|---|
+//! | Hybrid SK | `X25519 SK (32)` ‖ `ML-KEM-768 DK (2400)` = 2432 |
+//! | Hybrid PK | `X25519 PK (32)` ‖ `ML-KEM-768 EK (1184)` = 1216 |
+//! | Hybrid enc | `X25519 enc (32)` ‖ `ML-KEM-768 CT (1088)` = 1120 |
+//! | Shared secret | SHA-256(X-Wing-mix(ss1, ss2, ct2, pk2)) = 32 |
 
 // Note on async: mls-rs's `CipherSuiteProvider` trait is declared with
 // `maybe_async::must_be_sync` for default (non-`mls_build_async`)
 // builds, so every method is *synchronous* despite the `async fn`
 // notation in the source. Our impl therefore uses plain `fn` methods
-// and no `` (the same pattern the OpenSSL provider follows).
+// and no `.await` (the same pattern the OpenSSL provider follows).
 
-/// ML-KEM-768 `KemType` wrapper. Foundation for P1.5.b's hybrid KEM
-/// (gets combined with X25519 DhKem in a future revision).
+pub mod hash_adapter;
 pub mod ml_kem_768;
 
 use fips204::ml_dsa_65;
@@ -49,9 +73,19 @@ use mls_rs_core::crypto::{
     SignaturePublicKey, SignatureSecretKey,
 };
 use mls_rs_core::error::IntoAnyError;
+use mls_rs_crypto_hpke::dhkem::DhKem;
+use mls_rs_crypto_hpke::kem_combiner::xwing::{CombinedKem, XWingSharedSecretHashInput};
+use mls_rs_crypto_openssl::aead::Aead;
+use mls_rs_crypto_openssl::ecdh::Ecdh;
+use mls_rs_crypto_openssl::kdf::Kdf;
+use mls_rs_crypto_openssl::{OpensslCipherSuite, OpensslCryptoError};
+use mls_rs_crypto_traits::KemId;
+
+use self::hash_adapter::{Sha256Hasher, Shake256Vlh};
+use self::ml_kem_768::MlKem768Kem;
 
 // -----------------------------------------------------------------------------
-// Cipher-suite identifiers and layout constants.
+// Cipher-suite identifiers.
 // -----------------------------------------------------------------------------
 
 /// Private-use cipher suite ID for our hybrid suite. Constructed via
@@ -59,15 +93,21 @@ use mls_rs_core::error::IntoAnyError;
 /// type has no `const fn` constructor exposed publicly).
 pub const HYBRID_SUITE_ID: u16 = 0xF101;
 
-/// Base classical suite whose provider we wrap. Provides Ed25519
-/// signatures, X25519 KEM, AES-128-GCM AEAD, SHA-256 KDF/Hash.
-const BASE_SUITE_FOR_HYBRID: CipherSuite = CipherSuite::CURVE25519_AES128;
+/// Base classical suite used as the *parameter source* for the hybrid
+/// suite's KDF/AEAD/X25519 halves. We never expose this suite to MLS;
+/// it is only consulted to fetch `Ecdh`, `Kdf`, `Aead`, `KemId` values
+/// configured for X25519 / SHA-256 / AES-128-GCM.
+const PARAM_SOURCE_SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
 
 /// Returns the hybrid `CipherSuite` value as a runtime constant. Use
 /// this wherever a `CipherSuite` value is needed (mls-rs APIs).
 pub fn hybrid_cipher_suite() -> CipherSuite {
     CipherSuite::from(HYBRID_SUITE_ID)
 }
+
+// -----------------------------------------------------------------------------
+// Signature layout constants (P1.5.a).
+// -----------------------------------------------------------------------------
 
 /// Ed25519 secret-key length as the base provider emits it. mls-rs's
 /// OpenSSL provider returns the *expanded* 64-byte form
@@ -80,43 +120,96 @@ const ED25519_PK_LEN: usize = 32;
 /// Ed25519 signature length.
 const ED25519_SIG_LEN: usize = 64;
 
-const HYBRID_SK_LEN: usize = ED25519_SK_LEN + ml_dsa_65::SK_LEN; // 4064
-const HYBRID_PK_LEN: usize = ED25519_PK_LEN + ml_dsa_65::PK_LEN; // 1984
-const HYBRID_SIG_LEN: usize = ED25519_SIG_LEN + ml_dsa_65::SIG_LEN; // 3373
+const HYBRID_SK_LEN: usize = ED25519_SK_LEN + ml_dsa_65::SK_LEN;
+const HYBRID_PK_LEN: usize = ED25519_PK_LEN + ml_dsa_65::PK_LEN;
+const HYBRID_SIG_LEN: usize = ED25519_SIG_LEN + ml_dsa_65::SIG_LEN;
 
 // -----------------------------------------------------------------------------
-// HybridCryptoProvider — top-level provider that exposes the hybrid suite
-// in addition to whatever the base provider supports.
+// Type aliases for the composed hybrid cipher suite.
 // -----------------------------------------------------------------------------
 
+/// The hybrid KEM: X25519 (from the base provider) combined with
+/// ML-KEM-768 via the X-Wing shared-secret combiner.
+pub type HybridKem = CombinedKem<
+    DhKem<Ecdh, Kdf>,
+    MlKem768Kem,
+    Sha256Hasher,
+    Shake256Vlh,
+    XWingSharedSecretHashInput,
+>;
+
+/// The bare hybrid cipher suite (KEM/KDF/AEAD only — signatures still
+/// come from the base Ed25519 path). [`HybridCipherSuiteProvider`]
+/// wraps this to add the hybrid signature scheme on top.
+pub type HybridSuite = OpensslCipherSuite<HybridKem, Kdf, Aead>;
+
+// -----------------------------------------------------------------------------
+// HybridCryptoProvider — exposes only the hybrid suite.
+// -----------------------------------------------------------------------------
+
+/// `CryptoProvider` that exposes a single cipher suite: the hybrid
+/// `Ed25519+ML-DSA-65 / X25519+ML-KEM-768 / SHA-256 / AES-128-GCM` suite
+/// at private-use ID `0xF101`.
+///
+/// Construction is parameterless — the provider builds the underlying
+/// primitives itself by consulting the OpenSSL provider's parameter
+/// constants for `CURVE25519_AES128`.
 #[derive(Clone, Debug, Default)]
-pub struct HybridCryptoProvider<B> {
-    base: B,
-}
+pub struct HybridCryptoProvider;
 
-impl<B> HybridCryptoProvider<B> {
-    pub fn new(base: B) -> Self {
-        Self { base }
+impl HybridCryptoProvider {
+    pub fn new() -> Self {
+        Self
     }
 
-    pub fn inner(&self) -> &B {
-        &self.base
+    /// Builds a fresh hybrid cipher suite provider. Factored out so
+    /// tests can call it directly and so `cipher_suite_provider()` and
+    /// `supported_cipher_suites()` agree on a single construction path.
+    ///
+    /// Returns `None` only if the underlying OpenSSL provider is unable
+    /// to build a `CURVE25519_AES128` provider (the parameter source).
+    /// In practice this is reachable only on builds where libssl was
+    /// compiled without X25519, which is exceedingly rare.
+    fn build_hybrid_suite() -> Option<HybridCipherSuiteProvider<HybridSuite>> {
+        let kdf = Kdf::new(PARAM_SOURCE_SUITE)?;
+        let ecdh = Ecdh::new(PARAM_SOURCE_SUITE)?;
+        let kem_id = KemId::new(PARAM_SOURCE_SUITE)?;
+        // X25519 DhKem with SHA-256 KDF — identical to what the base
+        // provider builds for `CURVE25519_AES128`, just kept separately
+        // so we can hand it to `CombinedKem`.
+        let x25519 = DhKem::new(ecdh, kdf.clone(), kem_id as u16, kem_id.n_secret());
+        // X-Wing combiner: the IETF draft's recommended shared-secret
+        // mixing for X25519 + ML-KEM-768. See
+        // draft-connolly-cfrg-xwing-kem-01.
+        let hybrid_kem = CombinedKem::new_xwing(x25519, MlKem768Kem, Sha256Hasher, Shake256Vlh);
+        let aead = Aead::new(PARAM_SOURCE_SUITE)?;
+
+        // OpensslCipherSuite::new internally constructs `Hash::new` and
+        // `EcSigner::new` against the passed cipher_suite — both reject
+        // unknown IDs, so we cannot pass `0xF101` here. We pass the
+        // parameter-source suite (`CURVE25519_AES128`) which configures
+        // the inner Hash to SHA-256 and the inner EcSigner to Ed25519
+        // — exactly what we want for the hybrid suite's non-PQC halves.
+        // `HybridCipherSuiteProvider::cipher_suite()` overrides the
+        // reported ID back to `0xF101` so mls-rs serialises the right
+        // suite into KeyPackages / GroupContext.
+        let inner = OpensslCipherSuite::new(PARAM_SOURCE_SUITE, hybrid_kem, kdf, aead)?;
+        Some(HybridCipherSuiteProvider::new(inner))
     }
 }
 
-impl<B> CryptoProvider for HybridCryptoProvider<B>
-where
-    B: CryptoProvider + Send + Sync,
-    <B::CipherSuiteProvider as CipherSuiteProvider>::Error: Send + Sync,
-{
-    type CipherSuiteProvider = HybridOrBase<B::CipherSuiteProvider>;
+impl CryptoProvider for HybridCryptoProvider {
+    type CipherSuiteProvider = HybridCipherSuiteProvider<HybridSuite>;
 
     fn supported_cipher_suites(&self) -> Vec<CipherSuite> {
-        let mut suites = self.base.supported_cipher_suites();
-        if self.base.cipher_suite_provider(BASE_SUITE_FOR_HYBRID).is_some() {
-            suites.push(hybrid_cipher_suite());
+        // We expose only the hybrid suite. Classical-only peers cannot
+        // talk to us; that is by design — the whole point of P1.5 is
+        // PQC-mandatory group chat.
+        if Self::build_hybrid_suite().is_some() {
+            vec![hybrid_cipher_suite()]
+        } else {
+            Vec::new()
         }
-        suites
     }
 
     fn cipher_suite_provider(
@@ -124,378 +217,28 @@ where
         cipher_suite: CipherSuite,
     ) -> Option<Self::CipherSuiteProvider> {
         if cipher_suite == hybrid_cipher_suite() {
-            // For the hybrid suite, wrap the base's CURVE25519_AES128
-            // provider (for AEAD/KDF/HPKE) and override signatures.
-            self.base
-                .cipher_suite_provider(BASE_SUITE_FOR_HYBRID)
-                .map(|inner| HybridOrBase::Hybrid(HybridCipherSuiteProvider::new(inner)))
+            Self::build_hybrid_suite()
         } else {
-            self.base
-                .cipher_suite_provider(cipher_suite)
-                .map(HybridOrBase::Base)
+            None
         }
     }
 }
 
 // -----------------------------------------------------------------------------
-// HybridOrBase — enum-dispatch wrapper that exposes a single
-// `CipherSuiteProvider` impl while internally delegating to either the
-// hybrid wrapper or the base provider as appropriate.
+// HybridCipherSuiteProvider — wraps a bare cipher suite provider and
+// overrides only the signature methods to perform Ed25519 ‖ ML-DSA-65.
 // -----------------------------------------------------------------------------
 
-/// Dispatch enum so `HybridCryptoProvider::CipherSuiteProvider` is a
-/// single concrete type that can take either form. Variants are
-/// constructed only inside this module; outside callers see only the
-/// `CipherSuiteProvider` trait.
-#[derive(Clone)]
-pub enum HybridOrBase<P> {
-    Hybrid(HybridCipherSuiteProvider<P>),
-    Base(P),
-}
-
-
-impl<P> CipherSuiteProvider for HybridOrBase<P>
-where
-    P: CipherSuiteProvider + Send + Sync + Clone,
-    P::Error: Send + Sync,
-{
-    type Error = HybridSuiteError<P::Error>;
-    type HpkeContextS = P::HpkeContextS;
-    type HpkeContextR = P::HpkeContextR;
-
-    fn cipher_suite(&self) -> CipherSuite {
-        match self {
-            Self::Hybrid(h) => h.cipher_suite(),
-            Self::Base(b) => b.cipher_suite(),
-        }
-    }
-
-    fn hash(&self, data: &[u8]) -> Result<Vec<u8>, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h.inner.hash(data).map_err(HybridSuiteError::Base),
-            Self::Base(b) => b.hash(data).map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn mac(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h.inner.mac(key, data).map_err(HybridSuiteError::Base),
-            Self::Base(b) => b.mac(key, data).map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn aead_seal(
-        &self,
-        key: &[u8],
-        data: &[u8],
-        aad: Option<&[u8]>,
-        nonce: &[u8],
-    ) -> Result<Vec<u8>, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h
-                .inner
-                .aead_seal(key, data, aad, nonce)
-                
-                .map_err(HybridSuiteError::Base),
-            Self::Base(b) => b
-                .aead_seal(key, data, aad, nonce)
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn aead_open(
-        &self,
-        key: &[u8],
-        ciphertext: &[u8],
-        aad: Option<&[u8]>,
-        nonce: &[u8],
-    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h
-                .inner
-                .aead_open(key, ciphertext, aad, nonce)
-                
-                .map_err(HybridSuiteError::Base),
-            Self::Base(b) => b
-                .aead_open(key, ciphertext, aad, nonce)
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn aead_key_size(&self) -> usize {
-        match self {
-            Self::Hybrid(h) => h.inner.aead_key_size(),
-            Self::Base(b) => b.aead_key_size(),
-        }
-    }
-
-    fn aead_nonce_size(&self) -> usize {
-        match self {
-            Self::Hybrid(h) => h.inner.aead_nonce_size(),
-            Self::Base(b) => b.aead_nonce_size(),
-        }
-    }
-
-    fn kdf_extract(
-        &self,
-        salt: &[u8],
-        ikm: &[u8],
-    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h
-                .inner
-                .kdf_extract(salt, ikm)
-                
-                .map_err(HybridSuiteError::Base),
-            Self::Base(b) => b
-                .kdf_extract(salt, ikm)
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn kdf_expand(
-        &self,
-        prk: &[u8],
-        info: &[u8],
-        len: usize,
-    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h
-                .inner
-                .kdf_expand(prk, info, len)
-                
-                .map_err(HybridSuiteError::Base),
-            Self::Base(b) => b
-                .kdf_expand(prk, info, len)
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn kdf_extract_size(&self) -> usize {
-        match self {
-            Self::Hybrid(h) => h.inner.kdf_extract_size(),
-            Self::Base(b) => b.kdf_extract_size(),
-        }
-    }
-
-    fn hpke_seal(
-        &self,
-        remote_key: &HpkePublicKey,
-        info: &[u8],
-        aad: Option<&[u8]>,
-        pt: &[u8],
-    ) -> Result<HpkeCiphertext, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h
-                .inner
-                .hpke_seal(remote_key, info, aad, pt)
-                
-                .map_err(HybridSuiteError::Base),
-            Self::Base(b) => b
-                .hpke_seal(remote_key, info, aad, pt)
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn hpke_seal_psk(
-        &self,
-        remote_key: &HpkePublicKey,
-        info: &[u8],
-        aad: Option<&[u8]>,
-        pt: &[u8],
-        psk: mls_rs_core::crypto::HpkePsk<'_>,
-    ) -> Result<HpkeCiphertext, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h
-                .inner
-                .hpke_seal_psk(remote_key, info, aad, pt, psk)
-                
-                .map_err(HybridSuiteError::Base),
-            Self::Base(b) => b
-                .hpke_seal_psk(remote_key, info, aad, pt, psk)
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn hpke_open(
-        &self,
-        ciphertext: &HpkeCiphertext,
-        local_secret: &HpkeSecretKey,
-        local_public: &HpkePublicKey,
-        info: &[u8],
-        aad: Option<&[u8]>,
-    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h
-                .inner
-                .hpke_open(ciphertext, local_secret, local_public, info, aad)
-                
-                .map_err(HybridSuiteError::Base),
-            Self::Base(b) => b
-                .hpke_open(ciphertext, local_secret, local_public, info, aad)
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn hpke_open_psk(
-        &self,
-        ciphertext: &HpkeCiphertext,
-        local_secret: &HpkeSecretKey,
-        local_public: &HpkePublicKey,
-        info: &[u8],
-        aad: Option<&[u8]>,
-        psk: mls_rs_core::crypto::HpkePsk<'_>,
-    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h
-                .inner
-                .hpke_open_psk(ciphertext, local_secret, local_public, info, aad, psk)
-                
-                .map_err(HybridSuiteError::Base),
-            Self::Base(b) => b
-                .hpke_open_psk(ciphertext, local_secret, local_public, info, aad, psk)
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn hpke_setup_s(
-        &self,
-        remote_key: &HpkePublicKey,
-        info: &[u8],
-    ) -> Result<(Vec<u8>, Self::HpkeContextS), Self::Error> {
-        match self {
-            Self::Hybrid(h) => h
-                .inner
-                .hpke_setup_s(remote_key, info)
-                
-                .map_err(HybridSuiteError::Base),
-            Self::Base(b) => b
-                .hpke_setup_s(remote_key, info)
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn hpke_setup_r(
-        &self,
-        kem_output: &[u8],
-        local_secret: &HpkeSecretKey,
-        local_public: &HpkePublicKey,
-        info: &[u8],
-    ) -> Result<Self::HpkeContextR, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h
-                .inner
-                .hpke_setup_r(kem_output, local_secret, local_public, info)
-                
-                .map_err(HybridSuiteError::Base),
-            Self::Base(b) => b
-                .hpke_setup_r(kem_output, local_secret, local_public, info)
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn kem_derive(
-        &self,
-        ikm: &[u8],
-    ) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
-        match self {
-            Self::Hybrid(h) => h.inner.kem_derive(ikm).map_err(HybridSuiteError::Base),
-            Self::Base(b) => b.kem_derive(ikm).map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn kem_generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
-        match self {
-            Self::Hybrid(h) => h.inner.kem_generate().map_err(HybridSuiteError::Base),
-            Self::Base(b) => b.kem_generate().map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn kem_public_key_validate(&self, key: &HpkePublicKey) -> Result<(), Self::Error> {
-        match self {
-            Self::Hybrid(h) => h
-                .inner
-                .kem_public_key_validate(key)
-                .map_err(HybridSuiteError::Base),
-            Self::Base(b) => b.kem_public_key_validate(key).map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn random_bytes(&self, out: &mut [u8]) -> Result<(), Self::Error> {
-        match self {
-            Self::Hybrid(h) => h.inner.random_bytes(out).map_err(HybridSuiteError::Base),
-            Self::Base(b) => b.random_bytes(out).map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn signature_key_generate(
-        &self,
-    ) -> Result<(SignatureSecretKey, SignaturePublicKey), Self::Error> {
-        match self {
-            Self::Hybrid(h) => h.signature_key_generate(),
-            Self::Base(b) => b
-                .signature_key_generate()
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn signature_key_derive_public(
-        &self,
-        secret_key: &SignatureSecretKey,
-    ) -> Result<SignaturePublicKey, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h.signature_key_derive_public(secret_key),
-            Self::Base(b) => b
-                .signature_key_derive_public(secret_key)
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn sign(
-        &self,
-        secret_key: &SignatureSecretKey,
-        data: &[u8],
-    ) -> Result<Vec<u8>, Self::Error> {
-        match self {
-            Self::Hybrid(h) => h.sign(secret_key, data),
-            Self::Base(b) => b.sign(secret_key, data).map_err(HybridSuiteError::Base),
-        }
-    }
-
-    fn verify(
-        &self,
-        public_key: &SignaturePublicKey,
-        signature: &[u8],
-        data: &[u8],
-    ) -> Result<(), Self::Error> {
-        match self {
-            Self::Hybrid(h) => h.verify(public_key, signature, data),
-            Self::Base(b) => b
-                .verify(public_key, signature, data)
-                
-                .map_err(HybridSuiteError::Base),
-        }
-    }
-}
-
-// -----------------------------------------------------------------------------
-// HybridCipherSuiteProvider — the actual hybrid override. Implements only
-// the signature surface; everything else is reached through the parent
-// `HybridOrBase` enum that calls the inner base provider directly.
-// -----------------------------------------------------------------------------
-
+/// Wraps a bare cipher suite provider `B` and overrides its signature
+/// surface to use the hybrid `Ed25519 || ML-DSA-65` scheme. Every other
+/// method (hash, KDF, AEAD, HPKE, KEM, MAC, random) is delegated to `B`
+/// verbatim.
+///
+/// Generic in `B` so the same wrapper works for any base
+/// `CipherSuiteProvider` — in practice we only instantiate it on
+/// [`HybridSuite`] (i.e. `OpensslCipherSuite<HybridKem, Kdf, Aead>`),
+/// but the generic shape makes unit-testing against the bare classical
+/// `OpensslCipherSuite` straightforward.
 #[derive(Clone)]
 pub struct HybridCipherSuiteProvider<B> {
     inner: B,
@@ -510,19 +253,212 @@ where
         Self { inner }
     }
 
+    /// Access the wrapped provider. Used by tests; not part of the
+    /// public surface for ordinary callers.
+    #[cfg(test)]
+    pub fn inner(&self) -> &B {
+        &self.inner
+    }
+}
+
+impl<B> CipherSuiteProvider for HybridCipherSuiteProvider<B>
+where
+    B: CipherSuiteProvider + Send + Sync + Clone,
+    B::Error: Send + Sync,
+{
+    type Error = HybridSuiteError<B::Error>;
+    type HpkeContextS = B::HpkeContextS;
+    type HpkeContextR = B::HpkeContextR;
+
     fn cipher_suite(&self) -> CipherSuite {
+        // We *always* report the hybrid ID, regardless of what the
+        // inner provider was constructed against. mls-rs serialises
+        // this into KeyPackages and the GroupContext, so peers see
+        // 0xF101 and know to wire up a hybrid provider on their end.
         hybrid_cipher_suite()
     }
 
+    // ----- pass-through: hash / mac ---------------------------------
+
+    fn hash(&self, data: &[u8]) -> Result<Vec<u8>, Self::Error> {
+        self.inner.hash(data).map_err(HybridSuiteError::Base)
+    }
+
+    fn mac(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, Self::Error> {
+        self.inner.mac(key, data).map_err(HybridSuiteError::Base)
+    }
+
+    // ----- pass-through: AEAD --------------------------------------
+
+    fn aead_seal(
+        &self,
+        key: &[u8],
+        data: &[u8],
+        aad: Option<&[u8]>,
+        nonce: &[u8],
+    ) -> Result<Vec<u8>, Self::Error> {
+        self.inner
+            .aead_seal(key, data, aad, nonce)
+            .map_err(HybridSuiteError::Base)
+    }
+
+    fn aead_open(
+        &self,
+        key: &[u8],
+        ciphertext: &[u8],
+        aad: Option<&[u8]>,
+        nonce: &[u8],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Self::Error> {
+        self.inner
+            .aead_open(key, ciphertext, aad, nonce)
+            .map_err(HybridSuiteError::Base)
+    }
+
+    fn aead_key_size(&self) -> usize {
+        self.inner.aead_key_size()
+    }
+
+    fn aead_nonce_size(&self) -> usize {
+        self.inner.aead_nonce_size()
+    }
+
+    // ----- pass-through: KDF ---------------------------------------
+
+    fn kdf_extract(
+        &self,
+        salt: &[u8],
+        ikm: &[u8],
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Self::Error> {
+        self.inner
+            .kdf_extract(salt, ikm)
+            .map_err(HybridSuiteError::Base)
+    }
+
+    fn kdf_expand(
+        &self,
+        prk: &[u8],
+        info: &[u8],
+        len: usize,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Self::Error> {
+        self.inner
+            .kdf_expand(prk, info, len)
+            .map_err(HybridSuiteError::Base)
+    }
+
+    fn kdf_extract_size(&self) -> usize {
+        self.inner.kdf_extract_size()
+    }
+
+    // ----- pass-through: HPKE single-shot --------------------------
+
+    fn hpke_seal(
+        &self,
+        remote_key: &HpkePublicKey,
+        info: &[u8],
+        aad: Option<&[u8]>,
+        pt: &[u8],
+    ) -> Result<HpkeCiphertext, Self::Error> {
+        self.inner
+            .hpke_seal(remote_key, info, aad, pt)
+            .map_err(HybridSuiteError::Base)
+    }
+
+    fn hpke_seal_psk(
+        &self,
+        remote_key: &HpkePublicKey,
+        info: &[u8],
+        aad: Option<&[u8]>,
+        pt: &[u8],
+        psk: mls_rs_core::crypto::HpkePsk<'_>,
+    ) -> Result<HpkeCiphertext, Self::Error> {
+        self.inner
+            .hpke_seal_psk(remote_key, info, aad, pt, psk)
+            .map_err(HybridSuiteError::Base)
+    }
+
+    fn hpke_open(
+        &self,
+        ciphertext: &HpkeCiphertext,
+        local_secret: &HpkeSecretKey,
+        local_public: &HpkePublicKey,
+        info: &[u8],
+        aad: Option<&[u8]>,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Self::Error> {
+        self.inner
+            .hpke_open(ciphertext, local_secret, local_public, info, aad)
+            .map_err(HybridSuiteError::Base)
+    }
+
+    fn hpke_open_psk(
+        &self,
+        ciphertext: &HpkeCiphertext,
+        local_secret: &HpkeSecretKey,
+        local_public: &HpkePublicKey,
+        info: &[u8],
+        aad: Option<&[u8]>,
+        psk: mls_rs_core::crypto::HpkePsk<'_>,
+    ) -> Result<zeroize::Zeroizing<Vec<u8>>, Self::Error> {
+        self.inner
+            .hpke_open_psk(ciphertext, local_secret, local_public, info, aad, psk)
+            .map_err(HybridSuiteError::Base)
+    }
+
+    // ----- pass-through: HPKE streaming setup ----------------------
+
+    fn hpke_setup_s(
+        &self,
+        remote_key: &HpkePublicKey,
+        info: &[u8],
+    ) -> Result<(Vec<u8>, Self::HpkeContextS), Self::Error> {
+        self.inner
+            .hpke_setup_s(remote_key, info)
+            .map_err(HybridSuiteError::Base)
+    }
+
+    fn hpke_setup_r(
+        &self,
+        kem_output: &[u8],
+        local_secret: &HpkeSecretKey,
+        local_public: &HpkePublicKey,
+        info: &[u8],
+    ) -> Result<Self::HpkeContextR, Self::Error> {
+        self.inner
+            .hpke_setup_r(kem_output, local_secret, local_public, info)
+            .map_err(HybridSuiteError::Base)
+    }
+
+    // ----- pass-through: KEM ---------------------------------------
+
+    fn kem_derive(&self, ikm: &[u8]) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
+        self.inner.kem_derive(ikm).map_err(HybridSuiteError::Base)
+    }
+
+    fn kem_generate(&self) -> Result<(HpkeSecretKey, HpkePublicKey), Self::Error> {
+        self.inner.kem_generate().map_err(HybridSuiteError::Base)
+    }
+
+    fn kem_public_key_validate(&self, key: &HpkePublicKey) -> Result<(), Self::Error> {
+        self.inner
+            .kem_public_key_validate(key)
+            .map_err(HybridSuiteError::Base)
+    }
+
+    // ----- pass-through: random ------------------------------------
+
+    fn random_bytes(&self, out: &mut [u8]) -> Result<(), Self::Error> {
+        self.inner.random_bytes(out).map_err(HybridSuiteError::Base)
+    }
+
+    // ----- override: signatures ------------------------------------
+
     fn signature_key_generate(
         &self,
-    ) -> Result<(SignatureSecretKey, SignaturePublicKey), HybridSuiteError<B::Error>> {
+    ) -> Result<(SignatureSecretKey, SignaturePublicKey), Self::Error> {
         // Ed25519 portion via the base provider (Ed25519 is the
-        // CURVE25519_AES128 signature scheme there).
+        // PARAM_SOURCE_SUITE signature scheme there).
         let (ed_sk, ed_pk) = self
             .inner
             .signature_key_generate()
-            
             .map_err(HybridSuiteError::Base)?;
         let ed_sk_bytes: &[u8] = ed_sk.as_bytes();
         let ed_pk_bytes: &[u8] = ed_pk.as_bytes();
@@ -554,7 +490,7 @@ where
     fn signature_key_derive_public(
         &self,
         secret_key: &SignatureSecretKey,
-    ) -> Result<SignaturePublicKey, HybridSuiteError<B::Error>> {
+    ) -> Result<SignaturePublicKey, Self::Error> {
         let bytes: &[u8] = secret_key.as_bytes();
         if bytes.len() != HYBRID_SK_LEN {
             return Err(HybridSuiteError::Layout(format!(
@@ -569,7 +505,6 @@ where
         let ed_pk = self
             .inner
             .signature_key_derive_public(&ed_sk)
-            
             .map_err(HybridSuiteError::Base)?;
         let ed_pk_bytes: &[u8] = ed_pk.as_bytes();
         if ed_pk_bytes.len() != ED25519_PK_LEN {
@@ -597,7 +532,7 @@ where
         &self,
         secret_key: &SignatureSecretKey,
         data: &[u8],
-    ) -> Result<Vec<u8>, HybridSuiteError<B::Error>> {
+    ) -> Result<Vec<u8>, Self::Error> {
         let bytes: &[u8] = secret_key.as_bytes();
         if bytes.len() != HYBRID_SK_LEN {
             return Err(HybridSuiteError::Layout(format!(
@@ -612,7 +547,6 @@ where
         let ed_sig = self
             .inner
             .sign(&ed_sk, data)
-            
             .map_err(HybridSuiteError::Base)?;
         if ed_sig.len() != ED25519_SIG_LEN {
             return Err(HybridSuiteError::Layout(format!(
@@ -644,7 +578,7 @@ where
         public_key: &SignaturePublicKey,
         signature: &[u8],
         data: &[u8],
-    ) -> Result<(), HybridSuiteError<B::Error>> {
+    ) -> Result<(), Self::Error> {
         let pk_bytes: &[u8] = public_key.as_bytes();
         if pk_bytes.len() != HYBRID_PK_LEN {
             return Err(HybridSuiteError::Layout(format!(
@@ -667,7 +601,6 @@ where
         // Ed25519 half — base verifies; any failure short-circuits.
         self.inner
             .verify(&ed_pk, ed_sig, data)
-            
             .map_err(HybridSuiteError::Base)?;
 
         // ML-DSA-65 half — verifies independently. Both halves must
@@ -694,7 +627,7 @@ where
 
 #[derive(Debug, thiserror::Error)]
 pub enum HybridSuiteError<E> {
-    #[error("base provider error: {0}")]
+    #[error("base provider error: {0:?}")]
     Base(E),
     #[error("hybrid layout: {0}")]
     Layout(String),
@@ -725,7 +658,95 @@ impl std::fmt::Display for SimpleStringError {
 }
 impl std::error::Error for SimpleStringError {}
 
-/// AEAD anchor kept from P1 (silences dead-code warning until P1.5.b
-/// wires AEAD-specific instrumentation in for the hybrid HPKE path).
-#[allow(dead_code)]
-fn _aead_passthrough_anchor<T: mls_rs_crypto_traits::AeadType>(_t: T) {}
+// -----------------------------------------------------------------------------
+// Convenience alias for callers that just want "the" hybrid error.
+// -----------------------------------------------------------------------------
+
+/// Canonical concrete error type emitted by the hybrid suite as wired
+/// in production (i.e. on top of [`HybridSuite`]).
+pub type HybridProductionError = HybridSuiteError<OpensslCryptoError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `HybridCryptoProvider` exposes exactly one cipher suite — the
+    /// hybrid one. No other suites leak out.
+    #[test]
+    fn provider_advertises_only_hybrid_suite() {
+        let p = HybridCryptoProvider::new();
+        let suites = p.supported_cipher_suites();
+        assert_eq!(suites, vec![hybrid_cipher_suite()]);
+        assert!(p.cipher_suite_provider(hybrid_cipher_suite()).is_some());
+        assert!(
+            p.cipher_suite_provider(CipherSuite::CURVE25519_AES128)
+                .is_none()
+        );
+    }
+
+    /// End-to-end signature round-trip through the hybrid wrapper:
+    /// keygen → sign → verify must succeed; mutating either half of
+    /// the signature must make it fail.
+    #[test]
+    fn hybrid_signature_roundtrip_and_tamper_detection() {
+        let p = HybridCryptoProvider::new();
+        let suite = p.cipher_suite_provider(hybrid_cipher_suite()).expect("ok");
+
+        let msg = b"the quick brown fox jumps over the lazy dog";
+        let (sk, pk) = suite.signature_key_generate().expect("keygen");
+        assert_eq!(sk.as_bytes().len(), HYBRID_SK_LEN);
+        assert_eq!(pk.as_bytes().len(), HYBRID_PK_LEN);
+
+        let sig = suite.sign(&sk, msg).expect("sign");
+        assert_eq!(sig.len(), HYBRID_SIG_LEN);
+        suite.verify(&pk, &sig, msg).expect("verify");
+
+        // Flip a bit in the Ed25519 half (first 64 bytes).
+        let mut tampered = sig.clone();
+        tampered[0] ^= 0x01;
+        assert!(suite.verify(&pk, &tampered, msg).is_err());
+
+        // Flip a bit in the ML-DSA-65 half (after byte 64).
+        let mut tampered = sig.clone();
+        tampered[ED25519_SIG_LEN + 1] ^= 0x01;
+        assert!(suite.verify(&pk, &tampered, msg).is_err());
+    }
+
+    /// Hybrid KEM round-trip: kem_generate → hpke_seal → hpke_open must
+    /// recover the plaintext, and tampering with the ciphertext must
+    /// make `hpke_open` fail. This is the load-bearing property MLS
+    /// relies on for Welcome / path-secret encryption.
+    #[test]
+    fn hybrid_hpke_roundtrip_and_tamper_detection() {
+        let p = HybridCryptoProvider::new();
+        let suite = p.cipher_suite_provider(hybrid_cipher_suite()).expect("ok");
+
+        let (sk, pk) = suite.kem_generate().expect("kem_generate");
+        // The hybrid SK / PK should be the concatenated X25519 + ML-KEM-768
+        // byte strings — sanity-check lengths against FIPS-203 + RFC 7748.
+        assert_eq!(sk.as_ref().len(), 32 + 2400);
+        assert_eq!(pk.as_ref().len(), 32 + 1184);
+
+        let pt = b"hello hybrid HPKE";
+        let info = b"unit-test";
+        let aad: Option<&[u8]> = Some(b"aad-bytes");
+
+        let ct = suite.hpke_seal(&pk, info, aad, pt).expect("hpke_seal");
+        let recovered = suite
+            .hpke_open(&ct, &sk, &pk, info, aad)
+            .expect("hpke_open");
+        assert_eq!(recovered.as_slice(), pt);
+
+        // Tamper with the AEAD ciphertext body; opening must fail.
+        let mut tampered_ct = ct.clone();
+        if let Some(byte) = tampered_ct.ciphertext.first_mut() {
+            *byte ^= 0x01;
+        }
+        assert!(
+            suite
+                .hpke_open(&tampered_ct, &sk, &pk, info, aad)
+                .is_err(),
+            "tampered ciphertext must fail to open"
+        );
+    }
+}

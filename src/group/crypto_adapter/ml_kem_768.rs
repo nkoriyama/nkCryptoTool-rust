@@ -32,6 +32,7 @@ use fips203::ml_kem_768;
 use fips203::traits::{Decaps, Encaps, KeyGen, SerDes};
 use mls_rs_core::crypto::{HpkePublicKey, HpkeSecretKey};
 use mls_rs_core::error::IntoAnyError;
+use mls_rs_crypto_hpke::kem_combiner::FixedLengthKemType;
 use mls_rs_crypto_traits::{KemResult, KemType};
 
 /// Provisional KEM identifier for ML-KEM-768. The IETF has not yet
@@ -164,6 +165,28 @@ impl KemType for MlKem768Kem {
     }
 }
 
+/// `FixedLengthKemType` is required by `CombinedKem` so it can split
+/// concatenated keys / ciphertexts back into their per-KEM halves at
+/// `decap` time. ML-KEM-768 has fixed-length encodings (FIPS-203 §7),
+/// so the sizes are constants.
+impl FixedLengthKemType for MlKem768Kem {
+    fn public_key_size(&self) -> usize {
+        ml_kem_768::EK_LEN
+    }
+
+    fn secret_key_size(&self) -> usize {
+        ml_kem_768::DK_LEN
+    }
+
+    fn enc_size(&self) -> usize {
+        // Unlike `DhKem` (whose ciphertext is the ephemeral public key,
+        // i.e. `public_key_size()`), ML-KEM-768 ciphertexts are 1088 B
+        // — distinct from the 1184 B public key. We must override the
+        // default which equals `public_key_size()`.
+        ml_kem_768::CT_LEN
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum MlKem768Error {
     #[error("seed length: expected {expected}, got {got}")]
@@ -243,5 +266,20 @@ mod tests {
         assert_eq!(ml_kem_768::EK_LEN, 1184);
         assert_eq!(ml_kem_768::DK_LEN, 2400);
         assert_eq!(ml_kem_768::CT_LEN, 1088);
+    }
+
+    /// `FixedLengthKemType` sizes must match the FIPS-203 constants;
+    /// `CombinedKem::decap` uses these to split concatenated buffers
+    /// — getting any of them wrong silently produces wrong keys.
+    #[test]
+    fn fixed_length_sizes() {
+        let kem = MlKem768Kem;
+        assert_eq!(kem.public_key_size(), 1184);
+        assert_eq!(kem.secret_key_size(), 2400);
+        assert_eq!(kem.enc_size(), 1088);
+        // The default-impl of `enc_size` equals `public_key_size`; for
+        // ML-KEM the ciphertext is *smaller* than the public key, so
+        // ensure we have overridden it.
+        assert_ne!(kem.enc_size(), kem.public_key_size());
     }
 }

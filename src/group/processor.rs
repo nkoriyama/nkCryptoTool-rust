@@ -13,15 +13,17 @@ use mls_rs::identity::SigningIdentity;
 use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
 use mls_rs::{Client, ExtensionList};
 use mls_rs_core::crypto::{CipherSuiteProvider, CryptoProvider};
-use mls_rs_crypto_openssl::OpensslCryptoProvider;
 use zeroize::Zeroizing;
 
 use crate::group::crypto_adapter::{hybrid_cipher_suite, HybridCryptoProvider};
 use crate::group::types::{GroupError, GroupId};
 use crate::p2p::P2pEndpoint;
 
-/// MLS-RS `Client` built with our `HybridCryptoProvider` on top of an
-/// OpenSSL base.
+/// MLS-RS `Client` built with our `HybridCryptoProvider`.
+///
+/// `HybridCryptoProvider` is the only `CryptoProvider` we expose; it
+/// exposes a single cipher suite (the hybrid `0xF101`) and internally
+/// builds the X25519 + ML-KEM-768 / SHA-256 / AES-128-GCM primitives.
 ///
 /// Type alias shape follows the mls-rs 0.55 docs example: the builder
 /// stacks `WithIdentityProvider<.., WithCryptoProvider<.., BaseConfig>>`
@@ -30,15 +32,15 @@ use crate::p2p::P2pEndpoint;
 type MlsClient = Client<
     WithIdentityProvider<
         BasicIdentityProvider,
-        WithCryptoProvider<HybridCryptoProvider<OpensslCryptoProvider>, BaseConfig>,
+        WithCryptoProvider<HybridCryptoProvider, BaseConfig>,
     >,
 >;
 
-// P1.5.a: the cipher suite used here is the hybrid (Ed25519 + ML-DSA-65
-// signatures, classical X25519/AES128 KEM/AEAD via base). It is exposed
-// through `crate::group::crypto_adapter::hybrid_cipher_suite()` because
-// the underlying `CipherSuite` type has no `const fn` constructor for
-// private-use IDs. P1.5.b adds the hybrid KEM half.
+// P1.5.b: the cipher suite used here is the full hybrid suite — both
+// signatures (Ed25519 + ML-DSA-65) and KEM (X25519 + ML-KEM-768) are
+// hybrid. AEAD remains AES-128-GCM and KDF/Hash remain SHA-256; those
+// classical primitives are considered acceptable post-quantum for the
+// purposes of MLS because key material is protected by the PQ KEM.
 
 /// Transport-agnostic MLS group chat orchestrator.
 ///
@@ -62,11 +64,13 @@ impl GroupChatProcessor {
         display_name: &str,
         endpoint: Arc<dyn P2pEndpoint>,
     ) -> Result<Self, GroupError> {
-        let crypto = HybridCryptoProvider::new(OpensslCryptoProvider::default());
+        let crypto = HybridCryptoProvider::new();
         let suite_id = hybrid_cipher_suite();
         let suite = crypto.cipher_suite_provider(suite_id).ok_or_else(|| {
             GroupError::Backend(
-                "hybrid cipher suite (0xF101) not supported by the base provider".to_string(),
+                "hybrid cipher suite (0xF101) construction failed; \
+                 is OpenSSL configured with X25519 + SHA-256 + AES-128-GCM?"
+                    .to_string(),
             )
         })?;
 
@@ -135,19 +139,104 @@ mod tests {
     use super::*;
     use crate::p2p::backend::mock::MockNetwork;
     use crate::p2p::{P2pProtocol, PeerId};
+    use mls_rs::ExtensionList;
 
     const PROTO_MLS: P2pProtocol = P2pProtocol(b"nkct/mls/1");
+
+    /// Test helper: build a `GroupChatProcessor` with a freshly
+    /// registered mock endpoint. The endpoint is not exercised by
+    /// the test (its only purpose is to satisfy the `new` signature)
+    /// — the `peer_byte` parameter just lets the caller distinguish
+    /// PeerIds.
+    fn build_proc(display_name: &str, peer_byte: u8) -> GroupChatProcessor {
+        let net = MockNetwork::new();
+        let ep = net.register(PeerId::new([peer_byte; 32]), vec![PROTO_MLS]);
+        GroupChatProcessor::new(display_name, Arc::new(ep)).expect("builder")
+    }
 
     /// P1 smoke test: build a `GroupChatProcessor` with a mock
     /// endpoint and round-trip a `create_group` call.
     #[tokio::test]
     async fn create_group_smoke() {
-        let net = MockNetwork::new();
-        let ep = net.register(PeerId::new([1; 32]), vec![PROTO_MLS]);
-        let proc = GroupChatProcessor::new("alice", Arc::new(ep)).expect("builder");
-
+        let proc = build_proc("alice", 1);
         let gid = proc.create_group().await.expect("create_group");
         // GroupId は 32B 乱数。零値は事故時のみで実運用ではあり得ない。
         assert_ne!(gid.as_bytes(), &[0u8; 32]);
+    }
+
+    /// P1.5.b round-trip: exercise the full MLS Add flow with the
+    /// hybrid cipher suite. Alice creates a group, Bob produces a
+    /// KeyPackage, Alice commits the Add and emits a Welcome, Bob
+    /// joins via that Welcome. Both must end up on the same epoch
+    /// with two members.
+    ///
+    /// This is the load-bearing integration test for P1.5.b: it
+    /// runs the *real* mls-rs group machinery (commit construction,
+    /// Welcome encryption with hybrid HPKE, key-schedule advancement)
+    /// against our hybrid suite. If any part of the hybrid plumbing
+    /// is misconfigured — wrong KEM byte layout, sig key length,
+    /// SHAKE adapter wiring, etc. — this test fails.
+    #[tokio::test]
+    async fn add_member_roundtrip_with_hybrid_suite() {
+        // mls-rs's group machinery takes `&self` on the Client, so we
+        // can drive both Alice and Bob without consuming the procs.
+        let alice = build_proc("alice", 1);
+        let bob = build_proc("bob", 2);
+
+        // Alice creates a fresh group; she is the only member at epoch 0.
+        let mut alice_group = alice
+            .client
+            .create_group(ExtensionList::default(), Default::default(), None)
+            .expect("alice create_group");
+        assert_eq!(alice_group.current_epoch(), 0);
+        assert_eq!(alice_group.roster().members_iter().count(), 1);
+
+        // Bob generates a KeyPackage that Alice can use to add him.
+        let bob_key_package = bob
+            .client
+            .generate_key_package_message(
+                ExtensionList::default(),
+                ExtensionList::default(),
+                None,
+            )
+            .expect("bob generate_key_package");
+
+        // Alice builds a commit containing an Add proposal for Bob's
+        // KeyPackage. `build()` returns the commit + a Welcome message
+        // for Bob. The commit is now *pending* on Alice's side; she
+        // must apply it to advance her own state.
+        let commit_output = alice_group
+            .commit_builder()
+            .add_member(bob_key_package)
+            .expect("add_member proposal")
+            .build()
+            .expect("commit build");
+        assert_eq!(
+            commit_output.welcome_messages.len(),
+            1,
+            "Add produces exactly one Welcome"
+        );
+
+        // Alice apply_pending_commit() advances her own epoch.
+        alice_group
+            .apply_pending_commit()
+            .expect("alice apply_pending_commit");
+        assert_eq!(alice_group.current_epoch(), 1);
+        assert_eq!(alice_group.roster().members_iter().count(), 2);
+
+        // Bob joins via the Welcome — this is the path that exercises
+        // hybrid HPKE end-to-end (Welcome's GroupSecrets are HPKE-
+        // encrypted to Bob's KeyPackage init_key, which under the
+        // hybrid suite is an X25519+ML-KEM-768 composite).
+        let (bob_group, _info) = bob
+            .client
+            .join_group(None, &commit_output.welcome_messages[0], None)
+            .expect("bob join_group");
+
+        // Final invariant: both peers on epoch 1 with the same
+        // group_id and the same 2-member roster.
+        assert_eq!(bob_group.current_epoch(), 1);
+        assert_eq!(bob_group.roster().members_iter().count(), 2);
+        assert_eq!(bob_group.group_id(), alice_group.group_id());
     }
 }
