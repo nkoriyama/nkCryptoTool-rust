@@ -1,0 +1,14 @@
+// Unified Slint entry point for the `gui-mls` feature combination.
+//
+// slint-build's `compile()` sets `SLINT_INCLUDE_GENERATED` to its
+// output, overwriting any previous call — so the only way to have
+// BOTH the 1:1 chat window and the MLS group window available
+// through a single `slint::include_modules!()` is to import them
+// from one Slint document.
+//
+// This file is the build entry only when both `gui` and `mls`
+// features are enabled; the bare `gui` build still uses `chat.slint`
+// directly via the other branch in `build.rs`.
+
+export { ChatWindow, TransferMode } from "chat.slint";
+export { GroupChatWindow } from "group.slint";

@@ -187,6 +187,12 @@ struct Args {
     /// Leaf index to remove (for `--mls-cmd remove-member`).
     #[arg(long)]
     mls_index: Option<u32>,
+
+    /// Launch the MLS group chat GUI (requires `gui-mls` cargo feature).
+    /// Bypasses `--mls-cmd`; the GUI window owns the processor for the
+    /// duration of the session.
+    #[arg(long, help = "Launch the Slint-based MLS group chat window")]
+    mls_gui: bool,
 }
 
 #[tokio::main]
@@ -220,6 +226,19 @@ async fn main() -> anyhow::Result<()> {
         {
             anyhow::bail!(
                 "--mls-cmd requires the `mls` cargo feature; rebuild with `--features mls`"
+            );
+        }
+    }
+
+    if args.mls_gui {
+        #[cfg(feature = "gui-mls")]
+        {
+            return run_mls_gui(args).await;
+        }
+        #[cfg(not(feature = "gui-mls"))]
+        {
+            anyhow::bail!(
+                "--mls-gui requires the `gui-mls` cargo feature; rebuild with `--features gui-mls`"
             );
         }
     }
@@ -484,4 +503,47 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
     let processor = GroupChatProcessor::new(&args.mls_display_name, endpoint, storage)
         .map_err(|e| anyhow::anyhow!("build GroupChatProcessor: {e}"))?;
     cli::run(cmd, processor).await
+}
+
+#[cfg(feature = "gui-mls")]
+async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
+    use nk_crypto_tool::config::CryptoConfig;
+    use nk_crypto_tool::group::{cli, GroupChatProcessor, GroupStorage};
+    use nk_crypto_tool::p2p::P2pEndpoint;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    let storage_path: PathBuf = match args.mls_storage {
+        Some(p) => PathBuf::from(p),
+        None => cli::default_storage_path()?,
+    };
+    let storage = GroupStorage::open_at(&storage_path)
+        .map_err(|e| anyhow::anyhow!("open MLS storage at {storage_path:?}: {e}"))?;
+
+    // Build transport endpoint per --transport / --no-relay / --relay-url.
+    let mut transport_config = CryptoConfig::default();
+    transport_config.transport = args.transport;
+    transport_config.no_relay = args.no_relay;
+    transport_config.relay_url = args.relay_url;
+
+    let endpoint: Arc<dyn P2pEndpoint> = match transport_config.transport {
+        nk_crypto_tool::config::TransportKind::Iroh => Arc::new(
+            nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&transport_config, false)
+                .await?,
+        ),
+        nk_crypto_tool::config::TransportKind::Tcp => {
+            anyhow::bail!(
+                "MLS over TCP is not supported in this build; pass --transport iroh"
+            );
+        }
+    };
+
+    let processor = Arc::new(
+        GroupChatProcessor::new(&args.mls_display_name, endpoint, storage)
+            .map_err(|e| anyhow::anyhow!("build GroupChatProcessor: {e}"))?,
+    );
+
+    nk_crypto_tool::gui::group_chat::run_group_gui(processor)
+        .await
+        .map_err(|e| anyhow::anyhow!("GUI loop: {e}"))
 }

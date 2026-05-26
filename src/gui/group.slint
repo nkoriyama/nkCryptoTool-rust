@@ -1,0 +1,226 @@
+// MLS group chat window (P8).
+//
+// Minimal but functional UI per `MLS_GROUP_CHAT_PLAN.md` §8.2:
+// - left column: groups list + "create group" input + own ticket
+// - right column: members list, message history, compose box,
+//   add-member sub-form
+//
+// All state comes in from the Rust driver as `in-out property`;
+// user interactions go out as `callback`s. The Rust driver
+// (`src/gui/group_chat.rs`) refreshes the model after every
+// successful operation so the UI stays consistent with sqlite.
+
+import { Button, VerticalBox, HorizontalBox, LineEdit, GroupBox, StandardListView } from "std-widgets.slint";
+
+export component GroupChatWindow inherits Window {
+    title: "nkCryptoTool — MLS Group Chat";
+    width: 900px;
+    height: 600px;
+
+    // ----- inputs from Rust ------------------------------------------------
+    in-out property <[StandardListViewItem]> groups: [];
+    in-out property <[StandardListViewItem]> members: [];
+    in-out property <[StandardListViewItem]> messages: [];
+
+    /// Current group's id (hex). Empty when no group is selected.
+    in-out property <string> selected-group-id: "";
+
+    /// Our own reachable address as a base32 ticket. Read-only; the
+    /// user copies this and hands it to peers so they can address us
+    /// as the recipient of a Welcome.
+    in-out property <string> own-ticket: "";
+
+    /// Single-line status bar at the bottom of the right column.
+    /// The driver writes both successes (green) and errors (red) here.
+    in-out property <string> status: "";
+    in-out property <bool> status-is-error: false;
+
+    /// Compose-box buffers. Kept on the UI side so the user's typing
+    /// survives a model refresh.
+    in-out property <string> compose-text: "";
+    in-out property <string> create-name-text: "";
+    in-out property <string> add-member-ticket-text: "";
+    in-out property <string> add-member-kp-path-text: "";
+
+    // ----- callbacks → Rust -----------------------------------------------
+    /// User clicked "Create Group". `name` is the BasicCredential label.
+    callback create-group-pressed(string);
+    /// User clicked a row in the groups list. `row` is the index.
+    callback group-selected(int);
+    /// User pressed Send (or Enter in the compose box).
+    callback send-message-pressed(string);
+    /// User clicked Add — `ticket` is the new member's network address
+    /// (their `print-local-address` output), `kp-path` is the file
+    /// containing their KeyPackage blob.
+    callback add-member-pressed(string, string);
+    /// User clicked "Export KeyPackage" — driver opens a save-as dialog.
+    callback export-key-package-pressed();
+    /// User clicked Refresh — driver re-loads list_groups / list_members.
+    callback refresh-pressed();
+    /// User clicked the ticket text — driver copies to clipboard.
+    callback copy-ticket-pressed();
+
+    VerticalBox {
+        spacing: 8px;
+        padding: 8px;
+
+        HorizontalBox {
+            spacing: 8px;
+
+            // ---------- left column ------------------------------------
+            VerticalBox {
+                width: 280px;
+                spacing: 8px;
+
+                GroupBox {
+                    title: "Groups";
+                    StandardListView {
+                        model: root.groups;
+                        height: 220px;
+                        current-item-changed(idx) => {
+                            root.group-selected(idx);
+                        }
+                    }
+                }
+
+                GroupBox {
+                    title: "Create Group";
+                    VerticalBox {
+                        LineEdit {
+                            placeholder-text: "Group name (display only)";
+                            text <=> root.create-name-text;
+                            accepted => {
+                                root.create-group-pressed(root.create-name-text);
+                                root.create-name-text = "";
+                            }
+                        }
+                        Button {
+                            text: "Create";
+                            clicked => {
+                                root.create-group-pressed(root.create-name-text);
+                                root.create-name-text = "";
+                            }
+                        }
+                    }
+                }
+
+                GroupBox {
+                    title: "Your address";
+                    VerticalBox {
+                        Text {
+                            text: root.own-ticket == "" ? "(not initialized)" : root.own-ticket;
+                            font-size: 9px;
+                            wrap: word-wrap;
+                        }
+                        HorizontalBox {
+                            Button {
+                                text: "Copy Ticket";
+                                clicked => { root.copy-ticket-pressed(); }
+                            }
+                            Button {
+                                text: "Export KP";
+                                clicked => { root.export-key-package-pressed(); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---------- right column -----------------------------------
+            VerticalBox {
+                spacing: 8px;
+
+                Text {
+                    text: root.selected-group-id == ""
+                        ? "Select or create a group"
+                        : "Group: " + root.selected-group-id;
+                    font-size: 11px;
+                }
+
+                HorizontalBox {
+                    spacing: 8px;
+
+                    // Members sidebar (narrower).
+                    GroupBox {
+                        title: "Members";
+                        width: 160px;
+                        StandardListView {
+                            model: root.members;
+                        }
+                    }
+
+                    // Message log (takes the remaining width).
+                    GroupBox {
+                        title: "Messages";
+                        StandardListView {
+                            model: root.messages;
+                        }
+                    }
+                }
+
+                // Compose box.
+                HorizontalBox {
+                    LineEdit {
+                        placeholder-text: "Type a message…";
+                        text <=> root.compose-text;
+                        accepted => {
+                            root.send-message-pressed(root.compose-text);
+                            root.compose-text = "";
+                        }
+                    }
+                    Button {
+                        text: "Send";
+                        enabled: root.selected-group-id != "" && root.compose-text != "";
+                        clicked => {
+                            root.send-message-pressed(root.compose-text);
+                            root.compose-text = "";
+                        }
+                    }
+                }
+
+                // Add-member sub-form.
+                GroupBox {
+                    title: "Add Member (admin)";
+                    VerticalBox {
+                        spacing: 4px;
+                        LineEdit {
+                            placeholder-text: "Recipient ticket (their print-local-address)";
+                            text <=> root.add-member-ticket-text;
+                        }
+                        LineEdit {
+                            placeholder-text: "KeyPackage file path";
+                            text <=> root.add-member-kp-path-text;
+                        }
+                        HorizontalBox {
+                            Button {
+                                text: "Add";
+                                enabled: root.selected-group-id != ""
+                                    && root.add-member-ticket-text != ""
+                                    && root.add-member-kp-path-text != "";
+                                clicked => {
+                                    root.add-member-pressed(
+                                        root.add-member-ticket-text,
+                                        root.add-member-kp-path-text,
+                                    );
+                                    root.add-member-ticket-text = "";
+                                    root.add-member-kp-path-text = "";
+                                }
+                            }
+                            Button {
+                                text: "Refresh";
+                                clicked => { root.refresh-pressed(); }
+                            }
+                        }
+                    }
+                }
+
+                // Status bar.
+                if root.status != "" : Text {
+                    text: root.status;
+                    color: root.status-is-error ? red : gray;
+                    font-size: 10px;
+                }
+            }
+        }
+    }
+}

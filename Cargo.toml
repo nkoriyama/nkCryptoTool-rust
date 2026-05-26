@@ -104,6 +104,9 @@ gui-camera = ["gui", "nokhwa", "rqrr", "image"]
 gui-notifications = ["gui", "notify-rust"]
 gui-screen-protection = ["gui", "windows", "objc2"]
 gui-file-transfer = ["gui", "rfd"]
+# MLS group chat GUI (P8). Adds the GroupChatWindow Slint component and
+# its Rust driver on top of the base `gui` + `mls` feature combination.
+gui-mls = ["gui", "mls"]
 backend-openssl = ["openssl", "openssl-sys", "foreign-types"]
 backend-openssl-vendored = ["backend-openssl", "openssl/vendored", "openssl-src"]
 backend-rustcrypto = [

@@ -31,6 +31,10 @@ pub mod notifications;
 pub mod screen_protection;
 #[cfg(feature = "gui")]
 pub mod file_picker;
+/// MLS group chat GUI driver (P8). Gated on `gui-mls` so the default
+/// `gui` build (without MLS) skips the extra Slint module.
+#[cfg(feature = "gui-mls")]
+pub mod group_chat;
 
 #[cfg(feature = "gui")]
 pub fn pick_and_apply_file(ui: &ChatWindow, picker: &dyn file_picker::FilePickerProvider) {
