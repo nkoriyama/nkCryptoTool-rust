@@ -18,6 +18,7 @@
 //! Everything is gated behind `#[cfg(feature = "mls")]` so the default
 //! crate build (and all 1:1 chat / file transfer paths) are unaffected.
 
+pub mod cli;
 pub mod crypto_adapter;
 pub mod processor;
 pub mod storage;
