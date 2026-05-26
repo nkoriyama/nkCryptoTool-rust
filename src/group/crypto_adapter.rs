@@ -36,6 +36,11 @@
 // builds, so every method is *synchronous* despite the `async fn`
 // notation in the source. Our impl therefore uses plain `fn` methods
 // and no `` (the same pattern the OpenSSL provider follows).
+
+/// ML-KEM-768 `KemType` wrapper. Foundation for P1.5.b's hybrid KEM
+/// (gets combined with X25519 DhKem in a future revision).
+pub mod ml_kem_768;
+
 use fips204::ml_dsa_65;
 use fips204::traits::{SerDes, Signer, Verifier};
 use mls_rs::CipherSuite;
