@@ -49,6 +49,17 @@ mls-rs-crypto-openssl = { version = "0.21", optional = true }
 # and `kem_combiner::FixedLengthKemType` for the hybrid KEM composition
 # (X25519 ‖ ML-KEM-768). Version must track openssl provider's; bump together.
 mls-rs-crypto-hpke = { version = "0.21", optional = true }
+# P2 sqlite persistence. `sqlite-bundled` ships the upstream sqlite C
+# library (no system dep, larger binary) but keeps the database
+# unencrypted at rest — protection is provided by file mode 0o600 and
+# OS keystore for the signing-key passphrase (see SECURITY.md). The
+# `sqlcipher-bundled` upgrade path remains available for a future
+# encrypted-at-rest revision.
+mls-rs-provider-sqlite = { version = "0.23", default-features = false, features = ["sqlite-bundled"], optional = true }
+# Direct rusqlite dep so our custom `ConnectionStrategy` can apply the
+# busy_timeout / synchronous PRAGMAs that the upstream provider does
+# not set. Version must match `mls-rs-provider-sqlite`'s pin (0.37).
+rusqlite = { version = "0.37", default-features = false, optional = true }
 notify-rust = { version = "4.0", optional = true }
 rfd = { version = "0.14", optional = true }
 
@@ -116,6 +127,8 @@ mls = [
     "mls-rs-crypto-traits",
     "mls-rs-crypto-openssl",
     "mls-rs-crypto-hpke",
+    "mls-rs-provider-sqlite",
+    "rusqlite",
 ]
 
 [dev-dependencies]

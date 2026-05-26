@@ -102,6 +102,22 @@ impl fmt::Debug for Welcome {
     }
 }
 
+/// Snapshot of a group's state suitable for read-only display.
+///
+/// Returned by [`crate::group::GroupChatProcessor::load_group_summary`]
+/// after reconstructing a group from persistent storage. Carries
+/// enough to drive a UI listing (`epoch`, `member_count`) without
+/// exposing the underlying `mls_rs::Group` — which is dropped (and
+/// its key material zeroized) at the end of the load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GroupSummary {
+    pub id: GroupId,
+    /// Current MLS epoch. Increments by 1 on each Commit.
+    pub epoch: u64,
+    /// Number of members currently in the group (live LeafNode count).
+    pub member_count: usize,
+}
+
 /// Errors surfaced by the group chat API. Library-specific errors are
 /// caught at the boundary and wrapped in `Backend(String)` so callers
 /// never depend on a concrete `mls-rs` error type.

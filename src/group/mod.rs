@@ -20,8 +20,10 @@
 
 pub mod crypto_adapter;
 pub mod processor;
+pub mod storage;
 pub mod types;
 
 pub use crypto_adapter::{hybrid_cipher_suite, HYBRID_SUITE_ID};
 pub use processor::GroupChatProcessor;
-pub use types::{GroupError, GroupId, GroupMessage, MemberId, Welcome};
+pub use storage::{GroupStorage, TunedFileStrategy};
+pub use types::{GroupError, GroupId, GroupMessage, GroupSummary, MemberId, Welcome};
