@@ -500,9 +500,31 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
         }
     };
 
-    let processor = GroupChatProcessor::new(&args.mls_display_name, endpoint, storage)
+    let processor = GroupChatProcessor::new(&args.mls_display_name, endpoint.clone(), storage)
         .map_err(|e| anyhow::anyhow!("build GroupChatProcessor: {e}"))?;
-    cli::run(cmd, processor).await
+    let result = cli::run(cmd, processor).await;
+    // Graceful shutdown for one-shot commands that initiate outbound
+    // streams (add-member, remove-member, send, send-welcome-to):
+    // iroh's `SendStream::shutdown` only waits for the FIN to be
+    // ACK'd at the QUIC layer, not for the peer's *application* to
+    // have read the bytes. If we exit immediately, our Endpoint::drop
+    // resets the connection and the peer's mid-body read sees a
+    // spurious "connection lost". A short linger gives the receiver's
+    // event loop time to drain the stream before we go away.
+    //
+    // 2.5 s is empirically long enough for hybrid-suite Welcome and
+    // Application messages (a few KiB) on loopback / LAN. A future
+    // revision can replace this with an explicit ACK byte on the
+    // ALPN_MLS framing — see the address-book follow-up.
+    //
+    // NB: `endpoint.close()` is intentionally NOT called here — it
+    // tears down still-draining QUIC streams which is precisely the
+    // race we're trying to avoid. Letting `endpoint` go out of scope
+    // and dropping at process exit gives iroh's own drop-time
+    // graceful close path a chance to finish.
+    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    let _ = &endpoint; // keep endpoint alive for the linger above
+    result
 }
 
 #[cfg(feature = "gui-mls")]

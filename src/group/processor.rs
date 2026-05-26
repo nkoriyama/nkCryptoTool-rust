@@ -1529,7 +1529,7 @@ mod tests {
             .send_welcome_to(&bob_addr, &added.welcome)
             .await
             .expect("welcome send");
-        let (_bob_evt, _bob) = tokio::time::timeout(
+        let (_bob_evt, bob) = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             bob_task,
         )
@@ -1537,36 +1537,28 @@ mod tests {
         .expect("bob welcome timed out")
         .expect("bob task joined");
 
-        // Alice sends to herself (in addition to bob, who can decrypt).
-        // Spawn an Alice-acceptor task so the self-stream lands.
-        let alice_acceptor = {
-            // Move alice into the task — we'll get it back via the join.
-            // Note: we can't borrow alice for both send and accept
-            // simultaneously because accept_next takes &self.
-            // Workaround: make accept a separate handle. But our
-            // `accept_next` takes &self, so we can spawn alice's accept
-            // by Arc<Self> ... however, alice is not Arc-wrapped.
-            //
-            // Instead: clone the underlying endpoint Arc for a parallel
-            // accept call. The processor doesn't currently expose
-            // raw-endpoint access, so accept directly from the
-            // endpoint and verify the frame decode happens — we don't
-            // need full processor dispatch for this assertion.
-            None::<()>
-        };
-        let _ = alice_acceptor;
+        // P9 framing change: send_application_message now waits for
+        // the receiver's ACK byte before returning (so the sender's
+        // iroh endpoint doesn't drop while the receiver is still
+        // reading). For this test to make progress, Bob must be in
+        // an accept loop when Alice sends — spawn one.
+        let bob_recv_task = tokio::spawn(async move {
+            let _ = bob.accept_next().await;
+        });
+        tokio::task::yield_now().await;
 
-        // Simpler approach: use `send_application_message` with both
-        // addresses (alice + bob). The send_application_message
-        // returns the wire bytes — we can then try to feed those bytes
-        // into Alice's *own* process_incoming_message by going around
-        // the network. But our public API doesn't expose
-        // `process_bytes_directly`. So instead, just send to bob (who
-        // can decode) and use the returned wire bytes locally.
+        // Alice sends an application message to Bob. The interesting
+        // assertion isn't the delivery to Bob (we know that works
+        // from `three_member_message_roundtrip`); it's that the
+        // SAME wire bytes, fed back into Alice's own MLS state, fail
+        // to decrypt — the RFC 9420 §15.1 self-decrypt prohibition.
         let wire = alice
             .send_application_message(&gid, b"echo to me", &[bob_addr.clone()])
             .await
             .expect("alice send");
+        // Bob's task is no longer needed; abort so it doesn't keep
+        // the runtime alive past test completion.
+        bob_recv_task.abort();
 
         // Now try to feed `wire` back into alice via mls-rs directly.
         // We reach into the internal client; this is a test-only check.

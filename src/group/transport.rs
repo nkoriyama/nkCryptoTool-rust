@@ -15,6 +15,16 @@
 //! Application message is bounded by the message body size). We cap
 //! it at [`MAX_MLS_FRAME_BYTES`] to refuse obviously hostile inputs.
 //!
+//! After successfully decoding the body, the receiver writes a single
+//! ACK byte back on the same bi-stream. The sender's `send_mls_message`
+//! reads this byte before returning — that ensures the sender does not
+//! drop its iroh endpoint (and the underlying QUIC connection) while
+//! the receiver is still mid-read. Without the ACK, a sender that
+//! exits immediately after `shutdown()` returns can race the
+//! receiver's `read_exact` for the body and surface a spurious
+//! "connection lost" on the receive side. The ACK byte's value is
+//! arbitrary (`0x01`); only its presence matters.
+//!
 //! This module is *transport-only* — it does not interpret the
 //! `MlsMessage`. Dispatch by `wire_format()` happens in
 //! [`crate::group::processor::GroupChatProcessor`].
@@ -105,10 +115,6 @@ pub async fn send_mls_message<S: P2pStream>(
             what: "writing MLS frame body",
             err: e,
         })?;
-    // Flush + graceful shutdown: signal end-of-stream so the receiver's
-    // `recv_mls_message` sees a clean EOF after the body instead of
-    // waiting for IDLE_TIMEOUT. Matches the file-transfer convention
-    // documented in `crate::network::NetworkProcessor::send_file_with_progress`.
     tokio::time::timeout(IDLE_TIMEOUT, stream.flush())
         .await
         .map_err(|_| FramingError::Idle("flushing MLS frame"))?
@@ -116,6 +122,31 @@ pub async fn send_mls_message<S: P2pStream>(
             what: "flushing MLS frame",
             err: e,
         })?;
+    // Wait for the receiver's ACK byte before returning. Without this,
+    // a caller that exits immediately after `send_mls_message`
+    // returns can have its iroh endpoint dropped while the receiver
+    // is still mid-body — QUIC tears down the connection and the
+    // receiver sees a "connection lost" error mid-read. Reading one
+    // ACK byte synchronises the close.
+    let mut ack = [0u8; 1];
+    tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut ack))
+        .await
+        .map_err(|_| FramingError::Idle("waiting for receiver ACK"))?
+        .map_err(|e| FramingError::Io {
+            what: "reading receiver ACK",
+            err: e,
+        })?;
+    if ack[0] != 0x01 {
+        return Err(FramingError::Io {
+            what: "receiver ACK",
+            err: std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("expected ACK byte 0x01, got 0x{:02x}", ack[0]),
+            ),
+        });
+    }
+    // Only now is it safe to drop our SendStream — shutdown ensures
+    // FIN reaches the peer cleanly after the ACK round-trip.
     tokio::time::timeout(IDLE_TIMEOUT, stream.shutdown())
         .await
         .map_err(|_| FramingError::Idle("shutting down MLS stream"))?
@@ -168,6 +199,34 @@ pub async fn recv_mls_message<S: P2pStream>(
         what: "MLS decode",
         err: std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")),
     })?;
+    // Send the ACK byte back so the sender knows we got the whole
+    // body. Without this round-trip the sender could exit before the
+    // ACK timeout we both depend on for graceful close.
+    tokio::time::timeout(IDLE_TIMEOUT, stream.write_all(&[0x01u8]))
+        .await
+        .map_err(|_| FramingError::Idle("writing receiver ACK"))?
+        .map_err(|e| FramingError::Io {
+            what: "writing receiver ACK",
+            err: e,
+        })?;
+    tokio::time::timeout(IDLE_TIMEOUT, stream.flush())
+        .await
+        .map_err(|_| FramingError::Idle("flushing receiver ACK"))?
+        .map_err(|e| FramingError::Io {
+            what: "flushing receiver ACK",
+            err: e,
+        })?;
+    // Explicitly shutdown the SendStream half. Without this, dropping
+    // the stream relies on iroh's lazy close which may not push the
+    // ACK byte onto the UDP wire before the receiver process exits.
+    // Shutdown's FIN bundles in the pending data and forces it out.
+    tokio::time::timeout(IDLE_TIMEOUT, stream.shutdown())
+        .await
+        .map_err(|_| FramingError::Idle("shutting down ACK stream"))?
+        .map_err(|e| FramingError::Io {
+            what: "shutting down ACK stream",
+            err: e,
+        })?;
     Ok((msg, body))
 }
 

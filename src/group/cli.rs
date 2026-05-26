@@ -401,8 +401,26 @@ pub async fn run(
             eprintln!("Removed leaf {index} from {group_id}");
         }
         MlsCommand::AcceptOne => {
+            // Print our own address first so the inviter knows where to
+            // send the Welcome. The iroh NodeId is ephemeral per
+            // process; printing it on every accept-one invocation is
+            // the only practical way to surface it before we block.
+            match print_local_address(&processor).await {
+                Ok(ticket) => println!("Listening at: {ticket}"),
+                Err(e) => eprintln!("(warning: local_addr unavailable: {e})"),
+            }
+            // Flush so the listener side sees the address even though
+            // we're about to block on accept_next.
+            use std::io::Write as _;
+            let _ = std::io::stdout().flush();
             let evt = accept_one(&processor).await?;
             println!("{}", render_event(&evt));
+            // Linger briefly so the sender's `send_mls_message` reads
+            // back our ACK byte before we drop our iroh endpoint —
+            // otherwise the sender surfaces a spurious "connection
+            // lost" even though we successfully consumed the body.
+            // 2.5 s mirrors the sender-side grace period in main.rs.
+            tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
         }
         MlsCommand::Send {
             group_id,
