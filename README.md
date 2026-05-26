@@ -42,6 +42,12 @@ Rust版は、C++版の設計思想を継承しつつ、Rustのメモリ安全性
     * **MITM 対策**: Ticket 形式に PQC 鍵指紋を統合し、中間者攻撃を検知。
     * **プロトコル分離**: ALPN によるチャットとファイル転送の安全な共存。
 * **グラフィカルユーザーインターフェース (GUI) のサポート**: Slint を用いた直感的な GUI を搭載。`--gui` オプションで起動可能で、QR コードのスキャンやチャット機能、ファイル転送をグラフィカルに実行できます。
+* **MLS (RFC 9420) グループチャット (オプション機能)**: `--features mls` で有効化。
+  Ed25519 ‖ ML-DSA-65 + X25519 ‖ ML-KEM-768 (X-Wing) のハイブリッド PQC ciphersuite
+  (private-use ID `0xF101`) で 3 人以上のグループ E2EE を実現。sqlite 永続化と
+  Post-Compromise Security (`remove_member` で即時失効) を備える。
+  CLI (`--mls-cmd ...`) と GUI (`--features gui-mls` + `--mls-gui`) の両対応。
+  詳細は [`MLS_GROUP_CHAT_REPORT.md`](./MLS_GROUP_CHAT_REPORT.md) を参照。
 
 ## **セキュリティ (Security)**
 
@@ -314,6 +320,93 @@ P2P トランスポート Iroh を使用した、PQC 認証付きの安全な通
 > **⚠️ 注意**: 従来の TCP 直接接続モード (`--transport tcp`) は非推奨 (Deprecated) となりました。今後のアップデートで削除される予定です。
 
 詳細は [`SECURITY.md`](./SECURITY.md) と [`SPEC.md`](./SPEC.md) を参照。
+
+### **MLS グループチャット (オプション機能 / `--features mls`)**
+
+3 人以上で End-to-End 暗号化チャットを行うためのモード。RFC 9420 (MLS) を準拠し、
+[`mls-rs`](https://crates.io/crates/mls-rs) を **完全にハイブリッド PQC ciphersuite で**
+ラップした自前 `CipherSuiteProvider` (private-use suite ID `0xF101`) を実装している。
+
+* **暗号スイート構成 (`0xF101`)**:
+    - 署名: Ed25519 ‖ ML-DSA-65 (FIPS 204) — 連結ハイブリッド
+    - KEM: X25519 ‖ ML-KEM-768 (FIPS 203) — X-Wing 結合 (draft-connolly-cfrg-xwing-kem-01)
+    - KDF/Hash: SHA-256 / SHAKE-256
+    - AEAD: AES-128-GCM
+    - 古典側か PQC 側のどちらか一方が破られても、もう一方が保護を維持する。
+* **永続化**: sqlite (`mls-rs-provider-sqlite` 経由)。デフォルト保存先は
+  `$HOME/.local/share/nkct/groups.db` (パーミッション `0o600`、`PRAGMA journal_mode=WAL`、
+  `busy_timeout=5000`)。
+* **トランスポート**: 既存の Iroh エンドポイントに新規 ALPN `nkct/mls/1` を追加。
+  1 ストリーム = 1 `MlsMessage`、u32 LE 長さプレフィックス。
+* **Forward Secrecy / Post-Compromise Security**: MLS の TreeKEM ratchet と
+  `remove_member` Commit により、エポック更新で過去の鍵が無効化される。
+  退会したメンバーは新 epoch の Application message を**復号できない**ことを
+  PCS テストで pin している (`remove_member_blocks_new_epoch_decrypt`)。
+
+#### CLI 使用例 (2 人グループ)
+
+```bash
+# 1) Bob: 自分のアドレスを Ticket として出力
+nk-crypto-tool --mls-cmd print-local-address --mls-storage bob.db --no-relay
+# nkct1... (これを Alice に共有)
+
+# 2) Bob: KeyPackage を書き出し
+nk-crypto-tool --mls-cmd export-key-package \
+    --mls-output bob.kp --mls-storage bob.db --no-relay
+
+# 3) Alice: グループ作成
+nk-crypto-tool --mls-cmd create-group --mls-name "team" \
+    --mls-storage alice.db --no-relay
+# Created group "team": 2a84737f31fe9198...
+
+# 4) Bob: Welcome を待ち受け (別ターミナル)
+nk-crypto-tool --mls-cmd accept-one --mls-storage bob.db --no-relay
+
+# 5) Alice: Bob を招待 (bob.kp と Bob の Ticket を使う)
+nk-crypto-tool --mls-cmd add-member \
+    --mls-group-id 2a84737f... --mls-key-package bob.kp \
+    --mls-recipient-ticket nkct1... \
+    --mls-storage alice.db --no-relay
+
+# 6) Alice: 対話チャット (Bob の Ticket を recipient として指定)
+nk-crypto-tool --mls-cmd chat-group --mls-group-id 2a84737f... \
+    --mls-recipient-ticket nkct1... \
+    --mls-storage alice.db --no-relay
+```
+
+#### サブコマンド一覧
+
+| `--mls-cmd` | 用途 |
+|---|---|
+| `create-group` | 新規グループを作成 (1 人) |
+| `list-groups` | ローカル sqlite 上の GroupId 一覧 |
+| `list-members` | グループのメンバー (leaf index) 一覧 |
+| `export-key-package` | KeyPackage バイト列を出力 |
+| `add-member` | KeyPackage 受領者をグループへ招待 (Welcome 配送) |
+| `remove-member` | leaf index 指定でメンバー削除 (PCS Commit ブロードキャスト) |
+| `accept-one` | `nkct/mls/1` 上の 1 フレームを受信して処理 |
+| `send` | 1 通の application message を送信 |
+| `chat-group` | 双方向対話 (stdin → 送信、受信 → stdout) |
+| `print-local-address` | 自分の `PeerAddr` を Ticket 文字列として出力 |
+
+#### GUI (`--features gui-mls`)
+
+```bash
+cargo build --release --features gui-mls
+./target/release/nk-crypto-tool --mls-gui --no-relay
+```
+
+GUI は左カラムに Groups リスト + Create / 自分の Ticket、右カラムに選択中グループの
+Members / Messages / 入力欄 / Add Member サブフォーム。すべての操作は CLI と同じ
+`crate::group::cli::*` ハンドラを呼ぶため、CLI と GUI で別永続化スキーマや別実装は
+存在しない。
+
+> **設計上の注**: ハイブリッド suite (`0xF101`) のみを公開するため、クラシカルピア
+> (RFC 9420 標準スイートのみ実装) とは通信できない。Plan §1 「PQC mandatory」が
+> 意図された制約。
+
+詳細仕様は [`MLS_GROUP_CHAT_PLAN.md`](./MLS_GROUP_CHAT_PLAN.md) と
+[`MLS_GROUP_CHAT_REPORT.md`](./MLS_GROUP_CHAT_REPORT.md) を参照。
 
 ## **処理フロー**
 

@@ -245,6 +245,77 @@ V1.1.0 より、ファイル復号時に **Two-Pass (2回読み込み) 方式**�
 - **Zeroize 適用**: セッション鍵、派生鍵、および復号中の一時バッファに対し、`Zeroizing` 型による自動消去を適用しています。
 - **秘密鍵抽出の強化**: 秘密鍵抽出時のループ内再代入においても、旧データを明示的に zeroize するよう強化されています (Security Finding 37-5 修正済)。
 
+---
+
+## 7. MLS グループチャット (`--features mls`)
+
+3 人以上のグループ E2EE を提供する追加レイヤ。RFC 9420 準拠の `mls-rs` を、自前の
+ハイブリッド `CipherSuiteProvider` で **完全に PQC ciphersuite に包んだ** 構成。
+
+### 7.1 ハイブリッドスイート `0xF101` の構成
+
+| 役割 | アルゴリズム | 標準 / 仕様 |
+|---|---|---|
+| 署名 | Ed25519 ‖ ML-DSA-65 | RFC 8032 + FIPS 204、連結ハイブリッド |
+| KEM | X25519 ‖ ML-KEM-768 | RFC 7748 + FIPS 203、X-Wing combiner (`draft-connolly-cfrg-xwing-kem-01`) |
+| KDF / Hash | SHA-256 / SHAKE-256 | NIST SP 800-185 |
+| AEAD | AES-128-GCM | NIST SP 800-38D |
+
+**連結 (concat) 設計の保証**: 古典側 (Ed25519 / X25519) と PQC 側 (ML-DSA / ML-KEM)
+のどちらか **一方だけ** が破られても、もう一方が安全性を維持する。両方を同時に破る
+ことができる相手以外には、署名偽造も鍵カプセル化突破も不可。
+
+### 7.2 防御範囲と PCS
+
+- **Forward Secrecy**: MLS の TreeKEM ratchet により、各 epoch のメッセージ鍵は
+  独立。過去鍵を持つ相手が将来のトラフィックを復号できない。
+- **Post-Compromise Security**: `remove_member` Commit が新 epoch を生成し、
+  退会者が以前の epoch 鍵を持っていても新メッセージは復号不能。テスト
+  `remove_member_blocks_new_epoch_decrypt` で性質を pin。
+- **改竄検知**: Welcome / Commit / Application それぞれが MLS framing の MAC で
+  認証され、改竄や reorder が検知される。WireFormat 不一致は
+  `GroupError::InvalidWelcome` で拒否。
+- **Self-decrypt 拒否 (RFC 9420 §15.1)**: 自分が暗号化した Application message を
+  自分自身で復号することはできない (テスト `self_send_does_not_self_decrypt` で
+  pin)。UI 側で自分の送信内容を表示する場合は、別途 local echo が必須。
+
+### 7.3 永続化のリスクと緩和
+
+| 項目 | 現状 | 緩和策 |
+|---|---|---|
+| DB ファイル | プレーン sqlite (`mls-rs-provider-sqlite` の `sqlite-bundled` feature) | ファイル permission `0o600`、`WAL` モード、`busy_timeout=5000` |
+| 鍵素材 | mls-rs の `ZeroizeOnDrop` で in-memory 自動消去 | アプリ境界の中間 `Vec<u8>` も `Zeroizing` でラップ |
+| At-rest 暗号化 | 未実装 (今回の範囲外) | 次回スコープ: SQLCipher (`mls-rs-provider-sqlite` の `sqlcipher-bundled` feature) へ切替可能 |
+| 同時書き込み | 単一プロセス前提 | sqlite WAL + `busy_timeout` 5s で短期競合を吸収 (multi-process は非推奨) |
+
+### 7.4 トランスポート抽象 (ALPN `nkct/mls/1`)
+
+既存 Iroh エンドポイントに新規 ALPN `nkct/mls/1` を追加。1 ストリーム = 1
+`MlsMessage`、u32 LE 長さプレフィックス、最大 `MAX_MLS_FRAME_BYTES = 16 MiB`。
+不正な長さプレフィックス (>16 MiB or 0) は **バッファ確保前に** 拒否されるため、
+悪意の peer によるメモリ枯渇攻撃は成立しない。
+
+### 7.5 既知の制約
+
+- **ハイブリッド suite のみ公開**: クラシカル MLS (RFC 9420 標準スイート)
+  ピアとは通信できない。設計上の意図的制約 (PQC 必須化)。
+- **address book は未統合**: メンバーの `MemberId → PeerAddr` 対応は CLI/GUI 側で
+  手動指定 (`--mls-recipient-ticket`)。動的 discovery は将来作業。
+- **`cargo audit` の transitive 警告**: `iroh` 依存ツリーに hickory-proto 等の
+  既知警告があるが、これは Iroh アップストリームに追従が必要な範囲。
+  プロジェクト直接依存には脆弱性なし。
+
+### 7.6 抽象境界の CI 強制
+
+- `scripts/check_no_mls_leakage.sh` — `mls_rs::*` の import は `src/group/` と
+  GUI ドライバ (`src/gui/group_chat.rs`) のみ。リーク検出時 CI 失敗。
+- `scripts/check_p2p_abstraction.sh` — `iroh::*` の import は
+  `src/p2p/backend/iroh.rs` のみ。
+- どちらも GitHub Actions の `mls-abstraction-check` /
+  `p2p-abstraction-check` ジョブで毎 PR 検証。
+
+---
+
 ## 関連ドキュメント
 
 - `IROH_MIGRATION_PLAN.md` — 全体技術計画
@@ -252,3 +323,5 @@ V1.1.0 より、ファイル復号時に **Two-Pass (2回読み込み) 方式**�
 - `INTEROP_VERIFICATION_2026-05-07.md` — bazzite ↔ nkwire 異環境間動作実証
 - `SPEC.md` (リポジトリルート) — V3 ハンドシェイクとプロトコル仕様
 - `SECURITY.md` (リポジトリルート) — 公式セキュリティポリシー (もしあれば)
+- `MLS_GROUP_CHAT_PLAN.md` — MLS グループチャット実装計画
+- `MLS_GROUP_CHAT_REPORT.md` — MLS グループチャット完了レポート

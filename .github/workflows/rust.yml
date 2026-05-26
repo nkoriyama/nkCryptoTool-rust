@@ -25,6 +25,14 @@ jobs:
     - name: Enforce iroh-crate imports only live in src/p2p/backend/iroh.rs
       run: bash scripts/check_p2p_abstraction.sh
 
+  mls-abstraction-check:
+    needs: repo-integrity
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Enforce mls_rs* imports only live in src/group/ (+ gui/group_chat.rs)
+      run: bash scripts/check_no_mls_leakage.sh
+
   build:
     runs-on: ubuntu-latest
     strategy:
