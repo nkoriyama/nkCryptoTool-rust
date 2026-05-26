@@ -37,6 +37,13 @@ arboard = { version = "3.4", optional = true }
 nokhwa = { version = "0.10", optional = true, features = ["input-native", "output-threaded"] }
 rqrr = { version = "0.6", optional = true }
 image = { version = "0.24", optional = true }
+
+# MLS group chat (opt-in via `--features mls`). See MLS_GROUP_CHAT_PLAN.md.
+mls-rs = { version = "0.55", optional = true }
+mls-rs-core = { version = "0.27", optional = true }
+mls-rs-codec = { version = "0.7", optional = true }
+mls-rs-crypto-traits = { version = "0.22", optional = true }
+mls-rs-crypto-openssl = { version = "0.21", optional = true }
 notify-rust = { version = "4.0", optional = true }
 rfd = { version = "0.14", optional = true }
 
@@ -93,6 +100,16 @@ backend-rustcrypto = [
     "ghash",
     "subtle",
     "generic-array",
+]
+
+# MLS group chat (P1: non-PQC base passthrough). P1.5 adds PQC adapter.
+# Off by default; enable explicitly with `--features mls`.
+mls = [
+    "mls-rs",
+    "mls-rs-core",
+    "mls-rs-codec",
+    "mls-rs-crypto-traits",
+    "mls-rs-crypto-openssl",
 ]
 
 [dev-dependencies]
