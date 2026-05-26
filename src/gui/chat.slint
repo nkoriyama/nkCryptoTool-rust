@@ -1,0 +1,321 @@
+import { Button, VerticalBox, LineEdit, TextEdit, StandardListView, GroupBox, HorizontalBox, Switch, ProgressIndicator } from "std-widgets.slint";
+
+export enum TransferMode { Chat, FileSend, FileReceive }
+
+export component ChatWindow inherits Window {
+    title: "nkCryptoTool Chat (v2.1.0)";
+    width: 800px;
+    height: 600px;
+
+    callback connect-pressed(string, string, string); // ticket, privkey_path, pubkey_path
+    callback passphrase-provided(string);
+    callback send-message(string);
+    callback copy-to-clipboard(string);
+    callback scan-qr-pressed();
+    callback scan-cancel();
+    callback privacy-mode-toggled(bool);
+    callback select-file();
+    callback select-save-dir();
+    callback validate-save-file-name();
+    callback listen-pressed(string, string); // privkey_path, pubkey_path
+    callback listen-cancel();
+
+    in property <[StandardListViewItem]> messages: [];
+    in-out property <bool> connected: false;
+    in-out property <bool> asking-passphrase: false;
+    in-out property <bool> scanning-qr: false;
+    in-out property <string> connection-error: "";
+    in-out property <string> scanner-status: "";
+    in-out property <string> privacy-warning: "";
+
+    in-out property <string> input-text: "";
+    in-out property <string> ticket-text: "";
+    in-out property <string> privkey-path: "";
+    in-out property <string> pubkey-path: "";
+    in-out property <string> passphrase-input: "";
+    in-out property <bool> privacy-mode: false;
+
+    // F1: Transfer Mode + File Picker
+    in-out property <TransferMode> transfer-mode: TransferMode.Chat;
+    in-out property <string> selected-file-path: "";
+    in-out property <string> save-dir-path: "";
+    in-out property <string> save-file-name: "";
+
+    // F2: Listen mode (FileReceive)
+    in-out property <bool> listening: false;
+    in-out property <string> generated-ticket: "";
+    in-out property <bool> file-transfer-active: false;
+    in-out property <string> transfer-status: "";
+
+    // F3: Progress reporting
+    in-out property <float> transfer-progress: 0.0;
+    in-out property <int> transfer-bytes: 0;
+    in-out property <int> transfer-total: 0;
+
+    // F1/F2: Computed visibility (test-observable)
+    out property <bool> chat-area-visible: connected && transfer-mode == TransferMode.Chat;
+    out property <bool> file-picker-visible: !connected && !listening && !asking-passphrase && !scanning-qr && transfer-mode == TransferMode.FileSend;
+    out property <bool> save-dir-visible: !connected && !listening && !asking-passphrase && !scanning-qr && transfer-mode == TransferMode.FileReceive;
+    out property <bool> connection-settings-visible: !connected && !listening && !asking-passphrase && !scanning-qr;
+    out property <bool> listen-display-visible: listening && !connected;
+    out property <bool> file-transfer-visible: connected && transfer-mode != TransferMode.Chat;
+
+    VerticalBox {
+        // Privacy Mode and Warning
+        HorizontalBox {
+            alignment: start;
+            Text {
+                text: "Privacy Mode:";
+                vertical-alignment: center;
+            }
+            Switch {
+                checked <=> privacy-mode;
+                toggled => { root.privacy-mode-toggled(self.checked); }
+            }
+            if privacy-warning != "" : Text {
+                text: privacy-warning;
+                color: orange;
+                font-size: 10px;
+                vertical-alignment: center;
+            }
+        }
+
+        // Error display
+        if connection-error != "" : Text {
+            text: connection-error;
+            color: red;
+        }
+
+        // F1: Transfer Mode toggle (3-way selector)
+        if connection-settings-visible : HorizontalBox {
+            alignment: start;
+            Text { text: "Mode:"; vertical-alignment: center; }
+            Button {
+                text: "Chat";
+                primary: transfer-mode == TransferMode.Chat;
+                clicked => { root.transfer-mode = TransferMode.Chat; }
+            }
+            Button {
+                text: "File Send";
+                primary: transfer-mode == TransferMode.FileSend;
+                clicked => { root.transfer-mode = TransferMode.FileSend; }
+            }
+            Button {
+                text: "File Receive";
+                primary: transfer-mode == TransferMode.FileReceive;
+                clicked => { root.transfer-mode = TransferMode.FileReceive; }
+            }
+        }
+
+        // 1. Connection Settings
+        if connection-settings-visible : GroupBox {
+            title: transfer-mode == TransferMode.FileReceive ? "Listen Settings" : "Connection Settings";
+            VerticalBox {
+                if transfer-mode != TransferMode.FileReceive : HorizontalBox {
+                    LineEdit {
+                        placeholder-text: "Ticket (nkct1...)";
+                        text <=> ticket-text;
+                    }
+                    Button {
+                        text: "Copy";
+                        clicked => { root.copy-to-clipboard(root.ticket-text); }
+                    }
+                    Button {
+                        text: "Scan QR";
+                        clicked => { root.scan-qr-pressed(); }
+                    }
+                }
+                LineEdit {
+                    placeholder-text: "Private Key Path";
+                    text <=> privkey-path;
+                }
+                LineEdit {
+                    placeholder-text: transfer-mode == TransferMode.FileReceive ? "Public Key Path (expected sender, optional)" : "Public Key Path (Peer)";
+                    text <=> pubkey-path;
+                }
+
+                // F1: File Send extras
+                if file-picker-visible : VerticalBox {
+                    HorizontalBox {
+                        Text { text: "File:"; vertical-alignment: center; }
+                        LineEdit {
+                            placeholder-text: "(no file selected)";
+                            text <=> selected-file-path;
+                            read-only: true;
+                        }
+                        Button {
+                            text: "Choose File";
+                            clicked => { root.select-file(); }
+                        }
+                    }
+                }
+
+                // F1: File Receive extras
+                if save-dir-visible : VerticalBox {
+                    HorizontalBox {
+                        Text { text: "Save to:"; vertical-alignment: center; }
+                        LineEdit {
+                            placeholder-text: "(no directory selected)";
+                            text <=> save-dir-path;
+                            read-only: true;
+                        }
+                        Button {
+                            text: "Choose Directory";
+                            clicked => { root.select-save-dir(); }
+                        }
+                    }
+                    HorizontalBox {
+                        Text { text: "File name (optional):"; vertical-alignment: center; }
+                        LineEdit {
+                            placeholder-text: "Leave empty to use sender's name";
+                            text <=> save-file-name;
+                            edited => { root.validate-save-file-name(); }
+                        }
+                    }
+                }
+
+                Button {
+                    text: transfer-mode == TransferMode.Chat ? "Connect" : (transfer-mode == TransferMode.FileSend ? "Send File" : "Generate Ticket and Wait");
+                    clicked => {
+                        root.connection-error = "";
+                        if (transfer-mode == TransferMode.FileReceive) {
+                            root.listen-pressed(root.privkey-path, root.pubkey-path);
+                        } else {
+                            root.connect-pressed(root.ticket-text, root.privkey-path, root.pubkey-path);
+                        }
+                    }
+                }
+            }
+        }
+
+        // F2: Listen Display (FileReceive after Generate Ticket pressed)
+        if listen-display-visible : GroupBox {
+            title: "Waiting for Sender";
+            VerticalBox {
+                Text {
+                    text: "Share this ticket with the sender:";
+                    font-size: 12px;
+                }
+                HorizontalBox {
+                    LineEdit {
+                        text: generated-ticket;
+                        read-only: true;
+                    }
+                    Button {
+                        text: "Copy";
+                        clicked => { root.copy-to-clipboard(root.generated-ticket); }
+                    }
+                }
+                Text {
+                    text: "📡 Listening for incoming connection...";
+                    color: green;
+                    font-size: 11px;
+                }
+                Button {
+                    text: "Cancel";
+                    clicked => { root.listen-cancel(); }
+                }
+            }
+        }
+
+        // F2 + F3: File Transfer in Progress (post-handshake, non-chat modes)
+        if file-transfer-visible : GroupBox {
+            title: transfer-mode == TransferMode.FileSend ? "Sending File" : "Receiving File";
+            VerticalBox {
+                ProgressIndicator {
+                    progress: transfer-progress;
+                    indeterminate: transfer-total == 0;
+                    min-height: 16px;
+                }
+                Text {
+                    text: transfer-status != "" ? transfer-status : "Transfer in progress...";
+                    horizontal-alignment: center;
+                    font-size: 11px;
+                }
+            }
+        }
+        
+        // 2. Passphrase Dialog (M1)
+        if asking-passphrase : GroupBox {
+            title: "Passphrase Required";
+            VerticalBox {
+                Text {
+                    text: "The private key is encrypted. Please enter the passphrase.";
+                }
+                Text {
+                    text: "⚠️ Please turn OFF IME and use half-width characters.";
+                    font-size: 10px;
+                    color: orange;
+                }
+                LineEdit {
+                    // M1/M3: password type hides input and prevents clipboard copy on most platforms
+                    input-type: password;
+                    placeholder-text: "Enter Passphrase";
+                    text <=> passphrase-input;
+                    accepted => {
+                        root.passphrase-provided(root.passphrase-input);
+                        root.passphrase-input = "";
+                    }
+                }
+                Button {
+                    text: "Unlock and Connect";
+                    clicked => {
+                        root.passphrase-provided(root.passphrase-input);
+                        root.passphrase-input = "";
+                    }
+                }
+                Button {
+                    text: "Cancel";
+                    clicked => {
+                        root.asking-passphrase = false;
+                        root.passphrase-input = "";
+                    }
+                }
+            }
+        }
+
+        // 3. QR Scanner (M2)
+        if scanning-qr : GroupBox {
+            title: "QR Code Scanner";
+            VerticalBox {
+                Text {
+                    text: "📷 Camera Active (Scanning for Ticket)";
+                    color: green;
+                }
+                Text {
+                    text: scanner-status;
+                }
+                // Preview would ideally be here, but for now we focus on logic
+                Button {
+                    text: "Cancel";
+                    clicked => { root.scan-cancel(); }
+                }
+            }
+        }
+        
+        // 4. Chat Messages
+        if chat-area-visible : StandardListView {
+            model: messages;
+            min-height: 200px;
+        }
+
+        // 5. Message Input
+        if chat-area-visible : VerticalBox {
+            LineEdit {
+                text <=> input-text;
+                placeholder-text: "Type a message...";
+                accepted => {
+                    root.send-message(root.input-text);
+                    root.input-text = "";
+                }
+            }
+            Button {
+                text: "Send";
+                clicked => {
+                    root.send-message(root.input-text);
+                    root.input-text = "";
+                }
+            }
+        }
+    }
+}
