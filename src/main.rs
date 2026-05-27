@@ -134,7 +134,8 @@ struct Args {
     /// MLS subcommand selector. Valid values:
     /// `create-group`, `list-groups`, `list-members`,
     /// `export-key-package`, `add-member`, `remove-member`,
-    /// `accept-one`, `send`, `chat-group`, `print-local-address`.
+    /// `accept-one`, `listen`, `send`, `chat-group`,
+    /// `print-local-address`.
     #[arg(long, help = "MLS subcommand to run (see --help for the list)")]
     mls_cmd: Option<String>,
 
@@ -456,6 +457,16 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
             recipient_tickets: parse_tickets(&args.mls_recipient_ticket)?,
         },
         "accept-one" => MlsCommand::AcceptOne,
+        "listen" => {
+            let group_id = match args.mls_group_id.as_deref() {
+                Some(hex) => Some(parse_group_id(hex)?),
+                None => None,
+            };
+            MlsCommand::Listen {
+                group_id,
+                recipient_tickets: parse_tickets(&args.mls_recipient_ticket)?,
+            }
+        }
         "send" => MlsCommand::Send {
             group_id: parse_group_id(&require(&args.mls_group_id, "mls-group-id")?)?,
             body: require(&args.mls_body, "mls-body")?,
@@ -469,8 +480,8 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
         other => anyhow::bail!(
             "unknown --mls-cmd {other:?}; expected one of \
              create-group, list-groups, list-members, export-key-package, \
-             add-member, remove-member, accept-one, send, chat-group, \
-             print-local-address"
+             add-member, remove-member, accept-one, listen, send, \
+             chat-group, print-local-address"
         ),
     };
 

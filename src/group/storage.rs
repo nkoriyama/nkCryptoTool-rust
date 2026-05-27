@@ -34,7 +34,8 @@ use std::time::Duration;
 
 use mls_rs_provider_sqlite::connection_strategy::ConnectionStrategy;
 use mls_rs_provider_sqlite::storage::{
-    SqLiteGroupStateStorage, SqLiteKeyPackageStorage, SqLitePreSharedKeyStorage,
+    SqLiteApplicationStorage, SqLiteGroupStateStorage, SqLiteKeyPackageStorage,
+    SqLitePreSharedKeyStorage,
 };
 use mls_rs_provider_sqlite::{
     JournalMode, SqLiteDataStorageEngine, SqLiteDataStorageError,
@@ -179,6 +180,17 @@ impl GroupStorage {
         self.engine
             .pre_shared_key_storage()
             .map_err(|e| GroupError::Storage(format!("pre_shared_key_storage: {e}")))
+    }
+
+    /// Application-data kv table — used by [`GroupChatProcessor`] for
+    /// the persistent signing identity (`mls:identity:sk` /
+    /// `mls:identity:pk`). Exposed publicly so future revisions can
+    /// hang their own metadata (display name, address book, etc.) off
+    /// the same connection.
+    pub fn application_data_storage(&self) -> Result<SqLiteApplicationStorage, GroupError> {
+        self.engine
+            .application_data_storage()
+            .map_err(|e| GroupError::Storage(format!("application_data_storage: {e}")))
     }
 
     /// List the IDs of all groups whose state is stored in this

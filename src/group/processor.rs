@@ -93,20 +93,34 @@ pub struct GroupChatProcessor {
 }
 
 impl GroupChatProcessor {
-    /// Build a processor with a freshly generated signing identity and
-    /// sqlite-backed storage.
+    /// Build a processor backed by `storage`. The signing identity is
+    /// **loaded from the sqlite db** when present, otherwise generated
+    /// fresh and stored — so multiple invocations against the same db
+    /// (e.g. an `export-key-package` one-shot followed by a `listen`
+    /// long-running process) share the same MLS identity.
     ///
     /// `display_name` is stored in the MLS `BasicCredential` for UX
     /// only — it is not a security boundary; recipients verify by
     /// fingerprint of the hybrid public key.
     ///
     /// `endpoint` is the transport the processor will use for Welcome
-    /// and message delivery once those code paths land (P3+).
+    /// and message delivery.
     ///
     /// `storage` owns the sqlite file. Multiple processors must not
-    /// share a `GroupStorage` for the same file concurrently; sqlite
-    /// busy_timeout (5 s) absorbs short contention but the design here
-    /// assumes one writer per database. Reopen between sessions.
+    /// write to the same db concurrently from multiple machines; on a
+    /// single machine, sqlite WAL + `busy_timeout = 5 s` absorbs the
+    /// short contention windows that arise from a sibling one-shot
+    /// process opening the db while a `listen` holds it.
+    ///
+    /// ## Signing-key persistence
+    ///
+    /// Keys are stored in `mls-rs-provider-sqlite`'s application_data
+    /// kvs table under `mls:identity:sk` (private) and
+    /// `mls:identity:pk` (public). The bytes are **plaintext** in the
+    /// sqlite file; the file's `0o600` permission is the at-rest
+    /// boundary. SQLCipher (the `sqlcipher-bundled` feature of
+    /// `mls-rs-provider-sqlite`) is a one-feature swap away — see
+    /// `SECURITY_PROFILE.md` §7.3.
     pub fn new(
         display_name: &str,
         endpoint: Arc<dyn P2pEndpoint>,
@@ -122,9 +136,32 @@ impl GroupChatProcessor {
             )
         })?;
 
-        let (signing_key, signing_pub) = suite
-            .signature_key_generate()
-            .map_err(|e| GroupError::Backend(format!("sig keygen: {e}")))?;
+        // Load existing identity from the application_data table, or
+        // generate + store one on first use.
+        const IDENTITY_SK_KEY: &str = "mls:identity:sk";
+        const IDENTITY_PK_KEY: &str = "mls:identity:pk";
+        let app = storage.application_data_storage()?;
+        let (signing_key, signing_pub) = match (
+            app.get(IDENTITY_SK_KEY)
+                .map_err(|e| GroupError::Storage(format!("read identity sk: {e}")))?,
+            app.get(IDENTITY_PK_KEY)
+                .map_err(|e| GroupError::Storage(format!("read identity pk: {e}")))?,
+        ) {
+            (Some(sk), Some(pk)) => {
+                use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
+                (SignatureSecretKey::new(sk), SignaturePublicKey::new(pk))
+            }
+            _ => {
+                let (sk, pk) = suite
+                    .signature_key_generate()
+                    .map_err(|e| GroupError::Backend(format!("sig keygen: {e}")))?;
+                app.insert(IDENTITY_SK_KEY, sk.as_bytes())
+                    .map_err(|e| GroupError::Storage(format!("write identity sk: {e}")))?;
+                app.insert(IDENTITY_PK_KEY, pk.as_bytes())
+                    .map_err(|e| GroupError::Storage(format!("write identity pk: {e}")))?;
+                (sk, pk)
+            }
+        };
 
         let credential = BasicCredential::new(display_name.as_bytes().to_vec());
         let identity = SigningIdentity::new(credential.into_credential(), signing_pub);
