@@ -73,13 +73,17 @@ pub enum MlsCommand {
     /// Welcome, then runs accept_next forever on one task while a
     /// stdin REPL on the other lets the user issue commands:
     ///
-    ///   `/peer <ticket>`  — add a recipient address
-    ///   `/gid <hex>`      — set/override the active group id (e.g.
-    ///                       after creating one in a sibling process)
-    ///   `/quit`           — exit the loop
-    ///   (anything else)   — send the line as an application message
-    ///                       to all `/peer` recipients in the active
-    ///                       group (silently dropped if either is unset)
+    ///   `/peer <ticket>`         — add a recipient address
+    ///   `/gid <hex>`             — set/override the active group id (e.g.
+    ///                              after creating one in a sibling process)
+    ///   `/add <kp> <ticket>`     — add a new member to the active group,
+    ///                              re-using this listener's iroh endpoint
+    ///                              (no per-invocation process startup)
+    ///   `/status`                — print active gid + peer count
+    ///   `/quit`                  — exit the loop
+    ///   (anything else)          — send the line as an application message
+    ///                              to all `/peer` recipients in the active
+    ///                              group (silently dropped if either is unset)
     ///
     /// Inbound `NewGroup` events auto-set the active group id, so a
     /// freshly-invited peer that has the inviter's ticket via
@@ -538,9 +542,71 @@ pub async fn listen_loop(
                                 None => "<none>".to_string(),
                             };
                             say(format!("[listen] gid={gid_str} peers={n}")).await;
+                        } else if let Some(rest) = trimmed.strip_prefix("/add ") {
+                            // /add <kp_path> <new_member_ticket>
+                            //
+                            // In-REPL add-member: reuses this process's
+                            // already-bound iroh endpoint instead of forking a
+                            // separate `--mls-cmd add-member` invocation.
+                            // For N-member group builds the per-invocation
+                            // cost drops from ~270 ms (process start +
+                            // endpoint bind + 200 ms linger) to ~20-50 ms
+                            // (just the MLS state mutation + Welcome/Commit
+                            // QUIC handshakes on the existing endpoint).
+                            //
+                            // The ticket is the LAST whitespace-separated
+                            // token; everything before it is the KeyPackage
+                            // file path. Splits at the LAST space so paths
+                            // with spaces still work (tickets are BASE32
+                            // and contain no whitespace).
+                            let rest = rest.trim();
+                            let (kp_path_str, ticket_str) =
+                                match rest.rsplit_once(char::is_whitespace) {
+                                    Some((p, t)) if !p.is_empty() && !t.is_empty() => (p, t),
+                                    _ => {
+                                        say("[listen] usage: /add <kp_file> <ticket>".to_string())
+                                            .await;
+                                        continue;
+                                    }
+                                };
+                            let gid = match *group_id.lock().await {
+                                Some(g) => g,
+                                None => {
+                                    say("[listen] /add needs an active group — use /gid first".to_string())
+                                        .await;
+                                    continue;
+                                }
+                            };
+                            let new_ticket: Ticket = match ticket_str.parse() {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    say(format!("[listen] /add: bad ticket: {e}")).await;
+                                    continue;
+                                }
+                            };
+                            let recipient = new_ticket.peer_addr();
+                            let existing = recipients.lock().await.clone();
+                            match add_member(
+                                &processor,
+                                &gid,
+                                std::path::Path::new(kp_path_str),
+                                &recipient,
+                                &existing,
+                            )
+                            .await
+                            {
+                                Ok(()) => {
+                                    let mut rs = recipients.lock().await;
+                                    rs.push(recipient);
+                                    let n = rs.len();
+                                    drop(rs);
+                                    say(format!("[listen] /add ok — recipients now {n}")).await;
+                                }
+                                Err(e) => say(format!("[listen] /add failed: {e}")).await,
+                            }
                         } else if trimmed.starts_with('/') {
                             say(format!(
-                                "[listen] unknown command {trimmed:?}. Try /peer, /gid, /status, /quit."
+                                "[listen] unknown command {trimmed:?}. Try /peer, /gid, /status, /add, /quit."
                             ))
                             .await;
                         } else {
