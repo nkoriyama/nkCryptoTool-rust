@@ -590,24 +590,14 @@ impl GroupChatProcessor {
             .to_bytes()
             .map_err(|e| GroupError::Backend(format!("PrivateMessage encode: {e}")))?;
 
-        // Fan-out. We send one stream per recipient (1 frame = 1
-        // MlsMessage per the §5.4 contract). Any failure surfaces;
-        // partial fan-out is reported as the first error so the caller
-        // can choose to retry or compensate. We continue past a single
-        // failure on best-effort transports, but here we stop early —
-        // peer dropouts are visible in `endpoint.connect` errors.
-        for addr in recipients {
-            crate::group::transport::send_one(self.endpoint.as_ref(), addr, &msg)
-                .await
-                .map_err(|e| match e {
-                    crate::group::transport::FramingError::Transport(p) => {
-                        GroupError::Transport(p)
-                    }
-                    other => {
-                        GroupError::Backend(format!("send_application_message: {other}"))
-                    }
-                })?;
-        }
+        // Fan-out in parallel. One QUIC stream per recipient (1 frame =
+        // 1 MlsMessage per the §5.4 contract). We wait for all sends to
+        // settle and surface the first error encountered — that way a
+        // mid-list failure doesn't abandon downstream recipients (the
+        // earlier sequential `?` would skip recipients after the first
+        // error, leaving them silently unfed). Recipients that did
+        // succeed have actually received the message.
+        fanout_send(&self.endpoint, recipients, msg, "send_application_message").await?;
 
         Ok(Zeroizing::new(wire_bytes))
     }
@@ -641,19 +631,13 @@ impl GroupChatProcessor {
         // We accept either PublicMessage or PrivateMessage Commits.
         // mls-rs defaults to PrivateMessage; PublicMessage is opt-in.
         // We don't restrict here — recipients will revalidate.
-        for addr in recipients {
-            crate::group::transport::send_one(self.endpoint.as_ref(), addr, &msg)
-                .await
-                .map_err(|e| match e {
-                    crate::group::transport::FramingError::Transport(p) => {
-                        GroupError::Transport(p)
-                    }
-                    other => {
-                        GroupError::Backend(format!("broadcast_commit: {other}"))
-                    }
-                })?;
-        }
-        Ok(())
+        //
+        // Parallel fan-out: a Welcome+Commit for member N reaches N-1
+        // existing members. Sequential `connect()`s dominated setup
+        // time in N-member group builds (Σ handshakes grows quadratically
+        // with N); parallel cuts the wall-clock cost to ~one handshake's
+        // RTT regardless of recipient count.
+        fanout_send(&self.endpoint, recipients, msg, "broadcast_commit").await
     }
 
     /// Accept the next inbound MLS stream and dispatch by wire format
@@ -949,6 +933,72 @@ impl GroupChatProcessor {
             epoch,
             member_count,
         })
+    }
+}
+
+/// Send one `MlsMessage` to many recipients concurrently via the shared
+/// endpoint. Waits for every send to settle before returning, then
+/// surfaces the first error if any. `label` is used in error context.
+///
+/// Each send opens its own QUIC stream — the iroh endpoint multiplexes
+/// connections by NodeId, so concurrent `connect()`s to distinct peers
+/// run truly in parallel rather than serialising on a single mutex.
+async fn fanout_send(
+    endpoint: &Arc<dyn P2pEndpoint>,
+    recipients: &[crate::p2p::PeerAddr],
+    msg: MlsMessage,
+    label: &'static str,
+) -> Result<(), GroupError> {
+    if recipients.is_empty() {
+        return Ok(());
+    }
+    // Single recipient: avoid the JoinSet machinery — common case for
+    // 1→2 group transitions and direct sends.
+    if recipients.len() == 1 {
+        return crate::group::transport::send_one(endpoint.as_ref(), &recipients[0], &msg)
+            .await
+            .map_err(|e| match e {
+                crate::group::transport::FramingError::Transport(p) => {
+                    GroupError::Transport(p)
+                }
+                other => GroupError::Backend(format!("{label}: {other}")),
+            });
+    }
+    let msg = Arc::new(msg);
+    let mut set = tokio::task::JoinSet::new();
+    for addr in recipients {
+        let ep = Arc::clone(endpoint);
+        let msg = Arc::clone(&msg);
+        let addr = addr.clone();
+        set.spawn(async move {
+            crate::group::transport::send_one(ep.as_ref(), &addr, &msg).await
+        });
+    }
+    let mut first_err: Option<GroupError> = None;
+    while let Some(join_res) = set.join_next().await {
+        match join_res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let ge = match e {
+                    crate::group::transport::FramingError::Transport(p) => {
+                        GroupError::Transport(p)
+                    }
+                    other => GroupError::Backend(format!("{label}: {other}")),
+                };
+                if first_err.is_none() {
+                    first_err = Some(ge);
+                }
+            }
+            Err(je) => {
+                if first_err.is_none() {
+                    first_err = Some(GroupError::Backend(format!("{label} join: {je}")));
+                }
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
 }
 
