@@ -1,6 +1,6 @@
 use crate::config::CryptoConfig;
 use crate::error::{CryptoError, Result};
-use crate::network::{ALPN_CHAT, ALPN_FILE, ALPN_MLS};
+use crate::network::{ALPN_CHAT, ALPN_FILE, ALPN_INBOX, ALPN_MLS};
 use iroh::{Endpoint, Watcher};
 use std::str::FromStr;
 
@@ -144,6 +144,7 @@ impl IrohEndpoint {
             ALPN_CHAT.to_vec(),
             ALPN_FILE.to_vec(),
             ALPN_MLS.to_vec(),
+            ALPN_INBOX.to_vec(),
         ]);
 
         if is_test || config.no_relay {
@@ -165,6 +166,7 @@ impl IrohEndpoint {
             crate::p2p::P2pProtocol(ALPN_CHAT),
             crate::p2p::P2pProtocol(ALPN_FILE),
             crate::p2p::P2pProtocol(ALPN_MLS),
+            crate::p2p::P2pProtocol(ALPN_INBOX),
         ];
         Ok(Self::from_endpoint(endpoint, protocols))
     }

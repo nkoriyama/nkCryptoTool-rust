@@ -1,4 +1,6 @@
 pub mod tcp;
+#[cfg(feature = "mls")]
+pub mod inbox;
 
 use crate::backend;
 use crate::backend::{Aead, AeadBackend};
@@ -24,6 +26,12 @@ pub const ALPN_FILE: &[u8] = b"nkct/file/1";
 /// [`crate::group::transport`] framing helpers — Welcome / Commit /
 /// Application / Proposal as discriminated by `MlsMessage::wire_format`.
 pub const ALPN_MLS: &[u8] = b"nkct/mls/1";
+
+/// Inbox store-and-forward ALPN. Carries opaque payloads addressed to
+/// a recipient PeerId; the server stores them in sqlite and returns
+/// them on demand to the matching peer. See [`crate::network::inbox`]
+/// for the wire protocol and client/server implementations.
+pub const ALPN_INBOX: &[u8] = b"nkct/inbox/1";
 
 /// F3: 64 KiB chunk threshold for progress callback emission. Progress is
 /// emitted at most once per `PROGRESS_CHUNK_BYTES` bytes plus a final emission
