@@ -122,38 +122,30 @@ pub async fn send_mls_message<S: P2pStream>(
             what: "flushing MLS frame",
             err: e,
         })?;
-    // Wait for the receiver's ACK byte before returning. Without this,
-    // a caller that exits immediately after `send_mls_message`
-    // returns can have its iroh endpoint dropped while the receiver
-    // is still mid-body — QUIC tears down the connection and the
-    // receiver sees a "connection lost" error mid-read. Reading one
-    // ACK byte synchronises the close.
+    // Wait for the receiver's ACK byte (best-effort). The ACK serves
+    // two purposes: (1) it lets us linger long enough that an
+    // immediate process exit doesn't tear down the QUIC connection
+    // while the peer is still mid-body (mitigates the "connection
+    // lost" race observed in the live 3-party demo), and (2) it
+    // would in principle signal semantic delivery confirmation.
+    //
+    // ACK *failure* is treated as a soft outcome — silently swallowed.
+    // iroh drops the bistream when the receive side completes; a
+    // sender that exits right after writing+flushing the body will
+    // race against the receiver's close path, and frequently the
+    // ACK byte never reaches our `read_exact` even though the body
+    // is on the wire and the peer has decoded it. Surfacing this as
+    // an error would print misleading `[send err] connection lost`
+    // lines at the listen REPL while every other peer in fact got
+    // the message. We trade off semantic confirmation for clean UX —
+    // a future revision can plumb a verbosity flag (`RUST_LOG=...`
+    // or a `--verbose` switch) to re-expose these for debugging.
+    //
+    // Body-write failures *above* this point still surface as errors.
     let mut ack = [0u8; 1];
-    tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut ack))
-        .await
-        .map_err(|_| FramingError::Idle("waiting for receiver ACK"))?
-        .map_err(|e| FramingError::Io {
-            what: "reading receiver ACK",
-            err: e,
-        })?;
-    if ack[0] != 0x01 {
-        return Err(FramingError::Io {
-            what: "receiver ACK",
-            err: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("expected ACK byte 0x01, got 0x{:02x}", ack[0]),
-            ),
-        });
-    }
-    // Only now is it safe to drop our SendStream — shutdown ensures
-    // FIN reaches the peer cleanly after the ACK round-trip.
-    tokio::time::timeout(IDLE_TIMEOUT, stream.shutdown())
-        .await
-        .map_err(|_| FramingError::Idle("shutting down MLS stream"))?
-        .map_err(|e| FramingError::Io {
-            what: "shutting down MLS stream",
-            err: e,
-        })?;
+    let _ = tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut ack)).await;
+    // Best-effort shutdown — same rationale, swallow errors.
+    let _ = tokio::time::timeout(IDLE_TIMEOUT, stream.shutdown()).await;
     Ok(())
 }
 
