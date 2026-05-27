@@ -514,26 +514,35 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
     let processor = GroupChatProcessor::new(&args.mls_display_name, endpoint.clone(), storage)
         .map_err(|e| anyhow::anyhow!("build GroupChatProcessor: {e}"))?;
     let result = cli::run(cmd, processor).await;
-    // Graceful shutdown for one-shot commands that initiate outbound
-    // streams (add-member, remove-member, send, send-welcome-to):
-    // iroh's `SendStream::shutdown` only waits for the FIN to be
-    // ACK'd at the QUIC layer, not for the peer's *application* to
-    // have read the bytes. If we exit immediately, our Endpoint::drop
-    // resets the connection and the peer's mid-body read sees a
-    // spurious "connection lost". A short linger gives the receiver's
-    // event loop time to drain the stream before we go away.
+    // Graceful-shutdown linger. Only required for one-shot commands
+    // that opened OUTBOUND QUIC streams (add-member, remove-member,
+    // send): iroh's `SendStream::shutdown` only ACK's the FIN at the
+    // QUIC layer, not at the application layer. If we exit immediately,
+    // `Endpoint::drop` resets the connection and the peer can see a
+    // spurious "connection lost" before its stream-read finishes
+    // draining. The per-frame ACK byte in `send_mls_message` already
+    // confirms application-layer delivery, but the QUIC FIN still
+    // needs an RTT or two to flush; 200 ms is enough for loopback/LAN.
     //
-    // 2.5 s is empirically long enough for hybrid-suite Welcome and
-    // Application messages (a few KiB) on loopback / LAN. A future
-    // revision can replace this with an explicit ACK byte on the
-    // ALPN_MLS framing — see the address-book follow-up.
+    // `accept-one` is a RECEIVER — it needs to stay around long enough
+    // for the sender to read the ACK byte we just sent, so it keeps a
+    // longer 2.5 s linger (matched to the sender's grace period).
     //
-    // NB: `endpoint.close()` is intentionally NOT called here — it
-    // tears down still-draining QUIC streams which is precisely the
-    // race we're trying to avoid. Letting `endpoint` go out of scope
-    // and dropping at process exit gives iroh's own drop-time
-    // graceful close path a chance to finish.
-    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+    // Commands that didn't open any stream (create-group, list-groups,
+    // list-members, export-key-package, print-local-address) need no
+    // linger at all; skipping it saves 2.5 s per invocation, which
+    // dominates wall-clock time when scripting many one-shot commands.
+    //
+    // NB: `endpoint.close()` is intentionally NOT called — it tears
+    // down still-draining streams, which is the race we're avoiding.
+    let linger_ms: u64 = match cmd_name {
+        "add-member" | "remove-member" | "send" => 200,
+        "accept-one" => 2_500,
+        _ => 0,
+    };
+    if linger_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(linger_ms)).await;
+    }
     let _ = &endpoint; // keep endpoint alive for the linger above
     result
 }
