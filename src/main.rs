@@ -194,6 +194,20 @@ struct Args {
     /// duration of the session.
     #[arg(long, help = "Launch the Slint-based MLS group chat window")]
     mls_gui: bool,
+
+    /// Run as a standalone `nkct/inbox/1` store-and-forward server.
+    /// Binds an iroh endpoint, opens an inbox sqlite at `--mls-storage`
+    /// (or `~/.local/share/nkct/inbox.db`), prints our ticket, and
+    /// serves DEPOSIT/POLL forever. Untrusted — never reads payloads.
+    #[arg(long, help = "Run as an MLS inbox (store-and-forward) server")]
+    inbox_server: bool,
+
+    /// Ticket of an inbox server to use for store-and-forward fallback.
+    /// When set, every `--mls-cmd` outbound send tries the direct
+    /// connect first and falls back to the inbox if it fails or times
+    /// out. The listen REPL also runs a background poll task.
+    #[arg(long)]
+    inbox_url: Option<String>,
 }
 
 #[tokio::main]
@@ -218,6 +232,19 @@ async fn main() -> anyhow::Result<()> {
     // accepted by clap but rejected here so the user sees a clear
     // message rather than a clap-derived "unknown subcommand".
     // ----------------------------------------------------------------
+    if args.inbox_server {
+        #[cfg(feature = "mls")]
+        {
+            return run_inbox_server(args).await;
+        }
+        #[cfg(not(feature = "mls"))]
+        {
+            anyhow::bail!(
+                "--inbox-server requires the `mls` cargo feature; rebuild with `--features mls`"
+            );
+        }
+    }
+
     if args.mls_cmd.is_some() {
         #[cfg(feature = "mls")]
         {
@@ -511,8 +538,15 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
         }
     };
 
-    let processor = GroupChatProcessor::new(&args.mls_display_name, endpoint.clone(), storage)
+    let mut processor = GroupChatProcessor::new(&args.mls_display_name, endpoint.clone(), storage)
         .map_err(|e| anyhow::anyhow!("build GroupChatProcessor: {e}"))?;
+    if let Some(url) = &args.inbox_url {
+        let ticket: Ticket = url
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid --inbox-url ticket: {e}"))?;
+        processor.set_inbox(Some(ticket.peer_addr()));
+    }
+    let processor = processor;
     let result = cli::run(cmd, processor).await;
     // Graceful-shutdown linger. Only required for one-shot commands
     // that opened OUTBOUND QUIC streams (add-member, remove-member,
@@ -545,6 +579,66 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
     }
     let _ = &endpoint; // keep endpoint alive for the linger above
     result
+}
+
+// -----------------------------------------------------------------------------
+// Inbox store-and-forward server. Long-running process that binds an iroh
+// endpoint, opens an inbox sqlite, and serves `nkct/inbox/1` forever.
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "mls")]
+async fn run_inbox_server(args: Args) -> anyhow::Result<()> {
+    use nk_crypto_tool::config::CryptoConfig;
+    use nk_crypto_tool::network::inbox::InboxServer;
+    use nk_crypto_tool::p2p::P2pEndpoint;
+    use nk_crypto_tool::ticket::Ticket;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    let db_path: PathBuf = match args.mls_storage.as_deref() {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let home = std::env::var("HOME")
+                .map_err(|_| anyhow::anyhow!("$HOME not set; pass --mls-storage <path>"))?;
+            let dir = PathBuf::from(home).join(".local/share/nkct");
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| anyhow::anyhow!("create inbox dir {dir:?}: {e}"))?;
+            dir.join("inbox.db")
+        }
+    };
+    eprintln!("[inbox] storage: {db_path:?}");
+
+    let mut transport_config = CryptoConfig::default();
+    transport_config.transport = args.transport;
+    transport_config.no_relay = args.no_relay;
+    transport_config.relay_url = args.relay_url;
+
+    let endpoint: Arc<dyn P2pEndpoint> = match transport_config.transport {
+        nk_crypto_tool::config::TransportKind::Iroh => Arc::new(
+            nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&transport_config, false).await?,
+        ),
+        nk_crypto_tool::config::TransportKind::Tcp => {
+            anyhow::bail!("inbox server requires --transport iroh");
+        }
+    };
+
+    let local = endpoint
+        .local_addr()
+        .await
+        .map_err(|e| anyhow::anyhow!("local_addr: {e}"))?;
+    let ticket = Ticket::new(local, None, None);
+    println!("Inbox listening at: {ticket}");
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+
+    let server = Arc::new(
+        InboxServer::open(&db_path).map_err(|e| anyhow::anyhow!("open inbox: {e}"))?,
+    );
+    server
+        .run(endpoint)
+        .await
+        .map_err(|e| anyhow::anyhow!("inbox run: {e}"))?;
+    Ok(())
 }
 
 #[cfg(feature = "gui-mls")]

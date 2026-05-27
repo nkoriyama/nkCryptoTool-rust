@@ -51,7 +51,7 @@ use crate::group::storage::GroupStorage;
 use crate::group::types::{
     AddMemberOutput, GroupError, GroupId, GroupSummary, IncomingGroupEvent, MemberInfo,
 };
-use crate::p2p::P2pEndpoint;
+use crate::p2p::{P2pEndpoint, PeerAddr};
 
 /// MLS-RS `Config` shape after stacking our storage providers and
 /// crypto/identity providers on top of the base config.
@@ -90,6 +90,12 @@ pub struct GroupChatProcessor {
     /// subsystems (e.g. the 1:1 chat) if a single iroh endpoint serves
     /// multiple ALPNs.
     endpoint: Arc<dyn P2pEndpoint>,
+    /// Optional `nkct/inbox/1` store-and-forward server. When set,
+    /// every outbound send_one tries the direct path first and falls
+    /// back to depositing into the inbox if direct fails (peer offline
+    /// / unreachable). When `None`, behaviour matches the original
+    /// direct-only path.
+    inbox: Option<PeerAddr>,
 }
 
 impl GroupChatProcessor {
@@ -187,7 +193,28 @@ impl GroupChatProcessor {
             client,
             storage,
             endpoint,
+            inbox: None,
         })
+    }
+
+    /// Configure (or remove) the inbox store-and-forward server. When
+    /// set, every outbound send falls back to `inbox::deposit` if the
+    /// direct connect fails — providing offline-capable delivery via
+    /// an untrusted relay (the inbox never reads payloads).
+    pub fn set_inbox(&mut self, inbox: Option<PeerAddr>) {
+        self.inbox = inbox;
+    }
+
+    /// Currently configured inbox server address, if any.
+    pub fn inbox(&self) -> Option<&PeerAddr> {
+        self.inbox.as_ref()
+    }
+
+    /// Borrow the underlying P2P endpoint. Used by background tasks
+    /// (e.g. the listen-loop's inbox poller) that need to call
+    /// transport-level helpers directly.
+    pub fn endpoint_ref(&self) -> &dyn P2pEndpoint {
+        self.endpoint.as_ref()
     }
 
     /// Create a fresh single-member group and persist it.
@@ -474,14 +501,17 @@ impl GroupChatProcessor {
                 msg.wire_format()
             )));
         }
-        crate::group::transport::send_one(self.endpoint.as_ref(), recipient, &msg)
-            .await
-            .map_err(|e| match e {
-                crate::group::transport::FramingError::Transport(p) => {
-                    GroupError::Transport(p)
-                }
-                other => GroupError::Backend(format!("send_welcome_to framing: {other}")),
-            })
+        crate::group::transport::send_one_with_inbox(
+            self.endpoint.as_ref(),
+            recipient,
+            &msg,
+            self.inbox.as_ref(),
+        )
+        .await
+        .map_err(|e| match e {
+            crate::group::transport::FramingError::Transport(p) => GroupError::Transport(p),
+            other => GroupError::Backend(format!("send_welcome_to framing: {other}")),
+        })
     }
 
     /// Accept the next inbound MLS stream and process the single frame
@@ -597,7 +627,14 @@ impl GroupChatProcessor {
         // earlier sequential `?` would skip recipients after the first
         // error, leaving them silently unfed). Recipients that did
         // succeed have actually received the message.
-        fanout_send(&self.endpoint, recipients, msg, "send_application_message").await?;
+        fanout_send(
+            &self.endpoint,
+            recipients,
+            msg,
+            self.inbox.as_ref(),
+            "send_application_message",
+        )
+        .await?;
 
         Ok(Zeroizing::new(wire_bytes))
     }
@@ -637,7 +674,14 @@ impl GroupChatProcessor {
         // time in N-member group builds (Σ handshakes grows quadratically
         // with N); parallel cuts the wall-clock cost to ~one handshake's
         // RTT regardless of recipient count.
-        fanout_send(&self.endpoint, recipients, msg, "broadcast_commit").await
+        fanout_send(
+            &self.endpoint,
+            recipients,
+            msg,
+            self.inbox.as_ref(),
+            "broadcast_commit",
+        )
+        .await
     }
 
     /// Accept the next inbound MLS stream and dispatch by wire format
@@ -681,7 +725,33 @@ impl GroupChatProcessor {
                 }
                 other => GroupError::InvalidWelcome(format!("recv_mls_message: {other}")),
             })?;
+        self.process_mls_bytes(msg, raw).await
+    }
 
+    /// Process a single MLS payload that arrived through some channel
+    /// other than the direct `ALPN_MLS` stream (e.g. drained from an
+    /// inbox poll). The wire dispatch is identical to `accept_next`
+    /// post-framing; factoring it out lets us share one body between
+    /// the direct-receive and store-and-forward paths.
+    ///
+    /// The caller is responsible for length-prefix framing — pass the
+    /// raw bytes that would have been on the wire after the u32 length
+    /// prefix is stripped. (Inbox envelopes store exactly that.)
+    pub async fn process_inbox_envelope(
+        &self,
+        envelope: &[u8],
+    ) -> Result<IncomingGroupEvent, GroupError> {
+        let msg = MlsMessage::from_bytes(envelope).map_err(|e| {
+            GroupError::InvalidWelcome(format!("decode inbox envelope: {e}"))
+        })?;
+        self.process_mls_bytes(msg, envelope.to_vec()).await
+    }
+
+    async fn process_mls_bytes(
+        &self,
+        msg: MlsMessage,
+        raw: Vec<u8>,
+    ) -> Result<IncomingGroupEvent, GroupError> {
         match msg.wire_format() {
             WireFormat::Welcome => {
                 let gid = self.join_group_from_welcome(&raw).await?;
@@ -947,6 +1017,7 @@ async fn fanout_send(
     endpoint: &Arc<dyn P2pEndpoint>,
     recipients: &[crate::p2p::PeerAddr],
     msg: MlsMessage,
+    inbox: Option<&PeerAddr>,
     label: &'static str,
 ) -> Result<(), GroupError> {
     if recipients.is_empty() {
@@ -955,23 +1026,34 @@ async fn fanout_send(
     // Single recipient: avoid the JoinSet machinery — common case for
     // 1→2 group transitions and direct sends.
     if recipients.len() == 1 {
-        return crate::group::transport::send_one(endpoint.as_ref(), &recipients[0], &msg)
-            .await
-            .map_err(|e| match e {
-                crate::group::transport::FramingError::Transport(p) => {
-                    GroupError::Transport(p)
-                }
-                other => GroupError::Backend(format!("{label}: {other}")),
-            });
+        return crate::group::transport::send_one_with_inbox(
+            endpoint.as_ref(),
+            &recipients[0],
+            &msg,
+            inbox,
+        )
+        .await
+        .map_err(|e| match e {
+            crate::group::transport::FramingError::Transport(p) => GroupError::Transport(p),
+            other => GroupError::Backend(format!("{label}: {other}")),
+        });
     }
     let msg = Arc::new(msg);
+    let inbox_owned: Option<PeerAddr> = inbox.cloned();
     let mut set = tokio::task::JoinSet::new();
     for addr in recipients {
         let ep = Arc::clone(endpoint);
         let msg = Arc::clone(&msg);
         let addr = addr.clone();
+        let inbox = inbox_owned.clone();
         set.spawn(async move {
-            crate::group::transport::send_one(ep.as_ref(), &addr, &msg).await
+            crate::group::transport::send_one_with_inbox(
+                ep.as_ref(),
+                &addr,
+                &msg,
+                inbox.as_ref(),
+            )
+            .await
         });
     }
     let mut first_err: Option<GroupError> = None;

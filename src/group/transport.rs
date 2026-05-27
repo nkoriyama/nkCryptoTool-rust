@@ -230,11 +230,66 @@ pub async fn send_one(
     addr: &PeerAddr,
     msg: &MlsMessage,
 ) -> Result<(), FramingError> {
-    let stream = endpoint
-        .connect(addr, ALPN_MLS_PROTOCOL)
-        .await
-        .map_err(FramingError::Transport)?;
-    send_mls_message(stream, msg).await
+    send_one_with_inbox(endpoint, addr, msg, None).await
+}
+
+/// Window for the direct-connect attempt before the inbox fallback (if
+/// configured) kicks in. iroh's own unreachability detection can take
+/// ~10 s while it probes every advertised direct_addr; a tighter cap
+/// here keeps offline-delivery latency bounded for senders.
+const DIRECT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// `send_one` with an optional store-and-forward fallback.
+///
+/// Tries `endpoint.connect(addr, ALPN_MLS)` (with a
+/// [`DIRECT_CONNECT_TIMEOUT`] window) first. If that succeeds, the
+/// frame is delivered directly and the function returns. If it fails
+/// — connect error, timeout, or write error during framing — AND an
+/// `inbox` address is provided, the frame is encoded and deposited
+/// to the inbox server instead. The recipient picks it up on its
+/// next `crate::network::inbox::poll`.
+///
+/// When `inbox` is `None`, the function behaves exactly like the old
+/// `send_one`: direct-only with the original error surfaced.
+///
+/// Deposit failures are reported as `FramingError::Io` so callers
+/// can distinguish "we tried both paths and both failed" from
+/// "direct failed and we had no fallback".
+pub async fn send_one_with_inbox(
+    endpoint: &dyn P2pEndpoint,
+    addr: &PeerAddr,
+    msg: &MlsMessage,
+    inbox: Option<&PeerAddr>,
+) -> Result<(), FramingError> {
+    let direct = tokio::time::timeout(
+        DIRECT_CONNECT_TIMEOUT,
+        endpoint.connect(addr, ALPN_MLS_PROTOCOL),
+    )
+    .await;
+
+    let direct_result: Result<(), FramingError> = match direct {
+        Ok(Ok(stream)) => send_mls_message(stream, msg).await,
+        Ok(Err(e)) => Err(FramingError::Transport(e)),
+        Err(_) => Err(FramingError::Idle("direct connect timed out")),
+    };
+
+    match (direct_result, inbox) {
+        (Ok(()), _) => Ok(()),
+        (Err(direct_err), None) => Err(direct_err),
+        (Err(_direct_err), Some(inbox_addr)) => {
+            // Direct path failed; fall back to inbox.
+            let bytes = msg.to_bytes().map_err(|e| FramingError::Io {
+                what: "MLS encode for inbox",
+                err: std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{e}")),
+            })?;
+            crate::network::inbox::deposit(endpoint, inbox_addr, addr.peer_id, &bytes)
+                .await
+                .map_err(|e| FramingError::Io {
+                    what: "inbox deposit (after direct failure)",
+                    err: std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")),
+                })
+        }
+    }
 }
 
 #[cfg(test)]

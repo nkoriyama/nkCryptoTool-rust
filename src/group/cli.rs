@@ -417,6 +417,80 @@ pub async fn listen_loop(
     // Channel: inbound task signals "we were removed; please stop".
     let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel::<()>(1);
 
+    // -------- inbox poll task --------------------------------------------
+    // Only spawned when the processor has an inbox configured. Polls
+    // every 2 s, dispatches each envelope through the shared MLS state
+    // machine, and prints the resulting event with the same formatting
+    // as the direct accept_next path so the user sees a uniform event
+    // stream regardless of which channel delivered the message.
+    //
+    // Errors are surfaced to stdout but never break the loop — a
+    // transient unreachable inbox should not stop us from accepting
+    // future deliveries.
+    let inbox_task: Option<tokio::task::JoinHandle<()>> = if processor.inbox().is_some() {
+        let processor = Arc::clone(&processor);
+        let group_id = Arc::clone(&group_id);
+        let stdout = Arc::clone(&stdout);
+        let kill_tx = kill_tx.clone();
+        Some(tokio::spawn(async move {
+            let server = processor.inbox().expect("inbox checked above").clone();
+            let mut cursor: u64 = 0;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let poll_res =
+                    crate::network::inbox::poll(processor.endpoint_ref(), &server, cursor)
+                        .await;
+                let envelopes = match poll_res {
+                    Ok((new_cursor, env)) => {
+                        cursor = new_cursor;
+                        env
+                    }
+                    Err(e) => {
+                        let mut out = stdout.lock().await;
+                        let _ = out
+                            .write_all(format!("[inbox poll err] {e}\n").as_bytes())
+                            .await;
+                        let _ = out.flush().await;
+                        continue;
+                    }
+                };
+                for env in envelopes {
+                    let evt = match processor.process_inbox_envelope(&env).await {
+                        Ok(evt) => evt,
+                        Err(e) => {
+                            let mut out = stdout.lock().await;
+                            let _ = out
+                                .write_all(format!("[inbox dispatch err] {e}\n").as_bytes())
+                                .await;
+                            let _ = out.flush().await;
+                            continue;
+                        }
+                    };
+                    // Side-effect: NewGroup → adopt the gid; Removed →
+                    // signal the outer loop. Same logic as the inbound
+                    // task; factor later if a third source appears.
+                    if let IncomingGroupEvent::NewGroup { id } = &evt {
+                        let mut g = group_id.lock().await;
+                        *g = Some(*id);
+                    }
+                    let is_removed = matches!(evt, IncomingGroupEvent::RemovedFromGroup { .. });
+                    let line = render_event(&evt);
+                    let mut out = stdout.lock().await;
+                    let _ = out.write_all(line.as_bytes()).await;
+                    let _ = out.write_all(b"\n").await;
+                    let _ = out.flush().await;
+                    drop(out);
+                    if is_removed {
+                        let _ = kill_tx.send(()).await;
+                        return;
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // -------- inbound task ------------------------------------------------
     let inbound = {
         let processor = Arc::clone(&processor);
@@ -656,6 +730,9 @@ pub async fn listen_loop(
     }
 
     inbound.abort();
+    if let Some(t) = inbox_task {
+        t.abort();
+    }
     Ok(())
 }
 
