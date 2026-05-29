@@ -49,17 +49,21 @@ mls-rs-crypto-openssl = { version = "0.21", optional = true }
 # and `kem_combiner::FixedLengthKemType` for the hybrid KEM composition
 # (X25519 ‖ ML-KEM-768). Version must track openssl provider's; bump together.
 mls-rs-crypto-hpke = { version = "0.21", optional = true }
-# P2 sqlite persistence. `sqlite-bundled` ships the upstream sqlite C
-# library (no system dep, larger binary) but keeps the database
-# unencrypted at rest — protection is provided by file mode 0o600 and
-# OS keystore for the signing-key passphrase (see SECURITY.md). The
-# `sqlcipher-bundled` upgrade path remains available for a future
-# encrypted-at-rest revision.
-mls-rs-provider-sqlite = { version = "0.23", default-features = false, features = ["sqlite-bundled"], optional = true }
+# P2 sqlite persistence with SQLCipher at-rest encryption.
+# `sqlcipher-bundled` builds the SQLCipher 4 C library (AES-256-CBC +
+# HMAC-SHA512, PBKDF2-HMAC-SHA512 with 256 000 iterations) and pulls
+# rusqlite's `bundled-sqlcipher` feature transitively. The MLS sqlite
+# file is encrypted with a user-supplied passphrase configured via
+# `PRAGMA key` on every connection (see `TunedFileStrategy` in
+# `src/group/storage.rs`). File mode `0o600` remains as defence in
+# depth. See SECURITY_PROFILE.md §7.3.
+mls-rs-provider-sqlite = { version = "0.23", default-features = false, features = ["sqlcipher-bundled"], optional = true }
 # Direct rusqlite dep so our custom `ConnectionStrategy` can apply the
-# busy_timeout / synchronous PRAGMAs that the upstream provider does
-# not set. Version must match `mls-rs-provider-sqlite`'s pin (0.37).
-rusqlite = { version = "0.37", default-features = false, optional = true }
+# `key`, busy_timeout, and synchronous PRAGMAs that the upstream provider
+# does not set. `bundled-sqlcipher` keeps us on the same C library as
+# `mls-rs-provider-sqlite` (cargo unifies the underlying `libsqlite3-sys`
+# build). Version must match `mls-rs-provider-sqlite`'s pin (0.37).
+rusqlite = { version = "0.37", default-features = false, features = ["bundled-sqlcipher"], optional = true }
 notify-rust = { version = "4.0", optional = true }
 rfd = { version = "0.14", optional = true }
 

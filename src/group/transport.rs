@@ -316,6 +316,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let storage = crate::group::storage::GroupStorage::open_at(
             dir.path().join("p4_frame_test.db"),
+            crate::group::storage::test_passphrase(),
         )
         .expect("storage");
         // Endpoint for the GroupChatProcessor doesn't get used in this

@@ -122,11 +122,11 @@ impl GroupChatProcessor {
     ///
     /// Keys are stored in `mls-rs-provider-sqlite`'s application_data
     /// kvs table under `mls:identity:sk` (private) and
-    /// `mls:identity:pk` (public). The bytes are **plaintext** in the
-    /// sqlite file; the file's `0o600` permission is the at-rest
-    /// boundary. SQLCipher (the `sqlcipher-bundled` feature of
-    /// `mls-rs-provider-sqlite`) is a one-feature swap away — see
-    /// `SECURITY_PROFILE.md` §7.3.
+    /// `mls:identity:pk` (public). The whole sqlite file is
+    /// SQLCipher 4 encrypted (AES-256-CBC + HMAC-SHA512, PBKDF2-HMAC-
+    /// SHA512 256 000 iters) using the passphrase supplied to
+    /// [`GroupStorage::open_at`]. File mode `0o600` is retained as
+    /// defence in depth. See `SECURITY_PROFILE.md` §7.3.
     pub fn new(
         display_name: &str,
         endpoint: Arc<dyn P2pEndpoint>,
@@ -290,8 +290,9 @@ impl GroupChatProcessor {
     /// same bytes will fail — by design.
     ///
     /// The returned bytes are wrapped in `Zeroizing` even though they
-    /// are public. The private key half lives in sqlite (where 0o600
-    /// permissions protect it); the returned blob is harmless to leak.
+    /// are public. The private key half lives in the SQLCipher-encrypted
+    /// sqlite file (with `0o600` as defence in depth); the returned blob
+    /// is harmless to leak.
     /// The wrapper is for caller convenience — e.g. when piping into
     /// a file, the bytes get cleared from a transient buffer before
     /// the next allocation reuses the pages.
@@ -1108,7 +1109,11 @@ mod tests {
         peer_byte: u8,
     ) -> (GroupChatProcessor, tempfile::TempDir) {
         let dir = tempdir().expect("tempdir");
-        let storage = GroupStorage::open_at(dir.path().join("groups.db")).expect("storage");
+        let storage = GroupStorage::open_at(
+            dir.path().join("groups.db"),
+            crate::group::storage::test_passphrase(),
+        )
+        .expect("storage");
         let net = MockNetwork::new();
         let ep = net.register(PeerId::new([peer_byte; 32]), vec![PROTO_MLS]);
         let proc =
@@ -1126,7 +1131,11 @@ mod tests {
         peer_byte: u8,
     ) -> (GroupChatProcessor, tempfile::TempDir) {
         let dir = tempdir().expect("tempdir");
-        let storage = GroupStorage::open_at(dir.path().join("groups.db")).expect("storage");
+        let storage = GroupStorage::open_at(
+            dir.path().join("groups.db"),
+            crate::group::storage::test_passphrase(),
+        )
+        .expect("storage");
         let ep = net.register(PeerId::new([peer_byte; 32]), vec![PROTO_MLS]);
         let proc =
             GroupChatProcessor::new(display_name, Arc::new(ep), storage).expect("builder");
@@ -1159,7 +1168,11 @@ mod tests {
         // ---- session 1: create + persist ---------------------------
         let gid_before;
         {
-            let storage = GroupStorage::open_at(&db_path).expect("storage 1");
+            let storage = GroupStorage::open_at(
+                &db_path,
+                crate::group::storage::test_passphrase(),
+            )
+            .expect("storage 1");
             let net = MockNetwork::new();
             let ep = net.register(PeerId::new([1; 32]), vec![PROTO_MLS]);
             let proc = GroupChatProcessor::new("alice", Arc::new(ep), storage)
@@ -1171,7 +1184,11 @@ mod tests {
         }
 
         // ---- session 2: reload at the same path --------------------
-        let storage = GroupStorage::open_at(&db_path).expect("storage 2");
+        let storage = GroupStorage::open_at(
+            &db_path,
+            crate::group::storage::test_passphrase(),
+        )
+        .expect("storage 2");
         let net = MockNetwork::new();
         let ep = net.register(PeerId::new([2; 32]), vec![PROTO_MLS]);
         // New signing identity (the original one is gone). That is OK
@@ -1238,13 +1255,15 @@ mod tests {
         let alice = GroupChatProcessor::new(
             "alice",
             Arc::new(alice_ep),
-            GroupStorage::open_at(&path_a).expect("alice storage"),
+            GroupStorage::open_at(&path_a, crate::group::storage::test_passphrase())
+                .expect("alice storage"),
         )
         .expect("alice processor");
         let bob = GroupChatProcessor::new(
             "bob",
             Arc::new(bob_ep),
-            GroupStorage::open_at(&path_b).expect("bob storage"),
+            GroupStorage::open_at(&path_b, crate::group::storage::test_passphrase())
+                .expect("bob storage"),
         )
         .expect("bob processor");
 
@@ -1300,13 +1319,15 @@ mod tests {
         let alice2 = GroupChatProcessor::new(
             "alice",
             Arc::new(net.register(PeerId::new([3; 32]), vec![PROTO_MLS])),
-            GroupStorage::open_at(&path_a).expect("alice storage 2"),
+            GroupStorage::open_at(&path_a, crate::group::storage::test_passphrase())
+                .expect("alice storage 2"),
         )
         .expect("alice processor 2");
         let bob2 = GroupChatProcessor::new(
             "bob",
             Arc::new(net.register(PeerId::new([4; 32]), vec![PROTO_MLS])),
-            GroupStorage::open_at(&path_b).expect("bob storage 2"),
+            GroupStorage::open_at(&path_b, crate::group::storage::test_passphrase())
+                .expect("bob storage 2"),
         )
         .expect("bob processor 2");
 

@@ -18,6 +18,7 @@
 //! Everything is gated behind `#[cfg(feature = "mls")]` so the default
 //! crate build (and all 1:1 chat / file transfer paths) are unaffected.
 
+pub mod at_rest;
 pub mod cli;
 pub mod crypto_adapter;
 pub mod processor;
@@ -25,6 +26,7 @@ pub mod storage;
 pub mod transport;
 pub mod types;
 
+pub use at_rest::{open_at_rest_storage, AtRestKey, AtRestPaths};
 pub use crypto_adapter::{hybrid_cipher_suite, HYBRID_SUITE_ID};
 pub use processor::GroupChatProcessor;
 pub use storage::{GroupStorage, TunedFileStrategy};

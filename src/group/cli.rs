@@ -920,7 +920,11 @@ mod tests {
         peer_byte: u8,
     ) -> (GroupChatProcessor, tempfile::TempDir) {
         let dir = tempdir().expect("tempdir");
-        let storage = GroupStorage::open_at(dir.path().join("groups.db")).expect("storage");
+        let storage = GroupStorage::open_at(
+            dir.path().join("groups.db"),
+            crate::group::storage::test_passphrase(),
+        )
+        .expect("storage");
         let ep = net.register(
             PeerId::new([peer_byte; 32]),
             vec![P2pProtocol(crate::network::ALPN_MLS)],

@@ -421,7 +421,7 @@ async fn main() -> anyhow::Result<()> {
 async fn run_mls_command(args: Args) -> anyhow::Result<()> {
     use nk_crypto_tool::config::CryptoConfig;
     use nk_crypto_tool::group::cli::{self, MlsCommand};
-    use nk_crypto_tool::group::{GroupChatProcessor, GroupId, GroupStorage};
+    use nk_crypto_tool::group::{open_at_rest_storage, AtRestPaths, GroupChatProcessor, GroupId};
     use nk_crypto_tool::p2p::P2pEndpoint;
     use nk_crypto_tool::ticket::Ticket;
     use std::path::PathBuf;
@@ -517,7 +517,16 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
         Some(p) => PathBuf::from(p),
         None => cli::default_storage_path()?,
     };
-    let storage = GroupStorage::open_at(&storage_path)
+    // The MLS sqlite DB is SQLCipher-encrypted with a 256-bit DEK that
+    // is itself wrapped by an X25519+ML-KEM-768 hybrid KEM (at-rest PQC
+    // layer — see `group::at_rest` and SECURITY_PROFILE.md §7.3). The
+    // passphrase decrypts the hybrid private key file (`at-rest.key`);
+    // from there the DEK is recovered via HPKE open against the KEK
+    // file (`groups.db.kek`).
+    let mls_passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+        .map_err(|e| anyhow::anyhow!("read MLS storage passphrase: {e}"))?;
+    let at_rest_paths = AtRestPaths::from_db_path(&storage_path);
+    let storage = open_at_rest_storage(&at_rest_paths, &mls_passphrase)
         .map_err(|e| anyhow::anyhow!("open MLS storage at {storage_path:?}: {e}"))?;
 
     // Build a CryptoConfig with just the transport-relevant bits.
@@ -644,7 +653,7 @@ async fn run_inbox_server(args: Args) -> anyhow::Result<()> {
 #[cfg(feature = "gui-mls")]
 async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
     use nk_crypto_tool::config::CryptoConfig;
-    use nk_crypto_tool::group::{cli, GroupChatProcessor, GroupStorage};
+    use nk_crypto_tool::group::{cli, open_at_rest_storage, AtRestPaths, GroupChatProcessor};
     use nk_crypto_tool::p2p::P2pEndpoint;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -653,7 +662,12 @@ async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
         Some(p) => PathBuf::from(p),
         None => cli::default_storage_path()?,
     };
-    let storage = GroupStorage::open_at(&storage_path)
+    // PQC at-rest layer: passphrase → hybrid SK (at-rest.key) → DEK
+    // (groups.db.kek) → SQLCipher. See SECURITY_PROFILE.md §7.3.
+    let mls_passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+        .map_err(|e| anyhow::anyhow!("read MLS storage passphrase: {e}"))?;
+    let at_rest_paths = AtRestPaths::from_db_path(&storage_path);
+    let storage = open_at_rest_storage(&at_rest_paths, &mls_passphrase)
         .map_err(|e| anyhow::anyhow!("open MLS storage at {storage_path:?}: {e}"))?;
 
     // Build transport endpoint per --transport / --no-relay / --relay-url.

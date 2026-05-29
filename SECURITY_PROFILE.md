@@ -281,12 +281,36 @@ V1.1.0 より、ファイル復号時に **Two-Pass (2回読み込み) 方式**�
 
 ### 7.3 永続化のリスクと緩和
 
+at-rest は **ハイブリッド PQC 鍵階層**で保護される（`src/group/at_rest.rs`）。
+MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを再利用するため、
+*harvest-now-decrypt-later* 攻撃に対して MLS の通信と同等の量子耐性を持つ。
+
+```text
+  passphrase (ユーザー入力)
+    │  PBKDF2-HMAC-SHA512 (256 000 iters) + AES-256-GCM
+    ▼
+  at-rest hybrid SK   (X25519 SK || ML-KEM-768 DK)   ← at-rest.key
+    │  X-Wing hpke_open
+    ▼
+  DEK (256 bit, ランダム生成)                         ← in-memory
+    │  PRAGMA key = "x'<hex>'"
+    ▼
+  SQLCipher page key                                  ← groups.db を解錠
+```
+
 | 項目 | 現状 | 緩和策 |
 |---|---|---|
-| DB ファイル | プレーン sqlite (`mls-rs-provider-sqlite` の `sqlite-bundled` feature) | ファイル permission `0o600`、`WAL` モード、`busy_timeout=5000` |
-| 鍵素材 | mls-rs の `ZeroizeOnDrop` で in-memory 自動消去 | アプリ境界の中間 `Vec<u8>` も `Zeroizing` でラップ |
-| At-rest 暗号化 | 未実装 (今回の範囲外) | 次回スコープ: SQLCipher (`mls-rs-provider-sqlite` の `sqlcipher-bundled` feature) へ切替可能 |
+| DB ファイル | SQLCipher 4 暗号化 sqlite (`mls-rs-provider-sqlite` の `sqlcipher-bundled` feature) | 256-bit DEK で AES-256-CBC + HMAC-SHA512 page 暗号化、ファイル permission `0o600`、`WAL` モード、`busy_timeout=5000` |
+| 鍵素材 (in-memory) | mls-rs の `ZeroizeOnDrop` で in-memory 自動消去 | アプリ境界の中間 `Vec<u8>` も `Zeroizing` でラップ。DEK / at-rest SK / passphrase いずれも `Zeroizing` で保持 |
+| At-rest 暗号化 (古典層) | SQLCipher 4 (AES-256-CBC + HMAC-SHA512) を 256-bit ランダム DEK で適用 | 署名鍵 (`mls:identity:sk`)、グループ木、KeyPackage 秘密鍵、PSK が同一暗号境界に入る |
+| At-rest 暗号化 (PQC 層) | X-Wing ハイブリッド KEM (X25519+ML-KEM-768) で DEK を encapsulate (`groups.db.kek`) | MLS プロトコル層と同じ `HybridCryptoProvider` を流用。古典/PQC のどちらかが破られても他方で守られる |
+| at-rest 鍵ファイル (`at-rest.key`) | PBKDF2-HMAC-SHA512 (256 000 iters) → AES-256-GCM 封筒で hybrid SK を保管 | 42 B のヘッダ (magic / version / KDF params / salt / nonce) を AAD に含めるため、param 改竄も AEAD タグで検出。`0o600`、temp-then-rename でアトミック書込 |
+| KEK ファイル (`groups.db.kek`) | `HpkeCiphertext { kem_output, ciphertext }` を MLS-codec で serialise + 10 B ヘッダ | 改竄は HPKE AEAD タグで検出。HPKE `info = b"nkct-mls-at-rest-v1"` で他用途との domain separation |
+| パスフレーズ取得 | `NK_PASSPHRASE` 環境変数 or 対話入力 (`get_masked_passphrase`) | 既存の PEM 暗号化と同じ経路を再利用。空パスフレーズは `open_at_rest_storage` が拒否 |
 | 同時書き込み | 単一プロセス前提 | sqlite WAL + `busy_timeout` 5s で短期競合を吸収 (multi-process は非推奨) |
+| バックアップ運用 | `groups.db` 単体では復号不可 — `at-rest.key` + `groups.db.kek` + passphrase の 3 要素全部が必要 | 3 ファイルを同一ディレクトリで一括バックアップ。passphrase はユーザーが別管理 |
+| 鍵ローテーション | 当面未実装 | DEK は `groups.db.kek` を新規 encapsulate し直すだけで更新可 (SQLCipher の `PRAGMA rekey` で全ページ再暗号化)。at-rest hybrid SK の更新は `at-rest.key` の再生成 + 全 DEK の再 encapsulate |
+| 既存平文 DB の取扱い | 自動マイグレーション未実装 | SQLCipher 化前の `.db` は再利用不可。`sqlcipher` CLI で `ATTACH … KEY '…'` + `sqlcipher_export` するか、グループを作り直す |
 
 ### 7.4 トランスポート抽象 (ALPN `nkct/mls/1`)
 
@@ -304,6 +328,30 @@ V1.1.0 より、ファイル復号時に **Two-Pass (2回読み込み) 方式**�
 - **`cargo audit` の transitive 警告**: `iroh` 依存ツリーに hickory-proto 等の
   既知警告があるが、これは Iroh アップストリームに追従が必要な範囲。
   プロジェクト直接依存には脆弱性なし。
+- **at-rest AEAD は AES-128-GCM がボトルネック**: §7.3 の at-rest PQC 層は MLS
+  プロトコルと同じ cipher suite `0xF101` を流用するため、HPKE seal/open の AEAD は
+  **AES-128-GCM** になる。X25519+ML-KEM-768 KEM 自体は PQ-safe (NIST Cat 3 相当)
+  だが、KEM の外側で DEK を包む AEAD は Grover 攻撃で実効 64-bit まで減衰する
+  可能性がある。実害は当面ゼロ (数百万 logical qubit 規模が必要) だが、真の
+  AES-256 PQ-safe at-rest が必要になった時点で別 cipher suite (例: `0xF102 =
+  X-Wing / HKDF-SHA512 / AES-256-GCM`) を at-rest 専用に定義する必要がある。
+- **DEK の forward secrecy なし**: §7.3 で生成された DEK は DB 寿命の間固定。
+  `groups.db.kek` または `at-rest.key` が将来侵害された場合、その時点で DB 内の
+  既存メッセージはすべて復号可能になる (MLS の epoch ratchet は DEK の上位層
+  なので、at-rest 層では FS を提供しない)。緩和策として `PRAGMA rekey` 経由の
+  DEK ローテーション CLI を追加する余地あり (`nkct mls rekey` 等)。
+- **anti-rollback 不在**: SQLCipher は古いスナップショットへの巻き戻し攻撃を
+  検知しない。攻撃者が `groups.db` を時刻 T1 の版で上書きすると、その時点で
+  失効済みの member key が再び有効に見える可能性がある。MLS 自身の epoch
+  単調増加で部分的に検知可能だが、at-rest 層は無防備。tamper-evident storage
+  (TPM/Secure Enclave) との連携が将来作業。
+- **`groups.db.kek` の per-DB バインディングなし**: HPKE `info` は固定文字列
+  `b"nkct-mls-at-rest-v1"`。同一 at-rest 鍵で複数 DB を運用するユースケースは
+  現状想定していないが、将来サポートするなら DB パスやランダム salt を `info`
+  に含めて KEK 再利用攻撃を防ぐべき。
+- **平文 DB からの自動マイグレーション未実装**: SQLCipher 化前の `.db` ファイルは
+  読み込めない。`sqlcipher` CLI 経由の手動 export か、グループ再作成が必要 (§7.3
+  参照)。
 
 ### 7.6 抽象境界の CI 強制
 
