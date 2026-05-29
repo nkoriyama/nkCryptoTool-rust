@@ -453,6 +453,12 @@ pub fn open_at_rest_storage(
         dek
     };
 
+    // 2b. Finish any rekey that was interrupted by a crash between the
+    //     PRAGMA rekey and the KEK promotion (see `rotate_dek`). If a
+    //     `<kek>.pending` sidecar is present, this resolves which DEK the
+    //     DB is actually encrypted under and returns the matching one.
+    let dek = finalize_pending_rekey(paths, &at_rest_key, dek)?;
+
     // 3. Migrate a pre-SQLCipher plaintext DB in place, if one is found.
     //    Older builds shipped `groups.db` as an unencrypted sqlite file
     //    (the `sqlite-bundled` feature). Such a file cannot be opened with
@@ -465,6 +471,192 @@ pub fn open_at_rest_storage(
 
     // 4. Open SQLCipher with the raw DEK.
     GroupStorage::open_at_with_raw_key(&paths.db, &dek)
+}
+
+/// Path of the staging KEK written during a rekey (`<kek>.pending`).
+fn kek_pending_path(kek: &Path) -> PathBuf {
+    let mut s = kek.as_os_str().to_owned();
+    s.push(".pending");
+    PathBuf::from(s)
+}
+
+/// Rotate the SQLCipher DEK in place: re-encrypt every page of `groups.db`
+/// under a fresh 256-bit DEK and re-wrap that DEK into a new KEK file.
+///
+/// This mitigates a *suspected DEK exposure* (e.g. the old `groups.db.kek`
+/// leaked): future copies of the DB are protected by a key the attacker
+/// never saw. It does **not** retroactively protect a copy of the old
+/// ciphertext the attacker may already hold, and it does not rotate the
+/// at-rest hybrid keypair or passphrase (regenerate `at-rest.key` for
+/// that).
+///
+/// ## Crash safety
+///
+/// The DB page key (`groups.db`) and its wrapper (`groups.db.kek`) live in
+/// two separate files that must change together. To survive a crash at any
+/// point, the new KEK is first staged to `groups.db.kek.pending`, then the
+/// DB is rekeyed via `PRAGMA rekey`, then the staging file is atomically
+/// promoted over `groups.db.kek`. [`finalize_pending_rekey`] (run on every
+/// open) resolves a leftover `.pending` by testing which DEK actually
+/// opens the DB, so no crash window leaves the DB unrecoverable. On any
+/// error the staging file is left in place for that recovery to consume.
+pub fn rotate_dek(
+    paths: &AtRestPaths,
+    passphrase: &Zeroizing<String>,
+) -> Result<(), GroupError> {
+    if passphrase.is_empty() {
+        return Err(GroupError::Storage(
+            "at-rest passphrase must not be empty".into(),
+        ));
+    }
+    if !paths.key.exists() || !paths.kek.exists() || !paths.db.exists() {
+        return Err(GroupError::Storage(
+            "rekey requires an existing at-rest.key, groups.db.kek, and groups.db".into(),
+        ));
+    }
+    if is_plaintext_sqlite(&paths.db) {
+        return Err(GroupError::Storage(
+            "groups.db is not encrypted yet — open it once to migrate before rekey".into(),
+        ));
+    }
+
+    let at_rest_key = AtRestKey::load_encrypted(&paths.key, passphrase.as_str())?;
+
+    // Recover the current DEK, finishing any prior interrupted rekey first
+    // so we start from a consistent DB/KEK pair.
+    let kek_bytes = fs::read(&paths.kek)
+        .map_err(|e| GroupError::Storage(format!("read KEK {:?}: {e}", paths.kek)))?;
+    let old_dek = at_rest_key.decapsulate_dek(&kek_bytes)?;
+    let old_dek = finalize_pending_rekey(paths, &at_rest_key, old_dek)?;
+
+    // Fresh DEK + its KEK envelope.
+    let (new_kek_bytes, new_dek) = at_rest_key.encapsulate_dek()?;
+
+    // Stage the new KEK before touching the DB.
+    let pending = kek_pending_path(&paths.kek);
+    write_atomic_secret(&pending, &new_kek_bytes)?;
+
+    // Re-encrypt the DB from old to new DEK. SQLCipher wraps `PRAGMA rekey`
+    // in its own transaction, so a failure here rolls back to the old DEK;
+    // the stale `.pending` is then discarded by the next open's recovery.
+    {
+        use rusqlite::Connection;
+        let old_hex = Zeroizing::new(hex::encode(old_dek.as_ref()));
+        let new_hex = Zeroizing::new(hex::encode(new_dek.as_ref()));
+        let conn = Connection::open_with_flags(&paths.db, db_rw_no_create_flags())
+            .map_err(|e| GroupError::Storage(format!("open {:?}: {e}", paths.db)))?;
+        let key_stmt = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", old_hex.as_str()));
+        conn.execute_batch(key_stmt.as_str())
+            .map_err(|e| GroupError::Storage(format!("rekey set old key: {e}")))?;
+        // Confirm the old key actually opens it before rekeying.
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
+            .map_err(|e| GroupError::Storage(format!("rekey verify old key: {e}")))?;
+        // Re-encrypt under a rollback journal rather than WAL: a WAL-mode
+        // rekey writes the new-key pages to the -wal and leaves the OLD-key
+        // pages in the main file until a checkpoint, so a failed checkpoint
+        // would leave old-DEK data readable in the main file. Switching to
+        // DELETE journalling first folds any pre-existing WAL frames into
+        // the main file and then writes the re-encrypted pages straight to
+        // it, with a rollback journal that is removed on commit — no -wal
+        // residue under either key. GroupStorage re-enables WAL on the next
+        // open.
+        conn.execute_batch("PRAGMA journal_mode=DELETE;")
+            .map_err(|e| GroupError::Storage(format!("rekey set rollback journal: {e}")))?;
+        let rekey_stmt = Zeroizing::new(format!("PRAGMA rekey = \"x'{}'\";", new_hex.as_str()));
+        conn.execute_batch(rekey_stmt.as_str())
+            .map_err(|e| GroupError::Storage(format!("PRAGMA rekey: {e}")))?;
+        // Confirm the new key is now active.
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
+            .map_err(|e| GroupError::Storage(format!("rekey verify new key: {e}")))?;
+    }
+
+    // Promote the staged KEK over the live one. After this rename the DB
+    // and KEK are both on the new DEK.
+    fs::rename(&pending, &paths.kek).map_err(|e| {
+        GroupError::Storage(format!(
+            "promote {pending:?} -> {:?}: {e} (the DB is now on the new DEK; \
+             reopen to let recovery finish the promotion)",
+            paths.kek
+        ))
+    })?;
+    Ok(())
+}
+
+/// If a `<kek>.pending` staging file from an interrupted [`rotate_dek`] is
+/// present, decide which DEK the DB is encrypted under and return it,
+/// finishing the promotion (or discarding a stale staging file) as needed.
+///
+/// A no-op (returns `current_dek` unchanged) when there is no staging file,
+/// the DB does not exist, or the DB is still plaintext.
+fn finalize_pending_rekey(
+    paths: &AtRestPaths,
+    at_rest_key: &AtRestKey,
+    current_dek: Zeroizing<[u8; DEK_LEN]>,
+) -> Result<Zeroizing<[u8; DEK_LEN]>, GroupError> {
+    let pending = kek_pending_path(&paths.kek);
+    if !pending.exists() || !paths.db.exists() || is_plaintext_sqlite(&paths.db) {
+        return Ok(current_dek);
+    }
+
+    // Case 1: the live KEK already matches the DB — the rekey never
+    // committed (or already finished). Discard the stale staging file.
+    if dek_opens_db(&paths.db, &current_dek) {
+        if let Err(e) = fs::remove_file(&pending) {
+            // Non-fatal: the DB opens under the live KEK regardless. Warn
+            // so the leftover (which would re-trigger this probe next open)
+            // is visible rather than silently ignored.
+            eprintln!("[at-rest] warning: could not remove stale {pending:?}: {e}");
+        }
+        return Ok(current_dek);
+    }
+
+    // Case 2: the live KEK does not open the DB. The rekey committed but
+    // the promotion did not — the staging KEK should match.
+    let pending_bytes = fs::read(&pending)
+        .map_err(|e| GroupError::Storage(format!("read pending KEK {pending:?}: {e}")))?;
+    let pending_dek = at_rest_key.decapsulate_dek(&pending_bytes)?;
+    if dek_opens_db(&paths.db, &pending_dek) {
+        fs::rename(&pending, &paths.kek).map_err(|e| {
+            GroupError::Storage(format!("finish rekey promotion {pending:?}: {e}"))
+        })?;
+        return Ok(pending_dek);
+    }
+
+    // Neither DEK opens the DB: corruption or a wrong passphrase upstream.
+    // Leave the staging file in place for manual recovery.
+    Err(GroupError::Storage(
+        "interrupted rekey: neither the current nor the pending KEK opens groups.db; \
+         restore the three at-rest files from a backup"
+            .into(),
+    ))
+}
+
+/// Open flags for opening an **existing** database read-write without ever
+/// creating it. Used by probes and the rekey path so a file that vanished
+/// between an `exists()` check and the open surfaces as an error instead of
+/// silently leaving behind a stray empty sqlite file.
+fn db_rw_no_create_flags() -> rusqlite::OpenFlags {
+    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+        | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+}
+
+/// Cheap probe: does `dek` unlock `db`? Opens a throwaway connection,
+/// applies the raw key, and reads `sqlite_master`. Returns `false` on any
+/// error (wrong key surfaces as `SQLITE_NOTADB`).
+///
+/// Opens without `SQLITE_OPEN_CREATE`, so probing a missing DB returns
+/// `false` rather than materialising an empty file.
+fn dek_opens_db(db: &Path, dek: &[u8; DEK_LEN]) -> bool {
+    use rusqlite::Connection;
+    let hex = Zeroizing::new(hex::encode(dek));
+    let probe = || -> rusqlite::Result<i64> {
+        let conn = Connection::open_with_flags(db, db_rw_no_create_flags())?;
+        let stmt = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex.as_str()));
+        conn.execute_batch(stmt.as_str())?;
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
+    };
+    probe().is_ok()
 }
 
 /// Return `true` if `path` is an **unencrypted** sqlite database — i.e.
@@ -1024,5 +1216,123 @@ mod tests {
         drop(storage);
         let storage2 = open_at_rest_storage(&paths, &pass).expect("reopen");
         assert!(storage2.list_group_ids().expect("list").is_empty());
+    }
+
+    /// Open an at-rest storage, seed one application_data row, and return
+    /// the paths so a test can rekey and re-verify the row survived.
+    fn seed_storage(dir: &Path) -> (AtRestPaths, Zeroizing<String>) {
+        let paths = AtRestPaths::from_db_path(dir.join("groups.db"));
+        let pass = Zeroizing::new(TEST_PASS.to_string());
+        let storage = open_at_rest_storage(&paths, &pass).expect("seed open");
+        // list_group_ids proves the schema initialised; an empty DB is
+        // enough to exercise rekey's page re-encryption.
+        assert!(storage.list_group_ids().expect("list").is_empty());
+        drop(storage);
+        (paths, pass)
+    }
+
+    #[test]
+    fn rotate_dek_changes_kek_but_keeps_db_openable() {
+        let dir = tempdir().expect("tempdir");
+        let (paths, pass) = seed_storage(dir.path());
+
+        let kek_before = fs::read(&paths.kek).expect("kek before");
+        rotate_dek(&paths, &pass).expect("rekey");
+        let kek_after = fs::read(&paths.kek).expect("kek after");
+
+        assert_ne!(kek_before, kek_after, "KEK must change after rekey");
+        assert!(
+            !kek_pending_path(&paths.kek).exists(),
+            "no staging file should remain after a clean rekey"
+        );
+        // The DB still opens via the normal path (DEK recovered from the
+        // new KEK matches the rekeyed pages).
+        let storage = open_at_rest_storage(&paths, &pass).expect("reopen after rekey");
+        assert!(storage.list_group_ids().expect("list").is_empty());
+    }
+
+    #[test]
+    fn rotate_dek_rejects_plaintext_db() {
+        let dir = tempdir().expect("tempdir");
+        let paths = AtRestPaths::from_db_path(dir.path().join("groups.db"));
+        // at-rest.key + KEK exist (generate them), but groups.db is plaintext.
+        let key = AtRestKey::generate().expect("gen");
+        key.save_encrypted(&paths.key, TEST_PASS).expect("save key");
+        let (kek, _dek) = key.encapsulate_dek().expect("encap");
+        write_atomic_secret(&paths.kek, &kek).expect("write kek");
+        make_plaintext_db(&paths.db);
+
+        let err = rotate_dek(&paths, &Zeroizing::new(TEST_PASS.to_string()))
+            .expect_err("rekey on plaintext must fail");
+        match err {
+            GroupError::Storage(msg) => assert!(msg.contains("not encrypted")),
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_pending_rekey_completes_committed_promotion() {
+        // Simulate a crash *after* PRAGMA rekey committed but *before* the
+        // KEK was promoted: the live KEK holds the OLD dek, a `.pending`
+        // holds the NEW dek, and the DB is encrypted under the NEW dek.
+        let dir = tempdir().expect("tempdir");
+        let (paths, pass) = seed_storage(dir.path());
+        let at_rest_key = AtRestKey::load_encrypted(&paths.key, pass.as_str()).expect("load");
+
+        // Old dek = current KEK contents.
+        let old_kek = fs::read(&paths.kek).expect("old kek");
+        let old_dek = at_rest_key.decapsulate_dek(&old_kek).expect("old dek");
+
+        // Manually rekey the DB to a fresh dek and stage its KEK as pending,
+        // leaving the live KEK on the old dek (the interrupted state).
+        let (new_kek, new_dek) = at_rest_key.encapsulate_dek().expect("encap new");
+        {
+            use rusqlite::Connection;
+            let conn = Connection::open(&paths.db).expect("open db");
+            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(old_dek.as_ref())))
+                .expect("old key");
+            conn.execute_batch(&format!("PRAGMA rekey = \"x'{}'\";", hex::encode(new_dek.as_ref())))
+                .expect("rekey");
+        }
+        write_atomic_secret(&kek_pending_path(&paths.kek), &new_kek).expect("stage pending");
+
+        // Recovery: current (old) dek no longer opens the DB, so the
+        // pending (new) dek must be adopted and promoted.
+        let resolved = finalize_pending_rekey(&paths, &at_rest_key, old_dek).expect("recover");
+        assert_eq!(resolved.as_ref(), new_dek.as_ref(), "must adopt the new dek");
+        assert!(!kek_pending_path(&paths.kek).exists(), "pending promoted away");
+        // The promoted KEK now decapsulates to the new dek.
+        let promoted = at_rest_key
+            .decapsulate_dek(&fs::read(&paths.kek).expect("kek"))
+            .expect("promoted dek");
+        assert_eq!(promoted.as_ref(), new_dek.as_ref());
+        // And a normal open works end-to-end.
+        let storage = open_at_rest_storage(&paths, &pass).expect("open after recovery");
+        assert!(storage.list_group_ids().expect("list").is_empty());
+    }
+
+    #[test]
+    fn finalize_pending_rekey_discards_stale_staging() {
+        // Simulate a crash *before* PRAGMA rekey committed: the DB is still
+        // on the OLD dek, but a `.pending` (NEW dek) was already staged.
+        // Recovery must keep the old dek and delete the stale staging file.
+        let dir = tempdir().expect("tempdir");
+        let (paths, pass) = seed_storage(dir.path());
+        let at_rest_key = AtRestKey::load_encrypted(&paths.key, pass.as_str()).expect("load");
+        let old_dek = at_rest_key
+            .decapsulate_dek(&fs::read(&paths.kek).expect("kek"))
+            .expect("old dek");
+
+        // Stage a pending KEK for some other dek, but DO NOT rekey the DB.
+        let (stale_kek, _stale_dek) = at_rest_key.encapsulate_dek().expect("encap stale");
+        write_atomic_secret(&kek_pending_path(&paths.kek), &stale_kek).expect("stage");
+
+        let resolved = finalize_pending_rekey(&paths, &at_rest_key, old_dek.clone())
+            .expect("recover");
+        assert_eq!(resolved.as_ref(), old_dek.as_ref(), "must keep the old dek");
+        assert!(
+            !kek_pending_path(&paths.kek).exists(),
+            "stale staging file must be discarded"
+        );
     }
 }

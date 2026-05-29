@@ -309,7 +309,7 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
 | パスフレーズ取得 | `NK_PASSPHRASE` 環境変数 or 対話入力 (`get_masked_passphrase`) | 既存の PEM 暗号化と同じ経路を再利用。空パスフレーズは `open_at_rest_storage` が拒否 |
 | 同時書き込み | 単一プロセス前提 | sqlite WAL + `busy_timeout` 5s で短期競合を吸収 (multi-process は非推奨) |
 | バックアップ運用 | `groups.db` 単体では復号不可 — `at-rest.key` + `groups.db.kek` + passphrase の 3 要素全部が必要 | 3 ファイルを同一ディレクトリで一括バックアップ。passphrase はユーザーが別管理 |
-| 鍵ローテーション | 当面未実装 | DEK は `groups.db.kek` を新規 encapsulate し直すだけで更新可 (SQLCipher の `PRAGMA rekey` で全ページ再暗号化)。at-rest hybrid SK の更新は `at-rest.key` の再生成 + 全 DEK の再 encapsulate |
+| DEK ローテーション | `nkct mls --mls-cmd rekey` (`group::at_rest::rotate_dek`) | 新規 DEK を生成し `PRAGMA rekey` で全ページ再暗号化 → 新 KEK を再 encapsulate。クラッシュ安全: 新 KEK を `groups.db.kek.pending` に先行ステージ → DB rekey → atomic promote の順。中断時は次回 open の `finalize_pending_rekey` がどの DEK で DB が開くか実測して解決するため、DB/KEK 2 ファイルのどの中断点でも復旧可能。DEK 漏洩疑い時の緩和策 (既に流出した旧 ciphertext のコピーは保護しない)。at-rest hybrid SK / passphrase は別途 `at-rest.key` 再生成で更新 |
 | 既存平文 DB の取扱い | 起動時に自動マイグレーション (`group::at_rest::migrate_plaintext_to_sqlcipher`) | 先頭 16 byte の `SQLite format 3\0` magic で平文 DB を検出し、`sqlcipher_export()` で DEK 暗号化コピーへ変換 → 鍵で開けることを検証してから原本を atomic rename で置換。平文の原本・WAL/journal サイドカーは置換後に unlink するため平文残存なし。検証成功前は原本を破壊しない |
 
 ### 7.4 トランスポート抽象 (ALPN `nkct/mls/1`)
@@ -335,11 +335,13 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
   可能性がある。実害は当面ゼロ (数百万 logical qubit 規模が必要) だが、真の
   AES-256 PQ-safe at-rest が必要になった時点で別 cipher suite (例: `0xF102 =
   X-Wing / HKDF-SHA512 / AES-256-GCM`) を at-rest 専用に定義する必要がある。
-- **DEK の forward secrecy なし**: §7.3 で生成された DEK は DB 寿命の間固定。
-  `groups.db.kek` または `at-rest.key` が将来侵害された場合、その時点で DB 内の
-  既存メッセージはすべて復号可能になる (MLS の epoch ratchet は DEK の上位層
-  なので、at-rest 層では FS を提供しない)。緩和策として `PRAGMA rekey` 経由の
-  DEK ローテーション CLI を追加する余地あり (`nkct mls rekey` 等)。
+- **DEK の forward secrecy なし**: §7.3 で生成された DEK は (明示的に rekey
+  しない限り) DB 寿命の間固定。`groups.db.kek` または `at-rest.key` が将来侵害
+  された場合、その時点で DB 内の既存メッセージはすべて復号可能になる (MLS の
+  epoch ratchet は DEK の上位層なので、at-rest 層では FS を提供しない)。緩和策と
+  して `nkct mls --mls-cmd rekey` (`PRAGMA rekey` 経由の DEK ローテーション) を
+  提供済み — ただし漏洩前に取得済みの旧 ciphertext コピーは保護できない。完全な
+  FS には MLS epoch 境界での DEK 再生成等が別途必要。
 - **anti-rollback 不在**: SQLCipher は古いスナップショットへの巻き戻し攻撃を
   検知しない。攻撃者が `groups.db` を時刻 T1 の版で上書きすると、その時点で
   失効済みの member key が再び有効に見える可能性がある。MLS 自身の epoch

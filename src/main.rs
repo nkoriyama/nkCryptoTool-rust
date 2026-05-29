@@ -451,6 +451,25 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
 
     // --- build the typed command ---------------------------------------
     let cmd_name = args.mls_cmd.as_deref().unwrap();
+
+    // `rekey` is a purely local maintenance op on the at-rest files — it
+    // needs neither the network endpoint nor a GroupChatProcessor, so
+    // handle it before any of that is built and return early.
+    if cmd_name == "rekey" {
+        use nk_crypto_tool::group::{rotate_dek, AtRestPaths};
+        let storage_path: PathBuf = match args.mls_storage {
+            Some(p) => PathBuf::from(p),
+            None => cli::default_storage_path()?,
+        };
+        let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+            .map_err(|e| anyhow::anyhow!("read MLS storage passphrase: {e}"))?;
+        let at_rest_paths = AtRestPaths::from_db_path(&storage_path);
+        rotate_dek(&at_rest_paths, &passphrase)
+            .map_err(|e| anyhow::anyhow!("rekey MLS storage at {storage_path:?}: {e}"))?;
+        println!("Rotated at-rest DEK for {storage_path:?} (groups.db re-encrypted, KEK re-wrapped).");
+        return Ok(());
+    }
+
     let cmd = match cmd_name {
         "create-group" => MlsCommand::CreateGroup {
             name: require(&args.mls_name, "mls-name")?,
@@ -508,7 +527,7 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
             "unknown --mls-cmd {other:?}; expected one of \
              create-group, list-groups, list-members, export-key-package, \
              add-member, remove-member, accept-one, listen, send, \
-             chat-group, print-local-address"
+             chat-group, print-local-address, rekey"
         ),
     };
 
