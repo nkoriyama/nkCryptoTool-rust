@@ -13,6 +13,8 @@ pub mod p2p;
 pub mod processor;
 #[cfg(feature = "mls")]
 pub mod group;
+#[cfg(feature = "mls")]
+pub mod prekey;
 pub mod gui;
 #[cfg(feature = "gui-camera")]
 pub mod camera { pub use crate::gui::camera::*; }
