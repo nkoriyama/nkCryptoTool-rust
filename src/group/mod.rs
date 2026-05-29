@@ -20,6 +20,7 @@
 
 pub mod at_rest;
 pub mod cli;
+pub mod rollback;
 pub mod crypto_adapter;
 pub mod processor;
 pub mod storage;

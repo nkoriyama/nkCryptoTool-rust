@@ -345,11 +345,21 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
   して `nkct mls --mls-cmd rekey` (`PRAGMA rekey` 経由の DEK ローテーション) を
   提供済み — ただし漏洩前に取得済みの旧 ciphertext コピーは保護できない。完全な
   FS には MLS epoch 境界での DEK 再生成等が別途必要。
-- **anti-rollback 不在**: SQLCipher は古いスナップショットへの巻き戻し攻撃を
-  検知しない。攻撃者が `groups.db` を時刻 T1 の版で上書きすると、その時点で
-  失効済みの member key が再び有効に見える可能性がある。MLS 自身の epoch
-  単調増加で部分的に検知可能だが、at-rest 層は無防備。tamper-evident storage
-  (TPM/Secure Enclave) との連携が将来作業。
+- **anti-rollback (オプトイン・ソフトウェアカウンタで実装済み / 既定 off)**:
+  `NK_ROLLBACK_POLICY` で制御。`off`(既定) は従来通り KEK version `0x02`、挙動
+  不変。`permissive` は per-DB の単調カウンタ (`group::rollback::SoftwareCounter`、
+  `$XDG_STATE_HOME/nkct/rollback/<hash>.ctr` — ストレージ dir 外) を KEK の HPKE
+  `info` に暗号的にバインド (KEK version `0x03` = `bound_info || counter(u64 BE)`)。
+  カウンタは rekey 時に advance。古い `(groups.db, groups.db.kek)` スナップショット
+  に書き戻されても、現行カウンタとの `info` 不一致で HPKE AEAD 復号が失敗し
+  **巻き戻しを検知**する。カウンタ更新と DB 再暗号化の 2 リソース整合は既存の
+  `.pending` ステージング + `resolve_kek_to_dek` の 3 パターン復旧でクラッシュ安全。
+  設計の全体像は `ATREST_ANTIROLLBACK_DESIGN.md`。
+  - **残存リスク**: software カウンタは state ファイルごと過去スナップショットに
+    戻されると検知できない (case D 限界)。ハードウェア root (TPM 2.0 NV 単調
+    カウンタ、`strict` ポリシー) は未実装でフェーズ2 — 現状 `strict` はエラーで
+    silent downgrade を防ぐ。カウンタ消失時は v0x03 DB が開けなくなる (有効化の
+    対価として文書化)。MLS epoch 単調増加は引き続き部分的なバックストップ。
 - **KEK の per-DB バインディング (実装済み)**: KEK は HPKE `info =
   b"nkct-mls-at-rest-v1" || len(binding) || binding` でシールされ、binding は
   DB ファイル名 (`group::at_rest::db_binding`)。同一 at-rest 鍵を複数 DB で共有

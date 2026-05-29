@@ -97,6 +97,7 @@ use zeroize::Zeroizing;
 use crate::group::crypto_adapter::{
     build_at_rest_suite, build_at_rest_suite_legacy, HybridCipherSuiteProvider, HybridSuite,
 };
+use crate::group::rollback;
 use crate::group::storage::GroupStorage;
 use crate::group::types::GroupError;
 
@@ -145,6 +146,13 @@ const KEK_SUITE_XWING: u8 = 0x01;
 /// (`0xF102`). The AES-256 AEAD removes the Grover halving concern on the
 /// key that wraps the DEK, making the at-rest layer PQ-safe end to end.
 const KEK_SUITE_XWING_AES256: u8 = 0x02;
+/// Anti-rollback KEK version: HPKE `info` is `bound_info(binding) ||
+/// counter(u64 BE)`, where `counter` is the per-DB monotonic rollback
+/// counter (see [`crate::group::rollback`]). A KEK sealed under counter `c`
+/// only decapsulates when the current counter is still `c`; a restored
+/// older KEK (sealed under a smaller `c`) fails the AEAD check, detecting
+/// the rollback. Written only when `NK_ROLLBACK_POLICY` is enabled.
+const KEK_VERSION_COUNTER_BOUND: u8 = 0x03;
 const KEK_HEADER_LEN: usize = 8 + 1 + 1;
 
 /// HPKE `info` prefix. Domain-separates the at-rest DEK encapsulation
@@ -313,17 +321,26 @@ impl AtRestKey {
     ///
     /// `binding` is a per-DB identifier (the DB file name) mixed into the
     /// HPKE `info`, so the resulting KEK only decapsulates for a DB opened
-    /// with the same binding. The DEK is freshly random; callers store the
-    /// KEK bytes alongside the SQLCipher DB (as `groups.db.kek`) and hand
-    /// the DEK directly to [`GroupStorage::open_at_with_raw_key`].
+    /// with the same binding. `counter` is the optional anti-rollback
+    /// monotonic counter (see [`crate::group::rollback`]): `Some(c)` writes
+    /// a version-`0x03` KEK whose `info` also binds `c`, so a restored older
+    /// KEK (sealed under a smaller counter) fails to decapsulate; `None`
+    /// writes the version-`0x02` per-DB-bound KEK. The DEK is freshly
+    /// random; callers store the KEK bytes alongside the SQLCipher DB (as
+    /// `groups.db.kek`) and hand the DEK directly to
+    /// [`GroupStorage::open_at_with_raw_key`].
     pub fn encapsulate_dek(
         &self,
         binding: &[u8],
+        counter: Option<u64>,
     ) -> Result<(Vec<u8>, Zeroizing<[u8; DEK_LEN]>), GroupError> {
         let mut dek = Zeroizing::new([0u8; DEK_LEN]);
         OsRng.fill_bytes(dek.as_mut_slice());
 
-        let info = bound_info(binding);
+        let (version, info) = match counter {
+            None => (KEK_VERSION_BOUND, bound_info(binding)),
+            Some(c) => (KEK_VERSION_COUNTER_BOUND, counter_bound_info(binding, c)),
+        };
         let suite = at_rest_suite()?;
         let hpke_ct = suite
             .hpke_seal(&self.pk, &info, None, dek.as_ref())
@@ -334,7 +351,7 @@ impl AtRestKey {
             .map_err(|e| GroupError::Storage(format!("KEK encode: {e}")))?;
         let mut bytes = Vec::with_capacity(KEK_HEADER_LEN + inner.len());
         bytes.extend_from_slice(&KEK_MAGIC);
-        bytes.push(KEK_VERSION_BOUND);
+        bytes.push(version);
         bytes.push(KEK_SUITE_XWING_AES256);
         bytes.extend_from_slice(&inner);
 
@@ -344,15 +361,17 @@ impl AtRestKey {
     /// Decapsulate a previously-saved KEK file into the 256-bit DEK.
     ///
     /// `binding` must match the value passed to [`encapsulate_dek`] for a
-    /// [`KEK_VERSION_BOUND`] KEK; it is ignored for a legacy
-    /// [`KEK_VERSION_LEGACY`] KEK (which was written without binding). A
-    /// wrong at-rest key, a tampered KEK file, a wrong binding, or a
-    /// domain-separator mismatch will fail the HPKE AEAD check and surface
-    /// as `GroupError::Backend`.
+    /// bound KEK; it is ignored for a legacy [`KEK_VERSION_LEGACY`] KEK. For
+    /// a [`KEK_VERSION_COUNTER_BOUND`] (`0x03`) KEK, `counter` must be
+    /// `Some` and equal to the value the KEK was sealed under, else the HPKE
+    /// AEAD check fails (this is how an at-rest rollback is detected). A
+    /// wrong at-rest key, tampered KEK, wrong binding, or wrong counter all
+    /// surface as `GroupError::Backend`.
     pub fn decapsulate_dek(
         &self,
         kek_bytes: &[u8],
         binding: &[u8],
+        counter: Option<u64>,
     ) -> Result<Zeroizing<[u8; DEK_LEN]>, GroupError> {
         if kek_bytes.len() < KEK_HEADER_LEN {
             return Err(GroupError::Storage("KEK file too short".into()));
@@ -363,6 +382,16 @@ impl AtRestKey {
         let info = match kek_bytes[8] {
             KEK_VERSION_LEGACY => HPKE_INFO.to_vec(),
             KEK_VERSION_BOUND => bound_info(binding),
+            KEK_VERSION_COUNTER_BOUND => {
+                let c = counter.ok_or_else(|| {
+                    GroupError::Storage(
+                        "KEK is anti-rollback (v0x03) but no rollback counter is available; \
+                         set NK_ROLLBACK_POLICY to the policy this DB was created under"
+                            .into(),
+                    )
+                })?;
+                counter_bound_info(binding, c)
+            }
             other => {
                 return Err(GroupError::Storage(format!(
                     "KEK file: unsupported version {other:#x}"
@@ -512,6 +541,19 @@ pub fn resolve_dek(
     paths: &AtRestPaths,
     passphrase: &Zeroizing<String>,
 ) -> Result<Zeroizing<[u8; DEK_LEN]>, GroupError> {
+    let counter = rollback::counter_for(rollback::RollbackPolicy::from_env(), &paths.db)?;
+    resolve_dek_with(paths, passphrase, counter.as_deref())
+}
+
+/// [`resolve_dek`] with an explicit (optional) anti-rollback counter. The
+/// public wrapper builds the counter from `NK_ROLLBACK_POLICY`; this seam
+/// lets tests inject an in-memory counter. `None` reproduces the exact
+/// counter-free behaviour (version-`0x02` KEKs).
+pub(crate) fn resolve_dek_with(
+    paths: &AtRestPaths,
+    passphrase: &Zeroizing<String>,
+    counter: Option<&dyn rollback::RollbackCounter>,
+) -> Result<Zeroizing<[u8; DEK_LEN]>, GroupError> {
     if passphrase.is_empty() {
         return Err(GroupError::Storage(
             "at-rest passphrase must not be empty — set NK_PASSPHRASE or enter one interactively".into(),
@@ -536,25 +578,21 @@ pub fn resolve_dek(
         k
     };
 
-    // 2. Load or generate the KEK (which carries the DEK). The KEK is
-    //    bound to this DB's file name (see `bound_info`).
+    // 2. Load or generate the KEK (which carries the DEK), resolving any
+    //    crash-interrupted rekey and detecting an at-rest rollback when a
+    //    counter is in play.
     let binding = db_binding(&paths.db);
     let dek = if paths.kek.exists() {
-        let kek_bytes = fs::read(&paths.kek).map_err(|e| {
-            GroupError::Storage(format!("read KEK {:?}: {e}", paths.kek))
-        })?;
-        at_rest_key.decapsulate_dek(&kek_bytes, &binding)?
+        resolve_kek_to_dek(paths, &at_rest_key, &binding, counter)?
     } else {
-        let (kek_bytes, dek) = at_rest_key.encapsulate_dek(&binding)?;
+        // First use: seal the KEK under the counter's *current* value
+        // (0 if never advanced — there is no earlier state to roll back to
+        // yet). The counter only advances on rekey.
+        let cval = counter.map(|c| c.current()).transpose()?;
+        let (kek_bytes, dek) = at_rest_key.encapsulate_dek(&binding, cval)?;
         write_atomic_secret(&paths.kek, &kek_bytes)?;
         dek
     };
-
-    // 2b. Finish any rekey that was interrupted by a crash between the
-    //     PRAGMA rekey and the KEK promotion (see `rotate_dek`). If a
-    //     `<kek>.pending` sidecar is present, this resolves which DEK the
-    //     DB is actually encrypted under and returns the matching one.
-    let dek = finalize_pending_rekey(paths, &at_rest_key, dek)?;
 
     // 3. Migrate a pre-SQLCipher plaintext DB in place, if one is found.
     //    Older builds shipped the DB as an unencrypted sqlite file (the
@@ -567,6 +605,92 @@ pub fn resolve_dek(
     }
 
     Ok(dek)
+}
+
+/// Decapsulate the live KEK to the DEK, resolving any crash-interrupted
+/// rekey on the way. Two paths:
+///
+/// - **No counter** (`NK_ROLLBACK_POLICY=off`): decapsulate the live KEK,
+///   then run [`finalize_pending_rekey`] (which probes candidate DEKs
+///   against the DB) — exactly the pre-anti-rollback behaviour.
+/// - **With counter**: read the current counter `c` and reconcile the live
+///   KEK, an optional `.pending` KEK, and the DB, also rolling the counter
+///   forward if a rekey committed the DB but crashed before advancing it.
+///   A live KEK that opens under no candidate counter is reported as a
+///   rollback.
+fn resolve_kek_to_dek(
+    paths: &AtRestPaths,
+    at_rest_key: &AtRestKey,
+    binding: &[u8],
+    counter: Option<&dyn rollback::RollbackCounter>,
+) -> Result<Zeroizing<[u8; DEK_LEN]>, GroupError> {
+    let live = fs::read(&paths.kek)
+        .map_err(|e| GroupError::Storage(format!("read KEK {:?}: {e}", paths.kek)))?;
+
+    let Some(counter) = counter else {
+        // Counter-free path.
+        let dek = at_rest_key.decapsulate_dek(&live, binding, None)?;
+        return finalize_pending_rekey(paths, at_rest_key, dek);
+    };
+
+    let c = counter.current()?;
+    let pending = kek_pending_path(&paths.kek);
+
+    // 1) Live KEK at the current counter.
+    if let Ok(dek) = at_rest_key.decapsulate_dek(&live, binding, Some(c)) {
+        if !pending.exists() {
+            return Ok(dek); // steady state
+        }
+        // A pending exists: the live KEK still decapsulating at `c` means
+        // the counter was not advanced, so the rekey did not commit. If the
+        // live DEK opens the DB, discard the stale staging file.
+        if dek_opens_db(&paths.db, &dek) {
+            if let Err(e) = fs::remove_file(&pending) {
+                eprintln!("[at-rest] warning: could not remove stale {pending:?}: {e}");
+            }
+            return Ok(dek);
+        }
+        // Else fall through to pending recovery (DB was rekeyed).
+    }
+
+    // 2) Recovery from the staged KEK.
+    if pending.exists() {
+        let pend = fs::read(&pending)
+            .map_err(|e| GroupError::Storage(format!("read pending KEK {pending:?}: {e}")))?;
+        // 2a) Counter already advanced (crash after advance, before rename):
+        //     pending sealed at the current `c`.
+        if let Ok(dek) = at_rest_key.decapsulate_dek(&pend, binding, Some(c)) {
+            if dek_opens_db(&paths.db, &dek) {
+                fs::rename(&pending, &paths.kek).map_err(|e| {
+                    GroupError::Storage(format!("finish rekey promotion {pending:?}: {e}"))
+                })?;
+                return Ok(dek);
+            }
+        }
+        // 2b) DB rekeyed but counter not yet advanced (crash between rekey
+        //     and advance): pending sealed at `c + 1`. Roll forward.
+        if let Some(c1) = c.checked_add(1) {
+            if let Ok(dek) = at_rest_key.decapsulate_dek(&pend, binding, Some(c1)) {
+                if dek_opens_db(&paths.db, &dek) {
+                    counter.advance()?;
+                    fs::rename(&pending, &paths.kek).map_err(|e| {
+                        GroupError::Storage(format!("finish rekey promotion {pending:?}: {e}"))
+                    })?;
+                    return Ok(dek);
+                }
+            }
+        }
+    }
+
+    // 3) The live KEK does not match the current counter and no pending KEK
+    //    recovers the DB: an at-rest rollback (or counter-state loss /
+    //    corruption).
+    Err(GroupError::Storage(
+        "at-rest rollback detected: the on-disk KEK does not match the current rollback \
+         counter (NK_ROLLBACK_POLICY). The storage may have been reverted to an older \
+         snapshot, or the rollback counter state was lost."
+            .into(),
+    ))
 }
 
 /// Path of the staging KEK written during a rekey (`<kek>.pending`).
@@ -600,6 +724,20 @@ pub fn rotate_dek(
     paths: &AtRestPaths,
     passphrase: &Zeroizing<String>,
 ) -> Result<(), GroupError> {
+    let counter = rollback::counter_for(rollback::RollbackPolicy::from_env(), &paths.db)?;
+    rotate_dek_with(paths, passphrase, counter.as_deref())
+}
+
+/// [`rotate_dek`] with an explicit (optional) anti-rollback counter. When a
+/// counter is present the new KEK is sealed under `current + 1` and the
+/// counter is advanced **after** the DB is re-encrypted but **before** the
+/// KEK is promoted, so [`resolve_kek_to_dek`] can recover from a crash at
+/// any step (see its 2a/2b cases).
+pub(crate) fn rotate_dek_with(
+    paths: &AtRestPaths,
+    passphrase: &Zeroizing<String>,
+    counter: Option<&dyn rollback::RollbackCounter>,
+) -> Result<(), GroupError> {
     if passphrase.is_empty() {
         return Err(GroupError::Storage(
             "at-rest passphrase must not be empty".into(),
@@ -621,13 +759,12 @@ pub fn rotate_dek(
     // Recover the current DEK, finishing any prior interrupted rekey first
     // so we start from a consistent DB/KEK pair.
     let binding = db_binding(&paths.db);
-    let kek_bytes = fs::read(&paths.kek)
-        .map_err(|e| GroupError::Storage(format!("read KEK {:?}: {e}", paths.kek)))?;
-    let old_dek = at_rest_key.decapsulate_dek(&kek_bytes, &binding)?;
-    let old_dek = finalize_pending_rekey(paths, &at_rest_key, old_dek)?;
+    let old_dek = resolve_kek_to_dek(paths, &at_rest_key, &binding, counter)?;
 
-    // Fresh DEK + its KEK envelope (rewritten as a bound KEK).
-    let (new_kek_bytes, new_dek) = at_rest_key.encapsulate_dek(&binding)?;
+    // The new KEK binds the next counter value (if any), so the just-retired
+    // KEK can no longer decapsulate once the counter advances.
+    let new_counter_val = counter.map(|c| c.current()).transpose()?.map(|c| c + 1);
+    let (new_kek_bytes, new_dek) = at_rest_key.encapsulate_dek(&binding, new_counter_val)?;
 
     // Stage the new KEK before touching the DB.
     let pending = kek_pending_path(&paths.kek);
@@ -665,6 +802,16 @@ pub fn rotate_dek(
         // Confirm the new key is now active.
         conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
             .map_err(|e| GroupError::Storage(format!("rekey verify new key: {e}")))?;
+    }
+
+    // Advance the rollback counter now that the DB is on the new DEK but
+    // before promoting the KEK. This is the irreversible step; a crash
+    // here leaves a `.pending` sealed at the (already-current) counter,
+    // which `resolve_kek_to_dek` case 2a promotes on the next open. (A
+    // crash *before* this advance is recovered by case 2b, which rolls the
+    // counter forward.)
+    if let Some(c) = counter {
+        c.advance()?;
     }
 
     // Promote the staged KEK over the live one. After this rename the DB
@@ -711,7 +858,8 @@ fn finalize_pending_rekey(
     // the promotion did not — the staging KEK should match.
     let pending_bytes = fs::read(&pending)
         .map_err(|e| GroupError::Storage(format!("read pending KEK {pending:?}: {e}")))?;
-    let pending_dek = at_rest_key.decapsulate_dek(&pending_bytes, &db_binding(&paths.db))?;
+    let pending_dek =
+        at_rest_key.decapsulate_dek(&pending_bytes, &db_binding(&paths.db), None)?;
     if dek_opens_db(&paths.db, &pending_dek) {
         fs::rename(&pending, &paths.kek).map_err(|e| {
             GroupError::Storage(format!("finish rekey promotion {pending:?}: {e}"))
@@ -897,6 +1045,16 @@ fn bound_info(binding: &[u8]) -> Vec<u8> {
     info.extend_from_slice(HPKE_INFO);
     info.extend_from_slice(&(binding.len() as u32).to_be_bytes());
     info.extend_from_slice(binding);
+    info
+}
+
+/// Build the HPKE `info` for a [`KEK_VERSION_COUNTER_BOUND`] KEK:
+/// [`bound_info`] followed by the 8-byte big-endian rollback counter. The
+/// counter is appended after the (already length-prefixed) per-DB binding,
+/// so the concatenation stays unambiguous.
+fn counter_bound_info(binding: &[u8], counter: u64) -> Vec<u8> {
+    let mut info = bound_info(binding);
+    info.extend_from_slice(&counter.to_be_bytes());
     info
 }
 
@@ -1089,8 +1247,8 @@ mod tests {
     #[test]
     fn generate_then_encapsulate_decapsulate_roundtrips_dek() {
         let key = AtRestKey::generate().expect("generate");
-        let (kek_bytes, dek_a) = key.encapsulate_dek(TEST_BINDING).expect("encapsulate");
-        let dek_b = key.decapsulate_dek(&kek_bytes, TEST_BINDING).expect("decapsulate");
+        let (kek_bytes, dek_a) = key.encapsulate_dek(TEST_BINDING, None).expect("encapsulate");
+        let dek_b = key.decapsulate_dek(&kek_bytes, TEST_BINDING, None).expect("decapsulate");
         assert_eq!(dek_a.as_ref(), dek_b.as_ref(), "DEK must round-trip");
         assert_eq!(dek_a.len(), DEK_LEN);
     }
@@ -1101,9 +1259,9 @@ mod tests {
         // — this is the per-DB binding that stops KEK-swap attacks when
         // several DBs share one at-rest key.
         let key = AtRestKey::generate().expect("generate");
-        let (kek_bytes, _dek) = key.encapsulate_dek(b"groups.db").expect("encap");
+        let (kek_bytes, _dek) = key.encapsulate_dek(b"groups.db", None).expect("encap");
         let err = key
-            .decapsulate_dek(&kek_bytes, b"inbox.db")
+            .decapsulate_dek(&kek_bytes, b"inbox.db", None)
             .expect_err("wrong binding must fail");
         assert!(matches!(err, GroupError::Backend(_)));
     }
@@ -1130,7 +1288,7 @@ mod tests {
 
         // Any binding is ignored for a legacy KEK.
         let recovered = key
-            .decapsulate_dek(&kek, b"whatever.db")
+            .decapsulate_dek(&kek, b"whatever.db", None)
             .expect("legacy KEK must decapsulate");
         assert_eq!(recovered.as_ref(), dek.as_ref());
     }
@@ -1140,7 +1298,7 @@ mod tests {
         // A freshly encapsulated KEK must advertise the AES-256 suite
         // (0x02) and the bound version (0x02).
         let key = AtRestKey::generate().expect("generate");
-        let (kek, _dek) = key.encapsulate_dek(TEST_BINDING).expect("encap");
+        let (kek, _dek) = key.encapsulate_dek(TEST_BINDING, None).expect("encap");
         assert_eq!(kek[8], KEK_VERSION_BOUND, "version byte");
         assert_eq!(kek[9], KEK_SUITE_XWING_AES256, "suite byte");
     }
@@ -1165,11 +1323,11 @@ mod tests {
         kek.extend_from_slice(&ct.mls_encode_to_vec().expect("encode"));
 
         let recovered = key
-            .decapsulate_dek(&kek, TEST_BINDING)
+            .decapsulate_dek(&kek, TEST_BINDING, None)
             .expect("bound AES-128 KEK must decapsulate");
         assert_eq!(recovered.as_ref(), dek.as_ref());
         // And the wrong binding must still fail even for the legacy suite.
-        assert!(key.decapsulate_dek(&kek, b"other.db").is_err());
+        assert!(key.decapsulate_dek(&kek, b"other.db", None).is_err());
     }
 
     #[test]
@@ -1179,27 +1337,27 @@ mod tests {
         // really take effect, not a silent 128-bit downgrade): a KEK
         // sealed AES-256 must not open under the legacy AES-128 suite.
         let key = AtRestKey::generate().expect("gen");
-        let (kek, dek) = key.encapsulate_dek(TEST_BINDING).expect("encap");
+        let (kek, dek) = key.encapsulate_dek(TEST_BINDING, None).expect("encap");
         assert_eq!(kek[9], KEK_SUITE_XWING_AES256);
 
         let mut forced = kek.clone();
         forced[9] = KEK_SUITE_XWING; // pretend it's an AES-128 KEK
         assert!(
-            key.decapsulate_dek(&forced, TEST_BINDING).is_err(),
+            key.decapsulate_dek(&forced, TEST_BINDING, None).is_err(),
             "AES-256 KEK must fail under the AES-128 suite"
         );
 
         // Sanity: it opens correctly under its real suite.
-        let ok = key.decapsulate_dek(&kek, TEST_BINDING).expect("real suite");
+        let ok = key.decapsulate_dek(&kek, TEST_BINDING, None).expect("real suite");
         assert_eq!(ok.as_ref(), dek.as_ref());
     }
 
     #[test]
     fn trailing_bytes_in_kek_are_rejected() {
         let key = AtRestKey::generate().expect("gen");
-        let (mut kek, _dek) = key.encapsulate_dek(TEST_BINDING).expect("encap");
+        let (mut kek, _dek) = key.encapsulate_dek(TEST_BINDING, None).expect("encap");
         kek.push(0x00); // append junk
-        match key.decapsulate_dek(&kek, TEST_BINDING) {
+        match key.decapsulate_dek(&kek, TEST_BINDING, None) {
             Err(GroupError::Storage(msg)) => assert!(msg.contains("trailing")),
             other => panic!("expected trailing-byte rejection, got {other:?}"),
         }
@@ -1211,7 +1369,7 @@ mod tests {
         let path = dir.path().join("at-rest.key");
 
         let original = AtRestKey::generate().expect("generate");
-        let (kek_bytes, dek) = original.encapsulate_dek(TEST_BINDING).expect("encap");
+        let (kek_bytes, dek) = original.encapsulate_dek(TEST_BINDING, None).expect("encap");
 
         original.save_encrypted(&path, TEST_PASS).expect("save");
         assert!(path.exists());
@@ -1224,7 +1382,7 @@ mod tests {
         }
 
         let reloaded = AtRestKey::load_encrypted(&path, TEST_PASS).expect("load");
-        let dek_from_reload = reloaded.decapsulate_dek(&kek_bytes, TEST_BINDING).expect("decap");
+        let dek_from_reload = reloaded.decapsulate_dek(&kek_bytes, TEST_BINDING, None).expect("decap");
         assert_eq!(
             dek.as_ref(),
             dek_from_reload.as_ref(),
@@ -1255,7 +1413,7 @@ mod tests {
     #[test]
     fn tampered_kek_fails_decapsulation() {
         let key = AtRestKey::generate().expect("generate");
-        let (mut kek_bytes, _dek) = key.encapsulate_dek(TEST_BINDING).expect("encap");
+        let (mut kek_bytes, _dek) = key.encapsulate_dek(TEST_BINDING, None).expect("encap");
 
         // Flip a byte inside the HPKE ciphertext portion (skip our
         // 10-byte header).
@@ -1263,7 +1421,7 @@ mod tests {
         kek_bytes[idx] ^= 0x01;
 
         let err = key
-            .decapsulate_dek(&kek_bytes, TEST_BINDING)
+            .decapsulate_dek(&kek_bytes, TEST_BINDING, None)
             .expect_err("tampered KEK must fail");
         match err {
             GroupError::Backend(msg) => {
@@ -1307,10 +1465,10 @@ mod tests {
     fn cross_key_decapsulation_fails() {
         let key_a = AtRestKey::generate().expect("a");
         let key_b = AtRestKey::generate().expect("b");
-        let (kek, _dek) = key_a.encapsulate_dek(TEST_BINDING).expect("encap by a");
+        let (kek, _dek) = key_a.encapsulate_dek(TEST_BINDING, None).expect("encap by a");
 
         let err = key_b
-            .decapsulate_dek(&kek, TEST_BINDING)
+            .decapsulate_dek(&kek, TEST_BINDING, None)
             .expect_err("decap with wrong key must fail");
         assert!(matches!(err, GroupError::Backend(_)));
     }
@@ -1499,7 +1657,7 @@ mod tests {
         // at-rest.key + KEK exist (generate them), but groups.db is plaintext.
         let key = AtRestKey::generate().expect("gen");
         key.save_encrypted(&paths.key, TEST_PASS).expect("save key");
-        let (kek, _dek) = key.encapsulate_dek(&db_binding(&paths.db)).expect("encap");
+        let (kek, _dek) = key.encapsulate_dek(&db_binding(&paths.db), None).expect("encap");
         write_atomic_secret(&paths.kek, &kek).expect("write kek");
         make_plaintext_db(&paths.db);
 
@@ -1523,11 +1681,11 @@ mod tests {
         // Old dek = current KEK contents.
         let binding = db_binding(&paths.db);
         let old_kek = fs::read(&paths.kek).expect("old kek");
-        let old_dek = at_rest_key.decapsulate_dek(&old_kek, &binding).expect("old dek");
+        let old_dek = at_rest_key.decapsulate_dek(&old_kek, &binding, None).expect("old dek");
 
         // Manually rekey the DB to a fresh dek and stage its KEK as pending,
         // leaving the live KEK on the old dek (the interrupted state).
-        let (new_kek, new_dek) = at_rest_key.encapsulate_dek(&binding).expect("encap new");
+        let (new_kek, new_dek) = at_rest_key.encapsulate_dek(&binding, None).expect("encap new");
         {
             use rusqlite::Connection;
             let conn = Connection::open(&paths.db).expect("open db");
@@ -1545,7 +1703,7 @@ mod tests {
         assert!(!kek_pending_path(&paths.kek).exists(), "pending promoted away");
         // The promoted KEK now decapsulates to the new dek.
         let promoted = at_rest_key
-            .decapsulate_dek(&fs::read(&paths.kek).expect("kek"), &binding)
+            .decapsulate_dek(&fs::read(&paths.kek).expect("kek"), &binding, None)
             .expect("promoted dek");
         assert_eq!(promoted.as_ref(), new_dek.as_ref());
         // And a normal open works end-to-end.
@@ -1563,11 +1721,11 @@ mod tests {
         let at_rest_key = AtRestKey::load_encrypted(&paths.key, pass.as_str()).expect("load");
         let binding = db_binding(&paths.db);
         let old_dek = at_rest_key
-            .decapsulate_dek(&fs::read(&paths.kek).expect("kek"), &binding)
+            .decapsulate_dek(&fs::read(&paths.kek).expect("kek"), &binding, None)
             .expect("old dek");
 
         // Stage a pending KEK for some other dek, but DO NOT rekey the DB.
-        let (stale_kek, _stale_dek) = at_rest_key.encapsulate_dek(&binding).expect("encap stale");
+        let (stale_kek, _stale_dek) = at_rest_key.encapsulate_dek(&binding, None).expect("encap stale");
         write_atomic_secret(&kek_pending_path(&paths.kek), &stale_kek).expect("stage");
 
         let resolved = finalize_pending_rekey(&paths, &at_rest_key, old_dek.clone())
@@ -1577,5 +1735,166 @@ mod tests {
             !kek_pending_path(&paths.kek).exists(),
             "stale staging file must be discarded"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // Anti-rollback (counter-bound) tests
+    // -------------------------------------------------------------------------
+
+    use crate::group::rollback::{MemoryCounter, RollbackCounter, SoftwareCounter};
+
+    fn anti_rollback_paths(dir: &Path) -> (AtRestPaths, Zeroizing<String>) {
+        (
+            AtRestPaths::from_db_path(dir.join("groups.db")),
+            Zeroizing::new(TEST_PASS.to_string()),
+        )
+    }
+
+    /// Resolve the DEK *and* materialise the SQLCipher DB file (resolve_dek
+    /// alone only derives the key; the .db is created on first open).
+    fn init_db_with_counter(
+        paths: &AtRestPaths,
+        pass: &Zeroizing<String>,
+        counter: &dyn RollbackCounter,
+    ) {
+        let dek = resolve_dek_with(paths, pass, Some(counter)).expect("init dek");
+        drop(GroupStorage::open_at_with_raw_key(&paths.db, &dek).expect("init open"));
+    }
+
+    #[test]
+    fn counter_kek_is_v3_and_roundtrips() {
+        let dir = tempdir().expect("tempdir");
+        let (paths, pass) = anti_rollback_paths(dir.path());
+        let counter = MemoryCounter::new(0);
+
+        init_db_with_counter(&paths, &pass, &counter);
+        let kek = fs::read(&paths.kek).expect("kek");
+        assert_eq!(kek[8], KEK_VERSION_COUNTER_BOUND, "v0x03 when counter present");
+
+        // Normal reopen at the same counter works.
+        drop(resolve_dek_with(&paths, &pass, Some(&counter)).expect("reopen"));
+    }
+
+    #[test]
+    fn v3_kek_requires_a_counter_to_open() {
+        let dir = tempdir().expect("tempdir");
+        let (paths, pass) = anti_rollback_paths(dir.path());
+        let counter = MemoryCounter::new(0);
+        init_db_with_counter(&paths, &pass, &counter);
+
+        // Opening a v0x03 KEK with the policy disabled (no counter) must fail
+        // rather than silently bypass rollback protection.
+        match resolve_dek_with(&paths, &pass, None) {
+            Err(GroupError::Storage(m)) => assert!(m.contains("anti-rollback") || m.contains("counter")),
+            other => panic!("expected counter-required error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rekey_advances_counter_and_detects_restored_old_kek() {
+        let dir = tempdir().expect("tempdir");
+        let (paths, pass) = anti_rollback_paths(dir.path());
+        let counter = MemoryCounter::new(0);
+
+        init_db_with_counter(&paths, &pass, &counter);
+        let old_kek = fs::read(&paths.kek).expect("kek@0");
+
+        rotate_dek_with(&paths, &pass, Some(&counter)).expect("rekey");
+        assert_eq!(counter.current().unwrap(), 1, "rekey advances the counter");
+        // Steady-state reopen at counter 1 works.
+        drop(resolve_dek_with(&paths, &pass, Some(&counter)).expect("reopen@1"));
+
+        // Roll back: restore the pre-rekey KEK (sealed at counter 0) while the
+        // counter has advanced to 1.
+        fs::write(&paths.kek, &old_kek).expect("restore old kek");
+        match resolve_dek_with(&paths, &pass, Some(&counter)) {
+            Err(GroupError::Storage(m)) => assert!(m.contains("rollback"), "got: {m}"),
+            other => panic!("rollback must be detected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_rolls_forward_when_db_rekeyed_but_counter_not_advanced() {
+        // Crash case 2b: pending sealed at c+1, DB already rekeyed, counter
+        // still at c. Recovery must adopt the pending DEK and advance.
+        let dir = tempdir().expect("tempdir");
+        let (paths, pass) = anti_rollback_paths(dir.path());
+        let counter = MemoryCounter::new(0);
+        init_db_with_counter(&paths, &pass, &counter);
+
+        let key = AtRestKey::load_encrypted(&paths.key, pass.as_str()).expect("load");
+        let binding = db_binding(&paths.db);
+        let c = counter.current().unwrap(); // 0
+        let old_dek = key
+            .decapsulate_dek(&fs::read(&paths.kek).unwrap(), &binding, Some(c))
+            .expect("old dek");
+
+        // Stage a new KEK at c+1 and rekey the DB, but leave the counter at c
+        // and do not promote (the 2b crash window).
+        let (new_kek, new_dek) = key.encapsulate_dek(&binding, Some(c + 1)).expect("encap");
+        {
+            use rusqlite::Connection;
+            let conn = Connection::open(&paths.db).expect("open");
+            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(old_dek.as_ref()))).unwrap();
+            conn.execute_batch(&format!("PRAGMA rekey = \"x'{}'\";", hex::encode(new_dek.as_ref()))).unwrap();
+        }
+        write_atomic_secret(&kek_pending_path(&paths.kek), &new_kek).expect("stage");
+
+        let dek = resolve_kek_to_dek(&paths, &key, &binding, Some(&counter)).expect("recover");
+        assert_eq!(dek.as_ref(), new_dek.as_ref(), "adopts the new dek");
+        assert_eq!(counter.current().unwrap(), c + 1, "counter rolled forward");
+        assert!(!kek_pending_path(&paths.kek).exists(), "pending promoted");
+    }
+
+    #[test]
+    fn recovery_promotes_when_counter_already_advanced() {
+        // Crash case 2a: pending sealed at c, DB rekeyed, counter already
+        // advanced to c. Recovery promotes pending without re-advancing.
+        let dir = tempdir().expect("tempdir");
+        let (paths, pass) = anti_rollback_paths(dir.path());
+        let counter = MemoryCounter::new(0);
+        init_db_with_counter(&paths, &pass, &counter);
+
+        let key = AtRestKey::load_encrypted(&paths.key, pass.as_str()).expect("load");
+        let binding = db_binding(&paths.db);
+        let old_dek = key
+            .decapsulate_dek(&fs::read(&paths.kek).unwrap(), &binding, Some(0))
+            .expect("old dek");
+
+        // Advance the counter to 1, seal pending at 1, rekey DB, no promote.
+        let c1 = counter.advance().unwrap(); // 1
+        let (new_kek, new_dek) = key.encapsulate_dek(&binding, Some(c1)).expect("encap");
+        {
+            use rusqlite::Connection;
+            let conn = Connection::open(&paths.db).expect("open");
+            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(old_dek.as_ref()))).unwrap();
+            conn.execute_batch(&format!("PRAGMA rekey = \"x'{}'\";", hex::encode(new_dek.as_ref()))).unwrap();
+        }
+        write_atomic_secret(&kek_pending_path(&paths.kek), &new_kek).expect("stage");
+
+        let dek = resolve_kek_to_dek(&paths, &key, &binding, Some(&counter)).expect("recover");
+        assert_eq!(dek.as_ref(), new_dek.as_ref(), "adopts the new dek");
+        assert_eq!(counter.current().unwrap(), 1, "counter unchanged (already advanced)");
+        assert!(!kek_pending_path(&paths.kek).exists(), "pending promoted");
+    }
+
+    #[test]
+    fn software_counter_end_to_end_rekey() {
+        // Exercise the file-backed SoftwareCounter through the public-ish
+        // *_with seam: init, rekey, reopen.
+        let dir = tempdir().expect("tempdir");
+        let state = tempdir().expect("state");
+        let (paths, pass) = anti_rollback_paths(dir.path());
+        let counter = SoftwareCounter::at(state.path().join("groups.ctr"));
+
+        init_db_with_counter(&paths, &pass, &counter);
+        assert_eq!(counter.current().unwrap(), 0);
+        rotate_dek_with(&paths, &pass, Some(&counter)).expect("rekey");
+        assert_eq!(counter.current().unwrap(), 1);
+        let storage = {
+            let dek = resolve_dek_with(&paths, &pass, Some(&counter)).expect("reopen");
+            GroupStorage::open_at_with_raw_key(&paths.db, &dek).expect("open")
+        };
+        assert!(storage.list_group_ids().expect("list").is_empty());
     }
 }
