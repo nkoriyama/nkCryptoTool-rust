@@ -125,12 +125,22 @@ const HYBRID_PK_LEN: usize = 32 + 1184;
 // -----------------------------------------------------------------------------
 
 const KEK_MAGIC: [u8; 8] = *b"NKCT-KEK";
-const KEK_VERSION: u8 = 0x01;
+/// Legacy KEK version: HPKE `info` is the bare [`HPKE_INFO`] constant, with
+/// no per-DB binding. Still readable so DBs written before per-DB binding
+/// existed keep opening; rewritten as [`KEK_VERSION_BOUND`] on the next
+/// rekey.
+const KEK_VERSION_LEGACY: u8 = 0x01;
+/// Current KEK version: HPKE `info` is `HPKE_INFO || binding`, where the
+/// binding is a per-DB identifier (the DB file name). This stops a KEK
+/// from one DB being swapped in for another when several DBs share one
+/// at-rest hybrid key — the `info` mismatch fails the HPKE AEAD check.
+const KEK_VERSION_BOUND: u8 = 0x02;
 const KEK_SUITE_XWING: u8 = 0x01;
 const KEK_HEADER_LEN: usize = 8 + 1 + 1;
 
-/// HPKE `info` string. Domain-separates the at-rest DEK encapsulation
-/// from any other use of the hybrid suite (MLS Welcome, etc).
+/// HPKE `info` prefix. Domain-separates the at-rest DEK encapsulation
+/// from any other use of the hybrid suite (MLS Welcome, etc). For
+/// [`KEK_VERSION_BOUND`] KEKs the per-DB binding is appended to this.
 const HPKE_INFO: &[u8] = b"nkct-mls-at-rest-v1";
 
 /// Length of the SQLCipher raw key (matches `PRAGMA key = "x'<64 hex>'"`).
@@ -290,18 +300,22 @@ impl AtRestKey {
     /// Encapsulate a fresh 256-bit DEK against this key's public half
     /// and return both the serialized KEK file bytes and the DEK.
     ///
-    /// The DEK is freshly random; callers store the KEK bytes alongside
-    /// the SQLCipher DB (as `groups.db.kek`) and hand the DEK directly
-    /// to [`GroupStorage::open_at_with_raw_key`].
+    /// `binding` is a per-DB identifier (the DB file name) mixed into the
+    /// HPKE `info`, so the resulting KEK only decapsulates for a DB opened
+    /// with the same binding. The DEK is freshly random; callers store the
+    /// KEK bytes alongside the SQLCipher DB (as `groups.db.kek`) and hand
+    /// the DEK directly to [`GroupStorage::open_at_with_raw_key`].
     pub fn encapsulate_dek(
         &self,
+        binding: &[u8],
     ) -> Result<(Vec<u8>, Zeroizing<[u8; DEK_LEN]>), GroupError> {
         let mut dek = Zeroizing::new([0u8; DEK_LEN]);
         OsRng.fill_bytes(dek.as_mut_slice());
 
+        let info = bound_info(binding);
         let suite = hybrid_suite()?;
         let hpke_ct = suite
-            .hpke_seal(&self.pk, HPKE_INFO, None, dek.as_ref())
+            .hpke_seal(&self.pk, &info, None, dek.as_ref())
             .map_err(|e| GroupError::Backend(format!("at-rest hpke_seal: {e}")))?;
 
         let inner = hpke_ct
@@ -309,7 +323,7 @@ impl AtRestKey {
             .map_err(|e| GroupError::Storage(format!("KEK encode: {e}")))?;
         let mut bytes = Vec::with_capacity(KEK_HEADER_LEN + inner.len());
         bytes.extend_from_slice(&KEK_MAGIC);
-        bytes.push(KEK_VERSION);
+        bytes.push(KEK_VERSION_BOUND);
         bytes.push(KEK_SUITE_XWING);
         bytes.extend_from_slice(&inner);
 
@@ -318,12 +332,16 @@ impl AtRestKey {
 
     /// Decapsulate a previously-saved KEK file into the 256-bit DEK.
     ///
-    /// A wrong at-rest key, a tampered KEK file, or a domain-separator
-    /// mismatch will fail the HPKE AEAD check and surface as
-    /// `GroupError::Backend`.
+    /// `binding` must match the value passed to [`encapsulate_dek`] for a
+    /// [`KEK_VERSION_BOUND`] KEK; it is ignored for a legacy
+    /// [`KEK_VERSION_LEGACY`] KEK (which was written without binding). A
+    /// wrong at-rest key, a tampered KEK file, a wrong binding, or a
+    /// domain-separator mismatch will fail the HPKE AEAD check and surface
+    /// as `GroupError::Backend`.
     pub fn decapsulate_dek(
         &self,
         kek_bytes: &[u8],
+        binding: &[u8],
     ) -> Result<Zeroizing<[u8; DEK_LEN]>, GroupError> {
         if kek_bytes.len() < KEK_HEADER_LEN {
             return Err(GroupError::Storage("KEK file too short".into()));
@@ -331,12 +349,15 @@ impl AtRestKey {
         if kek_bytes[0..8] != KEK_MAGIC {
             return Err(GroupError::Storage("KEK file: bad magic".into()));
         }
-        if kek_bytes[8] != KEK_VERSION {
-            return Err(GroupError::Storage(format!(
-                "KEK file: unsupported version {:#x}",
-                kek_bytes[8]
-            )));
-        }
+        let info = match kek_bytes[8] {
+            KEK_VERSION_LEGACY => HPKE_INFO.to_vec(),
+            KEK_VERSION_BOUND => bound_info(binding),
+            other => {
+                return Err(GroupError::Storage(format!(
+                    "KEK file: unsupported version {other:#x}"
+                )))
+            }
+        };
         if kek_bytes[9] != KEK_SUITE_XWING {
             return Err(GroupError::Storage(format!(
                 "KEK file: unsupported suite {:#x}",
@@ -349,13 +370,18 @@ impl AtRestKey {
             .map_err(|e| GroupError::Storage(format!("KEK decode: {e}")))?;
 
         let suite = hybrid_suite()?;
-        let plaintext = suite
-            .hpke_open(&hpke_ct, &self.sk, &self.pk, HPKE_INFO, None)
-            .map_err(|e| {
-                GroupError::Backend(format!(
-                    "at-rest hpke_open (wrong key, tampered KEK, or wrong info?): {e}"
-                ))
-            })?;
+        // hpke_open returns a plain Vec<u8> holding the DEK; wrap it so the
+        // root key is wiped from the heap when this function returns rather
+        // than lingering in a freed allocation.
+        let plaintext = Zeroizing::new(
+            suite
+                .hpke_open(&hpke_ct, &self.sk, &self.pk, &info, None)
+                .map_err(|e| {
+                    GroupError::Backend(format!(
+                        "at-rest hpke_open (wrong key, tampered KEK, or wrong info?): {e}"
+                    ))
+                })?,
+        );
 
         if plaintext.len() != DEK_LEN {
             return Err(GroupError::Backend(format!(
@@ -485,14 +511,16 @@ pub fn resolve_dek(
         k
     };
 
-    // 2. Load or generate the KEK (which carries the DEK).
+    // 2. Load or generate the KEK (which carries the DEK). The KEK is
+    //    bound to this DB's file name (see `bound_info`).
+    let binding = db_binding(&paths.db);
     let dek = if paths.kek.exists() {
         let kek_bytes = fs::read(&paths.kek).map_err(|e| {
             GroupError::Storage(format!("read KEK {:?}: {e}", paths.kek))
         })?;
-        at_rest_key.decapsulate_dek(&kek_bytes)?
+        at_rest_key.decapsulate_dek(&kek_bytes, &binding)?
     } else {
-        let (kek_bytes, dek) = at_rest_key.encapsulate_dek()?;
+        let (kek_bytes, dek) = at_rest_key.encapsulate_dek(&binding)?;
         write_atomic_secret(&paths.kek, &kek_bytes)?;
         dek
     };
@@ -567,13 +595,14 @@ pub fn rotate_dek(
 
     // Recover the current DEK, finishing any prior interrupted rekey first
     // so we start from a consistent DB/KEK pair.
+    let binding = db_binding(&paths.db);
     let kek_bytes = fs::read(&paths.kek)
         .map_err(|e| GroupError::Storage(format!("read KEK {:?}: {e}", paths.kek)))?;
-    let old_dek = at_rest_key.decapsulate_dek(&kek_bytes)?;
+    let old_dek = at_rest_key.decapsulate_dek(&kek_bytes, &binding)?;
     let old_dek = finalize_pending_rekey(paths, &at_rest_key, old_dek)?;
 
-    // Fresh DEK + its KEK envelope.
-    let (new_kek_bytes, new_dek) = at_rest_key.encapsulate_dek()?;
+    // Fresh DEK + its KEK envelope (rewritten as a bound KEK).
+    let (new_kek_bytes, new_dek) = at_rest_key.encapsulate_dek(&binding)?;
 
     // Stage the new KEK before touching the DB.
     let pending = kek_pending_path(&paths.kek);
@@ -657,7 +686,7 @@ fn finalize_pending_rekey(
     // the promotion did not — the staging KEK should match.
     let pending_bytes = fs::read(&pending)
         .map_err(|e| GroupError::Storage(format!("read pending KEK {pending:?}: {e}")))?;
-    let pending_dek = at_rest_key.decapsulate_dek(&pending_bytes)?;
+    let pending_dek = at_rest_key.decapsulate_dek(&pending_bytes, &db_binding(&paths.db))?;
     if dek_opens_db(&paths.db, &pending_dek) {
         fs::rename(&pending, &paths.kek).map_err(|e| {
             GroupError::Storage(format!("finish rekey promotion {pending:?}: {e}"))
@@ -834,6 +863,28 @@ fn migrate_plaintext_to_sqlcipher(
 // Internals
 // -----------------------------------------------------------------------------
 
+/// Build the HPKE `info` for a [`KEK_VERSION_BOUND`] KEK: the domain
+/// separator followed by a length-prefixed per-DB binding. The length
+/// prefix keeps `HPKE_INFO || binding` unambiguous (no binding can forge a
+/// different (prefix, binding) split).
+fn bound_info(binding: &[u8]) -> Vec<u8> {
+    let mut info = Vec::with_capacity(HPKE_INFO.len() + 4 + binding.len());
+    info.extend_from_slice(HPKE_INFO);
+    info.extend_from_slice(&(binding.len() as u32).to_be_bytes());
+    info.extend_from_slice(binding);
+    info
+}
+
+/// Per-DB binding for the KEK `info`: the DB file name (not the full path,
+/// so moving the whole at-rest triple to another directory keeps the KEK
+/// valid while still distinguishing co-located DBs). Empty if the path has
+/// no file-name component.
+fn db_binding(db: &Path) -> Vec<u8> {
+    db.file_name()
+        .map(|s| s.as_encoded_bytes().to_vec())
+        .unwrap_or_default()
+}
+
 fn hybrid_suite(
 ) -> Result<<HybridCryptoProvider as CryptoProvider>::CipherSuiteProvider, GroupError> {
     HybridCryptoProvider::new()
@@ -997,14 +1048,54 @@ mod tests {
     use tempfile::tempdir;
 
     const TEST_PASS: &str = "nkct-at-rest-test-passphrase";
+    const TEST_BINDING: &[u8] = b"groups.db";
 
     #[test]
     fn generate_then_encapsulate_decapsulate_roundtrips_dek() {
         let key = AtRestKey::generate().expect("generate");
-        let (kek_bytes, dek_a) = key.encapsulate_dek().expect("encapsulate");
-        let dek_b = key.decapsulate_dek(&kek_bytes).expect("decapsulate");
+        let (kek_bytes, dek_a) = key.encapsulate_dek(TEST_BINDING).expect("encapsulate");
+        let dek_b = key.decapsulate_dek(&kek_bytes, TEST_BINDING).expect("decapsulate");
         assert_eq!(dek_a.as_ref(), dek_b.as_ref(), "DEK must round-trip");
         assert_eq!(dek_a.len(), DEK_LEN);
+    }
+
+    #[test]
+    fn wrong_binding_fails_decapsulation() {
+        // A KEK sealed for one DB name must not decapsulate under another
+        // — this is the per-DB binding that stops KEK-swap attacks when
+        // several DBs share one at-rest key.
+        let key = AtRestKey::generate().expect("generate");
+        let (kek_bytes, _dek) = key.encapsulate_dek(b"groups.db").expect("encap");
+        let err = key
+            .decapsulate_dek(&kek_bytes, b"inbox.db")
+            .expect_err("wrong binding must fail");
+        assert!(matches!(err, GroupError::Backend(_)));
+    }
+
+    #[test]
+    fn legacy_unbound_kek_still_decapsulates() {
+        // A v0x01 KEK written before per-DB binding existed (HPKE info =
+        // bare HPKE_INFO) must keep opening regardless of the binding
+        // passed in, so existing on-disk DBs are not orphaned.
+        let key = AtRestKey::generate().expect("generate");
+        let mut dek = Zeroizing::new([0u8; DEK_LEN]);
+        OsRng.fill_bytes(dek.as_mut_slice());
+        // Hand-build a legacy KEK: header version 0x01, info = HPKE_INFO.
+        let suite = hybrid_suite().expect("suite");
+        let ct = suite
+            .hpke_seal(&key.pk, HPKE_INFO, None, dek.as_ref())
+            .expect("seal");
+        let mut kek = Vec::new();
+        kek.extend_from_slice(&KEK_MAGIC);
+        kek.push(KEK_VERSION_LEGACY);
+        kek.push(KEK_SUITE_XWING);
+        kek.extend_from_slice(&ct.mls_encode_to_vec().expect("encode"));
+
+        // Any binding is ignored for a legacy KEK.
+        let recovered = key
+            .decapsulate_dek(&kek, b"whatever.db")
+            .expect("legacy KEK must decapsulate");
+        assert_eq!(recovered.as_ref(), dek.as_ref());
     }
 
     #[test]
@@ -1013,7 +1104,7 @@ mod tests {
         let path = dir.path().join("at-rest.key");
 
         let original = AtRestKey::generate().expect("generate");
-        let (kek_bytes, dek) = original.encapsulate_dek().expect("encap");
+        let (kek_bytes, dek) = original.encapsulate_dek(TEST_BINDING).expect("encap");
 
         original.save_encrypted(&path, TEST_PASS).expect("save");
         assert!(path.exists());
@@ -1026,7 +1117,7 @@ mod tests {
         }
 
         let reloaded = AtRestKey::load_encrypted(&path, TEST_PASS).expect("load");
-        let dek_from_reload = reloaded.decapsulate_dek(&kek_bytes).expect("decap");
+        let dek_from_reload = reloaded.decapsulate_dek(&kek_bytes, TEST_BINDING).expect("decap");
         assert_eq!(
             dek.as_ref(),
             dek_from_reload.as_ref(),
@@ -1057,7 +1148,7 @@ mod tests {
     #[test]
     fn tampered_kek_fails_decapsulation() {
         let key = AtRestKey::generate().expect("generate");
-        let (mut kek_bytes, _dek) = key.encapsulate_dek().expect("encap");
+        let (mut kek_bytes, _dek) = key.encapsulate_dek(TEST_BINDING).expect("encap");
 
         // Flip a byte inside the HPKE ciphertext portion (skip our
         // 10-byte header).
@@ -1065,7 +1156,7 @@ mod tests {
         kek_bytes[idx] ^= 0x01;
 
         let err = key
-            .decapsulate_dek(&kek_bytes)
+            .decapsulate_dek(&kek_bytes, TEST_BINDING)
             .expect_err("tampered KEK must fail");
         match err {
             GroupError::Backend(msg) => {
@@ -1109,10 +1200,10 @@ mod tests {
     fn cross_key_decapsulation_fails() {
         let key_a = AtRestKey::generate().expect("a");
         let key_b = AtRestKey::generate().expect("b");
-        let (kek, _dek) = key_a.encapsulate_dek().expect("encap by a");
+        let (kek, _dek) = key_a.encapsulate_dek(TEST_BINDING).expect("encap by a");
 
         let err = key_b
-            .decapsulate_dek(&kek)
+            .decapsulate_dek(&kek, TEST_BINDING)
             .expect_err("decap with wrong key must fail");
         assert!(matches!(err, GroupError::Backend(_)));
     }
@@ -1301,7 +1392,7 @@ mod tests {
         // at-rest.key + KEK exist (generate them), but groups.db is plaintext.
         let key = AtRestKey::generate().expect("gen");
         key.save_encrypted(&paths.key, TEST_PASS).expect("save key");
-        let (kek, _dek) = key.encapsulate_dek().expect("encap");
+        let (kek, _dek) = key.encapsulate_dek(&db_binding(&paths.db)).expect("encap");
         write_atomic_secret(&paths.kek, &kek).expect("write kek");
         make_plaintext_db(&paths.db);
 
@@ -1323,12 +1414,13 @@ mod tests {
         let at_rest_key = AtRestKey::load_encrypted(&paths.key, pass.as_str()).expect("load");
 
         // Old dek = current KEK contents.
+        let binding = db_binding(&paths.db);
         let old_kek = fs::read(&paths.kek).expect("old kek");
-        let old_dek = at_rest_key.decapsulate_dek(&old_kek).expect("old dek");
+        let old_dek = at_rest_key.decapsulate_dek(&old_kek, &binding).expect("old dek");
 
         // Manually rekey the DB to a fresh dek and stage its KEK as pending,
         // leaving the live KEK on the old dek (the interrupted state).
-        let (new_kek, new_dek) = at_rest_key.encapsulate_dek().expect("encap new");
+        let (new_kek, new_dek) = at_rest_key.encapsulate_dek(&binding).expect("encap new");
         {
             use rusqlite::Connection;
             let conn = Connection::open(&paths.db).expect("open db");
@@ -1346,7 +1438,7 @@ mod tests {
         assert!(!kek_pending_path(&paths.kek).exists(), "pending promoted away");
         // The promoted KEK now decapsulates to the new dek.
         let promoted = at_rest_key
-            .decapsulate_dek(&fs::read(&paths.kek).expect("kek"))
+            .decapsulate_dek(&fs::read(&paths.kek).expect("kek"), &binding)
             .expect("promoted dek");
         assert_eq!(promoted.as_ref(), new_dek.as_ref());
         // And a normal open works end-to-end.
@@ -1362,12 +1454,13 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let (paths, pass) = seed_storage(dir.path());
         let at_rest_key = AtRestKey::load_encrypted(&paths.key, pass.as_str()).expect("load");
+        let binding = db_binding(&paths.db);
         let old_dek = at_rest_key
-            .decapsulate_dek(&fs::read(&paths.kek).expect("kek"))
+            .decapsulate_dek(&fs::read(&paths.kek).expect("kek"), &binding)
             .expect("old dek");
 
         // Stage a pending KEK for some other dek, but DO NOT rekey the DB.
-        let (stale_kek, _stale_dek) = at_rest_key.encapsulate_dek().expect("encap stale");
+        let (stale_kek, _stale_dek) = at_rest_key.encapsulate_dek(&binding).expect("encap stale");
         write_atomic_secret(&kek_pending_path(&paths.kek), &stale_kek).expect("stage");
 
         let resolved = finalize_pending_rekey(&paths, &at_rest_key, old_dek.clone())

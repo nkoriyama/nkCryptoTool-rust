@@ -348,10 +348,15 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
   失効済みの member key が再び有効に見える可能性がある。MLS 自身の epoch
   単調増加で部分的に検知可能だが、at-rest 層は無防備。tamper-evident storage
   (TPM/Secure Enclave) との連携が将来作業。
-- **`groups.db.kek` の per-DB バインディングなし**: HPKE `info` は固定文字列
-  `b"nkct-mls-at-rest-v1"`。同一 at-rest 鍵で複数 DB を運用するユースケースは
-  現状想定していないが、将来サポートするなら DB パスやランダム salt を `info`
-  に含めて KEK 再利用攻撃を防ぐべき。
+- **KEK の per-DB バインディング (実装済み)**: KEK は HPKE `info =
+  b"nkct-mls-at-rest-v1" || len(binding) || binding` でシールされ、binding は
+  DB ファイル名 (`group::at_rest::db_binding`)。同一 at-rest 鍵を複数 DB で共有
+  しても、ある DB の KEK を別 DB の KEK 位置に差し替えると `info` 不一致で HPKE
+  AEAD が失敗するため KEK 再利用攻撃が成立しない。binding はフルパスでなくファイル
+  名なので、at-rest 三点セットごとディレクトリ移動しても KEK は有効。旧 `0x01`
+  (unbound) KEK は読み取り互換を保ち、次回 rekey で `0x02` (bound) に書き換わる。
+  なお inbox は `beside_db` で DB 固有の at-rest 鍵を持つため、そもそも groups.db
+  と鍵を共有しない。
 - **平文 DB マイグレーションのバックアップは取らない**: §7.3 の自動マイグレーション
   は原本を破壊する前に暗号化コピーの可読性を検証するため通常はデータ安全だが、
   平文バックアップを意図的に残さない (at-rest 平文残存を避けるため)。検証を通った
