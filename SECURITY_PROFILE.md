@@ -310,7 +310,7 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
 | 同時書き込み | 単一プロセス前提 | sqlite WAL + `busy_timeout` 5s で短期競合を吸収 (multi-process は非推奨) |
 | バックアップ運用 | `groups.db` 単体では復号不可 — `at-rest.key` + `groups.db.kek` + passphrase の 3 要素全部が必要 | 3 ファイルを同一ディレクトリで一括バックアップ。passphrase はユーザーが別管理 |
 | 鍵ローテーション | 当面未実装 | DEK は `groups.db.kek` を新規 encapsulate し直すだけで更新可 (SQLCipher の `PRAGMA rekey` で全ページ再暗号化)。at-rest hybrid SK の更新は `at-rest.key` の再生成 + 全 DEK の再 encapsulate |
-| 既存平文 DB の取扱い | 自動マイグレーション未実装 | SQLCipher 化前の `.db` は再利用不可。`sqlcipher` CLI で `ATTACH … KEY '…'` + `sqlcipher_export` するか、グループを作り直す |
+| 既存平文 DB の取扱い | 起動時に自動マイグレーション (`group::at_rest::migrate_plaintext_to_sqlcipher`) | 先頭 16 byte の `SQLite format 3\0` magic で平文 DB を検出し、`sqlcipher_export()` で DEK 暗号化コピーへ変換 → 鍵で開けることを検証してから原本を atomic rename で置換。平文の原本・WAL/journal サイドカーは置換後に unlink するため平文残存なし。検証成功前は原本を破壊しない |
 
 ### 7.4 トランスポート抽象 (ALPN `nkct/mls/1`)
 
@@ -349,9 +349,11 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
   `b"nkct-mls-at-rest-v1"`。同一 at-rest 鍵で複数 DB を運用するユースケースは
   現状想定していないが、将来サポートするなら DB パスやランダム salt を `info`
   に含めて KEK 再利用攻撃を防ぐべき。
-- **平文 DB からの自動マイグレーション未実装**: SQLCipher 化前の `.db` ファイルは
-  読み込めない。`sqlcipher` CLI 経由の手動 export か、グループ再作成が必要 (§7.3
-  参照)。
+- **平文 DB マイグレーションのバックアップは取らない**: §7.3 の自動マイグレーション
+  は原本を破壊する前に暗号化コピーの可読性を検証するため通常はデータ安全だが、
+  平文バックアップを意図的に残さない (at-rest 平文残存を避けるため)。検証を通った
+  暗号化コピーが直後に I/O 障害等で壊れる極端なケースに備えるなら、ユーザーが
+  事前に `groups.db` を手動コピーしておくこと。
 
 ### 7.6 抽象境界の CI 強制
 

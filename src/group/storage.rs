@@ -151,8 +151,11 @@ impl ConnectionStrategy for TunedFileStrategy {
                 // already been derived via the PQC at-rest layer.
                 debug_assert_eq!(hex.len(), 64);
                 debug_assert!(hex.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
-                let stmt = format!("PRAGMA key = \"x'{}'\";", hex.as_str());
-                conn.execute_batch(&stmt)
+                // The statement embeds the raw key, so the whole string
+                // must be zeroized too — `hex` being Zeroizing is not
+                // enough once it is spliced into a plain String.
+                let stmt = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex.as_str()));
+                conn.execute_batch(stmt.as_str())
                     .map_err(|e| SqLiteDataStorageError::SqlEngineError(e.into()))?;
             }
         }

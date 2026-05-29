@@ -453,8 +453,146 @@ pub fn open_at_rest_storage(
         dek
     };
 
-    // 3. Open SQLCipher with the raw DEK.
+    // 3. Migrate a pre-SQLCipher plaintext DB in place, if one is found.
+    //    Older builds shipped `groups.db` as an unencrypted sqlite file
+    //    (the `sqlite-bundled` feature). Such a file cannot be opened with
+    //    a SQLCipher key, so on upgrade we transparently re-encrypt it
+    //    under the freshly-derived DEK before the open below. A no-op when
+    //    `groups.db` is absent or already SQLCipher-encrypted.
+    if is_plaintext_sqlite(&paths.db) {
+        migrate_plaintext_to_sqlcipher(&paths.db, &dek)?;
+    }
+
+    // 4. Open SQLCipher with the raw DEK.
     GroupStorage::open_at_with_raw_key(&paths.db, &dek)
+}
+
+/// Return `true` if `path` is an **unencrypted** sqlite database — i.e.
+/// its first 16 bytes are the literal `b"SQLite format 3\0"` header.
+///
+/// A SQLCipher-encrypted DB has those 16 bytes occupied by the random
+/// per-database salt instead, so the magic never matches. A missing,
+/// empty, or sub-16-byte file is treated as "not a plaintext DB" (the
+/// caller's normal open path then creates/initialises it).
+fn is_plaintext_sqlite(path: &Path) -> bool {
+    const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
+    let mut hdr = [0u8; 16];
+    match fs::File::open(path).and_then(|mut f| {
+        use std::io::Read as _;
+        f.read_exact(&mut hdr)
+    }) {
+        Ok(()) => &hdr == SQLITE_MAGIC,
+        Err(_) => false,
+    }
+}
+
+/// Re-encrypt the plaintext sqlite database at `db` into a SQLCipher
+/// database keyed by `dek`, replacing the original file atomically.
+///
+/// Uses SQLCipher's `sqlcipher_export()`: the plaintext DB is opened with
+/// no key, a fresh encrypted target is `ATTACH`ed under the raw DEK, all
+/// schema and data are copied across, and the target is then verified to
+/// open under the same key before it atomically replaces `db`. The
+/// original plaintext is only unlinked (via the rename) **after** the
+/// encrypted copy is proven readable, so a failure at any step leaves the
+/// plaintext untouched for a retry.
+///
+/// Stale rollback-journal / WAL sidecars of the old plaintext DB are
+/// removed afterwards so they cannot be mis-applied to the new encrypted
+/// file on the next open.
+fn migrate_plaintext_to_sqlcipher(
+    db: &Path,
+    dek: &[u8; 32],
+) -> Result<(), GroupError> {
+    use rusqlite::Connection;
+
+    // 64 lowercase hex digits — safe to splice into the SQL `KEY` clause.
+    let hex = Zeroizing::new(hex::encode(dek));
+    debug_assert_eq!(hex.len(), 64);
+
+    // Encrypted output goes to an unpredictable temp name beside the DB,
+    // matching write_atomic_secret's anti-symlink / anti-collision policy.
+    let mut rand_suffix = [0u8; 16];
+    OsRng.fill_bytes(&mut rand_suffix);
+    let tmp = {
+        let base = db.file_name().and_then(|s| s.to_str()).unwrap_or("groups.db");
+        let name = format!(".{base}.sqlcipher-mig.{}.tmp", hex::encode(rand_suffix));
+        match db.parent().filter(|p| !p.as_os_str().is_empty()) {
+            Some(dir) => dir.join(name),
+            None => PathBuf::from(name),
+        }
+    };
+    // ATTACH refuses to overwrite, and a stale temp would corrupt the
+    // export, so clear any leftover from a previous crashed run.
+    let _ = fs::remove_file(&tmp);
+
+    let export = || -> Result<(), GroupError> {
+        let conn = Connection::open(db)
+            .map_err(|e| GroupError::Storage(format!("open plaintext {db:?}: {e}")))?;
+        // Fold any committed WAL frames back into the main file so the
+        // export sees the complete committed state.
+        let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
+        // The assembled SQL embeds the raw key, so keep the whole
+        // statement string in a Zeroizing buffer — `hex` alone being
+        // Zeroizing is not enough once it is spliced into a plain String.
+        let attach = Zeroizing::new(format!(
+            "ATTACH DATABASE ?1 AS encrypted KEY \"x'{}'\"",
+            hex.as_str()
+        ));
+        conn.execute(attach.as_str(), rusqlite::params![tmp.to_string_lossy()])
+            .map_err(|e| GroupError::Storage(format!("attach encrypted target: {e}")))?;
+        conn.query_row("SELECT sqlcipher_export('encrypted')", [], |_| Ok(()))
+            .map_err(|e| GroupError::Storage(format!("sqlcipher_export: {e}")))?;
+        conn.execute_batch("DETACH DATABASE encrypted")
+            .map_err(|e| GroupError::Storage(format!("detach encrypted target: {e}")))?;
+        Ok(())
+    };
+
+    if let Err(e) = export() {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Verify the encrypted copy actually opens under the DEK before we
+    // destroy the plaintext. A read of sqlite_master fails (NOTADB) if the
+    // key or file is wrong.
+    let verify = || -> Result<(), GroupError> {
+        let conn = Connection::open(&tmp)
+            .map_err(|e| GroupError::Storage(format!("verify open {tmp:?}: {e}")))?;
+        let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex.as_str()));
+        conn.execute_batch(pragma.as_str())
+            .map_err(|e| GroupError::Storage(format!("verify key: {e}")))?;
+        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+            r.get::<_, i64>(0)
+        })
+        .map(|_| ())
+        .map_err(|e| GroupError::Storage(format!("verify read (bad migration?): {e}")))
+    };
+    if let Err(e) = verify() {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    // Point of no return: atomically swap the encrypted copy over the
+    // plaintext original.
+    if let Err(e) = fs::rename(&tmp, db) {
+        let _ = fs::remove_file(&tmp);
+        return Err(GroupError::Storage(format!(
+            "replace {db:?} with migrated copy: {e}"
+        )));
+    }
+
+    // Drop now-stale plaintext sidecars (best-effort).
+    for suffix in ["-wal", "-shm", "-journal"] {
+        let mut sidecar = db.as_os_str().to_owned();
+        sidecar.push(suffix);
+        let _ = fs::remove_file(PathBuf::from(sidecar));
+    }
+
+    eprintln!(
+        "[at-rest] migrated plaintext {db:?} to SQLCipher (PQC-wrapped DEK)"
+    );
+    Ok(())
 }
 
 // -----------------------------------------------------------------------------
@@ -803,5 +941,88 @@ mod tests {
         assert_eq!(paths.db, PathBuf::from("/tmp/example/groups.db"));
         assert_eq!(paths.kek, PathBuf::from("/tmp/example/groups.db.kek"));
         assert_eq!(paths.key, PathBuf::from("/tmp/example/at-rest.key"));
+    }
+
+    /// Create a plaintext (unencrypted) sqlite DB with one table + row.
+    fn make_plaintext_db(path: &Path) {
+        let conn = rusqlite::Connection::open(path).expect("open plaintext");
+        conn.execute_batch(
+            "CREATE TABLE legacy (id INTEGER PRIMARY KEY, note TEXT);
+             INSERT INTO legacy (note) VALUES ('pre-sqlcipher row');",
+        )
+        .expect("seed plaintext");
+    }
+
+    #[test]
+    fn is_plaintext_sqlite_detects_unencrypted_db() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("groups.db");
+        make_plaintext_db(&path);
+        assert!(is_plaintext_sqlite(&path), "fresh sqlite must be detected");
+
+        // Missing file is not plaintext.
+        assert!(!is_plaintext_sqlite(&dir.path().join("absent.db")));
+    }
+
+    #[test]
+    fn is_plaintext_sqlite_rejects_sqlcipher_db() {
+        // A SQLCipher-encrypted DB has a random salt where the magic
+        // header would be, so detection must return false.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("groups.db");
+        let dek = [0x5Au8; 32];
+        drop(GroupStorage::open_at_with_raw_key(&path, &dek).expect("encrypted open"));
+        assert!(
+            !is_plaintext_sqlite(&path),
+            "encrypted DB must not be flagged as plaintext"
+        );
+    }
+
+    #[test]
+    fn migrate_plaintext_preserves_data_and_encrypts() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("groups.db");
+        make_plaintext_db(&path);
+        let dek = [0x11u8; 32];
+
+        migrate_plaintext_to_sqlcipher(&path, &dek).expect("migrate");
+
+        // No longer plaintext on disk.
+        assert!(!is_plaintext_sqlite(&path), "DB must be encrypted post-migration");
+
+        // Data survived and is readable only under the DEK.
+        let hex = hex::encode(dek);
+        let conn = rusqlite::Connection::open(&path).expect("reopen");
+        conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))
+            .expect("key");
+        let note: String = conn
+            .query_row("SELECT note FROM legacy WHERE id = 1", [], |r| r.get(0))
+            .expect("row survived");
+        assert_eq!(note, "pre-sqlcipher row");
+    }
+
+    #[test]
+    fn open_at_rest_storage_migrates_legacy_plaintext_db() {
+        let dir = tempdir().expect("tempdir");
+        let paths = AtRestPaths::from_db_path(dir.path().join("groups.db"));
+        // Simulate an upgrade: a plaintext groups.db with no at-rest.key
+        // or KEK alongside it.
+        make_plaintext_db(&paths.db);
+        assert!(is_plaintext_sqlite(&paths.db));
+
+        let pass = Zeroizing::new(TEST_PASS.to_string());
+        let storage = open_at_rest_storage(&paths, &pass).expect("open migrates");
+
+        // All three artefacts now exist and the DB is encrypted.
+        assert!(paths.key.exists() && paths.kek.exists());
+        assert!(!is_plaintext_sqlite(&paths.db));
+        // MLS schema initialised on top of the migrated tables.
+        assert!(storage.list_group_ids().expect("list").is_empty());
+
+        // Reopening with the same passphrase still works (DEK round-trips
+        // through the KEK we just wrote).
+        drop(storage);
+        let storage2 = open_at_rest_storage(&paths, &pass).expect("reopen");
+        assert!(storage2.list_group_ids().expect("list").is_empty());
     }
 }
