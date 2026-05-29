@@ -345,21 +345,40 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
   して `nkct mls --mls-cmd rekey` (`PRAGMA rekey` 経由の DEK ローテーション) を
   提供済み — ただし漏洩前に取得済みの旧 ciphertext コピーは保護できない。完全な
   FS には MLS epoch 境界での DEK 再生成等が別途必要。
-- **anti-rollback (オプトイン・ソフトウェアカウンタで実装済み / 既定 off)**:
+- **anti-rollback (オプトイン実装済み / 既定 off)**:
   `NK_ROLLBACK_POLICY` で制御。`off`(既定) は従来通り KEK version `0x02`、挙動
-  不変。`permissive` は per-DB の単調カウンタ (`group::rollback::SoftwareCounter`、
-  `$XDG_STATE_HOME/nkct/rollback/<hash>.ctr` — ストレージ dir 外) を KEK の HPKE
-  `info` に暗号的にバインド (KEK version `0x03` = `bound_info || counter(u64 BE)`)。
-  カウンタは rekey 時に advance。古い `(groups.db, groups.db.kek)` スナップショット
-  に書き戻されても、現行カウンタとの `info` 不一致で HPKE AEAD 復号が失敗し
-  **巻き戻しを検知**する。カウンタ更新と DB 再暗号化の 2 リソース整合は既存の
-  `.pending` ステージング + `resolve_kek_to_dek` の 3 パターン復旧でクラッシュ安全。
-  設計の全体像は `ATREST_ANTIROLLBACK_DESIGN.md`。
-  - **残存リスク**: software カウンタは state ファイルごと過去スナップショットに
-    戻されると検知できない (case D 限界)。ハードウェア root (TPM 2.0 NV 単調
-    カウンタ、`strict` ポリシー) は未実装でフェーズ2 — 現状 `strict` はエラーで
-    silent downgrade を防ぐ。カウンタ消失時は v0x03 DB が開けなくなる (有効化の
-    対価として文書化)。MLS epoch 単調増加は引き続き部分的なバックストップ。
+  不変。`permissive`/`strict` は per-DB の単調カウンタ値を KEK の HPKE `info` に
+  暗号的にバインド (KEK version `0x03` = `bound_info || counter(u64 BE)`)。カウンタ
+  は rekey 時に advance。古い `(groups.db, groups.db.kek)` スナップショットに書き
+  戻されても、現行カウンタとの `info` 不一致で HPKE AEAD 復号が失敗し**巻き戻しを
+  検知**する。カウンタ更新と DB 再暗号化の 2 リソース整合は既存の `.pending`
+  ステージング + `resolve_kek_to_dek` の 3 パターン復旧でクラッシュ安全。設計の
+  全体像は `ATREST_ANTIROLLBACK_DESIGN.md`。
+  - **`permissive` (フェーズ1)**: software カウンタ (`SoftwareCounter`、
+    `$XDG_STATE_HOME/nkct/rollback/<hash>.ctr` — ストレージ dir 外)。state ファイル
+    ごと過去スナップショットに戻されると検知できない (case D 限界)。
+  - **`strict` (フェーズ2)**: TPM 2.0 NV 単調カウンタ (`TpmCounter`、tpm2-tools +
+    `/dev/tpmrm0`)。ストレージ dir を丸ごと過去版に戻してもハードウェアカウンタは
+    巻き戻らないため case D 限界を解消。NV index は per-DB
+    (`0x0150_0000 | (sha256(abs_path)[..3] & 0xFFFFF)`、owner 域・20bit; 衝突
+    ≈1/2^20 は許容 — registry-free 設計の対価)。`tpm2_nvundefine`→再定義による
+    カウンタリセットは**効かない**: TPM は counter NV を過去最大値以上で初期化する
+    ため、再定義後の値は旧値以上に保たれる (実機確認済み)。TPM 不在時はエラーで
+    silent downgrade を防ぐ。
+  - **共通の残存リスク**: カウンタ消失 (state ファイル削除、または `TPM2_Clear` で
+    TPM 全体を初期化) 時は v0x03 DB が開けなくなる (有効化の対価として文書化)。
+    `TPM2_Clear` はプラットフォーム/owner クリア権限を要し全 TPM 状態を消すため、
+    巻き戻し攻撃の前提 (storage dir 書込) より遥かに高い壁。MLS epoch 単調増加は
+    引き続き部分的なバックストップ。フェーズ3 (inbox リモートチェックポイント) は
+    未実装。
+  - **DoS (fail-closed) の許容**: `/dev/tpmrm0` 書込権限を持つローカル攻撃者は NV
+    カウンタを勝手に increment / undefine して v0x03 DB を開けなくできる (DoS)。
+    ただしこれは **fail-closed** であり、カウンタを進める/消すことが古い KEK を
+    復号可能にすることはない — 巻き戻し防止という目的自体は保たれる。NV インデックス
+    は単一ユーザー前提で owner 域に置く (index auth を付けても owner auth による
+    undefine DoS は残るため不完全)。`tpm2-*` は PATH 上の名前で起動する
+    (`src/key/tpm` と同一・非 setuid ユーザー CLI 前提)。multi-process 同時 rekey は
+    非サポート (§7.3)。
 - **KEK の per-DB バインディング (実装済み)**: KEK は HPKE `info =
   b"nkct-mls-at-rest-v1" || len(binding) || binding` でシールされ、binding は
   DB ファイル名 (`group::at_rest::db_binding`)。同一 at-rest 鍵を複数 DB で共有

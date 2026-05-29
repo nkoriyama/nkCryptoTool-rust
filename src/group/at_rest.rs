@@ -1897,4 +1897,50 @@ mod tests {
         };
         assert!(storage.list_group_ids().expect("list").is_empty());
     }
+
+    #[test]
+    fn tpm_strict_end_to_end_detects_rollback() {
+        use crate::group::rollback::{tpm_available, TpmCounter};
+        if !tpm_available() {
+            eprintln!("skipping tpm_strict_end_to_end_detects_rollback: no TPM 2.0");
+            return;
+        }
+        let index = 0x0171_0000u32 | 0xFE02;
+        fn undefine(i: u32) {
+            let _ = std::process::Command::new("tpm2_nvundefine")
+                .arg(format!("0x{i:08X}"))
+                .args(["-C", "o"])
+                .env("TCTI", "device:/dev/tpmrm0")
+                .output();
+        }
+        struct Guard(u32);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                undefine(self.0);
+            }
+        }
+        undefine(index); // clear any stale test index
+        let _guard = Guard(index);
+
+        let dir = tempdir().expect("tempdir");
+        let (paths, pass) = anti_rollback_paths(dir.path());
+        let counter = TpmCounter::with_index(index);
+
+        // Init under the TPM counter → v0x03 KEK; materialise the DB.
+        init_db_with_counter(&paths, &pass, &counter);
+        let kek0 = fs::read(&paths.kek).expect("kek@init");
+        assert_eq!(kek0[8], KEK_VERSION_COUNTER_BOUND, "TPM-bound KEK is v0x03");
+
+        // Rekey advances the hardware counter; steady-state reopen works.
+        rotate_dek_with(&paths, &pass, Some(&counter)).expect("rekey");
+        drop(resolve_dek_with(&paths, &pass, Some(&counter)).expect("reopen"));
+
+        // Roll back the KEK to its pre-rekey snapshot: the TPM counter has
+        // advanced, so the restored KEK no longer decapsulates.
+        fs::write(&paths.kek, &kek0).expect("restore old kek");
+        match resolve_dek_with(&paths, &pass, Some(&counter)) {
+            Err(GroupError::Storage(m)) => assert!(m.contains("rollback"), "got: {m}"),
+            other => panic!("TPM rollback must be detected, got {other:?}"),
+        }
+    }
 }

@@ -90,13 +90,25 @@ pub fn counter_for(
 ) -> Result<Option<Box<dyn RollbackCounter>>, GroupError> {
     match policy {
         RollbackPolicy::Off => Ok(None),
+        // Software counter (always available, best-effort). Deterministic
+        // per policy: a DB created under `permissive` is always opened with
+        // the software counter, never silently switched to TPM.
         RollbackPolicy::Permissive => Ok(Some(Box::new(SoftwareCounter::for_db(db_path)?))),
-        RollbackPolicy::Strict => Err(GroupError::Storage(
-            "NK_ROLLBACK_POLICY=strict requires a hardware-backed rollback counter, \
-             which is not yet implemented (TPM NV is a future provider); \
-             use 'permissive' for the software counter"
-                .into(),
-        )),
+        // Hardware-backed TPM NV counter. Constructing the counter performs
+        // no TPM I/O (the NV index is allocated lazily on first use), so we
+        // gate on a cheap availability probe to fail fast on a TPM-less host.
+        RollbackPolicy::Strict => {
+            if tpm_available() {
+                Ok(Some(Box::new(TpmCounter::for_db(db_path)?)))
+            } else {
+                Err(GroupError::Storage(
+                    "NK_ROLLBACK_POLICY=strict requires a working TPM 2.0 (tpm2-tools + \
+                     /dev/tpmrm0); none was detected. Use 'permissive' for the software \
+                     counter, or 'off' to disable rollback protection"
+                        .into(),
+                ))
+            }
+        }
     }
 }
 
@@ -194,6 +206,155 @@ impl RollbackCounter for SoftwareCounter {
 }
 
 // -----------------------------------------------------------------------------
+// TpmCounter (TPM 2.0 NV monotonic counter)
+// -----------------------------------------------------------------------------
+
+/// TCTI used to reach the in-kernel resource manager. Matches
+/// [`crate::key::tpm`].
+const TPM_TCTI: &str = "device:/dev/tpmrm0";
+/// Owner-hierarchy NV-index base for per-DB rollback counters. The low 20
+/// bits are derived from the DB path, so co-located DBs get independent
+/// counters. Range `0x0150_0000..=0x0150_FFFFF` (≡ `0x0150_0000` |
+/// 20-bit) lives in the owner-defined NV space, above the TCG-reserved
+/// `0x0140_xxxx` block and below the platform range (`0x0180_0000+`).
+const TPM_NV_BASE: u32 = 0x0150_0000;
+/// Mask of DB-derived index bits (20). Path collision is ≈1/2^20 per DB
+/// pair; a true collision shares one TPM counter, so rekeying one DB would
+/// invalidate the other's KEK. Acceptable for the single-user / few-DB
+/// target (a registry-free design); documented in SECURITY_PROFILE.md §7.5.
+const TPM_NV_SUB_MASK: u32 = 0x000F_FFFF;
+
+/// Run a `tpm2-tools` command against [`TPM_TCTI`], returning raw stdout.
+/// `LC_ALL=C` pins message text so error-code matching (e.g. the
+/// uninitialized-NV probe) is locale-independent.
+fn tpm2(args: &[&str]) -> Result<Vec<u8>, GroupError> {
+    let out = std::process::Command::new(args[0])
+        .args(&args[1..])
+        .env("TCTI", TPM_TCTI)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .output()
+        .map_err(|e| GroupError::Backend(format!("spawn {}: {e}", args[0])))?;
+    if !out.status.success() {
+        return Err(GroupError::Backend(format!(
+            "{} failed: {}",
+            args[0],
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok(out.stdout)
+}
+
+/// Cheap probe: is a usable TPM 2.0 present?
+pub fn tpm_available() -> bool {
+    tpm2(&["tpm2_getcap", "properties-fixed"]).is_ok()
+}
+
+/// A monotonic counter backed by a TPM 2.0 NV counter index.
+///
+/// A TPM NV counter is hardware-enforced monotonic and survives a wipe of
+/// the storage directory entirely, so it closes the software counter's
+/// residual risk (an attacker who also restores the out-of-dir state file).
+/// Each increment advances the value by exactly 1; a freshly defined index
+/// is primed (incremented once) so it is immediately readable.
+pub struct TpmCounter {
+    /// NV index as a `tpm2-tools` argument, e.g. `0x01710A3F`.
+    index_arg: String,
+}
+
+impl TpmCounter {
+    /// Derive the per-DB NV index from the absolute DB path. Two DBs whose
+    /// paths collide in the low 16 bits of SHA-256 would share a counter
+    /// (≈1/65536 per pair) — acceptable for the single-user, few-DB target.
+    pub fn for_db(db_path: &Path) -> Result<Self, GroupError> {
+        let abs = absolutize(db_path);
+        let digest = hash(MessageDigest::sha256(), abs.as_os_str().as_encoded_bytes())
+            .map_err(|e| GroupError::Backend(format!("tpm index hash: {e}")))?;
+        let sub = u32::from_be_bytes([0, digest[0], digest[1], digest[2]]) & TPM_NV_SUB_MASK;
+        Ok(Self::with_index(TPM_NV_BASE | sub))
+    }
+
+    /// Construct for an explicit NV index (tests / custom layouts).
+    pub fn with_index(index: u32) -> Self {
+        Self {
+            index_arg: format!("0x{index:08X}"),
+        }
+    }
+
+    fn is_defined(&self) -> bool {
+        tpm2(&["tpm2_nvreadpublic", &self.index_arg]).is_ok()
+    }
+
+    /// Read the counter, or `None` if it has been defined but never
+    /// incremented (a TPM counter is unreadable until its first increment —
+    /// `tpm2_nvread` fails with TPM error `0x14A`, "used before being
+    /// initialized", which we map to `None`).
+    fn read_value(&self) -> Result<Option<u64>, GroupError> {
+        let bytes = match tpm2(&["tpm2_nvread", &self.index_arg, "-C", "o"]) {
+            Ok(b) => b,
+            Err(GroupError::Backend(msg))
+                if msg.contains("0x14A") || msg.contains("before being initialized") =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let arr: [u8; 8] = bytes.get(..8).and_then(|b| b.try_into().ok()).ok_or_else(|| {
+            GroupError::Backend(format!("tpm nvread returned {} bytes (expected 8)", bytes.len()))
+        })?;
+        Ok(Some(u64::from_be_bytes(arr)))
+    }
+
+    fn increment(&self) -> Result<(), GroupError> {
+        tpm2(&["tpm2_nvincrement", &self.index_arg, "-C", "o"]).map(|_| ())
+    }
+
+    /// Ensure the NV counter exists and is readable (define it if missing,
+    /// prime it with one increment if it has never been incremented). Safe
+    /// to call repeatedly; only writes the TPM the first time.
+    fn ensure_ready(&self) -> Result<(), GroupError> {
+        if !self.is_defined() {
+            tpm2(&[
+                "tpm2_nvdefine",
+                &self.index_arg,
+                "-C",
+                "o",
+                "-s",
+                "8",
+                "-a",
+                "ownerread|ownerwrite|authread|authwrite|nt=counter",
+            ])?;
+        }
+        // Prime: a just-defined (or define-then-crash) counter is unreadable
+        // until its first increment. Priming makes `current()` always return
+        // a real value and keeps per-increment deltas at exactly +1.
+        if self.read_value()?.is_none() {
+            self.increment()?;
+        }
+        Ok(())
+    }
+}
+
+impl RollbackCounter for TpmCounter {
+    fn current(&self) -> Result<u64, GroupError> {
+        self.ensure_ready()?;
+        self.read_value()?
+            .ok_or_else(|| GroupError::Backend("tpm counter unreadable after priming".into()))
+    }
+
+    fn advance(&self) -> Result<u64, GroupError> {
+        self.ensure_ready()?;
+        self.increment()?;
+        self.read_value()?
+            .ok_or_else(|| GroupError::Backend("tpm counter unreadable after increment".into()))
+    }
+
+    fn kind(&self) -> &'static str {
+        "tpm"
+    }
+}
+
+// -----------------------------------------------------------------------------
 // Internals
 // -----------------------------------------------------------------------------
 
@@ -208,15 +369,27 @@ fn state_dir() -> PathBuf {
     PathBuf::from(".")
 }
 
-/// Make `p` absolute without requiring it to exist (canonicalize fails on a
-/// not-yet-created DB). A relative path is joined onto the current dir.
+/// Make `p` absolute and as canonical as possible without requiring the DB
+/// file itself to exist (it may not yet on first init). A relative path is
+/// joined onto the current dir; the **parent** directory is canonicalized
+/// best-effort so the same DB reached via a symlinked or relative directory
+/// resolves to one stable counter (otherwise distinct paths to the same DB
+/// would derive distinct counters, which could bypass rollback detection).
+/// The file-name component is not symlink-resolved.
 fn absolutize(p: &Path) -> PathBuf {
-    if p.is_absolute() {
+    let abs = if p.is_absolute() {
         p.to_path_buf()
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(p)
+    };
+    match (abs.parent(), abs.file_name()) {
+        (Some(parent), Some(name)) => match fs::canonicalize(parent) {
+            Ok(canon) => canon.join(name),
+            Err(_) => abs, // parent doesn't exist yet; use the plain absolute path
+        },
+        _ => abs,
     }
 }
 
@@ -320,12 +493,45 @@ mod tests {
     }
 
     #[test]
-    fn strict_policy_errors_without_hardware() {
-        match counter_for(RollbackPolicy::Strict, Path::new("groups.db")) {
-            Err(GroupError::Storage(_)) => {}
-            Ok(_) => panic!("strict must error without hardware"),
-            Err(other) => panic!("unexpected error: {other:?}"),
+    fn strict_policy_matches_tpm_availability() {
+        // Constructing the strict counter does no TPM I/O; it just reflects
+        // whether a TPM is present. (No NV index is allocated here.)
+        let r = counter_for(RollbackPolicy::Strict, Path::new("groups.db"));
+        if tpm_available() {
+            assert!(matches!(r, Ok(Some(_))), "TPM present → counter");
+        } else {
+            assert!(matches!(r, Err(GroupError::Storage(_))), "no TPM → error");
         }
+    }
+
+    /// Undefine an NV index so TPM tests leave no residue, even on panic.
+    struct NvCleanup(u32);
+    impl Drop for NvCleanup {
+        fn drop(&mut self) {
+            let arg = format!("0x{:08X}", self.0);
+            let _ = tpm2(&["tpm2_nvundefine", &arg, "-C", "o"]);
+        }
+    }
+
+    #[test]
+    fn tpm_counter_advances_monotonically() {
+        if !tpm_available() {
+            eprintln!("skipping: no TPM 2.0 available");
+            return;
+        }
+        // Dedicated test index, cleaned up via the drop guard.
+        let index = TPM_NV_BASE | 0xFE01;
+        let _guard = NvCleanup(index);
+        let _ = tpm2(&["tpm2_nvundefine", &format!("0x{index:08X}"), "-C", "o"]); // stale
+
+        let c = TpmCounter::with_index(index);
+        let v0 = c.current().expect("current primes + reads");
+        let v1 = c.advance().expect("advance");
+        let v2 = c.advance().expect("advance");
+        assert_eq!(v1, v0 + 1, "increments by exactly 1");
+        assert_eq!(v2, v0 + 2);
+        // A fresh handle to the same index observes the persisted value.
+        assert_eq!(TpmCounter::with_index(index).current().unwrap(), v2);
     }
 }
 
