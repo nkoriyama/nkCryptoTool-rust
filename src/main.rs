@@ -572,7 +572,36 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
         let ticket: Ticket = url
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid --inbox-url ticket: {e}"))?;
-        processor.set_inbox(Some(ticket.peer_addr()));
+        let inbox_addr = ticket.peer_addr();
+        // Anti-rollback phase 3: when rollback protection is enabled, report
+        // our current at-rest epoch to the (semi-trusted) inbox server. A
+        // regression flagged here is an online cross-device hint that local
+        // storage was rolled back. Advisory only — warn, never block — since
+        // the server could equally lie; the local counter is authoritative.
+        match nk_crypto_tool::group::current_rollback_epoch(&at_rest_paths) {
+            Ok(Some(epoch)) => {
+                match nk_crypto_tool::network::inbox::checkpoint(
+                    endpoint.as_ref(),
+                    &inbox_addr,
+                    epoch,
+                )
+                .await
+                {
+                    Ok(nk_crypto_tool::network::inbox::CheckpointStatus::RollbackSuspected) => {
+                        eprintln!(
+                            "[at-rest] WARNING: inbox checkpoint reports a newer epoch than our \
+                             local {epoch} — local storage may have been rolled back to an older \
+                             snapshot. Verify before trusting this state."
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[at-rest] inbox checkpoint skipped: {e}"),
+                }
+            }
+            Ok(None) => {} // rollback policy off — nothing to report
+            Err(e) => eprintln!("[at-rest] could not read rollback epoch: {e}"),
+        }
+        processor.set_inbox(Some(inbox_addr));
     }
     let processor = processor;
     let result = cli::run(cmd, processor).await;

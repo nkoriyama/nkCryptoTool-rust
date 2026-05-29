@@ -369,8 +369,18 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
     TPM 全体を初期化) 時は v0x03 DB が開けなくなる (有効化の対価として文書化)。
     `TPM2_Clear` はプラットフォーム/owner クリア権限を要し全 TPM 状態を消すため、
     巻き戻し攻撃の前提 (storage dir 書込) より遥かに高い壁。MLS epoch 単調増加は
-    引き続き部分的なバックストップ。フェーズ3 (inbox リモートチェックポイント) は
-    未実装。
+    引き続き部分的なバックストップ。
+  - **`inbox` リモートチェックポイント (フェーズ3)**: `nkct/inbox/1` に `CHECKPOINT`
+    操作 (tag `0x03`) を追加。クライアントは現在の at-rest epoch を inbox サーバへ
+    報告し、サーバは認証済み peer (QUIC NodeId) ごとに最大 epoch を保持
+    (`checkpoints` テーブル) して退行を検知 (`network::inbox::checkpoint` ↔
+    `handle_checkpoint`)。**オフデバイスの独立アンカー**なので、storage dir + state
+    ファイルを丸ごと過去版に戻されても (software カウンタ単独では検知不能なケース)
+    オンライン時に検知できる。ただし inbox サーバは**半信頼**(payload 非読取の
+    Delivery Service) — サーバが嘘をつけば false negative/positive があり得るため、
+    `RollbackSuspected` は**警告**に留め、ローカル TPM/software カウンタを権威的な
+    チェックとして維持する (ハードフェイルしない)。`--inbox-url` 設定かつ
+    `NK_ROLLBACK_POLICY != off` のときに送信。
   - **DoS (fail-closed) の許容**: `/dev/tpmrm0` 書込権限を持つローカル攻撃者は NV
     カウンタを勝手に increment / undefine して v0x03 DB を開けなくできる (DoS)。
     ただしこれは **fail-closed** であり、カウンタを進める/消すことが古い KEK を

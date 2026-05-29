@@ -27,7 +27,9 @@ pub mod storage;
 pub mod transport;
 pub mod types;
 
-pub use at_rest::{open_at_rest_storage, resolve_dek, rotate_dek, AtRestKey, AtRestPaths};
+pub use at_rest::{
+    current_rollback_epoch, open_at_rest_storage, resolve_dek, rotate_dek, AtRestKey, AtRestPaths,
+};
 pub use crypto_adapter::{hybrid_cipher_suite, HYBRID_SUITE_ID};
 pub use processor::GroupChatProcessor;
 pub use storage::{GroupStorage, TunedFileStrategy};

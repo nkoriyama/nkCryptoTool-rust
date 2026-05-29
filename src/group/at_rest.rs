@@ -545,6 +545,21 @@ pub fn resolve_dek(
     resolve_dek_with(paths, passphrase, counter.as_deref())
 }
 
+/// The current at-rest rollback epoch for the DB at `paths.db` under the
+/// active `NK_ROLLBACK_POLICY`, or `None` when rollback protection is off.
+///
+/// Callers report this to a semi-trusted inbox server (see
+/// [`crate::network::inbox::checkpoint`]) for an online cross-device
+/// rollback check (anti-rollback phase 3). Reading it is side-effect-free
+/// for the software counter; for the TPM counter it primes the NV index on
+/// first use (same as opening the DB would).
+pub fn current_rollback_epoch(paths: &AtRestPaths) -> Result<Option<u64>, GroupError> {
+    match rollback::counter_for(rollback::RollbackPolicy::from_env(), &paths.db)? {
+        Some(c) => Ok(Some(c.current()?)),
+        None => Ok(None),
+    }
+}
+
 /// [`resolve_dek`] with an explicit (optional) anti-rollback counter. The
 /// public wrapper builds the counter from `NK_ROLLBACK_POLICY`; this seam
 /// lets tests inject an in-memory counter. `None` reproduces the exact

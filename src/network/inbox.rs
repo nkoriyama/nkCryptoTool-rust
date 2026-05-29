@@ -62,8 +62,29 @@ pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
 
 const TAG_DEPOSIT: u8 = 0x01;
 const TAG_POLL: u8 = 0x02;
+/// CHECKPOINT: the client reports its current at-rest rollback epoch; the
+/// server (an independent, off-device trust boundary) remembers the
+/// highest epoch seen per authenticated peer and flags a regression. See
+/// the anti-rollback phase 3 in ATREST_ANTIROLLBACK_DESIGN.md.
+const TAG_CHECKPOINT: u8 = 0x03;
 const REPLY_OK: u8 = 0x00;
+/// CHECKPOINT reply: the reported epoch is *older* than one the server has
+/// already seen for this peer — the client's local at-rest state may have
+/// been rolled back.
+const REPLY_ROLLBACK: u8 = 0xFE;
 const REPLY_FAIL: u8 = 0xFF;
+
+/// Outcome of a [`checkpoint`] exchange.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointStatus {
+    /// The reported epoch was ≥ the server's record; the record is updated.
+    Ok,
+    /// The reported epoch is older than the server's record — a possible
+    /// at-rest rollback. Advisory only: the inbox server is semi-trusted
+    /// (it could equally lie), so callers should warn rather than hard-fail;
+    /// the local TPM/software counter remains the authoritative check.
+    RollbackSuspected,
+}
 
 #[derive(thiserror::Error, Debug)]
 pub enum InboxError {
@@ -206,6 +227,41 @@ pub async fn poll(
     Ok((last_cursor, envelopes))
 }
 
+/// Report the local at-rest rollback `epoch` to the inbox `server` and ask
+/// whether it has seen a newer one for us (identified by the QUIC
+/// handshake NodeId). The server records `max(epoch, stored)` and replies
+/// [`CheckpointStatus::RollbackSuspected`] if `epoch` is *older* than its
+/// record — an online cross-device signal that the local storage was
+/// reverted to an earlier snapshot (closing the software-counter residual
+/// when online).
+///
+/// Advisory: the inbox server is semi-trusted, so a `RollbackSuspected`
+/// result should be surfaced as a warning, not a hard failure.
+pub async fn checkpoint(
+    endpoint: &dyn P2pEndpoint,
+    server: &PeerAddr,
+    epoch: u64,
+) -> Result<CheckpointStatus, InboxError> {
+    let mut stream = endpoint.connect(server, P2pProtocol(ALPN_INBOX)).await?;
+    let mut header = Vec::with_capacity(1 + 8);
+    header.push(TAG_CHECKPOINT);
+    header.extend_from_slice(&epoch.to_le_bytes());
+    write_timed(&mut stream, &header, "checkpoint header").await?;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush())
+        .await
+        .map_err(|_| InboxError::Timeout("checkpoint flush"))??;
+    let mut reply = [0u8; 1];
+    read_timed(&mut stream, &mut reply, "checkpoint reply").await?;
+    let _ = stream.shutdown().await;
+    match reply[0] {
+        REPLY_OK => Ok(CheckpointStatus::Ok),
+        REPLY_ROLLBACK => Ok(CheckpointStatus::RollbackSuspected),
+        other => Err(InboxError::Protocol(format!(
+            "checkpoint: unexpected reply {other:#x}"
+        ))),
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Server
 // -----------------------------------------------------------------------------
@@ -213,7 +269,7 @@ pub async fn poll(
 #[cfg(feature = "mls")]
 mod server {
     use super::*;
-    use rusqlite::{params, Connection};
+    use rusqlite::{params, Connection, OptionalExtension};
     use std::path::Path;
     use tokio::sync::Mutex as AsyncMutex;
     use zeroize::Zeroizing;
@@ -271,6 +327,10 @@ mod server {
                 );
                 CREATE INDEX IF NOT EXISTS envelopes_recipient_id
                     ON envelopes(recipient, id);
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    peer   BLOB PRIMARY KEY,
+                    epoch  INTEGER NOT NULL
+                );
                 ",
             )
             .map_err(InboxError::Sqlite)?;
@@ -325,6 +385,7 @@ mod server {
             match tag[0] {
                 TAG_DEPOSIT => self.handle_deposit(&mut *incoming.stream, sender).await,
                 TAG_POLL => self.handle_poll(&mut *incoming.stream, sender).await,
+                TAG_CHECKPOINT => self.handle_checkpoint(&mut *incoming.stream, sender).await,
                 t => Err(InboxError::Protocol(format!("unknown tag {t:#x}"))),
             }
         }
@@ -416,6 +477,51 @@ mod server {
             tokio::time::timeout(IO_TIMEOUT, stream.flush())
                 .await
                 .map_err(|_| InboxError::Timeout("poll flush"))??;
+            let _ = stream.shutdown().await;
+            Ok(())
+        }
+
+        async fn handle_checkpoint<S>(
+            &self,
+            stream: &mut S,
+            peer: PeerId,
+        ) -> Result<(), InboxError>
+        where
+            S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized,
+        {
+            let mut epoch_buf = [0u8; 8];
+            read_timed(stream, &mut epoch_buf, "checkpoint epoch").await?;
+            // Counters fit comfortably in i63; clamp defensively so a bogus
+            // huge value can't wrap when stored as sqlite INTEGER.
+            let epoch = u64::from_le_bytes(epoch_buf).min(i64::MAX as u64) as i64;
+            // `peer` is the handshake-authenticated NodeId, so a client can
+            // only checkpoint its own record (no peer field on the wire).
+            let reply = {
+                let db = self.db.lock().await;
+                let stored: Option<i64> = db
+                    .query_row(
+                        "SELECT epoch FROM checkpoints WHERE peer = ?",
+                        params![peer.as_bytes().as_slice()],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match stored {
+                    Some(s) if epoch < s => REPLY_ROLLBACK, // regression: do not update
+                    _ => {
+                        let newv = stored.map_or(epoch, |s| s.max(epoch));
+                        db.execute(
+                            "INSERT INTO checkpoints(peer, epoch) VALUES(?1, ?2) \
+                             ON CONFLICT(peer) DO UPDATE SET epoch = ?2",
+                            params![peer.as_bytes().as_slice(), newv],
+                        )?;
+                        REPLY_OK
+                    }
+                }
+            };
+            write_timed(stream, &[reply], "checkpoint reply").await?;
+            tokio::time::timeout(IO_TIMEOUT, stream.flush())
+                .await
+                .map_err(|_| InboxError::Timeout("checkpoint flush"))??;
             let _ = stream.shutdown().await;
             Ok(())
         }
@@ -590,5 +696,50 @@ mod tests {
             Ok(_) => panic!("wrong passphrase must fail"),
             Err(e) => assert!(matches!(e, InboxError::AtRest(_)), "unexpected error: {e}"),
         }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_tracks_max_and_flags_regression() {
+        let net = MockNetwork::new();
+        let client =
+            Arc::new(net.register(pid(7), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let other =
+            Arc::new(net.register(pid(8), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let server_ep =
+            Arc::new(net.register(pid(99), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let dir = tempdir().expect("tempdir");
+        let server = Arc::new(
+            InboxServer::open(dir.path().join("inbox.db"), &test_passphrase()).expect("open"),
+        );
+        let task = {
+            let s = Arc::clone(&server);
+            let ep = Arc::clone(&server_ep);
+            tokio::spawn(async move {
+                let _ = s.run(ep).await;
+            })
+        };
+        let srv = PeerAddr::new(pid(99));
+
+        // Monotonic non-decreasing reports are accepted.
+        assert_eq!(checkpoint(client.as_ref(), &srv, 5).await.unwrap(), CheckpointStatus::Ok);
+        assert_eq!(checkpoint(client.as_ref(), &srv, 5).await.unwrap(), CheckpointStatus::Ok);
+        assert_eq!(checkpoint(client.as_ref(), &srv, 9).await.unwrap(), CheckpointStatus::Ok);
+
+        // A lower epoch than the server's record => rollback suspected, and
+        // the record is NOT lowered.
+        assert_eq!(
+            checkpoint(client.as_ref(), &srv, 3).await.unwrap(),
+            CheckpointStatus::RollbackSuspected
+        );
+        assert_eq!(checkpoint(client.as_ref(), &srv, 9).await.unwrap(), CheckpointStatus::Ok);
+        assert_eq!(
+            checkpoint(client.as_ref(), &srv, 8).await.unwrap(),
+            CheckpointStatus::RollbackSuspected
+        );
+
+        // Records are per-peer: a different NodeId starts fresh.
+        assert_eq!(checkpoint(other.as_ref(), &srv, 1).await.unwrap(), CheckpointStatus::Ok);
+
+        task.abort();
     }
 }
