@@ -208,6 +208,68 @@ struct Args {
     /// out. The listen REPL also runs a background poll task.
     #[arg(long)]
     inbox_url: Option<String>,
+
+    // -------------------------------------------------------------
+    // One-Time Prekey flags (PQ-FS for the one-shot / inbox-async
+    // path; see PQFS_DESIGN.md). Gated behind `--features mls`.
+    // -------------------------------------------------------------
+    /// One-Time Prekey subcommand: `generate`, `list`, or `revoke`.
+    #[arg(long, help = "One-Time Prekey subcommand (generate|list|revoke)")]
+    prekey_cmd: Option<String>,
+
+    /// SQLCipher database holding prekey private keys. Defaults to
+    /// `prekeys.db` beside the MLS storage (directory auto-created).
+    #[arg(long)]
+    prekey_storage: Option<String>,
+
+    /// Number of prekeys to generate (for `--prekey-cmd generate`).
+    #[arg(long, default_value_t = 100)]
+    prekey_count: u32,
+
+    /// Optional path to write the signed public prekey bundle produced
+    /// by `--prekey-cmd generate` (for later upload / PUBLISH).
+    #[arg(long)]
+    prekey_output: Option<String>,
+
+    /// Prekey id to revoke (for `--prekey-cmd revoke`).
+    #[arg(long)]
+    prekey_id: Option<u32>,
+
+    /// Revoke every prekey (for `--prekey-cmd revoke`).
+    #[arg(long)]
+    prekey_all: bool,
+}
+
+/// Resolve a key-file argument against `--key-dir`. A bare filename (no
+/// path separator) is taken as living in `key_dir`; anything with a `/`
+/// or an absolute path is used verbatim. This lets
+/// `--key-dir D --user-mlkem-privkey foo.key` find `D/foo.key` without
+/// forcing the user to repeat the directory, while leaving explicit
+/// relative/absolute paths untouched.
+fn resolve_key_path(key_dir: &str, p: Option<String>) -> Option<String> {
+    p.map(|v| {
+        let path = std::path::Path::new(&v);
+        // "Bare filename" = no directory component and not absolute. Using
+        // Path (not a manual '/' check) makes this correct on every
+        // platform's separator.
+        let is_bare = !path.is_absolute()
+            && path.parent().map_or(true, |parent| parent.as_os_str().is_empty());
+        if is_bare {
+            std::path::Path::new(key_dir).join(&v).to_string_lossy().into_owned()
+        } else {
+            v
+        }
+    })
+}
+
+/// True if `path` points to a PEM file holding a passphrase-encrypted
+/// private key (a `BEGIN ENCRYPTED PRIVATE KEY` block), i.e. one that
+/// needs a passphrase to load. Missing/unreadable/plaintext keys → false.
+fn private_key_file_is_encrypted(path: &Option<String>) -> bool {
+    match path {
+        Some(p) => nk_crypto_tool::utils::private_key_file_is_encrypted(p),
+        None => false,
+    }
 }
 
 #[tokio::main]
@@ -271,6 +333,19 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if args.prekey_cmd.is_some() {
+        #[cfg(feature = "mls")]
+        {
+            return run_prekey_command(args).await;
+        }
+        #[cfg(not(feature = "mls"))]
+        {
+            anyhow::bail!(
+                "--prekey-cmd requires the `mls` cargo feature; rebuild with `--features mls`"
+            );
+        }
+    }
+
     let mode = match args.mode {
         Some(m) => m,
         None => return Err(anyhow::anyhow!("--mode is required for CLI operations")),
@@ -326,12 +401,14 @@ async fn main() -> anyhow::Result<()> {
     config.input_files = args.input_files;
     config.output_file = args.output_file;
     config.key_dir = args.key_dir.unwrap_or_else(|| "keys".to_string());
-    config.recipient_pubkey = args.recipient_pubkey;
-    config.recipient_mlkem_pubkey = args.recipient_mlkem_pubkey;
-    config.recipient_ecdh_pubkey = args.recipient_ecdh_pubkey;
-    config.user_privkey = args.user_privkey;
-    config.user_mlkem_privkey = args.user_mlkem_privkey;
-    config.user_ecdh_privkey = args.user_ecdh_privkey;
+    // Bare key filenames resolve under --key-dir; explicit relative/
+    // absolute paths are left as given.
+    config.recipient_pubkey = resolve_key_path(&config.key_dir, args.recipient_pubkey);
+    config.recipient_mlkem_pubkey = resolve_key_path(&config.key_dir, args.recipient_mlkem_pubkey);
+    config.recipient_ecdh_pubkey = resolve_key_path(&config.key_dir, args.recipient_ecdh_pubkey);
+    config.user_privkey = resolve_key_path(&config.key_dir, args.user_privkey);
+    config.user_mlkem_privkey = resolve_key_path(&config.key_dir, args.user_mlkem_privkey);
+    config.user_ecdh_privkey = resolve_key_path(&config.key_dir, args.user_ecdh_privkey);
     config.signing_privkey = args.signing_privkey;
     config.signing_pubkey = args.signing_pubkey;
     config.signature_file = args.signature;
@@ -364,6 +441,32 @@ async fn main() -> anyhow::Result<()> {
         eprintln!(
             "This may prevent connections from succeeding. Use --allow-unauth if you want anonymous chat."
         );
+    }
+
+    // If this operation reads a private key, that key is passphrase-
+    // encrypted, and no passphrase was supplied via NK_PASSPHRASE, prompt
+    // for one now — rather than failing deep in the strategy with
+    // "Encrypted private key requires a passphrase". Plaintext keys are
+    // left alone (no prompt).
+    if config.passphrase.is_none() {
+        let reads_private_key = matches!(
+            operation,
+            Operation::Decrypt | Operation::Sign | Operation::Connect | Operation::Listen
+        );
+        let encrypted_key_present = [
+            &config.user_privkey,
+            &config.user_mlkem_privkey,
+            &config.user_ecdh_privkey,
+            &config.signing_privkey,
+        ]
+        .into_iter()
+        .any(|p| private_key_file_is_encrypted(p));
+        if reads_private_key && encrypted_key_present {
+            config.passphrase = Some(
+                nk_crypto_tool::utils::get_masked_passphrase()
+                    .map_err(|e| anyhow::anyhow!("read private-key passphrase: {e}"))?,
+            );
+        }
     }
 
     if operation == Operation::Listen {
@@ -416,6 +519,139 @@ async fn main() -> anyhow::Result<()> {
 // flags, opens a `GroupStorage` at the user-specified (or default)
 // sqlite path, and hands everything to `nk_crypto_tool::group::cli::run`.
 // -----------------------------------------------------------------------------
+
+/// Load the raw ML-DSA-65 identity private key from a PEM file, mirroring
+/// the P2P handshake's key path (unwrap PEM → decrypt if encrypted →
+/// unwrap PKCS#8). `passphrase` decrypts an encrypted key; an empty
+/// passphrase is treated as "key is not encrypted".
+#[cfg(feature = "mls")]
+fn load_raw_dsa_priv(
+    path: &str,
+    passphrase: &zeroize::Zeroizing<String>,
+) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
+    use nk_crypto_tool::utils;
+    let bytes = zeroize::Zeroizing::new(
+        std::fs::read(path).map_err(|e| anyhow::anyhow!("read signing key {path}: {e}"))?,
+    );
+    let pem = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow::anyhow!("signing key {path} is not UTF-8 PEM"))?;
+    let der = utils::unwrap_from_pem(pem, "PRIVATE KEY")?;
+    let pass = if passphrase.is_empty() {
+        None
+    } else {
+        Some(passphrase.as_str())
+    };
+    let decrypted = utils::extract_raw_private_key(&der, pass)?;
+    Ok(utils::unwrap_pqc_priv_from_pkcs8(&decrypted, "ML-DSA-65")?)
+}
+
+/// One-Time Prekey maintenance (PQFS_DESIGN.md phase 1): `generate`,
+/// `list`, `revoke`. Purely local — no network endpoint needed. The
+/// prekey private keys live in their own SQLCipher DB, unlocked by the
+/// same PQC at-rest DEK mechanism as the MLS storage.
+#[cfg(feature = "mls")]
+async fn run_prekey_command(args: Args) -> anyhow::Result<()> {
+    use nk_crypto_tool::group::cli::default_storage_path;
+    use nk_crypto_tool::group::{resolve_dek, AtRestPaths};
+    use nk_crypto_tool::prekey::{self, PrekeyStore};
+    use std::path::PathBuf;
+
+    let cmd = args.prekey_cmd.as_deref().unwrap();
+
+    let store_path: PathBuf = match args.prekey_storage.as_deref() {
+        Some(p) => PathBuf::from(p),
+        None => default_storage_path()?.with_file_name("prekeys.db"),
+    };
+
+    // The at-rest passphrase unlocks the hybrid key that wraps the DEK
+    // protecting the prekey store. `beside_db` keeps a dedicated
+    // `prekeys.db.at-rest.key` so it never races the shared `at-rest.key`
+    // groups.db uses in the same directory.
+    let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+        .map_err(|e| anyhow::anyhow!("read prekey storage passphrase: {e}"))?;
+    let at_rest_paths = AtRestPaths::beside_db(&store_path);
+    let dek = resolve_dek(&at_rest_paths, &passphrase)
+        .map_err(|e| anyhow::anyhow!("resolve prekey at-rest DEK: {e}"))?;
+    let store = PrekeyStore::open(&store_path, &dek)
+        .map_err(|e| anyhow::anyhow!("open prekey store {store_path:?}: {e}"))?;
+
+    match cmd {
+        "generate" => {
+            let count = args.prekey_count;
+            // A sane upper bound: a huge count would over-allocate and is
+            // never operationally useful (each prekey is ~4.5 KB). Reject
+            // rather than risk an OOM on a fat-fingered argument.
+            const MAX_PREKEY_BATCH: u32 = 100_000;
+            if count == 0 || count > MAX_PREKEY_BATCH {
+                anyhow::bail!("--prekey-count must be between 1 and {MAX_PREKEY_BATCH}");
+            }
+            let signing_path = args
+                .signing_privkey
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--signing-privkey is required for prekey generate"))?;
+            // The at-rest passphrase doubles as the signing-key passphrase,
+            // matching this tool's single-secret (NK_PASSPHRASE) convention.
+            // An unencrypted key ignores it; a key under a *different*
+            // passphrase fails loudly at decrypt rather than silently.
+            let dsa_priv = load_raw_dsa_priv(signing_path, &passphrase)?;
+            // Reserve ids from the persistent monotonic counter so a batch
+            // never reuses an id, even after the pool was fully drained.
+            let start_id = store.reserve_ids(count)?;
+            let batch = prekey::generate(count, start_id, &dsa_priv)?;
+            let mut bundle = Vec::new();
+            for g in &batch {
+                store.insert(g.signed.prekey_id, g.xwing_priv.as_ref())?;
+                bundle.extend_from_slice(&g.signed.to_bytes());
+            }
+            let last = start_id + count - 1;
+            match args.prekey_output.as_deref() {
+                Some(out) => {
+                    std::fs::write(out, &bundle)
+                        .map_err(|e| anyhow::anyhow!("write prekey bundle {out}: {e}"))?;
+                    println!(
+                        "Generated {count} prekeys (ids {start_id}..={last}); stored privates and wrote signed bundle to {out}."
+                    );
+                }
+                None => println!(
+                    "Generated {count} prekeys (ids {start_id}..={last}); stored privates. Pass --prekey-output to write the signed public bundle for upload."
+                ),
+            }
+            println!("Pool now holds {} unused prekey(s).", store.count()?);
+        }
+        "list" => {
+            let ids = store.list_ids()?;
+            println!("{} unused prekey(s).", ids.len());
+            if !ids.is_empty() {
+                let preview: Vec<String> = ids.iter().take(20).map(|i| i.to_string()).collect();
+                let more = if ids.len() > 20 {
+                    format!(" … (+{} more)", ids.len() - 20)
+                } else {
+                    String::new()
+                };
+                println!("ids: {}{}", preview.join(", "), more);
+            }
+        }
+        "revoke" => {
+            if args.prekey_all {
+                let n = store.delete_all()?;
+                println!("Revoked all {n} prekey(s).");
+            } else {
+                let id = args.prekey_id.ok_or_else(|| {
+                    anyhow::anyhow!("--prekey-id <N> or --prekey-all is required for revoke")
+                })?;
+                if store.delete(id)? {
+                    println!("Revoked prekey {id}.");
+                } else {
+                    println!("No prekey with id {id}.");
+                }
+            }
+        }
+        other => anyhow::bail!(
+            "unknown --prekey-cmd {other:?}; expected one of generate, list, revoke"
+        ),
+    }
+    Ok(())
+}
 
 #[cfg(feature = "mls")]
 async fn run_mls_command(args: Args) -> anyhow::Result<()> {

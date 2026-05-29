@@ -14,6 +14,25 @@ use std::ops::{Deref, DerefMut};
 
 use std::path::Path;
 
+/// True if the PEM file at `path` holds a passphrase-encrypted private
+/// key (a PKCS#8 `EncryptedPrivateKeyInfo`). Note the encrypted form may
+/// still carry the plain `-----BEGIN PRIVATE KEY-----` label, so the
+/// label alone is not a reliable signal — we parse the DER. Missing,
+/// unreadable, or plaintext keys return `false`. Used to decide whether to
+/// prompt for a passphrase before loading the key.
+pub fn private_key_file_is_encrypted(path: &str) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    let Ok(pem) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let Ok(der) = unwrap_from_pem(pem, "PRIVATE KEY") else {
+        return false;
+    };
+    pkcs8::EncryptedPrivateKeyInfo::from_der(&der).is_ok()
+}
+
 pub fn extract_raw_private_key(
     priv_der: &[u8],
     passphrase: Option<&str>,
