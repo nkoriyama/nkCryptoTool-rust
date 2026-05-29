@@ -401,6 +401,31 @@ impl AtRestPaths {
             .unwrap_or_else(|| PathBuf::from("at-rest.key"));
         Self { db, kek, key }
     }
+
+    /// Like [`from_db_path`](Self::from_db_path) but keeps the hybrid key
+    /// file beside the DB as `<db>.at-rest.key` instead of a shared
+    /// `at-rest.key` in the parent directory.
+    ///
+    /// Use this when several independent databases live in one directory:
+    /// a shared `at-rest.key` would otherwise be a hazard if two of them
+    /// are initialised concurrently (both would generate and race to write
+    /// the single key file, leaving one DB's KEK wrapped under a hybrid key
+    /// that no longer exists on disk). A DB-specific key file keeps each
+    /// at-rest triple self-contained. The same passphrase still unlocks
+    /// every per-DB key file.
+    pub fn beside_db(db: impl Into<PathBuf>) -> Self {
+        let db = db.into();
+        let with_suffix = |suffix: &str| {
+            let mut s = db.clone().into_os_string();
+            s.push(suffix);
+            PathBuf::from(s)
+        };
+        Self {
+            kek: with_suffix(".kek"),
+            key: with_suffix(".at-rest.key"),
+            db,
+        }
+    }
 }
 
 /// Open (or initialise) a SQLCipher-encrypted MLS storage with PQC
@@ -417,6 +442,25 @@ pub fn open_at_rest_storage(
     paths: &AtRestPaths,
     passphrase: &Zeroizing<String>,
 ) -> Result<GroupStorage, GroupError> {
+    let dek = resolve_dek(paths, passphrase)?;
+    GroupStorage::open_at_with_raw_key(&paths.db, &dek)
+}
+
+/// Resolve the SQLCipher DEK for the database at `paths.db`, performing all
+/// the at-rest housekeeping a caller needs before opening their own
+/// connection: it ensures the parent directory exists, loads or generates
+/// the hybrid keypair (`at-rest.key`) and KEK (`<db>.kek`), finishes any
+/// rekey interrupted by a crash, and migrates a legacy plaintext DB in
+/// place. The returned raw DEK is fed to `PRAGMA key = "x'<hex>'"`.
+///
+/// This is the database-agnostic core of [`open_at_rest_storage`]; the
+/// inbox server reuses it to protect its own sqlite file (see
+/// `network::inbox`). An empty passphrase is rejected — the project policy
+/// mandates at-rest protection.
+pub fn resolve_dek(
+    paths: &AtRestPaths,
+    passphrase: &Zeroizing<String>,
+) -> Result<Zeroizing<[u8; DEK_LEN]>, GroupError> {
     if passphrase.is_empty() {
         return Err(GroupError::Storage(
             "at-rest passphrase must not be empty — set NK_PASSPHRASE or enter one interactively".into(),
@@ -460,17 +504,16 @@ pub fn open_at_rest_storage(
     let dek = finalize_pending_rekey(paths, &at_rest_key, dek)?;
 
     // 3. Migrate a pre-SQLCipher plaintext DB in place, if one is found.
-    //    Older builds shipped `groups.db` as an unencrypted sqlite file
-    //    (the `sqlite-bundled` feature). Such a file cannot be opened with
-    //    a SQLCipher key, so on upgrade we transparently re-encrypt it
-    //    under the freshly-derived DEK before the open below. A no-op when
-    //    `groups.db` is absent or already SQLCipher-encrypted.
+    //    Older builds shipped the DB as an unencrypted sqlite file (the
+    //    `sqlite-bundled` feature). Such a file cannot be opened with a
+    //    SQLCipher key, so on upgrade we transparently re-encrypt it under
+    //    the freshly-derived DEK before the caller opens it. A no-op when
+    //    the DB is absent or already SQLCipher-encrypted.
     if is_plaintext_sqlite(&paths.db) {
         migrate_plaintext_to_sqlcipher(&paths.db, &dek)?;
     }
 
-    // 4. Open SQLCipher with the raw DEK.
-    GroupStorage::open_at_with_raw_key(&paths.db, &dek)
+    Ok(dek)
 }
 
 /// Path of the staging KEK written during a rekey (`<kek>.pending`).

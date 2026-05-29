@@ -636,6 +636,12 @@ async fn run_inbox_server(args: Args) -> anyhow::Result<()> {
     };
     eprintln!("[inbox] storage: {db_path:?}");
 
+    // The inbox DB is SQLCipher-encrypted (PQC at-rest layer) so envelope
+    // metadata (recipient / sender / timestamps) is never plaintext on the
+    // relay's disk. The passphrase decrypts `inbox.db.at-rest.key`.
+    let inbox_passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+        .map_err(|e| anyhow::anyhow!("read inbox storage passphrase: {e}"))?;
+
     let mut transport_config = CryptoConfig::default();
     transport_config.transport = args.transport;
     transport_config.no_relay = args.no_relay;
@@ -660,7 +666,8 @@ async fn run_inbox_server(args: Args) -> anyhow::Result<()> {
     let _ = std::io::stdout().flush();
 
     let server = Arc::new(
-        InboxServer::open(&db_path).map_err(|e| anyhow::anyhow!("open inbox: {e}"))?,
+        InboxServer::open(&db_path, &inbox_passphrase)
+            .map_err(|e| anyhow::anyhow!("open inbox: {e}"))?,
     );
     server
         .run(endpoint)

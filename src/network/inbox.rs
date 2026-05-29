@@ -82,6 +82,9 @@ pub enum InboxError {
     #[cfg(feature = "mls")]
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[cfg(feature = "mls")]
+    #[error("at-rest: {0}")]
+    AtRest(String),
 }
 
 async fn write_timed<S>(
@@ -213,6 +216,7 @@ mod server {
     use rusqlite::{params, Connection};
     use std::path::Path;
     use tokio::sync::Mutex as AsyncMutex;
+    use zeroize::Zeroizing;
 
     /// Persistent inbox: sqlite-backed envelope storage + ALPN_INBOX
     /// accept loop.
@@ -224,8 +228,35 @@ mod server {
         /// Open an inbox at `path`, creating the schema on first use.
         /// WAL + NORMAL synchronous so concurrent DEPOSIT/POLL don't
         /// block each other.
-        pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, InboxError> {
-            let conn = Connection::open(path).map_err(InboxError::Sqlite)?;
+        ///
+        /// The DB is SQLCipher-encrypted with a 256-bit DEK wrapped by the
+        /// same PQC at-rest layer as the MLS storage (see `group::at_rest`
+        /// and SECURITY_PROFILE.md §7.3). This matters even though every
+        /// `payload` is already MLS ciphertext: the `recipient`, `sender`,
+        /// and `created_at` columns are *metadata* that would otherwise sit
+        /// in plaintext on the relay's disk. `passphrase` decrypts the
+        /// hybrid key file; a legacy plaintext `inbox.db` is migrated in
+        /// place on first open.
+        pub fn open<P: AsRef<Path>>(
+            path: P,
+            passphrase: &Zeroizing<String>,
+        ) -> Result<Self, InboxError> {
+            // Recover (or initialise) the DEK via the at-rest layer, then
+            // hand it to SQLCipher as the page key. `PRAGMA key` MUST run
+            // before any other statement on the connection.
+            //
+            // `beside_db` keeps the inbox's hybrid key in `inbox.db.at-rest.key`
+            // rather than the shared `at-rest.key`, so an MLS client and a
+            // co-located inbox server in the same directory never race to
+            // create one key file.
+            let at_rest_paths = crate::group::AtRestPaths::beside_db(path.as_ref());
+            let dek = crate::group::resolve_dek(&at_rest_paths, passphrase)
+                .map_err(|e| InboxError::AtRest(e.to_string()))?;
+            let conn = Connection::open(path.as_ref()).map_err(InboxError::Sqlite)?;
+            let key_pragma =
+                Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex::encode(dek.as_ref())));
+            conn.execute_batch(key_pragma.as_str())
+                .map_err(InboxError::Sqlite)?;
             conn.execute_batch(
                 "
                 PRAGMA journal_mode = WAL;
@@ -243,6 +274,19 @@ mod server {
                 ",
             )
             .map_err(InboxError::Sqlite)?;
+
+            // Defence in depth on top of SQLCipher: keep the ciphertext DB
+            // unreadable by other local users.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(path.as_ref()) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o600);
+                    let _ = std::fs::set_permissions(path.as_ref(), perms);
+                }
+            }
+
             Ok(Self {
                 db: Arc::new(AsyncMutex::new(conn)),
             })
@@ -396,6 +440,10 @@ mod tests {
         PeerId::new([b; 32])
     }
 
+    fn test_passphrase() -> zeroize::Zeroizing<String> {
+        zeroize::Zeroizing::new("nkct-inbox-test-passphrase".to_string())
+    }
+
     /// End-to-end: alice deposits a payload addressed to bob; bob polls
     /// and retrieves it. Cursor advances across calls; a second poll
     /// from the new cursor returns nothing until a fresh deposit lands.
@@ -413,7 +461,9 @@ mod tests {
         ) as Arc<dyn P2pEndpoint>;
 
         let dir = tempdir().expect("tempdir");
-        let server = Arc::new(InboxServer::open(dir.path().join("inbox.db")).expect("open"));
+        let server = Arc::new(
+            InboxServer::open(dir.path().join("inbox.db"), &test_passphrase()).expect("open"),
+        );
         let server_task = {
             let s = Arc::clone(&server);
             let ep = Arc::clone(&server_ep);
@@ -479,7 +529,9 @@ mod tests {
             net.register(pid(99), vec![P2pProtocol(ALPN_INBOX)]),
         ) as Arc<dyn P2pEndpoint>;
         let dir = tempdir().expect("tempdir");
-        let server = Arc::new(InboxServer::open(dir.path().join("inbox.db")).expect("open"));
+        let server = Arc::new(
+            InboxServer::open(dir.path().join("inbox.db"), &test_passphrase()).expect("open"),
+        );
         let task = {
             let s = Arc::clone(&server);
             let ep = Arc::clone(&server_ep);
@@ -504,5 +556,39 @@ mod tests {
         assert_eq!(carol_mail, vec![b"for carol".to_vec()]);
 
         task.abort();
+    }
+
+    /// The inbox DB is SQLCipher-encrypted under a per-DB at-rest key, and
+    /// the wrong passphrase cannot reopen it.
+    #[test]
+    fn inbox_db_is_encrypted_at_rest() {
+        let dir = tempdir().expect("tempdir");
+        let db = dir.path().join("inbox.db");
+        drop(InboxServer::open(&db, &test_passphrase()).expect("open"));
+
+        // Per-DB at-rest triple lives beside inbox.db (not a shared
+        // `at-rest.key`), so a co-located groups.db can't race it.
+        assert!(dir.path().join("inbox.db.at-rest.key").exists());
+        assert!(dir.path().join("inbox.db.kek").exists());
+        assert!(!dir.path().join("at-rest.key").exists());
+
+        // The DB file is not a plaintext sqlite: its 16-byte header is the
+        // SQLCipher salt, not the `SQLite format 3\0` magic.
+        let mut hdr = [0u8; 16];
+        {
+            use std::io::Read as _;
+            std::fs::File::open(&db)
+                .expect("open db file")
+                .read_exact(&mut hdr)
+                .expect("read header");
+        }
+        assert_ne!(&hdr, b"SQLite format 3\0", "inbox.db must be encrypted");
+
+        // Reopening with the same passphrase works; a wrong one fails.
+        drop(InboxServer::open(&db, &test_passphrase()).expect("reopen"));
+        match InboxServer::open(&db, &zeroize::Zeroizing::new("wrong".to_string())) {
+            Ok(_) => panic!("wrong passphrase must fail"),
+            Err(e) => assert!(matches!(e, InboxError::AtRest(_)), "unexpected error: {e}"),
+        }
     }
 }

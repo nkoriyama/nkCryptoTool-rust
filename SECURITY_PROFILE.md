@@ -311,6 +311,7 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
 | バックアップ運用 | `groups.db` 単体では復号不可 — `at-rest.key` + `groups.db.kek` + passphrase の 3 要素全部が必要 | 3 ファイルを同一ディレクトリで一括バックアップ。passphrase はユーザーが別管理 |
 | DEK ローテーション | `nkct mls --mls-cmd rekey` (`group::at_rest::rotate_dek`) | 新規 DEK を生成し `PRAGMA rekey` で全ページ再暗号化 → 新 KEK を再 encapsulate。クラッシュ安全: 新 KEK を `groups.db.kek.pending` に先行ステージ → DB rekey → atomic promote の順。中断時は次回 open の `finalize_pending_rekey` がどの DEK で DB が開くか実測して解決するため、DB/KEK 2 ファイルのどの中断点でも復旧可能。DEK 漏洩疑い時の緩和策 (既に流出した旧 ciphertext のコピーは保護しない)。at-rest hybrid SK / passphrase は別途 `at-rest.key` 再生成で更新 |
 | 既存平文 DB の取扱い | 起動時に自動マイグレーション (`group::at_rest::migrate_plaintext_to_sqlcipher`) | 先頭 16 byte の `SQLite format 3\0` magic で平文 DB を検出し、`sqlcipher_export()` で DEK 暗号化コピーへ変換 → 鍵で開けることを検証してから原本を atomic rename で置換。平文の原本・WAL/journal サイドカーは置換後に unlink するため平文残存なし。検証成功前は原本を破壊しない |
+| inbox DB (store-and-forward リレー) | `inbox.db` も同じ at-rest レイヤで SQLCipher 暗号化 (`network::inbox::InboxServer::open` → `group::resolve_dek`) | `payload` 自体は MLS 暗号文だが、`recipient` / `sender` / `created_at` の**メタデータ**がリレーのディスク上で平文になるのを防ぐ。at-rest 鍵は共有 `at-rest.key` ではなく DB 固有の `inbox.db.at-rest.key` に置き (`AtRestPaths::beside_db`)、同一ディレクトリの MLS クライアントと初期化レースしない。`0o600` も適用 |
 
 ### 7.4 トランスポート抽象 (ALPN `nkct/mls/1`)
 
