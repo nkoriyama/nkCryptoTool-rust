@@ -93,11 +93,24 @@ use self::ml_kem_768::MlKem768Kem;
 /// type has no `const fn` constructor exposed publicly).
 pub const HYBRID_SUITE_ID: u16 = 0xF101;
 
+/// Private-use cipher suite ID for the **at-rest** hybrid suite
+/// (X-Wing / HKDF-SHA512 / AES-256-GCM). Internal-only: it wraps the
+/// SQLCipher DEK and is never serialised into MLS structures, so it does
+/// not need a `CryptoProvider`. Recorded here for documentation and for
+/// the KEK suite byte `0x02`.
+pub const AT_REST_SUITE_ID: u16 = 0xF102;
+
 /// Base classical suite used as the *parameter source* for the hybrid
 /// suite's KDF/AEAD/X25519 halves. We never expose this suite to MLS;
 /// it is only consulted to fetch `Ecdh`, `Kdf`, `Aead`, `KemId` values
 /// configured for X25519 / SHA-256 / AES-128-GCM.
 const PARAM_SOURCE_SUITE: CipherSuite = CipherSuite::CURVE25519_AES128;
+
+/// Parameter source for the at-rest suite's HPKE key schedule + AEAD:
+/// `CURVE448_AES256` = HKDF-SHA512 + AES-256-GCM. Only the KDF and AEAD
+/// algorithms are taken from it (not its X448/Ed448 halves), so it imposes
+/// no libssl X448 requirement.
+const AT_REST_AEAD_KDF_SUITE: CipherSuite = CipherSuite::CURVE448_AES256;
 
 /// Returns the hybrid `CipherSuite` value as a runtime constant. Use
 /// this wherever a `CipherSuite` value is needed (mls-rs APIs).
@@ -171,31 +184,76 @@ impl HybridCryptoProvider {
     /// In practice this is reachable only on builds where libssl was
     /// compiled without X25519, which is exceedingly rare.
     fn build_hybrid_suite() -> Option<HybridCipherSuiteProvider<HybridSuite>> {
-        let kdf = Kdf::new(PARAM_SOURCE_SUITE)?;
-        let ecdh = Ecdh::new(PARAM_SOURCE_SUITE)?;
-        let kem_id = KemId::new(PARAM_SOURCE_SUITE)?;
-        // X25519 DhKem with SHA-256 KDF — identical to what the base
-        // provider builds for `CURVE25519_AES128`, just kept separately
-        // so we can hand it to `CombinedKem`.
-        let x25519 = DhKem::new(ecdh, kdf.clone(), kem_id as u16, kem_id.n_secret());
-        // X-Wing combiner: the IETF draft's recommended shared-secret
-        // mixing for X25519 + ML-KEM-768. See
-        // draft-connolly-cfrg-xwing-kem-01.
-        let hybrid_kem = CombinedKem::new_xwing(x25519, MlKem768Kem, Sha256Hasher, Shake256Vlh);
-        let aead = Aead::new(PARAM_SOURCE_SUITE)?;
-
-        // OpensslCipherSuite::new internally constructs `Hash::new` and
-        // `EcSigner::new` against the passed cipher_suite — both reject
-        // unknown IDs, so we cannot pass `0xF101` here. We pass the
-        // parameter-source suite (`CURVE25519_AES128`) which configures
-        // the inner Hash to SHA-256 and the inner EcSigner to Ed25519
-        // — exactly what we want for the hybrid suite's non-PQC halves.
-        // `HybridCipherSuiteProvider::cipher_suite()` overrides the
-        // reported ID back to `0xF101` so mls-rs serialises the right
-        // suite into KeyPackages / GroupContext.
-        let inner = OpensslCipherSuite::new(PARAM_SOURCE_SUITE, hybrid_kem, kdf, aead)?;
-        Some(HybridCipherSuiteProvider::new(inner))
+        // The MLS-facing hybrid suite uses the `CURVE25519_AES128`
+        // parameters (HKDF-SHA256 key schedule + AES-128-GCM) for the HPKE
+        // half. Interop with peers fixes this choice.
+        build_hybrid_suite_with(PARAM_SOURCE_SUITE)
     }
+}
+
+/// Build a hybrid (X-Wing) cipher suite provider whose HPKE key schedule
+/// KDF and AEAD are taken from `aead_kdf_suite`, while the KEM and the
+/// inner Hash/EcSigner stay on the `CURVE25519_AES128` parameters.
+///
+/// The X-Wing KEM (X25519 + ML-KEM-768, with a SHA-256 DhKem KDF) is held
+/// **identical** across every `aead_kdf_suite` so the generated keypairs
+/// are interchangeable — only the HPKE seal/open crypto differs. This lets
+/// the at-rest layer wrap its DEK under AES-256-GCM (see
+/// [`build_at_rest_suite`]) while the MLS protocol keeps AES-128-GCM, both
+/// using the same `at-rest.key` keypair format.
+fn build_hybrid_suite_with(
+    aead_kdf_suite: CipherSuite,
+) -> Option<HybridCipherSuiteProvider<HybridSuite>> {
+    let kem_kdf = Kdf::new(PARAM_SOURCE_SUITE)?;
+    let ecdh = Ecdh::new(PARAM_SOURCE_SUITE)?;
+    let kem_id = KemId::new(PARAM_SOURCE_SUITE)?;
+    // X25519 DhKem with SHA-256 KDF — identical to what the base
+    // provider builds for `CURVE25519_AES128`, just kept separately
+    // so we can hand it to `CombinedKem`. Kept on SHA-256 for *every*
+    // variant so the KEM shared-secret derivation (and thus keypair
+    // interchangeability) does not depend on the AEAD/KDF choice.
+    let x25519 = DhKem::new(ecdh, kem_kdf, kem_id as u16, kem_id.n_secret());
+    // X-Wing combiner: the IETF draft's recommended shared-secret
+    // mixing for X25519 + ML-KEM-768. See
+    // draft-connolly-cfrg-xwing-kem-01.
+    let hybrid_kem = CombinedKem::new_xwing(x25519, MlKem768Kem, Sha256Hasher, Shake256Vlh);
+
+    // HPKE key-schedule KDF + AEAD come from `aead_kdf_suite`.
+    let kdf = Kdf::new(aead_kdf_suite)?;
+    let aead = Aead::new(aead_kdf_suite)?;
+
+    // OpensslCipherSuite::new internally constructs `Hash::new` and
+    // `EcSigner::new` against the passed cipher_suite — both reject
+    // unknown IDs, so we cannot pass `0xF101` here. We pass the
+    // parameter-source suite (`CURVE25519_AES128`) which configures
+    // the inner Hash to SHA-256 and the inner EcSigner to Ed25519.
+    // Neither is exercised by the at-rest HPKE path, and for the MLS
+    // path they are exactly the non-PQC halves we want.
+    // `HybridCipherSuiteProvider::cipher_suite()` overrides the
+    // reported ID back to `0xF101` so mls-rs serialises the right
+    // suite into KeyPackages / GroupContext.
+    let inner = OpensslCipherSuite::new(PARAM_SOURCE_SUITE, hybrid_kem, kdf, aead)?;
+    Some(HybridCipherSuiteProvider::new(inner))
+}
+
+/// Build the **at-rest** hybrid suite: X-Wing KEM with an HKDF-SHA512 HPKE
+/// key schedule and AES-256-GCM AEAD (private-use ID
+/// [`AT_REST_SUITE_ID`] `0xF102`). Used only to wrap the SQLCipher DEK in
+/// `group::at_rest`; never exposed to MLS.
+///
+/// Upgrading the at-rest AEAD from AES-128 to AES-256 removes the Grover
+/// halving concern for the key that wraps the DEK, making the at-rest layer
+/// genuinely PQ-safe end to end. The KEM is identical to the `0xF101`
+/// suite, so existing `at-rest.key` keypairs keep working.
+pub fn build_at_rest_suite() -> Option<HybridCipherSuiteProvider<HybridSuite>> {
+    build_hybrid_suite_with(AT_REST_AEAD_KDF_SUITE)
+}
+
+/// Build the legacy at-rest suite (AES-128-GCM / HKDF-SHA256), used only to
+/// open KEK files written before the AES-256 upgrade (KEK suite byte
+/// `0x01`). Identical construction to the MLS-facing `0xF101` suite.
+pub fn build_at_rest_suite_legacy() -> Option<HybridCipherSuiteProvider<HybridSuite>> {
+    build_hybrid_suite_with(PARAM_SOURCE_SUITE)
 }
 
 impl CryptoProvider for HybridCryptoProvider {

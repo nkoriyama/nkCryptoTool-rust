@@ -329,13 +329,15 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
 - **`cargo audit` の transitive 警告**: `iroh` 依存ツリーに hickory-proto 等の
   既知警告があるが、これは Iroh アップストリームに追従が必要な範囲。
   プロジェクト直接依存には脆弱性なし。
-- **at-rest AEAD は AES-128-GCM がボトルネック**: §7.3 の at-rest PQC 層は MLS
-  プロトコルと同じ cipher suite `0xF101` を流用するため、HPKE seal/open の AEAD は
-  **AES-128-GCM** になる。X25519+ML-KEM-768 KEM 自体は PQ-safe (NIST Cat 3 相当)
-  だが、KEM の外側で DEK を包む AEAD は Grover 攻撃で実効 64-bit まで減衰する
-  可能性がある。実害は当面ゼロ (数百万 logical qubit 規模が必要) だが、真の
-  AES-256 PQ-safe at-rest が必要になった時点で別 cipher suite (例: `0xF102 =
-  X-Wing / HKDF-SHA512 / AES-256-GCM`) を at-rest 専用に定義する必要がある。
+- **at-rest AEAD は AES-256-GCM (実装済み)**: 当初 at-rest 層は MLS と同じ
+  `0xF101` (AES-128-GCM) を流用しており、KEM の外側で DEK を包む AEAD が Grover
+  攻撃で実効 64-bit まで減衰する懸念があった。現在は at-rest 専用スイート
+  `0xF102` (X-Wing KEM / HKDF-SHA512 / **AES-256-GCM**, `crypto_adapter::
+  build_at_rest_suite`) で DEK を封入するため、AEAD も Grover 後で実効 128-bit を
+  保ち PQ-safe。KEM は `0xF101` と同一なので `at-rest.key` 鍵ペアは互換。KEK の
+  suite バイトで旧 `0x01` (AES-128) を読み取り互換し、次回 rekey で `0x02`
+  (AES-256) に書き換わる。MLS プロトコル層は interop 制約のため `0xF101`
+  (AES-128) のまま (こちらは MLS epoch ratchet で別途守られる)。
 - **DEK の forward secrecy なし**: §7.3 で生成された DEK は (明示的に rekey
   しない限り) DB 寿命の間固定。`groups.db.kek` または `at-rest.key` が将来侵害
   された場合、その時点で DB 内の既存メッセージはすべて復号可能になる (MLS の

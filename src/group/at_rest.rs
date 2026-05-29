@@ -87,14 +87,16 @@ use std::path::{Path, PathBuf};
 
 use mls_rs::CipherSuiteProvider;
 use mls_rs_codec::{MlsDecode, MlsEncode};
-use mls_rs_core::crypto::{CryptoProvider, HpkeCiphertext, HpkePublicKey, HpkeSecretKey};
+use mls_rs_core::crypto::{HpkeCiphertext, HpkePublicKey, HpkeSecretKey};
 use openssl::hash::MessageDigest;
 use openssl::pkcs5::pbkdf2_hmac;
 use openssl::symm::{Cipher, Crypter, Mode};
 use rand_core::{OsRng, RngCore};
 use zeroize::Zeroizing;
 
-use crate::group::crypto_adapter::{hybrid_cipher_suite, HybridCryptoProvider};
+use crate::group::crypto_adapter::{
+    build_at_rest_suite, build_at_rest_suite_legacy, HybridCipherSuiteProvider, HybridSuite,
+};
 use crate::group::storage::GroupStorage;
 use crate::group::types::GroupError;
 
@@ -135,7 +137,14 @@ const KEK_VERSION_LEGACY: u8 = 0x01;
 /// from one DB being swapped in for another when several DBs share one
 /// at-rest hybrid key — the `info` mismatch fails the HPKE AEAD check.
 const KEK_VERSION_BOUND: u8 = 0x02;
+/// Legacy KEK suite: X-Wing KEM with an HKDF-SHA256 / AES-128-GCM HPKE
+/// (the `0xF101` MLS suite's parameters). Still readable; rewritten as
+/// [`KEK_SUITE_XWING_AES256`] on the next rekey.
 const KEK_SUITE_XWING: u8 = 0x01;
+/// Current KEK suite: X-Wing KEM with an HKDF-SHA512 / AES-256-GCM HPKE
+/// (`0xF102`). The AES-256 AEAD removes the Grover halving concern on the
+/// key that wraps the DEK, making the at-rest layer PQ-safe end to end.
+const KEK_SUITE_XWING_AES256: u8 = 0x02;
 const KEK_HEADER_LEN: usize = 8 + 1 + 1;
 
 /// HPKE `info` prefix. Domain-separates the at-rest DEK encapsulation
@@ -175,9 +184,11 @@ impl std::fmt::Debug for AtRestKey {
 
 impl AtRestKey {
     /// Generate a fresh hybrid keypair via the same X-Wing KEM the MLS
-    /// protocol layer uses.
+    /// protocol layer uses. (The KEM is identical across at-rest suite
+    /// versions, so the keypair is valid for both AES-128 and AES-256
+    /// KEKs.)
     pub fn generate() -> Result<Self, GroupError> {
-        let suite = hybrid_suite()?;
+        let suite = at_rest_suite()?;
         let (sk, pk) = suite
             .kem_generate()
             .map_err(|e| GroupError::Backend(format!("at-rest kem_generate: {e}")))?;
@@ -313,7 +324,7 @@ impl AtRestKey {
         OsRng.fill_bytes(dek.as_mut_slice());
 
         let info = bound_info(binding);
-        let suite = hybrid_suite()?;
+        let suite = at_rest_suite()?;
         let hpke_ct = suite
             .hpke_seal(&self.pk, &info, None, dek.as_ref())
             .map_err(|e| GroupError::Backend(format!("at-rest hpke_seal: {e}")))?;
@@ -324,7 +335,7 @@ impl AtRestKey {
         let mut bytes = Vec::with_capacity(KEK_HEADER_LEN + inner.len());
         bytes.extend_from_slice(&KEK_MAGIC);
         bytes.push(KEK_VERSION_BOUND);
-        bytes.push(KEK_SUITE_XWING);
+        bytes.push(KEK_SUITE_XWING_AES256);
         bytes.extend_from_slice(&inner);
 
         Ok((bytes, dek))
@@ -358,18 +369,32 @@ impl AtRestKey {
                 )))
             }
         };
-        if kek_bytes[9] != KEK_SUITE_XWING {
-            return Err(GroupError::Storage(format!(
-                "KEK file: unsupported suite {:#x}",
-                kek_bytes[9]
-            )));
-        }
+        // The suite byte selects the HPKE crypto used to seal this KEK.
+        // Legacy `0x01` KEKs (AES-128) stay readable; new KEKs are `0x02`
+        // (AES-256). The KEM is identical across both, so `self`'s keypair
+        // opens either.
+        let suite = match kek_bytes[9] {
+            KEK_SUITE_XWING => at_rest_suite_legacy()?,
+            KEK_SUITE_XWING_AES256 => at_rest_suite()?,
+            other => {
+                return Err(GroupError::Storage(format!(
+                    "KEK file: unsupported suite {other:#x}"
+                )))
+            }
+        };
 
         let mut inner = &kek_bytes[KEK_HEADER_LEN..];
         let hpke_ct = HpkeCiphertext::mls_decode(&mut inner)
             .map_err(|e| GroupError::Storage(format!("KEK decode: {e}")))?;
+        if !inner.is_empty() {
+            // A well-formed KEK is exactly header + one MLS-encoded
+            // HpkeCiphertext. Trailing bytes mean corruption or tampering.
+            return Err(GroupError::Storage(format!(
+                "KEK file: {} trailing byte(s) after ciphertext",
+                inner.len()
+            )));
+        }
 
-        let suite = hybrid_suite()?;
         // hpke_open returns a plain Vec<u8> holding the DEK; wrap it so the
         // root key is wiped from the heap when this function returns rather
         // than lingering in a freed allocation.
@@ -885,17 +910,28 @@ fn db_binding(db: &Path) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn hybrid_suite(
-) -> Result<<HybridCryptoProvider as CryptoProvider>::CipherSuiteProvider, GroupError> {
-    HybridCryptoProvider::new()
-        .cipher_suite_provider(hybrid_cipher_suite())
-        .ok_or_else(|| {
-            GroupError::Backend(
-                "hybrid cipher suite (0xF101) construction failed; \
-                 is OpenSSL configured with X25519 + SHA-256 + AES-128-GCM?"
-                    .into(),
-            )
-        })
+/// The current at-rest HPKE suite: X-Wing KEM, HKDF-SHA512 key schedule,
+/// AES-256-GCM AEAD (KEK suite byte [`KEK_SUITE_XWING_AES256`]). Used for
+/// key generation, sealing, and opening `0x02` KEKs.
+fn at_rest_suite() -> Result<HybridCipherSuiteProvider<HybridSuite>, GroupError> {
+    build_at_rest_suite().ok_or_else(|| {
+        GroupError::Backend(
+            "at-rest hybrid suite (0xF102) construction failed; \
+             is OpenSSL configured with X25519 + SHA-512 + AES-256-GCM?"
+                .into(),
+        )
+    })
+}
+
+/// The legacy at-rest HPKE suite: X-Wing KEM, HKDF-SHA256, AES-128-GCM
+/// (KEK suite byte [`KEK_SUITE_XWING`]). Used only to open KEKs written
+/// before the AES-256 upgrade.
+fn at_rest_suite_legacy() -> Result<HybridCipherSuiteProvider<HybridSuite>, GroupError> {
+    build_at_rest_suite_legacy().ok_or_else(|| {
+        GroupError::Backend(
+            "legacy at-rest hybrid suite (0xF101 params) construction failed".into(),
+        )
+    })
 }
 
 fn derive_aead_key(
@@ -1080,8 +1116,9 @@ mod tests {
         let key = AtRestKey::generate().expect("generate");
         let mut dek = Zeroizing::new([0u8; DEK_LEN]);
         OsRng.fill_bytes(dek.as_mut_slice());
-        // Hand-build a legacy KEK: header version 0x01, info = HPKE_INFO.
-        let suite = hybrid_suite().expect("suite");
+        // Hand-build a legacy KEK: version 0x01 (unbound info), suite 0x01
+        // (AES-128), info = bare HPKE_INFO, sealed with the legacy suite.
+        let suite = at_rest_suite_legacy().expect("suite");
         let ct = suite
             .hpke_seal(&key.pk, HPKE_INFO, None, dek.as_ref())
             .expect("seal");
@@ -1096,6 +1133,76 @@ mod tests {
             .decapsulate_dek(&kek, b"whatever.db")
             .expect("legacy KEK must decapsulate");
         assert_eq!(recovered.as_ref(), dek.as_ref());
+    }
+
+    #[test]
+    fn new_kek_uses_aes256_suite_byte() {
+        // A freshly encapsulated KEK must advertise the AES-256 suite
+        // (0x02) and the bound version (0x02).
+        let key = AtRestKey::generate().expect("generate");
+        let (kek, _dek) = key.encapsulate_dek(TEST_BINDING).expect("encap");
+        assert_eq!(kek[8], KEK_VERSION_BOUND, "version byte");
+        assert_eq!(kek[9], KEK_SUITE_XWING_AES256, "suite byte");
+    }
+
+    #[test]
+    fn bound_aes128_kek_still_decapsulates() {
+        // KEKs written between the per-DB-binding change and the AES-256
+        // upgrade are version 0x02 (bound) + suite 0x01 (AES-128). They
+        // must keep opening under the legacy suite with the matching
+        // binding.
+        let key = AtRestKey::generate().expect("generate");
+        let mut dek = Zeroizing::new([0u8; DEK_LEN]);
+        OsRng.fill_bytes(dek.as_mut_slice());
+        let suite = at_rest_suite_legacy().expect("legacy suite");
+        let ct = suite
+            .hpke_seal(&key.pk, &bound_info(TEST_BINDING), None, dek.as_ref())
+            .expect("seal");
+        let mut kek = Vec::new();
+        kek.extend_from_slice(&KEK_MAGIC);
+        kek.push(KEK_VERSION_BOUND);
+        kek.push(KEK_SUITE_XWING);
+        kek.extend_from_slice(&ct.mls_encode_to_vec().expect("encode"));
+
+        let recovered = key
+            .decapsulate_dek(&kek, TEST_BINDING)
+            .expect("bound AES-128 KEK must decapsulate");
+        assert_eq!(recovered.as_ref(), dek.as_ref());
+        // And the wrong binding must still fail even for the legacy suite.
+        assert!(key.decapsulate_dek(&kek, b"other.db").is_err());
+    }
+
+    #[test]
+    fn aes256_kek_not_openable_by_legacy_suite() {
+        // Positive proof that the AES-256 suite is cryptographically
+        // distinct from AES-128 (the explicit SHA-512 KDF + AES-256 AEAD
+        // really take effect, not a silent 128-bit downgrade): a KEK
+        // sealed AES-256 must not open under the legacy AES-128 suite.
+        let key = AtRestKey::generate().expect("gen");
+        let (kek, dek) = key.encapsulate_dek(TEST_BINDING).expect("encap");
+        assert_eq!(kek[9], KEK_SUITE_XWING_AES256);
+
+        let mut forced = kek.clone();
+        forced[9] = KEK_SUITE_XWING; // pretend it's an AES-128 KEK
+        assert!(
+            key.decapsulate_dek(&forced, TEST_BINDING).is_err(),
+            "AES-256 KEK must fail under the AES-128 suite"
+        );
+
+        // Sanity: it opens correctly under its real suite.
+        let ok = key.decapsulate_dek(&kek, TEST_BINDING).expect("real suite");
+        assert_eq!(ok.as_ref(), dek.as_ref());
+    }
+
+    #[test]
+    fn trailing_bytes_in_kek_are_rejected() {
+        let key = AtRestKey::generate().expect("gen");
+        let (mut kek, _dek) = key.encapsulate_dek(TEST_BINDING).expect("encap");
+        kek.push(0x00); // append junk
+        match key.decapsulate_dek(&kek, TEST_BINDING) {
+            Err(GroupError::Storage(msg)) => assert!(msg.contains("trailing")),
+            other => panic!("expected trailing-byte rejection, got {other:?}"),
+        }
     }
 
     #[test]
