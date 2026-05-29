@@ -13,7 +13,7 @@
 - ✅ 一般的な脅威 (ISP、公衆 WiFi、Telegram 級サーバ侵入、商用 SaaS 召喚状) に対しては **ほぼ完璧**
 - ✅ 量子計算機が将来登場した時の "Harvest Now, Decrypt Later" 攻撃に対して **解読不能**
 - ✅ Signal / WhatsApp / iMessage と同等以上、Telegram のデフォルトチャットとは **比較にならないほど強い**
-- ⚠️ 完璧ではない領域 (Post-Quantum Forward Secrecy / メタデータ秘匿) は本書末尾で正直に明示
+- ⚠️ 完璧ではない領域 (ワンショット暗号化の Post-Quantum Forward Secrecy / メタデータ秘匿) は本書末尾で正直に明示。なおライブ P2P チャット・同期ファイル転送は PQ-FS 達成済み
 
 ---
 
@@ -129,36 +129,45 @@
 | 国家による大量監視 (中・露・欧米) | ✅ relay 不使用で direct 接続なら強い |
 | 法執行機関 (令状ベース) | ✅ 中央サーバ無いので召喚状効かない (端末押収には別途無力) |
 | TLA 級アクター (NSA / GCHQ 等)、現時点 | ✅ 内容は安全、メタデータは relay 構成次第 |
-| TLA、量子計算機後の解読 | △ HNDL 攻撃に対し内容を保護、ただし長期鍵漏洩時は過去通信解読の余地 (§5.1 参照) |
+| TLA、量子計算機後の解読 | ✅ ライブ P2P は相互 ephemeral で完全保護。△ ワンショット (ファイル/inbox) のみ長期鍵漏洩時に過去解読の余地 (§5.1 参照) |
 | 物理的に端末を確保された場合 | ❌ 鍵が出てくる、無力 (HSM/TPM 利用や Full Disk Encryption が別途必要) |
 
 ---
 
 ## 5. 正直な弱点 (今後の改善余地)
 
-### 5.1 Post-Quantum Forward Secrecy が未実装 🟠
+### 5.1 Post-Quantum Forward Secrecy — ライブ P2P は達成済み、ワンショットのみ未対応 🟠
 
-最大の制限。詳細:
+PQ-FS の状況は通信経路によって異なる。**ライブ P2P トランスポート（チャット・同期ファイル転送）は既に PQ-FS を達成しており、制限が残るのは非同期・ワンショット経路（ローカルファイル暗号化 / inbox 配送）のみ**である。
 
-セッション鍵導出は:
+#### ライブ P2P ハンドシェイク（chat / 同期ファイル転送）: ✅ PQ-FS あり
+
+`src/p2p/processor.rs` の実ハンドシェイクは、双方が毎接続で使い捨て鍵を生成する相互 ephemeral ハイブリッドである:
 ```
-ss_ecc      = ECDH(ephemeral keys)              ← Pre-Quantum FS あり (鍵は使い捨て)
-kem_ss      = ML-KEM(static client KEM key)     ← Post-Quantum FS なし (鍵は固定)
-session_key = HKDF(ss_ecc || kem_ss)
+ss_ecc      = ECDH(ephemeral ‖ ephemeral)       ← 両側 ephemeral
+kem_ss      = ML-KEM(client ephemeral KEM key)  ← クライアント ephemeral 鍵に encap
+session_key = HKDF(ss_ecc ‖ kem_ss)
 ```
+- クライアントは接続ごとに ephemeral KEM 鍵ペアを生成して公開鍵を送り、サーバはそれに encap する。サーバの長期 KEM 鍵は **指紋照合（MITM 検出）専用** で、鍵導出には一切関与しない。
+- KEM では鍵ペアを提示する側（=クライアント）が ephemeral であれば共有秘密全体が ephemeral 依存となり、双方向通信に対して完全な FS が成立する（TLS 1.3 / SIGMA と同型。認証は ML-DSA 静的鍵による transcript 署名で別途担保）。
+- したがって将来 CRQC が登場し、長期 KEM 鍵を盗み、ECDH を破ったとしても、使い捨て KEM 秘密鍵（セッション後に zeroize 済み）への encap は復元できず、**過去のライブ通信は復号されない**。
 
-**Pre-Quantum 世界 (現在の脅威モデル)**: 攻撃者が長期 KEM 秘密鍵を盗んでも、過去の通信は復号不能 (ECDH ephemeral 秘密が永遠に失われる)。
+#### ワンショット（ローカルファイル暗号化 / inbox 非同期配送）: 🟠 PQ-FS なし
 
+受信者がオフラインの非同期経路では双方向の ephemeral 交換ができず、`src/strategy/pqc.rs` は受信者の **長期固定 KEM 公開鍵** に encap する:
+```
+kem_ss = ML-KEM(static recipient KEM key)        ← Post-Quantum FS なし (鍵は固定)
+```
 **Post-Quantum 世界 (将来 CRQC 出現後)**: 攻撃者が
-- (a) 過去の通信を録画
-- (b) 長期 KEM 秘密鍵を盗み
+- (a) 過去の暗号文を保存し
+- (b) 受信者の長期 KEM 秘密鍵を盗み
 - (c) 量子計算機で ECDH を破る
 
-の 3 点が揃うと、過去の通信が復号される。
+の 3 点が揃うと、過去のワンショット暗号文が復号される。
 
 **緩和策**:
-- 長期鍵を定期ローテーション (運用)
-- 将来的な Double Ratchet 相当の実装 (ロードマップに記載)
+- inbox 非同期配送: One-Time Prekey（PQXDH 風）の導入で PQ-FS を達成可能（ロードマップ）。
+- ローカルファイル自己暗号化: 双方向交換も Prekey インフラも無いため原理的に PQ-FS 不可。長期 KEM 鍵の定期ローテーション（運用）が唯一の緩和策。
 
 ### 5.2 メタデータ漏洩 (relay 経由時) 🟡
 
@@ -209,7 +218,7 @@ ticket 共有経路を攻撃者が制御していると、攻撃者の ticket �
 
 ⚠️ **追加対策が必要なシーン**:
 - 国家レベルアクターから狙われる活動家 (Tor 経由の Briar / Cwtch を併用検討)
-- 数十年スパンでのアーカイブを要する機密 (PQ-FS が必要)
+- 数十年スパンでのアーカイブを要する機密を**ワンショット暗号化（ファイル/inbox）**で扱う場合 (ライブ P2P は PQ-FS 済みだがワンショット経路は長期鍵ローテで緩和)
 - 大規模 (>10 人) のグループチャット (現状 1:1 のみ)
 
 ❌ **不適切なシーン**:
@@ -224,7 +233,7 @@ ticket 共有経路を攻撃者が制御していると、攻撃者の ticket �
 
 メインストリームの暗号化メッセンジャーを使っている人にとって、nkCryptoTool への移行は **すべての安全性指標で改善** (UX 以外)、特に Telegram のデフォルトチャットからの移行は **桁違いの強化**となる。
 
-完璧ではない領域 (PQ-FS / メタデータ) は今後の改善ロードマップで対応予定で、現時点でも世界トップクラスのセキュリティを提供している。
+完璧ではない領域 (ワンショット暗号化の PQ-FS / メタデータ) は今後の改善ロードマップで対応予定で、現時点でも世界トップクラスのセキュリティを提供している (ライブ P2P 通信は PQ-FS 達成済み)。
 
 ---
 
