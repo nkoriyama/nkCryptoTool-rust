@@ -409,8 +409,8 @@ async fn main() -> anyhow::Result<()> {
     config.user_privkey = resolve_key_path(&config.key_dir, args.user_privkey);
     config.user_mlkem_privkey = resolve_key_path(&config.key_dir, args.user_mlkem_privkey);
     config.user_ecdh_privkey = resolve_key_path(&config.key_dir, args.user_ecdh_privkey);
-    config.signing_privkey = args.signing_privkey;
-    config.signing_pubkey = args.signing_pubkey;
+    config.signing_privkey = resolve_key_path(&config.key_dir, args.signing_privkey);
+    config.signing_pubkey = resolve_key_path(&config.key_dir, args.signing_pubkey);
     config.signature_file = args.signature;
     config.digest_algo = args.digest_algo;
     config.aead_algo = args.aead_algo;
@@ -987,4 +987,47 @@ async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
     nk_crypto_tool::gui::group_chat::run_group_gui(processor)
         .await
         .map_err(|e| anyhow::anyhow!("GUI loop: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_key_path;
+
+    #[test]
+    fn bare_filename_resolves_under_key_dir() {
+        assert_eq!(
+            resolve_key_path("keys", Some("foo.key".into())),
+            Some("keys/foo.key".into())
+        );
+        // Trailing slash on key_dir is normalised by Path::join.
+        assert_eq!(
+            resolve_key_path("/a/b/", Some("foo.key".into())),
+            Some("/a/b/foo.key".into())
+        );
+    }
+
+    #[test]
+    fn paths_with_a_directory_component_are_left_alone() {
+        assert_eq!(
+            resolve_key_path("keys", Some("sub/foo.key".into())),
+            Some("sub/foo.key".into())
+        );
+        assert_eq!(
+            resolve_key_path("keys", Some("./foo.key".into())),
+            Some("./foo.key".into())
+        );
+    }
+
+    #[test]
+    fn absolute_paths_are_left_alone() {
+        assert_eq!(
+            resolve_key_path("keys", Some("/etc/foo.key".into())),
+            Some("/etc/foo.key".into())
+        );
+    }
+
+    #[test]
+    fn none_stays_none() {
+        assert_eq!(resolve_key_path("keys", None), None);
+    }
 }

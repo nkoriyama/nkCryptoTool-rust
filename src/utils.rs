@@ -765,4 +765,21 @@ mod tests {
         let unwrapped = unwrap_pqc_priv_from_pkcs8(&pkcs8, algo).unwrap();
         assert_eq!(&*unwrapped, &expanded, "Should have extracted expanded key");
     }
+
+    #[test]
+    fn plaintext_key_not_flagged_as_encrypted() {
+        // A plaintext PKCS#8 "PRIVATE KEY" PEM must NOT be flagged — else the
+        // CLI would prompt for a passphrase that isn't needed. Missing files
+        // are likewise treated as not-encrypted.
+        let (sk, _pk, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+        let pkcs8 = wrap_pqc_priv_to_pkcs8(&sk, "ML-DSA-65").unwrap();
+        let pem = wrap_to_pem(&pkcs8, "PRIVATE KEY");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.key");
+        std::fs::write(&path, pem).unwrap();
+        assert!(!private_key_file_is_encrypted(path.to_str().unwrap()));
+        assert!(!private_key_file_is_encrypted(
+            dir.path().join("nope.key").to_str().unwrap()
+        ));
+    }
 }
