@@ -41,6 +41,46 @@
 //! Pass `since_cursor = 0` on first call to drain the backlog; pass the
 //! largest returned cursor on subsequent calls to receive only new
 //! envelopes. `max` is clamped server-side to [`MAX_POLL_BATCH`].
+//!
+//! ### PUBLISH (One-Time Prekeys)
+//!
+//! ```text
+//! request:  u8(0x04) || count(u32) || [ blob_len(u32) || blob ] * count
+//! reply:    u8(0x00 = ok | 0xFF = rejected)
+//! ```
+//!
+//! The recipient pre-publishes a batch of *signed* One-Time Prekeys
+//! (PQ-FS, see `crate::prekey` and PQFS_DESIGN.md) into its **own** slot —
+//! the slot key is the handshake-authenticated NodeId, never a wire field,
+//! so no peer can stuff prekeys into someone else's slot. Each `blob` is an
+//! opaque `SignedPrekey::to_bytes()`; the server stores it verbatim and
+//! never parses or verifies it (verification is the *fetching sender's*
+//! job, against the recipient's ML-DSA identity). A per-recipient cap of
+//! [`MAX_PREKEYS_STORED`] bounds storage abuse: the newest prekeys win.
+//!
+//! ### FETCH (One-Time Prekey)
+//!
+//! ```text
+//! request:  u8(0x05) || recipient([u8;32])
+//! reply (ok):           u8(0x00) || blob_len(u32) || blob
+//! reply (depleted):     u8(0xFD)
+//! reply (rate limited): u8(0xFC)
+//! ```
+//!
+//! A sender fetches a single prekey for `recipient` to build a
+//! forward-secret one-shot ciphertext. Prekeys are **one-time**: the served
+//! row is deleted in the same critical section, so each is handed out once.
+//!
+//! FETCH is the prekey-*depletion downgrade* attack surface (PQFS_DESIGN.md
+//! §4.1): an attacker who drains the pool forces the recipient down to the
+//! no-FS static-key fallback. The mitigation is a **token-bucket rate limit
+//! keyed by the connecting (sender) NodeId** ([`FETCH_RL_CAPACITY`] /
+//! [`FETCH_RL_REFILL_PER_SEC`]). It raises the per-identity cost of
+//! draining; it is not a complete defence (NodeIds are cheap to mint), so
+//! the Strict profile's "refuse on depletion" policy remains the backstop.
+//! `depleted` and `rate limited` are distinct replies so the sender can
+//! tell genuine exhaustion (→ fallback / refuse) from a transient throttle
+//! (→ back off and retry).
 
 use crate::network::ALPN_INBOX;
 use crate::p2p::{P2pEndpoint, P2pError, P2pIncoming, P2pProtocol, PeerAddr, PeerId};
@@ -56,6 +96,35 @@ pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 /// repeat polls until they get a count < this cap to fully drain.
 pub const MAX_POLL_BATCH: u32 = 64;
 
+/// Largest single serialized prekey blob accepted by PUBLISH/FETCH. A
+/// X-Wing `SignedPrekey` is ~4.5 KiB (1216 B key + 3309 B ML-DSA-65 sig +
+/// framing); 8 KiB leaves headroom while rejecting absurd lengths.
+pub const MAX_PREKEY_BLOB: usize = 8 * 1024;
+
+/// Largest number of prekeys accepted in one PUBLISH.
+pub const MAX_PUBLISH_BATCH: u32 = 128;
+
+/// Per-recipient cap on stored prekeys. A PUBLISH that pushes the slot over
+/// this trims the oldest, bounding storage abuse by a malicious recipient.
+pub const MAX_PREKEYS_STORED: u64 = 256;
+
+/// FETCH token-bucket burst capacity, per connecting NodeId: a sender may
+/// fetch this many prekeys back-to-back (e.g. fanning out to several
+/// recipients) before the refill rate gates it.
+pub const FETCH_RL_CAPACITY: f64 = 8.0;
+
+/// FETCH token-bucket refill rate (tokens/second), per connecting NodeId.
+/// One token every 30 s (≈120/hour) sustains legitimate use — a sender
+/// normally fetches *one* prekey per recipient — while making a single
+/// identity's attempt to drain a [`MAX_PREKEYS_STORED`] pool slow and
+/// conspicuous. Tunable policy; see the FETCH note in the module docs.
+pub const FETCH_RL_REFILL_PER_SEC: f64 = 1.0 / 30.0;
+
+/// Soft cap on distinct NodeIds tracked for FETCH rate limiting. When the
+/// table reaches this, fully-refilled (idle) buckets are pruned, bounding
+/// memory without losing any throttle state for active senders.
+const FETCH_RL_MAX_TRACKED: usize = 4096;
+
 /// Default per-frame idle timeout. Generous enough to absorb iroh
 /// hole-punching latency; short enough to bound retry cost.
 pub const IO_TIMEOUT: Duration = Duration::from_secs(30);
@@ -67,7 +136,19 @@ const TAG_POLL: u8 = 0x02;
 /// highest epoch seen per authenticated peer and flags a regression. See
 /// the anti-rollback phase 3 in ATREST_ANTIROLLBACK_DESIGN.md.
 const TAG_CHECKPOINT: u8 = 0x03;
+/// PUBLISH: recipient deposits a batch of signed One-Time Prekeys into its
+/// own slot. FETCH: a sender pops one prekey for a named recipient. See the
+/// PUBLISH/FETCH sections in the module docs and PQFS_DESIGN.md §4.1.
+const TAG_PUBLISH: u8 = 0x04;
+const TAG_FETCH: u8 = 0x05;
 const REPLY_OK: u8 = 0x00;
+/// FETCH reply: the connecting NodeId exceeded the per-identity FETCH rate
+/// limit. Transient — distinct from depletion so the sender backs off
+/// rather than treating the pool as exhausted.
+const REPLY_RATE_LIMITED: u8 = 0xFC;
+/// FETCH reply: the recipient has no prekeys left. The sender falls back to
+/// a static-only encapsulation (default profile) or refuses (Strict).
+const REPLY_PREKEY_NONE: u8 = 0xFD;
 /// CHECKPOINT reply: the reported epoch is *older* than one the server has
 /// already seen for this peer — the client's local at-rest state may have
 /// been rolled back.
@@ -262,6 +343,109 @@ pub async fn checkpoint(
     }
 }
 
+/// Outcome of a [`fetch_prekey`] call.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FetchOutcome {
+    /// A serialized prekey blob. The caller MUST parse it
+    /// (`SignedPrekey::from_bytes`) and verify the signature against the
+    /// recipient's ML-DSA identity before use — the inbox server is
+    /// untrusted and could substitute a forged blob.
+    Prekey(Vec<u8>),
+    /// The recipient's prekey pool is empty. The sender encrypts with the
+    /// static key only (default profile, no PQ-FS) or refuses (Strict).
+    Depleted,
+    /// This sender NodeId is being rate-limited; back off and retry later.
+    /// Deliberately *not* folded into `Depleted` so a throttle is never
+    /// mistaken for genuine exhaustion (which would wrongly trigger the
+    /// static-key downgrade).
+    RateLimited,
+}
+
+/// Publish a batch of signed One-Time Prekeys to our **own** slot on the
+/// inbox `server`. The slot is keyed by our handshake-authenticated NodeId,
+/// so this only ever writes to the caller's own prekey pool. Each entry is
+/// an opaque `SignedPrekey::to_bytes()`; the server stores it verbatim.
+pub async fn publish_prekeys(
+    endpoint: &dyn P2pEndpoint,
+    server: &PeerAddr,
+    prekeys: &[Vec<u8>],
+) -> Result<(), InboxError> {
+    if prekeys.is_empty() || prekeys.len() > MAX_PUBLISH_BATCH as usize {
+        return Err(InboxError::Protocol(format!(
+            "publish batch of {} out of range (1..={MAX_PUBLISH_BATCH})",
+            prekeys.len()
+        )));
+    }
+    for p in prekeys {
+        if p.is_empty() || p.len() > MAX_PREKEY_BLOB {
+            return Err(InboxError::TooLarge(p.len()));
+        }
+    }
+    let mut stream = endpoint.connect(server, P2pProtocol(ALPN_INBOX)).await?;
+    let mut header = Vec::with_capacity(1 + 4);
+    header.push(TAG_PUBLISH);
+    header.extend_from_slice(&(prekeys.len() as u32).to_le_bytes());
+    write_timed(&mut stream, &header, "publish header").await?;
+    for p in prekeys {
+        write_timed(&mut stream, &(p.len() as u32).to_le_bytes(), "publish blob len").await?;
+        write_timed(&mut stream, p, "publish blob").await?;
+    }
+    tokio::time::timeout(IO_TIMEOUT, stream.flush())
+        .await
+        .map_err(|_| InboxError::Timeout("publish flush"))??;
+    let mut reply = [0u8; 1];
+    read_timed(&mut stream, &mut reply, "publish reply").await?;
+    let _ = stream.shutdown().await;
+    match reply[0] {
+        REPLY_OK => Ok(()),
+        _ => Err(InboxError::Rejected),
+    }
+}
+
+/// Fetch a single One-Time Prekey for `recipient` from the inbox `server`,
+/// to build a forward-secret one-shot ciphertext. Prekeys are one-time —
+/// the server hands each out once. Returns [`FetchOutcome::Depleted`] if the
+/// pool is empty or [`FetchOutcome::RateLimited`] if this NodeId is being
+/// throttled; the caller decides the fallback per its profile.
+pub async fn fetch_prekey(
+    endpoint: &dyn P2pEndpoint,
+    server: &PeerAddr,
+    recipient: PeerId,
+) -> Result<FetchOutcome, InboxError> {
+    let mut stream = endpoint.connect(server, P2pProtocol(ALPN_INBOX)).await?;
+    let mut header = Vec::with_capacity(1 + 32);
+    header.push(TAG_FETCH);
+    header.extend_from_slice(recipient.as_bytes());
+    write_timed(&mut stream, &header, "fetch header").await?;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush())
+        .await
+        .map_err(|_| InboxError::Timeout("fetch flush"))??;
+    let mut reply = [0u8; 1];
+    read_timed(&mut stream, &mut reply, "fetch reply").await?;
+    let outcome = match reply[0] {
+        REPLY_OK => {
+            let mut len_buf = [0u8; 4];
+            read_timed(&mut stream, &mut len_buf, "fetch len").await?;
+            let len = u32::from_le_bytes(len_buf) as usize;
+            if len == 0 || len > MAX_PREKEY_BLOB {
+                return Err(InboxError::TooLarge(len));
+            }
+            let mut blob = vec![0u8; len];
+            read_timed(&mut stream, &mut blob, "fetch blob").await?;
+            FetchOutcome::Prekey(blob)
+        }
+        REPLY_PREKEY_NONE => FetchOutcome::Depleted,
+        REPLY_RATE_LIMITED => FetchOutcome::RateLimited,
+        other => {
+            return Err(InboxError::Protocol(format!(
+                "fetch: unexpected reply {other:#x}"
+            )))
+        }
+    };
+    let _ = stream.shutdown().await;
+    Ok(outcome)
+}
+
 // -----------------------------------------------------------------------------
 // Server
 // -----------------------------------------------------------------------------
@@ -270,14 +454,55 @@ pub async fn checkpoint(
 mod server {
     use super::*;
     use rusqlite::{params, Connection, OptionalExtension};
+    use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::Mutex as StdMutex;
+    use std::time::Instant;
     use tokio::sync::Mutex as AsyncMutex;
     use zeroize::Zeroizing;
+
+    /// A leaky-bucket throttle for one connecting NodeId: `tokens` refills
+    /// at [`FETCH_RL_REFILL_PER_SEC`] up to [`FETCH_RL_CAPACITY`], and each
+    /// FETCH costs one token.
+    struct TokenBucket {
+        tokens: f64,
+        last: Instant,
+    }
+
+    impl TokenBucket {
+        fn new(now: Instant) -> Self {
+            Self { tokens: FETCH_RL_CAPACITY, last: now }
+        }
+
+        /// Refill for elapsed time, then take a token if one is available.
+        fn try_take(&mut self, now: Instant) -> bool {
+            let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+            self.last = now;
+            self.tokens =
+                (self.tokens + elapsed * FETCH_RL_REFILL_PER_SEC).min(FETCH_RL_CAPACITY);
+            if self.tokens >= 1.0 {
+                self.tokens -= 1.0;
+                true
+            } else {
+                false
+            }
+        }
+
+        /// A bucket that has refilled to capacity is indistinguishable from a
+        /// fresh one, so it can be pruned to reclaim memory.
+        fn is_full(&self) -> bool {
+            self.tokens >= FETCH_RL_CAPACITY
+        }
+    }
 
     /// Persistent inbox: sqlite-backed envelope storage + ALPN_INBOX
     /// accept loop.
     pub struct InboxServer {
         db: Arc<AsyncMutex<Connection>>,
+        /// Per-NodeId FETCH rate limiters (prekey-depletion mitigation).
+        /// A std mutex, not async: the critical section is a few map ops
+        /// with no `.await`, so it never blocks the runtime meaningfully.
+        fetch_rl: StdMutex<HashMap<PeerId, TokenBucket>>,
     }
 
     impl InboxServer {
@@ -331,6 +556,18 @@ mod server {
                     peer   BLOB PRIMARY KEY,
                     epoch  INTEGER NOT NULL
                 );
+                -- One-Time Prekey pool. `blob` is an opaque
+                -- SignedPrekey::to_bytes(); the server never parses it. Keyed
+                -- by the recipient (= publisher's handshake NodeId); FETCH
+                -- pops the lowest id (FIFO) for one-time use.
+                CREATE TABLE IF NOT EXISTS prekeys (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recipient   BLOB NOT NULL,
+                    blob        BLOB NOT NULL,
+                    created_at  INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS prekeys_recipient_id
+                    ON prekeys(recipient, id);
                 ",
             )
             .map_err(InboxError::Sqlite)?;
@@ -349,7 +586,30 @@ mod server {
 
             Ok(Self {
                 db: Arc::new(AsyncMutex::new(conn)),
+                fetch_rl: StdMutex::new(HashMap::new()),
             })
+        }
+
+        /// Charge one FETCH token against the connecting NodeId's bucket,
+        /// returning `true` if the request is within the rate limit. Prunes
+        /// idle (fully-refilled) buckets when the table grows past
+        /// [`FETCH_RL_MAX_TRACKED`] so the map can't grow without bound under
+        /// a stream of distinct NodeIds.
+        fn allow_fetch(&self, who: PeerId) -> bool {
+            let now = Instant::now();
+            // Recover from a poisoned lock rather than propagating the panic:
+            // a throttle table is not security-critical state, and the server
+            // must keep serving other peers.
+            let mut map = self
+                .fetch_rl
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if map.len() >= FETCH_RL_MAX_TRACKED {
+                map.retain(|_, b| !b.is_full());
+            }
+            map.entry(who)
+                .or_insert_with(|| TokenBucket::new(now))
+                .try_take(now)
         }
 
         /// Run the accept loop. Each accepted stream is dispatched on
@@ -386,6 +646,8 @@ mod server {
                 TAG_DEPOSIT => self.handle_deposit(&mut *incoming.stream, sender).await,
                 TAG_POLL => self.handle_poll(&mut *incoming.stream, sender).await,
                 TAG_CHECKPOINT => self.handle_checkpoint(&mut *incoming.stream, sender).await,
+                TAG_PUBLISH => self.handle_publish(&mut *incoming.stream, sender).await,
+                TAG_FETCH => self.handle_fetch(&mut *incoming.stream, sender).await,
                 t => Err(InboxError::Protocol(format!("unknown tag {t:#x}"))),
             }
         }
@@ -522,6 +784,137 @@ mod server {
             tokio::time::timeout(IO_TIMEOUT, stream.flush())
                 .await
                 .map_err(|_| InboxError::Timeout("checkpoint flush"))??;
+            let _ = stream.shutdown().await;
+            Ok(())
+        }
+
+        async fn handle_publish<S>(
+            &self,
+            stream: &mut S,
+            recipient: PeerId,
+        ) -> Result<(), InboxError>
+        where
+            S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized,
+        {
+            let mut count_buf = [0u8; 4];
+            read_timed(stream, &mut count_buf, "publish count").await?;
+            let count = u32::from_le_bytes(count_buf);
+            if count == 0 || count > MAX_PUBLISH_BATCH {
+                let _ = write_timed(stream, &[REPLY_FAIL], "publish reply (fail)").await;
+                return Err(InboxError::Protocol(format!(
+                    "publish count {count} out of range (1..={MAX_PUBLISH_BATCH})"
+                )));
+            }
+            // Read the whole (bounded) batch before touching the DB so a
+            // slow/short writer can't hold the db mutex across reads.
+            let mut blobs: Vec<Vec<u8>> = Vec::with_capacity(count as usize);
+            for _ in 0..count {
+                let mut len_buf = [0u8; 4];
+                read_timed(stream, &mut len_buf, "publish blob len").await?;
+                let len = u32::from_le_bytes(len_buf) as usize;
+                if len == 0 || len > MAX_PREKEY_BLOB {
+                    let _ = write_timed(stream, &[REPLY_FAIL], "publish reply (fail)").await;
+                    return Err(InboxError::TooLarge(len));
+                }
+                let mut blob = vec![0u8; len];
+                read_timed(stream, &mut blob, "publish blob").await?;
+                blobs.push(blob);
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            // The slot is keyed by `recipient` = the handshake-authenticated
+            // NodeId, so a peer can only ever publish into its own pool.
+            {
+                let db = self.db.lock().await;
+                let tx = db.unchecked_transaction()?;
+                for blob in &blobs {
+                    tx.execute(
+                        "INSERT INTO prekeys(recipient, blob, created_at) VALUES(?, ?, ?)",
+                        params![recipient.as_bytes().as_slice(), blob, now],
+                    )?;
+                }
+                // Bound storage abuse: keep only the newest MAX_PREKEYS_STORED
+                // for this recipient, dropping the oldest by id.
+                tx.execute(
+                    "DELETE FROM prekeys WHERE recipient = ?1 AND id NOT IN (
+                         SELECT id FROM prekeys WHERE recipient = ?1
+                         ORDER BY id DESC LIMIT ?2
+                     )",
+                    params![recipient.as_bytes().as_slice(), MAX_PREKEYS_STORED as i64],
+                )?;
+                tx.commit()?;
+            }
+            write_timed(stream, &[REPLY_OK], "publish reply (ok)").await?;
+            tokio::time::timeout(IO_TIMEOUT, stream.flush())
+                .await
+                .map_err(|_| InboxError::Timeout("publish flush"))??;
+            let _ = stream.shutdown().await;
+            Ok(())
+        }
+
+        async fn handle_fetch<S>(
+            &self,
+            stream: &mut S,
+            fetcher: PeerId,
+        ) -> Result<(), InboxError>
+        where
+            S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized,
+        {
+            // Read the recipient field first so the wire framing stays
+            // consistent even when we go on to reject the request.
+            let mut recip_buf = [0u8; 32];
+            read_timed(stream, &mut recip_buf, "fetch recipient").await?;
+            let recipient = PeerId::new(recip_buf);
+
+            // Rate-limit by the connecting (sender) NodeId — the documented
+            // mitigation for the prekey-depletion downgrade (PQFS_DESIGN.md
+            // §4.1). Done before the DB pop so a throttled caller can't drain.
+            if !self.allow_fetch(fetcher) {
+                write_timed(stream, &[REPLY_RATE_LIMITED], "fetch reply (rate limited)").await?;
+                tokio::time::timeout(IO_TIMEOUT, stream.flush())
+                    .await
+                    .map_err(|_| InboxError::Timeout("fetch flush"))??;
+                let _ = stream.shutdown().await;
+                return Ok(());
+            }
+
+            // Pop the lowest-id prekey atomically: SELECT then DELETE under the
+            // single db mutex, so two concurrent FETCHes can never be handed
+            // the same one-time key.
+            let blob: Option<Vec<u8>> = {
+                let db = self.db.lock().await;
+                let row: Option<(i64, Vec<u8>)> = db
+                    .query_row(
+                        "SELECT id, blob FROM prekeys WHERE recipient = ? \
+                         ORDER BY id ASC LIMIT 1",
+                        params![recipient.as_bytes().as_slice()],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                match row {
+                    Some((id, blob)) => {
+                        db.execute("DELETE FROM prekeys WHERE id = ?", params![id])?;
+                        Some(blob)
+                    }
+                    None => None,
+                }
+            };
+
+            match blob {
+                Some(b) => {
+                    write_timed(stream, &[REPLY_OK], "fetch reply (ok)").await?;
+                    write_timed(stream, &(b.len() as u32).to_le_bytes(), "fetch len").await?;
+                    write_timed(stream, &b, "fetch blob").await?;
+                }
+                None => {
+                    write_timed(stream, &[REPLY_PREKEY_NONE], "fetch reply (none)").await?;
+                }
+            }
+            tokio::time::timeout(IO_TIMEOUT, stream.flush())
+                .await
+                .map_err(|_| InboxError::Timeout("fetch flush"))??;
             let _ = stream.shutdown().await;
             Ok(())
         }
@@ -739,6 +1132,127 @@ mod tests {
 
         // Records are per-peer: a different NodeId starts fresh.
         assert_eq!(checkpoint(other.as_ref(), &srv, 1).await.unwrap(), CheckpointStatus::Ok);
+
+        task.abort();
+    }
+
+    /// Spin up an inbox server on a fresh MockNetwork and return the network,
+    /// server handle, accept-loop task, and its address. Shared by the
+    /// prekey tests below.
+    async fn spawn_server() -> (
+        Arc<MockNetwork>,
+        Arc<InboxServer>,
+        tokio::task::JoinHandle<()>,
+        PeerAddr,
+        tempfile::TempDir,
+    ) {
+        let net = MockNetwork::new();
+        let server_ep =
+            Arc::new(net.register(pid(99), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let dir = tempdir().expect("tempdir");
+        let server = Arc::new(
+            InboxServer::open(dir.path().join("inbox.db"), &test_passphrase()).expect("open"),
+        );
+        let task = {
+            let s = Arc::clone(&server);
+            let ep = Arc::clone(&server_ep);
+            tokio::spawn(async move {
+                let _ = s.run(ep).await;
+            })
+        };
+        (net, server, task, PeerAddr::new(pid(99)), dir)
+    }
+
+    /// bob publishes prekeys into his own slot; alice fetches them in FIFO
+    /// order, one-time (each served once), and gets Depleted once drained.
+    #[tokio::test]
+    async fn publish_then_fetch_is_fifo_one_time() {
+        let (net, _server, task, srv, _dir) = spawn_server().await;
+        let bob =
+            Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let alice =
+            Arc::new(net.register(pid(1), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+
+        let batch = vec![b"prekey-A".to_vec(), b"prekey-B".to_vec()];
+        publish_prekeys(bob.as_ref(), &srv, &batch).await.expect("publish");
+
+        // FIFO: A then B.
+        assert_eq!(
+            fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
+            FetchOutcome::Prekey(b"prekey-A".to_vec())
+        );
+        assert_eq!(
+            fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
+            FetchOutcome::Prekey(b"prekey-B".to_vec())
+        );
+        // One-time: the pool is now empty.
+        assert_eq!(
+            fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
+            FetchOutcome::Depleted
+        );
+
+        task.abort();
+    }
+
+    /// Prekey pools are isolated by recipient slot, which is the publisher's
+    /// handshake NodeId — bob cannot publish into carol's slot.
+    #[tokio::test]
+    async fn prekey_pools_are_isolated_by_recipient() {
+        let (net, _server, task, srv, _dir) = spawn_server().await;
+        let bob =
+            Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let alice =
+            Arc::new(net.register(pid(1), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+
+        publish_prekeys(bob.as_ref(), &srv, &[b"bob-pk".to_vec()])
+            .await
+            .expect("publish");
+
+        // Fetching for bob (pid 2) yields bob's prekey...
+        assert_eq!(
+            fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
+            FetchOutcome::Prekey(b"bob-pk".to_vec())
+        );
+        // ...but carol (pid 3) published nothing, so her slot is empty even
+        // though bob deposited to the same server.
+        assert_eq!(
+            fetch_prekey(alice.as_ref(), &srv, pid(3)).await.unwrap(),
+            FetchOutcome::Depleted
+        );
+
+        task.abort();
+    }
+
+    /// A single sender NodeId fetching in a tight burst is throttled once it
+    /// exhausts its token bucket — and the throttle is reported as
+    /// RateLimited, distinct from genuine Depletion (the pool still has keys).
+    #[tokio::test]
+    async fn fetch_is_rate_limited_per_sender() {
+        let (net, _server, task, srv, _dir) = spawn_server().await;
+        let bob =
+            Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let alice =
+            Arc::new(net.register(pid(1), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+
+        // Publish more prekeys than the burst capacity so we hit the rate
+        // limit before the pool runs dry — proving the two are distinct.
+        let cap = FETCH_RL_CAPACITY as usize;
+        let batch: Vec<Vec<u8>> = (0..cap + 4).map(|i| format!("pk-{i}").into_bytes()).collect();
+        publish_prekeys(bob.as_ref(), &srv, &batch).await.expect("publish");
+
+        // The first `cap` fetches succeed (burst); negligible time passes so
+        // the bucket barely refills.
+        for _ in 0..cap {
+            assert!(matches!(
+                fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
+                FetchOutcome::Prekey(_)
+            ));
+        }
+        // The next fetch is throttled — NOT depleted (keys remain).
+        assert_eq!(
+            fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
+            FetchOutcome::RateLimited
+        );
 
         task.abort();
     }
