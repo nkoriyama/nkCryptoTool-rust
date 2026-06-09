@@ -15,6 +15,8 @@ pub mod processor;
 pub mod group;
 #[cfg(feature = "mls")]
 pub mod prekey;
+#[cfg(feature = "mls")]
+pub mod one_shot;
 pub mod gui;
 #[cfg(feature = "gui-camera")]
 pub mod camera { pub use crate::gui::camera::*; }
