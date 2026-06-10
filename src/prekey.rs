@@ -290,7 +290,24 @@ impl PrekeyStore {
                  id    INTEGER PRIMARY KEY CHECK (id = 0),
                  next  INTEGER NOT NULL
              );
-             INSERT OR IGNORE INTO prekey_seq (id, next) VALUES (0, 0);",
+             INSERT OR IGNORE INTO prekey_seq (id, next) VALUES (0, 0);
+             -- Long-term static X-Wing keypair (the reachability/fallback
+             -- target a sender always encapsulates to; the One-Time Prekeys
+             -- supply forward secrecy on top). Single row (id=0). Stored in
+             -- the same SQLCipher boundary as the prekeys.
+             CREATE TABLE IF NOT EXISTS static_keypair (
+                 id          INTEGER PRIMARY KEY CHECK (id = 0),
+                 xwing_priv  BLOB NOT NULL,
+                 xwing_pub   BLOB NOT NULL,
+                 created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+             );
+             -- Small key/value scratch for receive-side state, currently the
+             -- inbox poll cursor so `recv` does not re-process old envelopes
+             -- (re-opening a consumed prekey would just fail noisily anyway).
+             CREATE TABLE IF NOT EXISTS prekey_meta (
+                 k  TEXT PRIMARY KEY,
+                 v  INTEGER NOT NULL
+             );",
         )?;
         // Tighten the DB file to owner-only — it holds (SQLCipher-encrypted)
         // prekey private keys; 0600 matches how the at-rest key files are
@@ -407,6 +424,92 @@ impl PrekeyStore {
     pub fn delete_all(&self) -> Result<u64> {
         let n = self.conn.execute("DELETE FROM onetime_prekeys", [])?;
         Ok(n as u64)
+    }
+
+    /// Persist the long-term static X-Wing keypair (the reachability target
+    /// every sender encapsulates to). Fails if an identity already exists —
+    /// replacing it would orphan every recipient bundle already handed out
+    /// and every static-fallback ciphertext already in flight, so rotation
+    /// is a deliberate `delete_identity` + re-`init` rather than a silent
+    /// overwrite.
+    pub fn store_identity(&self, sk: &HpkeSecretKey, pk: &HpkePublicKey) -> Result<()> {
+        if pk.as_ref().len() != XWING_PK_LEN {
+            return Err(PrekeyError::BadPublicKeyLen(0, pk.as_ref().len()));
+        }
+        let changed = self.conn.execute(
+            "INSERT INTO static_keypair (id, xwing_priv, xwing_pub) VALUES (0, ?1, ?2)",
+            rusqlite::params![sk.as_ref(), pk.as_ref()],
+        );
+        match changed {
+            Ok(_) => Ok(()),
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Err(PrekeyError::Wire(
+                    "a static identity already exists in this store".into(),
+                ))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Generate a fresh long-term static X-Wing keypair, persist it, and
+    /// return the public half for inclusion in a recipient bundle. Convenience
+    /// over [`store_identity`](Self::store_identity); same one-shot semantics.
+    pub fn generate_identity(&self) -> Result<HpkePublicKey> {
+        let suite = build_at_rest_suite().ok_or(PrekeyError::Suite)?;
+        let (sk, pk) = suite
+            .kem_generate()
+            .map_err(|e| PrekeyError::Keygen(e.to_string()))?;
+        self.store_identity(&sk, &pk)?;
+        Ok(pk)
+    }
+
+    /// Load the long-term static X-Wing keypair, or `None` if none has been
+    /// generated yet. The private key arrives in a `ZeroizeOnDrop`
+    /// [`HpkeSecretKey`].
+    pub fn load_identity(&self) -> Result<Option<(HpkeSecretKey, HpkePublicKey)>> {
+        let row: Option<(Vec<u8>, Vec<u8>)> = self
+            .conn
+            .query_row(
+                "SELECT xwing_priv, xwing_pub FROM static_keypair WHERE id = 0",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(row.map(|(sk, pk)| (HpkeSecretKey::from(sk), HpkePublicKey::from(pk))))
+    }
+
+    /// The last inbox poll cursor persisted by [`set_inbox_cursor`], or 0 if
+    /// `recv` has never run against this store.
+    pub fn inbox_cursor(&self) -> Result<u64> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT v FROM prekey_meta WHERE k = 'inbox_cursor'",
+                [],
+                |r| r.get(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(other),
+            })?;
+        Ok(v.unwrap_or(0) as u64)
+    }
+
+    /// Persist the inbox poll cursor so the next `recv` resumes after it.
+    pub fn set_inbox_cursor(&self, cursor: u64) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO prekey_meta (k, v) VALUES ('inbox_cursor', ?1)
+             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
+            rusqlite::params![cursor as i64],
+        )?;
+        Ok(())
     }
 }
 
@@ -610,6 +713,36 @@ mod tests {
         let (parsed, consumed) = SignedPrekey::from_bytes(&bytes).unwrap();
         assert_eq!(consumed, bytes.len());
         assert_eq!(parsed, g.signed);
+    }
+
+    #[test]
+    fn identity_generate_load_and_no_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PrekeyStore::open(&dir.path().join("prekeys.db"), &[0x55u8; 32]).unwrap();
+        // None before generation.
+        assert!(store.load_identity().unwrap().is_none());
+        let pk = store.generate_identity().unwrap();
+        assert_eq!(pk.as_ref().len(), XWING_PK_LEN);
+        // Loads back the same public key.
+        let (sk, pk2) = store.load_identity().unwrap().unwrap();
+        assert_eq!(pk2.as_ref(), pk.as_ref());
+        assert_eq!(sk.as_ref().len(), XWING_SK_LEN);
+        // A second generate refuses to clobber the existing identity.
+        assert!(store.generate_identity().is_err());
+        // The original key is untouched after the failed overwrite.
+        let (_sk3, pk3) = store.load_identity().unwrap().unwrap();
+        assert_eq!(pk3.as_ref(), pk.as_ref());
+    }
+
+    #[test]
+    fn inbox_cursor_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = PrekeyStore::open(&dir.path().join("prekeys.db"), &[0x66u8; 32]).unwrap();
+        assert_eq!(store.inbox_cursor().unwrap(), 0);
+        store.set_inbox_cursor(42).unwrap();
+        assert_eq!(store.inbox_cursor().unwrap(), 42);
+        store.set_inbox_cursor(100).unwrap();
+        assert_eq!(store.inbox_cursor().unwrap(), 100);
     }
 
     #[test]

@@ -53,10 +53,12 @@
 use crate::network::inbox::{self, FetchOutcome};
 use crate::p2p::{P2pEndpoint, PeerAddr, PeerId};
 use crate::prekey::{
-    self, recipient_key_schedule, sender_key_schedule, PrekeyError, PrekeyStore, SignedPrekey,
-    MODE_FULL, MODE_STATIC_ONLY, XWING_PK_LEN,
+    self, peer_id_from_dsa_pub, recipient_key_schedule, sender_key_schedule, PrekeyError,
+    PrekeyStore, SignedPrekey, MODE_FULL, MODE_STATIC_ONLY, XWING_PK_LEN,
 };
 use crate::strategy::streaming_aead::{aead_decrypt_chunk, aead_encrypt_chunk, V3_NONCE_LEN};
+use crate::ticket::Ticket;
+use data_encoding::HEXLOWER;
 use mls_rs_core::crypto::{HpkePublicKey, HpkeSecretKey};
 use rand_core::{OsRng, RngCore};
 use zeroize::Zeroizing;
@@ -106,6 +108,12 @@ pub enum OneShotError {
     DowngradeRejected,
     #[error("prekey {0} not in store (consumed, replayed, or unknown) — cannot decrypt")]
     PrekeyMissing(u32),
+    #[error("recipient bundle: {0}")]
+    Bundle(String),
+    #[error("recipient bundle self-signature does not verify (corrupt or tampered)")]
+    BundleUntrusted,
+    #[error("recipient fingerprint mismatch: bundle is {got}, expected {want}")]
+    FingerprintMismatch { got: String, want: String },
 }
 
 type Result<T> = std::result::Result<T, OneShotError>;
@@ -322,6 +330,271 @@ pub fn generate_and_store(
         bundle.push(g.signed.to_bytes());
     }
     Ok(bundle)
+}
+
+// ----- recipient bundle (discovery) ------------------------------------------
+
+const BUNDLE_MAGIC: &[u8; 4] = b"NKB1";
+const BUNDLE_VERSION: u8 = 1;
+/// Domain separator so a bundle self-signature can never be mistaken for a
+/// signature over a prekey, a handshake transcript, or a file header.
+const BUNDLE_SIG_CONTEXT: &[u8] = b"nkct-recipient-bundle-v1";
+/// ML-DSA-65 public keys are 1952 B; the cap rejects a bogus length before
+/// any large copy.
+const MAX_DSA_PUB_LEN: usize = 4 * 1024;
+/// A `nkct1…` ticket is well under this; the cap bounds the parse.
+const MAX_TICKET_LEN: usize = 4 * 1024;
+/// ML-DSA-65 signatures are 3309 B.
+const MAX_BUNDLE_SIG_LEN: usize = 8 * 1024;
+
+/// Everything a sender needs to address and encrypt to a recipient, bound
+/// together and self-signed under the recipient's ML-DSA-65 identity:
+///
+/// * `dsa_pub` — the identity key; verifies fetched prekeys and is the
+///   thing the sender pins by fingerprint.
+/// * `static_xwing_pub` — the long-term reachability/fallback KEM key.
+/// * `node_id` — the recipient's stable iroh NodeId, i.e. its inbox slot.
+/// * `inbox_ticket` — the (semi-trusted) inbox Delivery Service to use.
+///
+/// The self-signature binds these four together so a substituted
+/// `static_xwing_pub` (which would let an attacker read a static-only
+/// fallback envelope) or a redirected `node_id`/`inbox_ticket` cannot be
+/// forged without the identity key. It does **not** by itself establish
+/// that `dsa_pub` is the identity you mean to reach — for that the sender
+/// compares [`fingerprint`](Self::fingerprint) against an out-of-band
+/// trusted value (see `seal` in the CLI).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecipientBundle {
+    pub dsa_pub: Vec<u8>,
+    pub static_xwing_pub: Vec<u8>,
+    pub node_id: [u8; 32],
+    pub inbox_ticket: String,
+}
+
+impl RecipientBundle {
+    /// Build and self-sign a bundle. `dsa_priv` is the raw ML-DSA-65 private
+    /// key (as [`prekey::generate`] consumes); the matching public key is
+    /// derived here so the signed identity always agrees with the signer.
+    pub fn build_signed(
+        dsa_priv: &[u8],
+        static_xwing_pub: &HpkePublicKey,
+        node_id: [u8; 32],
+        inbox_ticket: &str,
+    ) -> Result<Vec<u8>> {
+        let static_pk = static_xwing_pub.as_ref();
+        if static_pk.len() != XWING_PK_LEN {
+            return Err(OneShotError::Bundle(format!(
+                "static X-Wing pub is {} B, expected {XWING_PK_LEN}",
+                static_pk.len()
+            )));
+        }
+        // Bound the variable-length fields *before* the u16 length-prefix
+        // casts so an over-long input is rejected cleanly rather than
+        // silently truncating the prefix into a corrupt (unparseable)
+        // bundle. The same caps are enforced on parse.
+        if inbox_ticket.len() > MAX_TICKET_LEN {
+            return Err(OneShotError::Bundle(format!(
+                "inbox ticket is {} B, exceeds max {MAX_TICKET_LEN}",
+                inbox_ticket.len()
+            )));
+        }
+        let dsa_pub = crate::backend::pqc_pub_from_priv_dsa(prekey::PREKEY_SIGN_ALGO, dsa_priv)
+            .map_err(OneShotError::Crypto)?;
+        if dsa_pub.is_empty() || dsa_pub.len() > MAX_DSA_PUB_LEN {
+            return Err(OneShotError::Bundle(format!(
+                "identity public key is {} B, out of range 1..={MAX_DSA_PUB_LEN}",
+                dsa_pub.len()
+            )));
+        }
+        let payload = Self::payload_bytes(&dsa_pub, static_pk, &node_id, inbox_ticket);
+        let mut msg = Vec::with_capacity(BUNDLE_SIG_CONTEXT.len() + payload.len());
+        msg.extend_from_slice(BUNDLE_SIG_CONTEXT);
+        msg.extend_from_slice(&payload);
+        let sig = crate::backend::pqc_sign(prekey::PREKEY_SIGN_ALGO, dsa_priv, &msg, None)
+            .map_err(OneShotError::Crypto)?;
+        let mut out = payload;
+        out.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+        out.extend_from_slice(&sig);
+        Ok(out)
+    }
+
+    /// Parse a bundle and verify its self-signature. A bad signature yields
+    /// [`OneShotError::BundleUntrusted`]. The caller should additionally pin
+    /// [`fingerprint`](Self::fingerprint) against a trusted value.
+    pub fn parse_and_verify(buf: &[u8]) -> Result<Self> {
+        let mut o = 0usize;
+        let take = |o: &mut usize, n: usize| -> Result<&[u8]> {
+            let end = o
+                .checked_add(n)
+                .ok_or_else(|| OneShotError::Bundle("length overflow".into()))?;
+            if end > buf.len() {
+                return Err(OneShotError::Bundle("truncated bundle".into()));
+            }
+            let s = &buf[*o..end];
+            *o = end;
+            Ok(s)
+        };
+        if take(&mut o, 4)? != BUNDLE_MAGIC {
+            return Err(OneShotError::Bundle("bad magic".into()));
+        }
+        let version = take(&mut o, 1)?[0];
+        if version != BUNDLE_VERSION {
+            return Err(OneShotError::Bundle(format!("unsupported version {version}")));
+        }
+        let dsa_len = u16::from_le_bytes(take(&mut o, 2)?.try_into().unwrap()) as usize;
+        if dsa_len == 0 || dsa_len > MAX_DSA_PUB_LEN {
+            return Err(OneShotError::Bundle(format!("dsa pub len {dsa_len} out of range")));
+        }
+        let dsa_pub = take(&mut o, dsa_len)?.to_vec();
+        let static_xwing_pub = take(&mut o, XWING_PK_LEN)?.to_vec();
+        let mut node_id = [0u8; 32];
+        node_id.copy_from_slice(take(&mut o, 32)?);
+        let ticket_len = u16::from_le_bytes(take(&mut o, 2)?.try_into().unwrap()) as usize;
+        if ticket_len == 0 || ticket_len > MAX_TICKET_LEN {
+            return Err(OneShotError::Bundle(format!("ticket len {ticket_len} out of range")));
+        }
+        let ticket_bytes = take(&mut o, ticket_len)?.to_vec();
+        let inbox_ticket = String::from_utf8(ticket_bytes)
+            .map_err(|_| OneShotError::Bundle("inbox ticket is not UTF-8".into()))?;
+
+        // The signed region is exactly the bytes parsed so far (everything
+        // before sig_len), prefixed by the domain separator.
+        let payload = &buf[..o];
+        let sig_len = u32::from_le_bytes(take(&mut o, 4)?.try_into().unwrap()) as usize;
+        if sig_len == 0 || sig_len > MAX_BUNDLE_SIG_LEN {
+            return Err(OneShotError::Bundle(format!("sig len {sig_len} out of range")));
+        }
+        let sig = take(&mut o, sig_len)?;
+        // Reject trailing bytes: the signature covers only `payload`, so any
+        // appended data would otherwise ride along as a second valid encoding
+        // of the same bundle (malleability). A well-formed bundle ends here.
+        if o != buf.len() {
+            return Err(OneShotError::Bundle(format!(
+                "{} trailing byte(s) after bundle signature",
+                buf.len() - o
+            )));
+        }
+        let mut msg = Vec::with_capacity(BUNDLE_SIG_CONTEXT.len() + payload.len());
+        msg.extend_from_slice(BUNDLE_SIG_CONTEXT);
+        msg.extend_from_slice(payload);
+        let ok = crate::backend::pqc_verify(prekey::PREKEY_SIGN_ALGO, &dsa_pub, &msg, sig)
+            .map_err(OneShotError::Crypto)?;
+        if !ok {
+            return Err(OneShotError::BundleUntrusted);
+        }
+        Ok(Self { dsa_pub, static_xwing_pub, node_id, inbox_ticket })
+    }
+
+    fn payload_bytes(
+        dsa_pub: &[u8],
+        static_xwing_pub: &[u8],
+        node_id: &[u8; 32],
+        inbox_ticket: &str,
+    ) -> Vec<u8> {
+        let mut p = Vec::with_capacity(
+            4 + 1 + 2 + dsa_pub.len() + XWING_PK_LEN + 32 + 2 + inbox_ticket.len(),
+        );
+        p.extend_from_slice(BUNDLE_MAGIC);
+        p.push(BUNDLE_VERSION);
+        p.extend_from_slice(&(dsa_pub.len() as u16).to_le_bytes());
+        p.extend_from_slice(dsa_pub);
+        p.extend_from_slice(static_xwing_pub);
+        p.extend_from_slice(node_id);
+        p.extend_from_slice(&(inbox_ticket.len() as u16).to_le_bytes());
+        p.extend_from_slice(inbox_ticket.as_bytes());
+        p
+    }
+
+    /// The recipient identity fingerprint, `SHA3-256(dsa_pub)` as lowercase
+    /// hex — the value a sender pins out-of-band (matches the P2P PeerId and
+    /// `--fingerprint`).
+    pub fn fingerprint(&self) -> String {
+        HEXLOWER.encode(&peer_id_from_dsa_pub(&self.dsa_pub))
+    }
+
+    /// The recipient's inbox slot address (its stable iroh NodeId).
+    pub fn recipient_peer_id(&self) -> PeerId {
+        PeerId::new(self.node_id)
+    }
+
+    /// The recipient's long-term static X-Wing public key.
+    pub fn static_pk(&self) -> HpkePublicKey {
+        HpkePublicKey::from(self.static_xwing_pub.clone())
+    }
+
+    /// The inbox Delivery Service address parsed from the embedded ticket.
+    pub fn inbox_addr(&self) -> Result<PeerAddr> {
+        let ticket: Ticket = self
+            .inbox_ticket
+            .parse()
+            .map_err(|e| OneShotError::Bundle(format!("invalid inbox ticket: {e}")))?;
+        Ok(ticket.peer_addr())
+    }
+}
+
+// ----- end-to-end orchestration ----------------------------------------------
+
+/// Fetch a prekey, seal `payload` for the recipient described by `bundle`,
+/// and deposit the envelope into the recipient's inbox slot — the complete
+/// sender side. `bundle` must already be verified
+/// ([`RecipientBundle::parse_and_verify`]) and fingerprint-pinned by the
+/// caller. Returns the [`Sealed`] so the caller can report whether full
+/// PQ-FS was achieved or it fell back to static-only.
+pub async fn seal_and_deposit(
+    endpoint: &dyn P2pEndpoint,
+    bundle: &RecipientBundle,
+    payload: &[u8],
+    profile: FsProfile,
+) -> Result<Sealed> {
+    let inbox_server = bundle.inbox_addr()?;
+    let recipient = bundle.recipient_peer_id();
+    let static_pk = bundle.static_pk();
+    let sealed = seal_via_inbox(
+        endpoint,
+        &inbox_server,
+        recipient,
+        &bundle.dsa_pub,
+        &static_pk,
+        payload,
+        profile,
+    )
+    .await?;
+    inbox::deposit(endpoint, &inbox_server, recipient, &sealed.envelope).await?;
+    Ok(sealed)
+}
+
+/// One opened (or failed) inbox envelope, paired with its poll cursor so the
+/// caller can persist progress even across a mix of successes and failures.
+pub struct Received {
+    pub cursor: u64,
+    pub result: Result<Zeroizing<Vec<u8>>>,
+}
+
+/// Poll the inbox once from `since_cursor` and attempt to [`open`] every
+/// envelope addressed to us — the complete receiver side. Each envelope is
+/// opened independently (a bad/foreign/replayed one does not abort the
+/// batch); the returned new cursor should be persisted
+/// ([`PrekeyStore::set_inbox_cursor`]) so the next poll resumes after it.
+pub async fn receive(
+    endpoint: &dyn P2pEndpoint,
+    inbox_server: &PeerAddr,
+    static_sk: &HpkeSecretKey,
+    static_pk: &HpkePublicKey,
+    store: &PrekeyStore,
+    since_cursor: u64,
+    profile: FsProfile,
+) -> Result<(u64, Vec<Received>)> {
+    let (cursor, envelopes) = inbox::poll(endpoint, inbox_server, since_cursor).await?;
+    let mut out = Vec::with_capacity(envelopes.len());
+    for env in &envelopes {
+        let result = open(static_sk, static_pk, store, env, profile);
+        // The per-envelope cursor is not returned by `poll`; the batch cursor
+        // is monotonic, so on a resume from `cursor` any unprocessed envelope
+        // is re-polled. Pair each result with the batch cursor for the
+        // caller's bookkeeping.
+        out.push(Received { cursor, result });
+    }
+    Ok((cursor, out))
 }
 
 // ----- wire helpers ----------------------------------------------------------
@@ -621,5 +894,107 @@ mod tests {
         );
         // The legit prekey was never consumed by the failed open.
         assert_eq!(r.store.count().unwrap(), 1);
+    }
+
+    fn inbox_ticket_for(peer: PeerId) -> String {
+        crate::ticket::Ticket::new(PeerAddr::new(peer), None, None).to_string()
+    }
+
+    /// A signed bundle round-trips, exposes the right fingerprint, and any
+    /// single-byte tamper (here: the static X-Wing key) breaks verification.
+    #[test]
+    fn bundle_roundtrips_and_detects_tamper() {
+        let dir = tempdir().unwrap();
+        let r = make_recipient(dir.path());
+        let node_id = *r.peer_id.as_bytes();
+        let ticket = inbox_ticket_for(PeerId::new([99u8; 32]));
+
+        let bytes =
+            RecipientBundle::build_signed(&r.dsa_priv, &r.static_pk, node_id, &ticket).unwrap();
+        let parsed = RecipientBundle::parse_and_verify(&bytes).unwrap();
+        assert_eq!(parsed.dsa_pub, r.dsa_pub);
+        assert_eq!(parsed.static_xwing_pub, r.static_pk.as_ref());
+        assert_eq!(parsed.node_id, node_id);
+        assert_eq!(parsed.inbox_ticket, ticket);
+        assert_eq!(parsed.recipient_peer_id(), r.peer_id);
+        // Fingerprint is SHA3-256(dsa_pub) hex — the value pinned out-of-band.
+        assert_eq!(parsed.fingerprint(), HEXLOWER.encode(&prekey::peer_id_from_dsa_pub(&r.dsa_pub)));
+
+        // Flip a byte inside the signed static-key region → BundleUntrusted.
+        let mut tampered = bytes.clone();
+        let off = 4 + 1 + 2 + r.dsa_pub.len() + 5; // into static_xwing_pub
+        tampered[off] ^= 0xff;
+        match RecipientBundle::parse_and_verify(&tampered) {
+            Err(OneShotError::BundleUntrusted) | Err(OneShotError::Bundle(_)) => {}
+            other => panic!("tampered bundle must not verify, got {other:?}"),
+        }
+
+        // Appended trailing bytes are rejected (no malleable second encoding).
+        let mut trailing = bytes.clone();
+        trailing.push(0x00);
+        match RecipientBundle::parse_and_verify(&trailing) {
+            Err(OneShotError::Bundle(_)) => {}
+            other => panic!("trailing data must be rejected, got {other:?}"),
+        }
+    }
+
+    /// Full sender→receiver E2E over the inbox using only the bundle and the
+    /// store-managed identity: generate identity + prekeys, publish, build a
+    /// bundle, `seal_and_deposit`, then `receive` and match the plaintext.
+    #[tokio::test]
+    async fn e2e_seal_and_deposit_then_receive() {
+        let net = MockNetwork::new();
+        let dir = tempdir().unwrap();
+        let (dsa_priv, dsa_pub, _) = crate::backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+        let node_id = prekey::peer_id_from_dsa_pub(&dsa_pub); // recipient's stable id
+        let peer_id = PeerId::new(node_id);
+        let store = PrekeyStore::open(&dir.path().join("prekeys.db"), &[0x44u8; 32]).unwrap();
+
+        let (task, srv) = spawn_inbox(&net, dir.path()).await;
+        let inbox_ticket = inbox_ticket_for(PeerId::new([99u8; 32]));
+
+        // Recipient sets up: long-term static key + a prekey + publish.
+        let static_pk = store.generate_identity().unwrap();
+        let recipient_ep =
+            Arc::new(net.register(peer_id, vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let prekey_bundle = generate_and_store(&store, &dsa_priv, 3).unwrap();
+        inbox::publish_prekeys(recipient_ep.as_ref(), &srv, &prekey_bundle).await.unwrap();
+
+        // Recipient hands out a signed discovery bundle.
+        let bundle_bytes =
+            RecipientBundle::build_signed(&dsa_priv, &static_pk, node_id, &inbox_ticket).unwrap();
+
+        // Sender: verify the bundle, then seal + deposit.
+        let sender =
+            Arc::new(net.register(PeerId::new([7u8; 32]), vec![P2pProtocol(ALPN_INBOX)]))
+                as Arc<dyn P2pEndpoint>;
+        let bundle = RecipientBundle::parse_and_verify(&bundle_bytes).unwrap();
+        let msg = b"end-to-end forward-secret message";
+        let sealed =
+            seal_and_deposit(sender.as_ref(), &bundle, msg, FsProfile::StrictPqFs).await.unwrap();
+        assert_eq!(sealed.mode, MODE_FULL);
+
+        // Recipient: poll + open via the store-managed identity.
+        let (static_sk, static_pk2) = store.load_identity().unwrap().unwrap();
+        let (cursor, received) = receive(
+            recipient_ep.as_ref(),
+            &srv,
+            &static_sk,
+            &static_pk2,
+            &store,
+            store.inbox_cursor().unwrap(),
+            FsProfile::StrictPqFs,
+        )
+        .await
+        .unwrap();
+        store.set_inbox_cursor(cursor).unwrap();
+
+        assert_eq!(received.len(), 1);
+        let plaintext = received[0].result.as_ref().unwrap();
+        assert_eq!(plaintext.as_slice(), msg);
+        // The prekey was consumed (2 of the original 3 remain).
+        assert_eq!(store.count().unwrap(), 2);
+
+        task.abort();
     }
 }
