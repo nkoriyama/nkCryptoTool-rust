@@ -116,6 +116,14 @@ pub struct CryptoConfig {
     pub no_relay: bool,
     pub relay_url: Option<String>,
 
+    // Persistent iroh node secret key. When `Some`, the iroh endpoint
+    // loads (or creates, 0600) a stable ed25519 secret key from this path
+    // so our NodeId survives across process runs — required for the
+    // asynchronous inbox/prekey flow, where a recipient PUBLISHes prekeys
+    // in one run and POLLs in another and must address the same slot.
+    // `None` keeps the historical ephemeral-NodeId behaviour.
+    pub node_key_path: Option<std::path::PathBuf>,
+
     // For regenerate-pubkey
     pub regenerate_privkey_path: Option<String>,
     pub regenerate_pubkey_path: Option<String>,
@@ -160,6 +168,7 @@ impl Default for CryptoConfig {
             target_enc_fp: None,
             no_relay: false,
             relay_url: None,
+            node_key_path: None,
             regenerate_privkey_path: None,
             regenerate_pubkey_path: None,
         }

@@ -1,7 +1,8 @@
 use crate::config::CryptoConfig;
 use crate::error::{CryptoError, Result};
 use crate::network::{ALPN_CHAT, ALPN_FILE, ALPN_INBOX, ALPN_MLS};
-use iroh::{Endpoint, Watcher};
+use iroh::{Endpoint, SecretKey, Watcher};
+use std::path::Path;
 use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
@@ -36,6 +37,67 @@ fn iroh_node_addr_from_peer(addr: &crate::p2p::PeerAddr) -> Result<iroh::NodeAdd
         relay_url,
         direct_addresses: addr.direct_addrs.iter().cloned().collect(),
     })
+}
+
+/// Load the persistent iroh node secret key from `path`, or create one
+/// (0600, parent dirs made as needed) on first use. The key is a raw
+/// 32-byte ed25519 seed — the same wire form `SecretKey::to_bytes`
+/// produces — so the file is forward/backward compatible with iroh's own
+/// key encoding. Returning a stable key keeps our NodeId fixed across runs.
+fn load_or_create_node_secret(path: &Path) -> Result<SecretKey> {
+    use zeroize::Zeroizing;
+    if path.exists() {
+        let bytes = Zeroizing::new(
+            std::fs::read(path)
+                .map_err(|e| CryptoError::Parameter(format!("read node key {path:?}: {e}")))?,
+        );
+        let seed: &[u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+            CryptoError::Parameter(format!(
+                "node key {path:?} is {} bytes, expected 32",
+                bytes.len()
+            ))
+        })?;
+        return Ok(SecretKey::from_bytes(seed));
+    }
+
+    // First run: mint a fresh seed and persist it 0600 before returning.
+    let mut seed = Zeroizing::new([0u8; 32]);
+    {
+        use rand_core::RngCore;
+        rand_core::OsRng.fill_bytes(seed.as_mut());
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                CryptoError::Parameter(format!("create node key dir {parent:?}: {e}"))
+            })?;
+        }
+    }
+    // Create owner-only from the start so the seed is never briefly world-
+    // readable between write and chmod.
+    write_owner_only(path, seed.as_ref())
+        .map_err(|e| CryptoError::Parameter(format!("write node key {path:?}: {e}")))?;
+    Ok(SecretKey::from_bytes(&seed))
+}
+
+/// Write `bytes` to `path`, creating it exclusively (`O_EXCL`) so we never
+/// follow a symlink an attacker raced into place between the existence check
+/// and here, and never clobber a file that appeared concurrently. On unix
+/// the file is opened mode 0600 so it is never group/other-readable; other
+/// platforms fall back to an exclusive create (perms inherited from the
+/// parent dir, matching how the rest of the at-rest key files are handled).
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(bytes)?;
+    f.flush()
 }
 
 // ---------------------------------------------------------------------------
@@ -146,6 +208,14 @@ impl IrohEndpoint {
             ALPN_MLS.to_vec(),
             ALPN_INBOX.to_vec(),
         ]);
+
+        // A persistent node key gives us a stable NodeId across runs, which
+        // the asynchronous inbox/prekey flow needs (PUBLISH in one run, POLL
+        // in another, both addressing the same recipient slot). Without it
+        // iroh mints a fresh ephemeral key on every `bind()`.
+        if let Some(path) = config.node_key_path.as_deref() {
+            builder = builder.secret_key(load_or_create_node_secret(path)?);
+        }
 
         if is_test || config.no_relay {
             builder = builder.relay_mode(iroh::RelayMode::Disabled);
@@ -288,6 +358,39 @@ mod tests {
     fn reset_state() {
         CHAT_ACTIVE.store(false, Ordering::SeqCst);
         PEER_COOLDOWNS.lock().clear();
+    }
+
+    /// The persistent node key is created on first use and reloaded
+    /// verbatim afterwards, so our NodeId is stable across runs.
+    #[test]
+    fn node_key_is_created_then_reloaded_stably() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("sub").join("node.key");
+
+        // First call mints + persists; the file appears 0600.
+        let k1 = load_or_create_node_secret(&path).unwrap();
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "node key must be owner-only");
+        }
+
+        // Second call reloads the same bytes → identical public NodeId.
+        let k2 = load_or_create_node_secret(&path).unwrap();
+        assert_eq!(k1.to_bytes(), k2.to_bytes());
+        assert_eq!(k1.public(), k2.public());
+    }
+
+    /// A truncated/corrupt key file is rejected loudly rather than
+    /// silently producing a different identity.
+    #[test]
+    fn node_key_wrong_length_is_rejected() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("node.key");
+        fs::write(&path, [0u8; 16]).unwrap();
+        assert!(load_or_create_node_secret(&path).is_err());
     }
 
     fn modify_ticket(ticket_str: &str, sign_fp: Option<[u8; 32]>, enc_fp: Option<[u8; 32]>) -> String {
