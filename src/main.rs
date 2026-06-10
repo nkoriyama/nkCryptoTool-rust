@@ -238,6 +238,33 @@ struct Args {
     /// Revoke every prekey (for `--prekey-cmd revoke`).
     #[arg(long)]
     prekey_all: bool,
+
+    /// Path to the persistent iroh node secret key. A stable NodeId is
+    /// required for the asynchronous prekey flow (publish / seal / recv):
+    /// the recipient must keep the same inbox address across runs.
+    /// Defaults to `node.key` beside the prekey storage. Created 0600 on
+    /// first use.
+    #[arg(long)]
+    node_key: Option<String>,
+
+    /// Signed recipient bundle file (for `--prekey-cmd seal`). Produced by
+    /// the recipient's `--prekey-cmd init-identity`; carries the verified
+    /// identity, static X-Wing key, NodeId, and inbox ticket.
+    #[arg(long)]
+    recipient_bundle: Option<String>,
+
+    /// Expected recipient identity fingerprint (64 hex chars) to check the
+    /// `--recipient-bundle` against (for `--prekey-cmd seal`). Optional but
+    /// recommended: without it the bundle's self-signature only proves
+    /// internal consistency, not that the identity is the one you trust.
+    #[arg(long)]
+    recipient_fingerprint: Option<String>,
+
+    /// Refuse to send without post-quantum forward secrecy (for
+    /// `--prekey-cmd seal`). When set, a depleted/throttled prekey pool
+    /// makes the send fail rather than fall back to a static-only envelope.
+    #[arg(long)]
+    strict_pqfs: bool,
 }
 
 /// Resolve a key-file argument against `--key-dir`. A bare filename (no
@@ -558,9 +585,22 @@ async fn run_prekey_command(args: Args) -> anyhow::Result<()> {
 
     let cmd = args.prekey_cmd.as_deref().unwrap();
 
+    // `seal` is the sender side: it needs no prekey store (no store
+    // passphrase), only the recipient bundle and a transport endpoint.
+    // Handle it before any store/passphrase work.
+    if cmd == "seal" {
+        return run_prekey_seal(args).await;
+    }
+
     let store_path: PathBuf = match args.prekey_storage.as_deref() {
         Some(p) => PathBuf::from(p),
         None => default_storage_path()?.with_file_name("prekeys.db"),
+    };
+    // The persistent node key lives beside the store unless overridden, so a
+    // recipient keeps the same inbox NodeId across publish / recv runs.
+    let node_key_path: PathBuf = match args.node_key.as_deref() {
+        Some(p) => PathBuf::from(p),
+        None => store_path.with_file_name("node.key"),
     };
 
     // The at-rest passphrase unlocks the hybrid key that wraps the DEK
@@ -646,9 +686,317 @@ async fn run_prekey_command(args: Args) -> anyhow::Result<()> {
                 }
             }
         }
+        "init-identity" => {
+            run_prekey_init_identity(&args, &store, &node_key_path, &passphrase).await?;
+        }
+        "publish" => {
+            run_prekey_publish(&args, &store, &node_key_path, &passphrase).await?;
+        }
+        "recv" => {
+            run_prekey_recv(&args, &store, &node_key_path).await?;
+        }
         other => anyhow::bail!(
-            "unknown --prekey-cmd {other:?}; expected one of generate, list, revoke"
+            "unknown --prekey-cmd {other:?}; expected one of \
+             generate, list, revoke, init-identity, publish, seal, recv"
         ),
+    }
+    Ok(())
+}
+
+/// Build an iroh endpoint for the asynchronous prekey commands, pinned to a
+/// persistent node key so our NodeId (= inbox slot) is stable across runs.
+#[cfg(feature = "mls")]
+async fn build_prekey_endpoint(
+    args: &Args,
+    node_key_path: &std::path::Path,
+) -> anyhow::Result<std::sync::Arc<dyn nk_crypto_tool::p2p::P2pEndpoint>> {
+    use nk_crypto_tool::config::{CryptoConfig, TransportKind};
+    use nk_crypto_tool::p2p::P2pEndpoint;
+    use std::sync::Arc;
+    if args.transport != TransportKind::Iroh {
+        anyhow::bail!("prekey async commands require --transport iroh");
+    }
+    let mut cfg = CryptoConfig::default();
+    cfg.transport = args.transport;
+    cfg.no_relay = args.no_relay;
+    cfg.relay_url = args.relay_url.clone();
+    cfg.node_key_path = Some(node_key_path.to_path_buf());
+    let ep = nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&cfg, false).await?;
+    Ok(Arc::new(ep) as Arc<dyn P2pEndpoint>)
+}
+
+/// Parse the inbox Delivery Service address from `--inbox-url`.
+#[cfg(feature = "mls")]
+fn require_inbox_addr(args: &Args) -> anyhow::Result<nk_crypto_tool::p2p::PeerAddr> {
+    use nk_crypto_tool::ticket::Ticket;
+    let url = args
+        .inbox_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--inbox-url <ticket> is required for this command"))?;
+    let ticket: Ticket = url
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid --inbox-url ticket: {e}"))?;
+    Ok(ticket.peer_addr())
+}
+
+#[cfg(feature = "mls")]
+fn fs_profile(args: &Args) -> nk_crypto_tool::one_shot::FsProfile {
+    if args.strict_pqfs {
+        nk_crypto_tool::one_shot::FsProfile::StrictPqFs
+    } else {
+        nk_crypto_tool::one_shot::FsProfile::DefaultFallback
+    }
+}
+
+/// `init-identity`: one-time recipient setup. Generates the long-term static
+/// X-Wing key, stocks an initial prekey batch, publishes the signed bundle to
+/// the inbox, and writes a signed recipient bundle for senders to use.
+#[cfg(feature = "mls")]
+async fn run_prekey_init_identity(
+    args: &Args,
+    store: &nk_crypto_tool::prekey::PrekeyStore,
+    node_key_path: &std::path::Path,
+    passphrase: &zeroize::Zeroizing<String>,
+) -> anyhow::Result<()> {
+    use nk_crypto_tool::network::inbox;
+    use nk_crypto_tool::one_shot::{generate_and_store, RecipientBundle};
+
+    let output = args
+        .prekey_output
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--prekey-output <file> is required for init-identity"))?;
+    let inbox_url = args
+        .inbox_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--inbox-url <ticket> is required for init-identity"))?;
+    let signing_path = args
+        .signing_privkey
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--signing-privkey is required for init-identity"))?;
+
+    if store.load_identity()?.is_some() {
+        anyhow::bail!(
+            "this store already holds a static identity; \
+             rotating it would orphan existing bundles — start a fresh store to re-init"
+        );
+    }
+    let count = args.prekey_count;
+    const MAX_PREKEY_BATCH: u32 = 100_000;
+    if count == 0 || count > MAX_PREKEY_BATCH {
+        anyhow::bail!("--prekey-count must be between 1 and {MAX_PREKEY_BATCH}");
+    }
+    let dsa_priv = load_raw_dsa_priv(signing_path, passphrase)?;
+
+    // Generate + persist the long-term static key.
+    let static_pk = store.generate_identity()?;
+
+    // Endpoint first (it mints/loads the persistent node key → our NodeId).
+    let endpoint = build_prekey_endpoint(args, node_key_path).await?;
+    let inbox_addr = require_inbox_addr(args)?;
+    let node_id = endpoint.local_id().to_bytes();
+
+    // Stock and publish the initial prekey batch.
+    let bundle = generate_and_store(store, &dsa_priv, count)?;
+    inbox::publish_prekeys(endpoint.as_ref(), &inbox_addr, &bundle).await?;
+
+    // Write the signed recipient bundle senders will consume.
+    let signed = RecipientBundle::build_signed(&dsa_priv, &static_pk, node_id, inbox_url)?;
+    std::fs::write(output, &signed)
+        .map_err(|e| anyhow::anyhow!("write recipient bundle {output}: {e}"))?;
+
+    let parsed = RecipientBundle::parse_and_verify(&signed)?;
+    println!(
+        "Initialized recipient identity and published {count} prekey(s).\n\
+         Wrote signed bundle to {output}.\n\
+         Share this fingerprint out-of-band so senders can pin your identity:\n  {}",
+        parsed.fingerprint()
+    );
+    Ok(())
+}
+
+/// `publish`: replenish the prekey pool — generate a fresh batch and PUBLISH
+/// it to our inbox slot. Requires an existing identity (run `init-identity`).
+#[cfg(feature = "mls")]
+async fn run_prekey_publish(
+    args: &Args,
+    store: &nk_crypto_tool::prekey::PrekeyStore,
+    node_key_path: &std::path::Path,
+    passphrase: &zeroize::Zeroizing<String>,
+) -> anyhow::Result<()> {
+    use nk_crypto_tool::network::inbox;
+    use nk_crypto_tool::one_shot::generate_and_store;
+
+    if store.load_identity()?.is_none() {
+        anyhow::bail!("no identity in this store; run `--prekey-cmd init-identity` first");
+    }
+    let signing_path = args
+        .signing_privkey
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--signing-privkey is required for publish"))?;
+    let count = args.prekey_count;
+    const MAX_PREKEY_BATCH: u32 = 100_000;
+    if count == 0 || count > MAX_PREKEY_BATCH {
+        anyhow::bail!("--prekey-count must be between 1 and {MAX_PREKEY_BATCH}");
+    }
+    let dsa_priv = load_raw_dsa_priv(signing_path, passphrase)?;
+
+    let endpoint = build_prekey_endpoint(args, node_key_path).await?;
+    let inbox_addr = require_inbox_addr(args)?;
+    let bundle = generate_and_store(store, &dsa_priv, count)?;
+    inbox::publish_prekeys(endpoint.as_ref(), &inbox_addr, &bundle).await?;
+    println!(
+        "Published {count} prekey(s); pool now holds {} unused.",
+        store.count()?
+    );
+    Ok(())
+}
+
+/// `recv`: poll the inbox and decrypt every envelope addressed to us, writing
+/// each plaintext to `<output>.<n>`. Requires an existing identity.
+#[cfg(feature = "mls")]
+async fn run_prekey_recv(
+    args: &Args,
+    store: &nk_crypto_tool::prekey::PrekeyStore,
+    node_key_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    use nk_crypto_tool::one_shot::receive;
+
+    let (static_sk, static_pk) = store
+        .load_identity()?
+        .ok_or_else(|| anyhow::anyhow!("no identity in this store; run `--prekey-cmd init-identity` first"))?;
+    let out_base = args
+        .output_file
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--output-file <prefix> is required for recv"))?;
+
+    let endpoint = build_prekey_endpoint(args, node_key_path).await?;
+    let inbox_addr = require_inbox_addr(args)?;
+    let profile = fs_profile(args);
+
+    let since = store.inbox_cursor()?;
+    let (cursor, received) =
+        receive(endpoint.as_ref(), &inbox_addr, &static_sk, &static_pk, store, since, profile)
+            .await?;
+    store.set_inbox_cursor(cursor)?;
+
+    let mut ok = 0usize;
+    let mut failed = 0usize;
+    for (i, item) in received.iter().enumerate() {
+        match &item.result {
+            Ok(plaintext) => {
+                let path = format!("{out_base}.{i}");
+                write_plaintext_private(&path, plaintext.as_slice())?;
+                println!("Decrypted envelope {i} → {path} ({} bytes)", plaintext.len());
+                ok += 1;
+            }
+            Err(e) => {
+                eprintln!("[recv] envelope {i} skipped: {e}");
+                failed += 1;
+            }
+        }
+    }
+    println!("recv complete: {ok} decrypted, {failed} skipped (cursor now {cursor}).");
+    Ok(())
+}
+
+/// Write decrypted plaintext owner-only (0600 on unix), refusing to write
+/// *through* a symlink. On unix the open carries `O_NOFOLLOW`, so if the
+/// final path component is a symlink the open fails atomically — closing the
+/// check-then-open TOCTOU window a separate `symlink_metadata` test would
+/// leave. A plain regular file is still overwritten (so re-running `recv`
+/// stays idempotent), and `set_permissions` forces 0600 even on that
+/// overwrite path, where `mode()` (create-only) would not apply.
+#[cfg(feature = "mls")]
+fn write_plaintext_private(path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW: fail (ELOOP) instead of following a symlink planted at
+        // the target — atomic, no TOCTOU. mode() seeds 0600 on creation.
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut f = opts
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("open output {path}: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // Cover the overwrite-existing-regular-file case: mode() above only
+        // applies when the file is newly created, so re-lock to 0600 here.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| anyhow::anyhow!("set perms {path}: {e}"))?;
+    }
+    f.write_all(bytes).map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
+    f.flush().map_err(|e| anyhow::anyhow!("flush {path}: {e}"))?;
+    Ok(())
+}
+
+/// `seal`: sender side. Verify a recipient bundle (optionally pinning its
+/// fingerprint), then fetch a prekey, seal the input file, and deposit the
+/// envelope into the recipient's inbox slot.
+#[cfg(feature = "mls")]
+async fn run_prekey_seal(args: Args) -> anyhow::Result<()> {
+    use nk_crypto_tool::one_shot::{seal_and_deposit, RecipientBundle};
+    use std::path::PathBuf;
+
+    let bundle_path = args
+        .recipient_bundle
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--recipient-bundle <file> is required for seal"))?;
+    if args.input_files.len() != 1 {
+        anyhow::bail!("seal takes exactly one input file (the plaintext to send)");
+    }
+    let input = &args.input_files[0];
+
+    let bundle_bytes = std::fs::read(bundle_path)
+        .map_err(|e| anyhow::anyhow!("read recipient bundle {bundle_path}: {e}"))?;
+    let bundle = RecipientBundle::parse_and_verify(&bundle_bytes)
+        .map_err(|e| anyhow::anyhow!("recipient bundle rejected: {e}"))?;
+
+    // Identity pinning: the self-signature only proves the bundle is
+    // internally consistent. Compare the fingerprint against the trusted,
+    // out-of-band value when supplied; otherwise show it and proceed (TOFU).
+    let got = bundle.fingerprint();
+    match args.recipient_fingerprint.as_deref() {
+        Some(want) => {
+            let want = want.trim().to_ascii_lowercase();
+            if want != got {
+                anyhow::bail!(
+                    "recipient fingerprint mismatch:\n  bundle:   {got}\n  expected: {want}\n\
+                     refusing to send — the bundle is not the identity you pinned"
+                );
+            }
+            eprintln!("[seal] recipient fingerprint verified: {got}");
+        }
+        None => {
+            eprintln!(
+                "[seal] WARNING: sending without --recipient-fingerprint. Verify this \
+                 fingerprint out-of-band before trusting it:\n  {got}"
+            );
+        }
+    }
+
+    let payload = std::fs::read(input)
+        .map_err(|e| anyhow::anyhow!("read input {input}: {e}"))?;
+
+    let node_key_path: PathBuf = match args.node_key.as_deref() {
+        Some(p) => PathBuf::from(p),
+        None => nk_crypto_tool::group::cli::default_storage_path()?.with_file_name("node.key"),
+    };
+    let endpoint = build_prekey_endpoint(&args, &node_key_path).await?;
+    let profile = fs_profile(&args);
+
+    let sealed = seal_and_deposit(endpoint.as_ref(), &bundle, &payload, profile).await?;
+    if sealed.mode == nk_crypto_tool::prekey::MODE_FULL {
+        println!("Sealed with full PQ-FS and deposited to recipient inbox.");
+    } else {
+        println!(
+            "Sealed STATIC-ONLY (no post-quantum forward secrecy — prekey pool depleted \
+             or throttled) and deposited to recipient inbox."
+        );
     }
     Ok(())
 }
