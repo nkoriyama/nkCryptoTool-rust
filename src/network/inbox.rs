@@ -217,6 +217,33 @@ where
     Ok(())
 }
 
+/// Graceful-close barrier for the server side: after sending a full response,
+/// wait for the peer to finish its send stream (EOF) before letting the
+/// connection drop. Every client reads our response *in full* and only then
+/// calls `shutdown()` on its own send half, so observing that EOF proves the
+/// response was delivered. Without this barrier the handler returns, drops the
+/// last reference to the QUIC connection, and quinn emits an immediate
+/// CONNECTION_CLOSE(0) that races the still-in-flight response — the client
+/// then sees "connection lost: closed by peer: 0" instead of its reply.
+/// Best-effort and bounded: any read error (peer reset) or the timeout just
+/// ends the wait.
+async fn await_peer_close<S>(stream: &mut S)
+where
+    S: AsyncReadExt + Unpin + ?Sized,
+{
+    let _ = tokio::time::timeout(IO_TIMEOUT, async {
+        let mut scratch = [0u8; 64];
+        loop {
+            match stream.read(&mut scratch).await {
+                Ok(0) => break,    // clean EOF: peer finished after reading us
+                Ok(_) => continue, // unexpected trailing bytes — ignore and keep draining
+                Err(_) => break,   // reset/closed — nothing left to wait for
+            }
+        }
+    })
+    .await;
+}
+
 // -----------------------------------------------------------------------------
 // Client API
 // -----------------------------------------------------------------------------
@@ -642,14 +669,22 @@ mod server {
             let sender = incoming.peer_id;
             let mut tag = [0u8; 1];
             read_timed(&mut incoming.stream, &mut tag, "request tag").await?;
-            match tag[0] {
+            let result = match tag[0] {
                 TAG_DEPOSIT => self.handle_deposit(&mut *incoming.stream, sender).await,
                 TAG_POLL => self.handle_poll(&mut *incoming.stream, sender).await,
                 TAG_CHECKPOINT => self.handle_checkpoint(&mut *incoming.stream, sender).await,
                 TAG_PUBLISH => self.handle_publish(&mut *incoming.stream, sender).await,
                 TAG_FETCH => self.handle_fetch(&mut *incoming.stream, sender).await,
                 t => Err(InboxError::Protocol(format!("unknown tag {t:#x}"))),
+            };
+            // On success the handler has written its full response and finished
+            // our send half; hold the connection open until the client closes
+            // so the response is not truncated by an eager CONNECTION_CLOSE.
+            // See `await_peer_close`. On error there is nothing to protect.
+            if result.is_ok() {
+                await_peer_close(&mut *incoming.stream).await;
             }
+            result
         }
 
         async fn handle_deposit<S>(
