@@ -110,6 +110,15 @@ struct Args {
     #[arg(long, value_enum, default_value = "iroh")]
     transport: nk_crypto_tool::config::TransportKind,
 
+    /// Dynamic peer discovery (iroh). `none` (default) reaches a node only via
+    /// the addresses/relay in its ticket. `local` enables mDNS local-network
+    /// discovery so a NodeId resolves to its current LAN addresses even when a
+    /// ticket's addresses go stale (e.g. after an IP change) — useful for the
+    /// async inbox/prekey flow under --no-relay. Presence is advertised on the
+    /// local segment only, never to a public service.
+    #[arg(long, value_enum, default_value = "none")]
+    discovery: nk_crypto_tool::config::DiscoveryMode,
+
     #[arg(long, help = "Disable Iroh relay (only direct connections)")]
     no_relay: bool,
 
@@ -449,6 +458,7 @@ async fn main() -> anyhow::Result<()> {
     }
     config.no_relay = args.no_relay;
     config.relay_url = args.relay_url;
+    config.discovery = args.discovery;
     config.passphrase = passphrase;
     config.use_tpm = args.use_tpm;
     config.listen_addr = args.listen;
@@ -723,6 +733,7 @@ async fn build_prekey_endpoint(
     cfg.transport = args.transport;
     cfg.no_relay = args.no_relay;
     cfg.relay_url = args.relay_url.clone();
+    cfg.discovery = args.discovery;
     cfg.node_key_path = Some(node_key_path.to_path_buf());
     let ep = nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&cfg, false).await?;
     Ok(Arc::new(ep) as Arc<dyn P2pEndpoint>)
@@ -1187,6 +1198,7 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
     transport_config.transport = args.transport;
     transport_config.no_relay = args.no_relay;
     transport_config.relay_url = args.relay_url;
+    transport_config.discovery = args.discovery;
 
     let endpoint: Arc<dyn P2pEndpoint> = match transport_config.transport {
         nk_crypto_tool::config::TransportKind::Iroh => Arc::new(
@@ -1309,6 +1321,7 @@ async fn run_inbox_server(args: Args) -> anyhow::Result<()> {
     transport_config.transport = args.transport;
     transport_config.no_relay = args.no_relay;
     transport_config.relay_url = args.relay_url;
+    transport_config.discovery = args.discovery;
 
     let endpoint: Arc<dyn P2pEndpoint> = match transport_config.transport {
         nk_crypto_tool::config::TransportKind::Iroh => Arc::new(
@@ -1364,6 +1377,7 @@ async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
     transport_config.transport = args.transport;
     transport_config.no_relay = args.no_relay;
     transport_config.relay_url = args.relay_url;
+    transport_config.discovery = args.discovery;
 
     let endpoint: Arc<dyn P2pEndpoint> = match transport_config.transport {
         nk_crypto_tool::config::TransportKind::Iroh => Arc::new(

@@ -184,6 +184,12 @@ Iroh 公式 relay (Number Zero, US 運営) を経由した場合、relay 運営�
 
 メッセージ**内容**は relay にも漏れない (E2EE の保証)。漏れるのは「**誰が誰といつ話したか**」のみ。
 
+**`--discovery local`（mDNS、既定 off）のメタデータ注意**: 動的 peer discovery を `local` にすると、
+自ノードの NodeId と direct アドレスを **LAN セグメント上にマルチキャスト広告**する（ticket の stale
+アドレス自己修復のため）。広告は**ローカルネットワーク内のみ**で公開 DNS/DHT には出ないが、同一 LAN の
+観測者は「この NodeId がこの IP にいる」を受動的に知り得る。既定 `none` は何も広告しない（最もメタデータが
+少ない）。公開サービスへ publish する n0 DNS / mainline DHT discovery は意図的に未対応。
+
 ### 5.3 端末侵害
 
 プログラムの暗号強度とは独立した問題:

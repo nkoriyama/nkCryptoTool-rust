@@ -310,6 +310,7 @@ P2P トランスポート Iroh を使用した、PQC 認証付きの安全な通
 * **高度なオプション**:
     - `--no-relay`: リレーサーバーを無効化し、ダイレクト接続のみを許可。
     - `--relay-url <url>`: 特定のプライベートリレーを使用。
+    - `--discovery <none|local>`: 動的 peer discovery (既定 `none`)。`local` は mDNS で NodeId を LAN 上の現在のアドレスへ解決し、ticket に焼かれたアドレスが古くなっても (IP 変更後など) 自己修復する。非同期 inbox/prekey フローを `--no-relay` で運用する際に有用。プレゼンスは **LAN 内のみ**に広告され公開サービスには出ない ([SECURITY_PROFILE.md §5.2](./SECURITY_PROFILE.md) 参照)。
 * **ピア許可リスト併用 (推奨)**:
     ```bash
     nk-crypto-tool ... --peer-allowlist <allowlist.txt>

@@ -227,6 +227,18 @@ impl IrohEndpoint {
             ));
         }
 
+        // Dynamic peer discovery. Default `None` keeps the historical
+        // ticket-only reachability (no presence advertised). `Local` adds
+        // mDNS so a NodeId resolves to its current LAN addresses even when a
+        // ticket's embedded addresses go stale — presence stays on the local
+        // segment, never published to a public service.
+        match config.discovery {
+            crate::config::DiscoveryMode::None => {}
+            crate::config::DiscoveryMode::Local => {
+                builder = builder.discovery_local_network();
+            }
+        }
+
         let endpoint = builder
             .bind()
             .await
@@ -391,6 +403,30 @@ mod tests {
         let path = dir.path().join("node.key");
         fs::write(&path, [0u8; 16]).unwrap();
         assert!(load_or_create_node_secret(&path).is_err());
+    }
+
+    /// `--discovery local` wires mDNS into the endpoint builder: an endpoint
+    /// constructs successfully with the `discovery-local-network` feature on
+    /// and yields a stable NodeId. Guards the feature flag + builder call;
+    /// actual LAN resolution needs two real nodes and isn't exercised here.
+    #[tokio::test]
+    #[serial]
+    async fn endpoint_builds_with_local_discovery() {
+        let mut config = CryptoConfig::default();
+        config.transport = crate::config::TransportKind::Iroh;
+        config.discovery = crate::config::DiscoveryMode::Local;
+        config.no_relay = true;
+        let ep = IrohEndpoint::new(&config, true).await;
+        assert!(
+            ep.is_ok(),
+            "endpoint with mDNS discovery must build: {:?}",
+            ep.err()
+        );
+        // None is the historical default and must still build (no discovery).
+        let mut plain = CryptoConfig::default();
+        plain.transport = crate::config::TransportKind::Iroh;
+        plain.no_relay = true;
+        assert!(IrohEndpoint::new(&plain, true).await.is_ok());
     }
 
     fn modify_ticket(ticket_str: &str, sign_fp: Option<[u8; 32]>, enc_fp: Option<[u8; 32]>) -> String {

@@ -52,6 +52,30 @@ impl Default for TransportKind {
     }
 }
 
+/// Dynamic peer discovery mode for the iroh transport. Controls whether a
+/// NodeId can be resolved to *current* network addresses beyond those baked
+/// into a ticket — and whether this node advertises its own presence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
+pub enum DiscoveryMode {
+    /// No discovery (default, historical behaviour): a node is reachable only
+    /// via the direct addresses / relay URL embedded in its ticket. Nothing
+    /// is advertised anywhere — the most private option, but ticket addresses
+    /// that go stale (e.g. after an IP change) cannot self-heal.
+    None,
+    /// Local-network (mDNS) discovery: advertise and resolve NodeId↔address on
+    /// the local segment via multicast DNS. Stale ticket addresses self-heal
+    /// on the LAN with no external infrastructure, which fits the `--no-relay`
+    /// posture. Presence is broadcast on the local network only — never to a
+    /// public DNS/DHT service.
+    Local,
+}
+
+impl Default for DiscoveryMode {
+    fn default() -> Self {
+        DiscoveryMode::None
+    }
+}
+
 impl fmt::Display for CryptoMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{:?}", self)
@@ -116,6 +140,11 @@ pub struct CryptoConfig {
     pub no_relay: bool,
     pub relay_url: Option<String>,
 
+    // Dynamic peer discovery (iroh transport). `None` keeps the historical
+    // ticket-only reachability; `Local` enables mDNS so stale ticket
+    // addresses self-heal on the LAN.
+    pub discovery: DiscoveryMode,
+
     // Persistent iroh node secret key. When `Some`, the iroh endpoint
     // loads (or creates, 0600) a stable ed25519 secret key from this path
     // so our NodeId survives across process runs — required for the
@@ -168,6 +197,7 @@ impl Default for CryptoConfig {
             target_enc_fp: None,
             no_relay: false,
             relay_url: None,
+            discovery: DiscoveryMode::default(),
             node_key_path: None,
             regenerate_privkey_path: None,
             regenerate_pubkey_path: None,
