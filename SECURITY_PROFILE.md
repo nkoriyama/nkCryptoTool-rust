@@ -166,8 +166,8 @@ kem_ss = ML-KEM(static recipient KEM key)        ← Post-Quantum FS なし (鍵
 の 3 点が揃うと、過去のワンショット暗号文が復号される。
 
 **緩和策**:
-- inbox 非同期配送: One-Time Prekey（PQXDH 風）の導入で PQ-FS を達成可能（ロードマップ）。
-- ローカルファイル自己暗号化: 双方向交換も Prekey インフラも無いため原理的に PQ-FS 不可。長期 KEM 鍵の定期ローテーション（運用）が唯一の緩和策。
+- inbox 非同期配送: One-Time Prekey（PQXDH 風）で PQ-FS を達成（実装済み）。`--prekey-cmd init-identity|publish|seal|recv`。
+- ローカルファイル自己暗号化: 双方向交換も Prekey インフラも無いため原理的に PQ-FS 不可。長期 KEM 鍵の定期ローテーション（運用）が唯一の緩和策 → 手順は **[KEY_ROTATION_GUIDE.md](KEY_ROTATION_GUIDE.md)**。
 
 ### 5.2 メタデータ漏洩 (relay 経由時) 🟡
 

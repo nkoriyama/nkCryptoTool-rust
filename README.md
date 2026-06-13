@@ -249,18 +249,18 @@ Linux 環境では、TPM デバイス (`/dev/tpmrm0` 等) へのアクセス権�
 
 * **ECC モード**:
     ```bash
-    nk-crypto-tool --mode ecc --encrypt --recipient-pubkey <pub.key> -o <encrypted.bin> <input.txt>
+    nk-crypto-tool --mode ecc --encrypt --recipient-pubkey <pub.key> --output-file <encrypted.bin> <input.txt>
     ```
 * **PQC モード**:
     ```bash
-    nk-crypto-tool --mode pqc --encrypt --recipient-pubkey <pub.key> -o <encrypted.bin> <input.txt>
+    nk-crypto-tool --mode pqc --encrypt --recipient-pubkey <pub.key> --output-file <encrypted.bin> <input.txt>
     ```
 * **Hybrid モード** (RFC 9180 的設計):
     ```bash
     nk-crypto-tool --mode hybrid --encrypt \
         --recipient-mlkem-pubkey <mlkem_pub.key> \
         --recipient-ecdh-pubkey <ecdh_pub.key> \
-        -o <encrypted.bin> <input.txt>
+        --output-file <encrypted.bin> <input.txt>
     ```
 * **AEAD アルゴリズムの指定**: 全モードで `--aead-algo <ALGO>` (例: `AES-256-GCM` (default), `ChaCha20-Poly1305`)
 
@@ -270,14 +270,14 @@ Linux 環境では、TPM デバイス (`/dev/tpmrm0` 等) へのアクセス権�
 
 * **ECC モード**:
     ```bash
-    nk-crypto-tool --mode ecc --decrypt --user-privkey <priv.key> -o <decrypted.txt> <encrypted.bin>
+    nk-crypto-tool --mode ecc --decrypt --user-privkey <priv.key> --output-file <decrypted.txt> <encrypted.bin>
     ```
 * **Hybrid モード**:
     ```bash
     nk-crypto-tool --mode hybrid --decrypt \
         --user-mlkem-privkey <mlkem_priv.key> \
         --user-ecdh-privkey <ecdh_priv.key> \
-        -o <decrypted.txt> <encrypted.bin>
+        --output-file <decrypted.txt> <encrypted.bin>
     ```
 
 ### **署名・検証**
@@ -801,6 +801,7 @@ v3 `ChunkedAead` 形式 + バッファ再利用最適化を適用した現行コ
 
 * [`SECURITY.md`](./SECURITY.md): セキュリティポリシー、脅威モデル、メモリ保護モデル、運用ベストプラクティス
 * [`SPEC.md`](./SPEC.md): プロトコル仕様、PQC アルゴリズム詳細、ネットワーク (NKCT) プロトコル、DoS 防御設計、不変性 (invariants) 定義
+* [`KEY_ROTATION_GUIDE.md`](./KEY_ROTATION_GUIDE.md): ローカルファイル暗号化向け長期 KEM 鍵ローテーション運用ガイド（暴露の時間的封じ込め）
 * [`PENDING_ROADMAP_v56.md`](./PENDING_ROADMAP_v56.md): 今後の機能拡張ロードマップ
 
 ## **ライセンス**
