@@ -81,6 +81,23 @@
 //! `depleted` and `rate limited` are distinct replies so the sender can
 //! tell genuine exhaustion (→ fallback / refuse) from a transient throttle
 //! (→ back off and retry).
+//!
+//! ### COUNT (own prekey pool size)
+//!
+//! ```text
+//! request:  u8(0x06)
+//! reply:    u8(0x00) || count(u32)
+//! ```
+//!
+//! The recipient asks how many of its prekeys remain, to drive
+//! auto-replenishment ([`crate::one_shot::replenish_to_target`]). Like
+//! PUBLISH/POLL it is keyed by the handshake NodeId and carries **no
+//! recipient field**, so it can only report the *caller's own* slot — it
+//! cannot probe a victim's pool size. The count is a semi-trusted
+//! *availability* hint: a hostile server can lie, but it can already drain
+//! the pool outright, so this grants it no new power. The downgrade defence
+//! stays sender-side (FETCH rate limit + Strict profile); COUNT only keeps
+//! the honest-server case topped up.
 
 use crate::network::ALPN_INBOX;
 use crate::p2p::{P2pEndpoint, P2pError, P2pIncoming, P2pProtocol, PeerAddr, PeerId};
@@ -141,6 +158,15 @@ const TAG_CHECKPOINT: u8 = 0x03;
 /// PUBLISH/FETCH sections in the module docs and PQFS_DESIGN.md §4.1.
 const TAG_PUBLISH: u8 = 0x04;
 const TAG_FETCH: u8 = 0x05;
+/// COUNT: the recipient asks how many of its own prekeys remain on the
+/// server, to drive auto-replenishment. Authenticated by the handshake
+/// NodeId (= the caller's own slot) exactly like POLL/PUBLISH, so it can
+/// only ever read the caller's own pool — no field on the wire names a
+/// recipient, so it cannot probe a victim's pool size. The count is a
+/// semi-trusted hint (a malicious server can lie, but it can already drain
+/// the pool outright); the real downgrade defense stays sender-side
+/// (FETCH rate limit + Strict profile). See PQFS_DESIGN.md §4.1.
+const TAG_COUNT: u8 = 0x06;
 const REPLY_OK: u8 = 0x00;
 /// FETCH reply: the connecting NodeId exceeded the per-identity FETCH rate
 /// limit. Transient — distinct from depletion so the sender backs off
@@ -473,6 +499,34 @@ pub async fn fetch_prekey(
     Ok(outcome)
 }
 
+/// Ask the inbox `server` how many of **our own** unused prekeys it still
+/// holds, for auto-replenishment. Authenticated by our handshake NodeId, so
+/// it reads only our slot. The result is a semi-trusted availability hint —
+/// see [`TAG_COUNT`] — not a security boundary.
+pub async fn count_prekeys(
+    endpoint: &dyn P2pEndpoint,
+    server: &PeerAddr,
+) -> Result<u32, InboxError> {
+    let mut stream = endpoint.connect(server, P2pProtocol(ALPN_INBOX)).await?;
+    write_timed(&mut stream, &[TAG_COUNT], "count tag").await?;
+    tokio::time::timeout(IO_TIMEOUT, stream.flush())
+        .await
+        .map_err(|_| InboxError::Timeout("count flush"))??;
+    let mut reply = [0u8; 1];
+    read_timed(&mut stream, &mut reply, "count reply").await?;
+    if reply[0] != REPLY_OK {
+        let _ = stream.shutdown().await;
+        return Err(InboxError::Protocol(format!(
+            "count: unexpected reply {:#x}",
+            reply[0]
+        )));
+    }
+    let mut count_buf = [0u8; 4];
+    read_timed(&mut stream, &mut count_buf, "count value").await?;
+    let _ = stream.shutdown().await;
+    Ok(u32::from_le_bytes(count_buf))
+}
+
 // -----------------------------------------------------------------------------
 // Server
 // -----------------------------------------------------------------------------
@@ -675,6 +729,7 @@ mod server {
                 TAG_CHECKPOINT => self.handle_checkpoint(&mut *incoming.stream, sender).await,
                 TAG_PUBLISH => self.handle_publish(&mut *incoming.stream, sender).await,
                 TAG_FETCH => self.handle_fetch(&mut *incoming.stream, sender).await,
+                TAG_COUNT => self.handle_count(&mut *incoming.stream, sender).await,
                 t => Err(InboxError::Protocol(format!("unknown tag {t:#x}"))),
             };
             // On success the handler has written its full response and finished
@@ -950,6 +1005,38 @@ mod server {
             tokio::time::timeout(IO_TIMEOUT, stream.flush())
                 .await
                 .map_err(|_| InboxError::Timeout("fetch flush"))??;
+            let _ = stream.shutdown().await;
+            Ok(())
+        }
+
+        /// COUNT: report how many prekeys remain in the **caller's own** slot.
+        /// `caller` is the handshake-authenticated NodeId, so the count is
+        /// always of the requester's pool — no recipient field is read, which
+        /// is what makes it impossible to probe another identity's pool size.
+        async fn handle_count<S>(
+            &self,
+            stream: &mut S,
+            caller: PeerId,
+        ) -> Result<(), InboxError>
+        where
+            S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized,
+        {
+            let count: i64 = {
+                let db = self.db.lock().await;
+                db.query_row(
+                    "SELECT COUNT(*) FROM prekeys WHERE recipient = ?",
+                    params![caller.as_bytes().as_slice()],
+                    |r| r.get(0),
+                )?
+            };
+            // The per-recipient pool is capped at MAX_PREKEYS_STORED, well
+            // within u32; clamp defensively so the cast can never wrap.
+            let count = count.clamp(0, u32::MAX as i64) as u32;
+            write_timed(stream, &[REPLY_OK], "count reply (ok)").await?;
+            write_timed(stream, &count.to_le_bytes(), "count value").await?;
+            tokio::time::timeout(IO_TIMEOUT, stream.flush())
+                .await
+                .map_err(|_| InboxError::Timeout("count flush"))??;
             let _ = stream.shutdown().await;
             Ok(())
         }
@@ -1288,6 +1375,39 @@ mod tests {
             fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
             FetchOutcome::RateLimited
         );
+
+        task.abort();
+    }
+
+    /// COUNT reports the caller's OWN slot (authenticated by NodeId), tracks
+    /// consumption as fetches drain the pool, and cannot be used to probe
+    /// another identity's pool size.
+    #[tokio::test]
+    async fn count_reports_own_slot_and_tracks_consumption() {
+        let (net, _server, task, srv, _dir) = spawn_server().await;
+        let bob =
+            Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let alice =
+            Arc::new(net.register(pid(1), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+
+        // Empty slot → 0.
+        assert_eq!(count_prekeys(bob.as_ref(), &srv).await.unwrap(), 0);
+
+        let batch = vec![b"pk-A".to_vec(), b"pk-B".to_vec(), b"pk-C".to_vec()];
+        publish_prekeys(bob.as_ref(), &srv, &batch).await.expect("publish");
+        assert_eq!(count_prekeys(bob.as_ref(), &srv).await.unwrap(), 3);
+
+        // A fetch consumes one → the count drops.
+        assert!(matches!(
+            fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
+            FetchOutcome::Prekey(_)
+        ));
+        assert_eq!(count_prekeys(bob.as_ref(), &srv).await.unwrap(), 2);
+
+        // COUNT reads the *caller's* slot: alice (pid 1) published nothing, so
+        // she sees 0 even though bob's slot on the same server holds 2. The op
+        // therefore cannot probe a victim's pool size.
+        assert_eq!(count_prekeys(alice.as_ref(), &srv).await.unwrap(), 0);
 
         task.abort();
     }

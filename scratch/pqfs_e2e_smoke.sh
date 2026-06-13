@@ -44,6 +44,17 @@ timeout 60 "$BIN" --prekey-cmd seal --transport iroh --no-relay \
     --strict-pqfs "$W/msg.txt" \
     || { echo "FAIL: seal"; exit 1; }
 
+# 4b. Recipient: auto-replenish. seal consumed one prekey (5 published, now
+# 4 on the server), so maintain to target 5 should publish exactly 1.
+MAINT=$(timeout 60 "$BIN" --prekey-cmd maintain --transport iroh --no-relay \
+    --prekey-storage "$W/prekeys.db" --node-key "$W/rnode.key" \
+    --signing-privkey "$W/rkeys/private_sign_pqc.key" \
+    --inbox-url "$TICKET" --prekey-count 5 2>&1) \
+    || { echo "FAIL: maintain"; echo "$MAINT"; exit 1; }
+echo "$MAINT" | grep -q 'published 1' \
+    && echo "PASS: maintain topped up ($(echo "$MAINT" | grep -oE 'server had.*'))" \
+    || { echo "FAIL: maintain did not publish the expected deficit"; echo "$MAINT"; exit 1; }
+
 # 5. Recipient: poll + open.
 timeout 60 "$BIN" --prekey-cmd recv --transport iroh --no-relay \
     --prekey-storage "$W/prekeys.db" --node-key "$W/rnode.key" \

@@ -692,12 +692,15 @@ async fn run_prekey_command(args: Args) -> anyhow::Result<()> {
         "publish" => {
             run_prekey_publish(&args, &store, &node_key_path, &passphrase).await?;
         }
+        "maintain" => {
+            run_prekey_maintain(&args, &store, &node_key_path, &passphrase).await?;
+        }
         "recv" => {
             run_prekey_recv(&args, &store, &node_key_path).await?;
         }
         other => anyhow::bail!(
             "unknown --prekey-cmd {other:?}; expected one of \
-             generate, list, revoke, init-identity, publish, seal, recv"
+             generate, list, revoke, init-identity, publish, maintain, seal, recv"
         ),
     }
     Ok(())
@@ -848,6 +851,53 @@ async fn run_prekey_publish(
         "Published {count} prekey(s); pool now holds {} unused.",
         store.count()?
     );
+    Ok(())
+}
+
+/// `maintain`: auto-replenish. Ask the inbox how many of our prekeys remain
+/// and top the pool back up to `--prekey-count` (the target), generating and
+/// PUBLISHing only the deficit. One-shot — run it from a timer/cron for
+/// hands-off replenishment. Requires an existing identity (`init-identity`).
+#[cfg(feature = "mls")]
+async fn run_prekey_maintain(
+    args: &Args,
+    store: &nk_crypto_tool::prekey::PrekeyStore,
+    node_key_path: &std::path::Path,
+    passphrase: &zeroize::Zeroizing<String>,
+) -> anyhow::Result<()> {
+    use nk_crypto_tool::network::inbox::MAX_PREKEYS_STORED;
+    use nk_crypto_tool::one_shot::replenish_to_target;
+
+    if store.load_identity()?.is_none() {
+        anyhow::bail!("no identity in this store; run `--prekey-cmd init-identity` first");
+    }
+    let signing_path = args
+        .signing_privkey
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--signing-privkey is required for maintain"))?;
+    let target = args.prekey_count;
+    if target == 0 || target as u64 > MAX_PREKEYS_STORED {
+        anyhow::bail!(
+            "--prekey-count (the maintain target) must be between 1 and {MAX_PREKEYS_STORED}"
+        );
+    }
+    let dsa_priv = load_raw_dsa_priv(signing_path, passphrase)?;
+
+    let endpoint = build_prekey_endpoint(args, node_key_path).await?;
+    let inbox_addr = require_inbox_addr(args)?;
+    let report =
+        replenish_to_target(endpoint.as_ref(), &inbox_addr, store, &dsa_priv, target).await?;
+    if report.published == 0 {
+        println!(
+            "Pool already at target: server holds {} prekey(s) (target {}); nothing to do.",
+            report.server_before, report.target
+        );
+    } else {
+        println!(
+            "Replenished: server had {}, published {} → target {}.",
+            report.server_before, report.published, report.target
+        );
+    }
     Ok(())
 }
 

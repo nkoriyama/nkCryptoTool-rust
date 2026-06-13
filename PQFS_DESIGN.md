@@ -133,7 +133,7 @@ ikm &= SS_{static} \mathbin{\Vert} SS_{prekey} \\
 ## 4. inbox プロトコル拡張と Prekey ストア管理
 
 ### 4.1 inbox 新オペレーション（既存 DEPOSIT/POLL 様式準拠）
-既存の `0x01 DEPOSIT` / `0x02 POLL` / `0x03 CHECKPOINT` に 2 op を追加する。
+既存の `0x01 DEPOSIT` / `0x02 POLL` / `0x03 CHECKPOINT` に 3 op を追加する。
 
 - **`PUBLISH (0x04)`**: `0x04 ‖ count(u16) ‖ [SignedPrekey] * count`
   - 認証: POLL と同様 iroh QUIC ハンドシェイクの **NodeId（= recipient ID）** で認証。他人の Prekey 群は上書き不可。
@@ -141,6 +141,10 @@ ikm &= SS_{static} \mathbin{\Vert} SS_{prekey} \\
 - **`FETCH (0x05)`**: `0x05 ‖ recipient([u8;32])`
   - 認証: なし（DEPOSIT 同様、送信準備のため誰でも引ける）。
   - サーバ処理: 該当 recipient の未使用 Prekey を 1 件 SELECT して返し、**即 DELETE（消費）**。0 件なら `REPLY_EMPTY (0xFE)`（既存の `REPLY_ROLLBACK 0xFE` とは op 文脈が異なるため衝突しない／必要なら別値）。
+- **`COUNT (0x06)`**（自動補充用、2026-06-13 追加）: `0x06`（recipient フィールド無し） → `0x00 ‖ count(u32)`
+  - 認証: PUBLISH/POLL と同様 **接続元 NodeId（= 自分のスロット）**。wire に recipient を載せないため、**他人のプール残数は覗けない**（被害者プール探索を構造的に封じる）。
+  - サーバ処理: `SELECT COUNT(*) FROM prekeys WHERE recipient = <caller>`。
+  - 位置づけ: 残数は **semi-trusted な可用性ヒント**。悪意サーバは嘘を返せるが、元々プールを直接削除して枯渇させられる（=COUNT で新たな権限は増えない）。**ダウングレード防御は引き続き送信側 FETCH レート制限 + Strict** が担い、COUNT は正直サーバ時の補充トリガに徹する。受信側 `replenish_to_target` が「残数 < target → 不足分を生成・PUBLISH」を実行。CLI は `--prekey-cmd maintain`（一発、cron/timer 運用）。
 
 > [!WARNING]
 > **【補強① 重要】枯渇によるダウングレード攻撃**: FETCH が未認証だと、攻撃者が全 Prekey を引いて枯渇させ、**静的鍵フォールバック（PQ-FS なし）を強制**できる。HNDL を狙う攻撃者は「事前に PQ-FS を無効化してから傍受」が可能になり、本方式の価値を失わせる最大の攻撃である。

@@ -332,6 +332,56 @@ pub fn generate_and_store(
     Ok(bundle)
 }
 
+/// Outcome of [`replenish_to_target`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplenishReport {
+    /// Prekeys the server reported holding for us *before* this top-up.
+    pub server_before: u32,
+    /// Fresh prekeys generated, stored, and published this call (the deficit).
+    pub published: u32,
+    /// The (clamped) target pool size aimed for.
+    pub target: u32,
+}
+
+/// Auto-replenish: top the recipient's **server-side** prekey pool back up to
+/// `target`. Queries the inbox for how many of our prekeys remain (the
+/// semi-trusted COUNT hint — [`inbox::count_prekeys`]), generates and stores
+/// the deficit locally, then PUBLISHes it, chunked to respect
+/// [`inbox::MAX_PUBLISH_BATCH`].
+///
+/// `target` is clamped to [`inbox::MAX_PREKEYS_STORED`]: the server evicts
+/// beyond that, so aiming higher would only orphan local private keys whose
+/// public was dropped server-side and can never be fetched.
+///
+/// Idempotent in steady state — when the pool already meets `target` nothing
+/// is generated or published. This availability mechanism deliberately trusts
+/// the COUNT hint; the *downgrade* defense does not (a lying or hostile server
+/// is bounded by sender-side FETCH rate limiting + the Strict profile, and can
+/// already drain the pool outright). See `PQFS_DESIGN.md` §4.1.
+pub async fn replenish_to_target(
+    endpoint: &dyn P2pEndpoint,
+    inbox_server: &PeerAddr,
+    store: &PrekeyStore,
+    dsa_priv: &[u8],
+    target: u32,
+) -> Result<ReplenishReport> {
+    let target = target.min(inbox::MAX_PREKEYS_STORED as u32);
+    let server_before = inbox::count_prekeys(endpoint, inbox_server).await?;
+    let deficit = target.saturating_sub(server_before);
+    if deficit == 0 {
+        return Ok(ReplenishReport { server_before, published: 0, target });
+    }
+    // Generate + store the whole deficit locally first, then PUBLISH in batches
+    // the server will accept. If a later chunk's publish fails, the earlier
+    // chunks are already up and the unsent privates are simply stored locally
+    // (orphaned, harmless) — never a half-built prekey.
+    let bundle = generate_and_store(store, dsa_priv, deficit)?;
+    for chunk in bundle.chunks(inbox::MAX_PUBLISH_BATCH as usize) {
+        inbox::publish_prekeys(endpoint, inbox_server, chunk).await?;
+    }
+    Ok(ReplenishReport { server_before, published: deficit, target })
+}
+
 // ----- recipient bundle (discovery) ------------------------------------------
 
 const BUNDLE_MAGIC: &[u8; 4] = b"NKB1";
@@ -774,6 +824,49 @@ mod tests {
             Err(OneShotError::PrekeyMissing(_)) => {}
             other => panic!("replay must fail with PrekeyMissing, got {other:?}"),
         }
+
+        task.abort();
+    }
+
+    /// Auto-replenish tops the server pool up to the target, is idempotent
+    /// once full, and after consumption refills exactly the deficit.
+    #[tokio::test]
+    async fn replenish_tops_up_to_target() {
+        let net = MockNetwork::new();
+        let dir = tempdir().unwrap();
+        let r = make_recipient(dir.path());
+        let (task, srv) = spawn_inbox(&net, dir.path()).await;
+        let recipient_ep =
+            Arc::new(net.register(r.peer_id, vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let sender =
+            Arc::new(net.register(PeerId::new([1u8; 32]), vec![P2pProtocol(ALPN_INBOX)]))
+                as Arc<dyn P2pEndpoint>;
+
+        // Empty pool → publishes the full target.
+        let rep = replenish_to_target(recipient_ep.as_ref(), &srv, &r.store, &r.dsa_priv, 5)
+            .await
+            .unwrap();
+        assert_eq!((rep.server_before, rep.published, rep.target), (0, 5, 5));
+        assert_eq!(inbox::count_prekeys(recipient_ep.as_ref(), &srv).await.unwrap(), 5);
+
+        // Already at target → idempotent, nothing generated or published.
+        let rep = replenish_to_target(recipient_ep.as_ref(), &srv, &r.store, &r.dsa_priv, 5)
+            .await
+            .unwrap();
+        assert_eq!((rep.server_before, rep.published), (5, 0));
+
+        // Consume two from the server, then replenish refills exactly the gap.
+        for _ in 0..2 {
+            assert!(matches!(
+                inbox::fetch_prekey(sender.as_ref(), &srv, r.peer_id).await.unwrap(),
+                FetchOutcome::Prekey(_)
+            ));
+        }
+        let rep = replenish_to_target(recipient_ep.as_ref(), &srv, &r.store, &r.dsa_priv, 5)
+            .await
+            .unwrap();
+        assert_eq!((rep.server_before, rep.published), (3, 2));
+        assert_eq!(inbox::count_prekeys(recipient_ep.as_ref(), &srv).await.unwrap(), 5);
 
         task.abort();
     }
