@@ -61,9 +61,11 @@ timeout 60 "$BIN" --prekey-cmd recv --transport iroh --no-relay \
     --inbox-url "$TICKET" --output-file "$W/out" --strict-pqfs \
     || { echo "FAIL: recv"; exit 1; }
 
-# 6. Verify plaintext round-trips.
-if [ -f "$W/out.0" ] && diff -q "$W/out.0" "$W/msg.txt" >/dev/null; then
-    echo "PASS: plaintext round-trips ($(cat "$W/out.0"))"
+# 6. Verify plaintext round-trips. recv names outputs <out>.<cursor>.<i>, so
+# match the single produced file rather than a fixed name.
+OUTFILE=$(ls "$W"/out.*.0 2>/dev/null | head -1)
+if [ -n "$OUTFILE" ] && diff -q "$OUTFILE" "$W/msg.txt" >/dev/null; then
+    echo "PASS: plaintext round-trips ($(cat "$OUTFILE"))"
 else
     echo "FAIL: plaintext mismatch"; ls -la "$W"; exit 1
 fi

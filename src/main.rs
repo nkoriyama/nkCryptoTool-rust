@@ -945,7 +945,13 @@ async fn run_prekey_recv(
     for (i, item) in received.iter().enumerate() {
         match &item.result {
             Ok(plaintext) => {
-                let path = format!("{out_base}.{i}");
+                // Name by batch cursor + index, not by index alone: the cursor
+                // advances every run, so a later `recv` writing its own
+                // envelope 0 cannot clobber a previous run's `<out>.0`. Within
+                // one batch the cursor is constant, so `i` disambiguates; a
+                // crash-replay of the *same* batch reuses the same cursor and
+                // idempotently overwrites identical content.
+                let path = format!("{out_base}.{cursor}.{i}");
                 write_plaintext_private(&path, plaintext.as_slice())?;
                 println!("Decrypted envelope {i} → {path} ({} bytes)", plaintext.len());
                 ok += 1;
