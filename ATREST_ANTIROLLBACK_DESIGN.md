@@ -210,6 +210,20 @@ TPM が無効、あるいはデバイスパーミッションがない環境で�
 > [!WARNING]
 > TPM 等のハードウェア root が存在せず、かつオフライン状態で動作させる場合、攻撃者がストレージディレクトリ（`groups.db` 一式）とローカルの分散メタデータファイルをすべて過去の同じスナップショットに差し替えた場合、**ソフトウェア単体でこの巻き戻しを検知することは原理的に不可能**です。
 
+### 5.1 プラットフォーム別のハードウェアカウンタ可用性（2026-06-13 調査で確定）
+
+当初フェーズ2（§6）は macOS / Windows 向けハードウェアカウンタの抽象化を計画したが、**一次情報調査の結果、非特権デスクトップアプリが使えるオフラインのハードウェアモノトニックカウンタは Linux/TPM のみ**と確定した。`Strict` は **Linux 限定**とし、他 OS では正直にエラーとする（`src/group/rollback.rs::strict_counter` を `cfg(target_os)` で分岐）。
+
+| OS | ハードウェアモノトニックカウンタ | 根拠 | `Strict` の挙動 |
+|---|---|---|---|
+| **Linux** | ✅ あり | TPM 2.0 NV カウンタ（`/dev/tpmrm0` + tpm2-tools）。OS はブロックしない。 | TPM カウンタを使用 |
+| **macOS** | ❌ なし | Secure Enclave はモノトニックカウンタを**内部利用のみ**で公開 API 皆無（CryptoKit `SecureEnclave` は鍵操作だけ、`kSecAttrTokenIDSecureEnclave` は鍵保管場所属性）。DeviceCheck は Mac で `isSupported=false`、App Attest（macOS 27+）のカウンタは**サーバ検証前提**でオフライン局所カウンタにならない。→ **「Secure Enclave 永続カウンター」は誤認だった。** | 正直にエラー（後述） |
+| **Windows** | ❌ 実質なし | TPM は TBS（`windows-sys::TpmBaseServices`）で到達できるが、`NV_Increment`/`NV_DefineSpace` は **TPM ドライバが owner hierarchy 向けにブロック**（Windows 10 1809 以降ハードコード、管理者でも `TbsCommandBlocked`、レジストリ回避不可）。owner auth も OS 管理。 | 正直にエラー（後述） |
+
+**macOS/Windows の代替（局所手段）**: Keychain `…ThisDeviceOnly` / DPAPI による**端末バインド**は、ファイルコピー・別端末復元は防ぐが、**同一端末のスナップショット巻き戻しは検知できない**（鍵ごと巻き戻る）。したがって端末バインドは anti-rollback の代替にならない。
+
+**macOS/Windows の anti-rollback の本筋 = オンライン**: これらの OS では §5「ソフトウェアフォールバック緩和策」の **`Permissive`（ソフトカウンタ）＋ リモートチェックポイント（inbox CHECKPOINT, フェーズ3 実装済み）** が現実的な巻き戻し検知手段となる。`Strict` 選択時は黙ってソフトカウンタへ降格せず、上記事実を説明して**エラーで拒否**する（ハードウェアを名乗る名前でソフトに降格しない）。
+
 ---
 
 ## 6. 段階的実装計画とテスト戦略
@@ -226,7 +240,8 @@ TPM が無効、あるいはデバイスパーミッションがない環境で�
 
 #### フェーズ 2: グレースフルデグレードとマルチプラットフォーム
 *   `Permissive` ポリシーと分散メタデータファイルによるフォールバック検知の実装。
-*   macOS (Secure Enclave 永続カウンター) および Windows (TPM 2.0 / TBS API) 向けのハードウェアプロバイダの抽象化レイヤの実装。
+*   ~~macOS (Secure Enclave 永続カウンター) および Windows (TPM 2.0 / TBS API) 向けのハードウェアプロバイダの抽象化レイヤの実装。~~
+    → **2026-06-13 調査により撤回（§5.1）**。macOS は公開カウンタ API が無く、Windows は TPM NV を OS がブロックするため、非特権アプリのオフライン HW カウンタは実現不可。`Strict` は Linux 限定とし、macOS/Windows では `cfg(target_os)` 分岐で正直にエラー（代替は `Permissive` ＋ オンライン CHECKPOINT）。`RollbackCounter` 抽象自体は維持し、将来 OS 側が公開カウンタを提供した時点でプロバイダを追加できる形にしてある。
 
 #### フェーズ 3: リモートチェックポイント (Inbox) 統合
 *   `network/inbox` プロトコルへのエポック検証シーケンスの追加。

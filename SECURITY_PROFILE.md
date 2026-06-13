@@ -372,7 +372,7 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
   - **`permissive` (フェーズ1)**: software カウンタ (`SoftwareCounter`、
     `$XDG_STATE_HOME/nkct/rollback/<hash>.ctr` — ストレージ dir 外)。state ファイル
     ごと過去スナップショットに戻されると検知できない (case D 限界)。
-  - **`strict` (フェーズ2)**: TPM 2.0 NV 単調カウンタ (`TpmCounter`、tpm2-tools +
+  - **`strict` (フェーズ2、Linux 限定)**: TPM 2.0 NV 単調カウンタ (`TpmCounter`、tpm2-tools +
     `/dev/tpmrm0`)。ストレージ dir を丸ごと過去版に戻してもハードウェアカウンタは
     巻き戻らないため case D 限界を解消。NV index は per-DB
     (`0x0150_0000 | (sha256(abs_path)[..3] & 0xFFFFF)`、owner 域・20bit; 衝突
@@ -380,6 +380,12 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
     カウンタリセットは**効かない**: TPM は counter NV を過去最大値以上で初期化する
     ため、再定義後の値は旧値以上に保たれる (実機確認済み)。TPM 不在時はエラーで
     silent downgrade を防ぐ。
+  - **macOS / Windows の `strict`**: **非対応（正直にエラー）**。非特権アプリが使える
+    オフラインのハードウェアモノトニックカウンタが存在しないため (macOS は Secure Enclave に
+    公開カウンタ API 皆無、Windows は TPM ドライバが NV カウンタコマンドをブロック; 詳細は
+    [ATREST_ANTIROLLBACK_DESIGN.md §5.1](./ATREST_ANTIROLLBACK_DESIGN.md))。`cfg(target_os)` で
+    分岐し、黙ってソフトカウンタへ降格せず拒否する。これらの OS の巻き戻し検知は
+    `permissive`（ソフトカウンタ）＋ 後述のオンライン `inbox` CHECKPOINT が担う。
   - **共通の残存リスク**: カウンタ消失 (state ファイル削除、または `TPM2_Clear` で
     TPM 全体を初期化) 時は v0x03 DB が開けなくなる (有効化の対価として文書化)。
     `TPM2_Clear` はプラットフォーム/owner クリア権限を要し全 TPM 状態を消すため、

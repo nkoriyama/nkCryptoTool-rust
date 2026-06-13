@@ -94,22 +94,58 @@ pub fn counter_for(
         // per policy: a DB created under `permissive` is always opened with
         // the software counter, never silently switched to TPM.
         RollbackPolicy::Permissive => Ok(Some(Box::new(SoftwareCounter::for_db(db_path)?))),
-        // Hardware-backed TPM NV counter. Constructing the counter performs
-        // no TPM I/O (the NV index is allocated lazily on first use), so we
-        // gate on a cheap availability probe to fail fast on a TPM-less host.
-        RollbackPolicy::Strict => {
-            if tpm_available() {
-                Ok(Some(Box::new(TpmCounter::for_db(db_path)?)))
-            } else {
-                Err(GroupError::Storage(
-                    "NK_ROLLBACK_POLICY=strict requires a working TPM 2.0 (tpm2-tools + \
-                     /dev/tpmrm0); none was detected. Use 'permissive' for the software \
-                     counter, or 'off' to disable rollback protection"
-                        .into(),
-                ))
-            }
-        }
+        // Hardware-backed counter. A true hardware monotonic counter usable
+        // by a non-elevated app exists only on Linux (TPM 2.0 NV). macOS and
+        // Windows have no such facility (see `strict_counter`), so the policy
+        // is dispatched per platform rather than pretending otherwise.
+        RollbackPolicy::Strict => strict_counter(db_path),
     }
+}
+
+/// `Strict` on Linux: a TPM 2.0 NV monotonic counter, or a fail-fast error if
+/// no TPM is present. Constructing the counter does no TPM I/O (the NV index
+/// is allocated lazily on first use), so we gate on a cheap availability probe.
+#[cfg(target_os = "linux")]
+fn strict_counter(db_path: &Path) -> Result<Option<Box<dyn RollbackCounter>>, GroupError> {
+    if tpm_available() {
+        Ok(Some(Box::new(TpmCounter::for_db(db_path)?)))
+    } else {
+        Err(GroupError::Storage(
+            "NK_ROLLBACK_POLICY=strict requires a working TPM 2.0 (tpm2-tools + \
+             /dev/tpmrm0); none was detected. Use 'permissive' for the software \
+             counter, or 'off' to disable rollback protection"
+                .into(),
+        ))
+    }
+}
+
+/// `Strict` on macOS / Windows: refused, honestly. Neither platform exposes an
+/// application-accessible hardware monotonic counter:
+///
+/// * **macOS** — the Secure Enclave keeps monotonic counters *internally* but
+///   exposes none through any public API (CryptoKit `SecureEnclave` is
+///   key-only; `kSecAttrTokenIDSecureEnclave` is a storage-location attribute).
+/// * **Windows** — the TPM exists, but its driver *blocks* the NV counter
+///   commands (`NV_Increment` / `NV_DefineSpace`) for the owner hierarchy,
+///   hardcoded since Windows 10 1809, even for administrators.
+///
+/// So rather than fall back to a software counter under a name that promises
+/// hardware, we refuse and point at the realistic anti-rollback story on these
+/// platforms: `permissive` (software counter) plus the online inbox CHECKPOINT
+/// for cross-device rollback detection. See ATREST_ANTIROLLBACK_DESIGN.md §5.
+#[cfg(not(target_os = "linux"))]
+fn strict_counter(_db_path: &Path) -> Result<Option<Box<dyn RollbackCounter>>, GroupError> {
+    Err(GroupError::Storage(
+        "NK_ROLLBACK_POLICY=strict is unavailable on this platform: no \
+         application-accessible hardware monotonic counter exists on macOS \
+         (the Secure Enclave exposes none) or Windows (the TPM driver blocks \
+         NV counter commands). A true hardware anti-rollback counter is \
+         supported only on Linux via TPM 2.0. On this OS use \
+         NK_ROLLBACK_POLICY=permissive (software counter), ideally paired with \
+         the online inbox CHECKPOINT for cross-device rollback detection, or \
+         'off' to disable. See ATREST_ANTIROLLBACK_DESIGN.md §5"
+            .into(),
+    ))
 }
 
 // -----------------------------------------------------------------------------
@@ -492,6 +528,7 @@ mod tests {
         assert!(c.is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn strict_policy_matches_tpm_availability() {
         // Constructing the strict counter does no TPM I/O; it just reflects
@@ -501,6 +538,23 @@ mod tests {
             assert!(matches!(r, Ok(Some(_))), "TPM present → counter");
         } else {
             assert!(matches!(r, Err(GroupError::Storage(_))), "no TPM → error");
+        }
+    }
+
+    /// On macOS / Windows there is no application-accessible hardware monotonic
+    /// counter, so Strict is refused with an honest explanation — never
+    /// silently downgraded to the software counter under a hardware name.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn strict_policy_refused_off_linux() {
+        match counter_for(RollbackPolicy::Strict, Path::new("groups.db")) {
+            Err(GroupError::Storage(msg)) => {
+                assert!(
+                    msg.contains("unavailable on this platform"),
+                    "expected the honest platform message, got: {msg}"
+                );
+            }
+            other => panic!("Strict off Linux must be a Storage error, got {other:?}"),
         }
     }
 
