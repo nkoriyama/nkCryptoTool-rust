@@ -67,6 +67,11 @@ pub enum DiscoveryMode {
     /// on the LAN with no external infrastructure, which fits the `--no-relay`
     /// posture. Presence is broadcast on the local network only — never to a
     /// public DNS/DHT service.
+    ///
+    /// NOTE: temporarily unsupported on the iroh 1.0 transport (1.0 removed
+    /// local-network discovery from core and no iroh-1.0 mDNS adapter exists
+    /// yet). Selecting it currently fails loudly at endpoint construction;
+    /// re-implementation over `swarm-discovery` is tracked as a follow-up.
     Local,
 }
 

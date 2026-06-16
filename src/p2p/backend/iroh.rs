@@ -13,30 +13,38 @@ use std::str::FromStr;
 // `crate::p2p::backend::iroh` once that module is introduced (step 3).
 // ---------------------------------------------------------------------------
 
-fn peer_addr_from_iroh(addr: &iroh::NodeAddr) -> crate::p2p::PeerAddr {
+fn peer_addr_from_iroh(addr: &iroh::EndpointAddr) -> crate::p2p::PeerAddr {
+    // iroh 1.0 collapses relay URL + direct socket addrs into a single
+    // `addrs: BTreeSet<TransportAddr>`; split them back out for `PeerAddr`.
+    let mut relay_url = None;
+    let mut direct_addrs = Vec::new();
+    for a in &addr.addrs {
+        match a {
+            iroh::TransportAddr::Relay(u) => relay_url = Some(u.to_string()),
+            iroh::TransportAddr::Ip(s) => direct_addrs.push(*s),
+            _ => {}
+        }
+    }
     crate::p2p::PeerAddr {
-        peer_id: crate::p2p::PeerId::new(*addr.node_id.as_bytes()),
-        relay_url: addr.relay_url.as_ref().map(|u| u.to_string()),
-        direct_addrs: addr.direct_addresses.iter().cloned().collect(),
+        peer_id: crate::p2p::PeerId::new(*addr.id.as_bytes()),
+        relay_url,
+        direct_addrs,
     }
 }
 
-fn iroh_node_addr_from_peer(addr: &crate::p2p::PeerAddr) -> Result<iroh::NodeAddr> {
-    let node_id = iroh::NodeId::from_bytes(addr.peer_id.as_bytes())
-        .map_err(|e| CryptoError::Parameter(format!("Invalid NodeId: {}", e)))?;
-    let relay_url = addr
-        .relay_url
-        .as_ref()
-        .map(|s| {
-            iroh::RelayUrl::from_str(s)
-                .map_err(|e| CryptoError::Parameter(format!("Invalid RelayUrl: {}", e)))
-        })
-        .transpose()?;
-    Ok(iroh::NodeAddr {
-        node_id,
-        relay_url,
-        direct_addresses: addr.direct_addrs.iter().cloned().collect(),
-    })
+fn iroh_node_addr_from_peer(addr: &crate::p2p::PeerAddr) -> Result<iroh::EndpointAddr> {
+    let id = iroh::EndpointId::from_bytes(addr.peer_id.as_bytes())
+        .map_err(|e| CryptoError::Parameter(format!("Invalid EndpointId: {}", e)))?;
+    let mut addrs: Vec<iroh::TransportAddr> = Vec::new();
+    if let Some(s) = addr.relay_url.as_ref() {
+        let relay_url = iroh::RelayUrl::from_str(s)
+            .map_err(|e| CryptoError::Parameter(format!("Invalid RelayUrl: {}", e)))?;
+        addrs.push(iroh::TransportAddr::Relay(relay_url));
+    }
+    for s in &addr.direct_addrs {
+        addrs.push(iroh::TransportAddr::Ip(*s));
+    }
+    Ok(iroh::EndpointAddr::from_parts(id, addrs))
 }
 
 /// Load the persistent iroh node secret key from `path`, or create one
@@ -185,7 +193,7 @@ impl IrohEndpoint {
         endpoint: iroh::Endpoint,
         protocols: Vec<crate::p2p::P2pProtocol>,
     ) -> Self {
-        let local_id = crate::p2p::PeerId::new(*endpoint.node_id().as_bytes());
+        let local_id = crate::p2p::PeerId::new(*endpoint.id().as_bytes());
         Self {
             endpoint,
             local_id,
@@ -202,7 +210,7 @@ impl IrohEndpoint {
     /// so the integration test suite does not depend on the public
     /// relay network.
     pub async fn new(config: &CryptoConfig, is_test: bool) -> Result<Self> {
-        let mut builder = Endpoint::builder().alpns(vec![
+        let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal).alpns(vec![
             ALPN_CHAT.to_vec(),
             ALPN_FILE.to_vec(),
             ALPN_MLS.to_vec(),
@@ -225,17 +233,31 @@ impl IrohEndpoint {
             builder = builder.relay_mode(iroh::RelayMode::Custom(
                 iroh_relay::RelayMap::from(relay_url),
             ));
+        } else {
+            // The `Minimal` preset sets no relay mode, so restore the
+            // historical default (n0 public relays) when none is configured.
+            builder = builder.relay_mode(iroh::endpoint::default_relay_mode());
         }
 
         // Dynamic peer discovery. Default `None` keeps the historical
-        // ticket-only reachability (no presence advertised). `Local` adds
-        // mDNS so a NodeId resolves to its current LAN addresses even when a
-        // ticket's embedded addresses go stale — presence stays on the local
-        // segment, never published to a public service.
+        // ticket-only reachability (no presence advertised).
+        //
+        // `Local` (mDNS) is temporarily unsupported on iroh 1.0: 1.0 removed
+        // local-network discovery from core (only dns/memory/pkarr address
+        // lookups remain) and no iroh-1.0 mDNS adapter crate exists yet.
+        // Re-implementation over `swarm-discovery` is tracked separately. We
+        // fail loudly rather than silently downgrading to `None`, so a user
+        // who asked for LAN self-healing is never misled into thinking it is
+        // active.
         match config.discovery {
             crate::config::DiscoveryMode::None => {}
             crate::config::DiscoveryMode::Local => {
-                builder = builder.discovery_local_network();
+                return Err(CryptoError::Parameter(
+                    "--discovery local (mDNS) is not yet supported on the iroh 1.0 \
+                     transport. Use --discovery none for now; LAN mDNS discovery \
+                     re-implementation is tracked as a follow-up."
+                        .to_string(),
+                ));
             }
         }
 
@@ -270,7 +292,19 @@ impl crate::p2p::P2pEndpoint for IrohEndpoint {
     async fn local_addr(
         &self,
     ) -> std::result::Result<crate::p2p::PeerAddr, crate::p2p::P2pError> {
-        let node_addr = self.endpoint.node_addr().initialized().await;
+        // iroh 1.0's `watch_addr()` yields an `EndpointAddr` (not an
+        // `Option`), so there is no `initialized()`; wait until at least one
+        // address (direct or relay) is known, matching the old readiness wait.
+        let mut watcher = self.endpoint.watch_addr();
+        let node_addr = loop {
+            let addr = watcher.get();
+            if !addr.addrs.is_empty() {
+                break addr;
+            }
+            if watcher.updated().await.is_err() {
+                break watcher.get();
+            }
+        };
         Ok(peer_addr_from_iroh(&node_addr))
     }
 
@@ -322,9 +356,7 @@ impl crate::p2p::P2pEndpoint for IrohEndpoint {
         let connection = connecting
             .await
             .map_err(|e| crate::p2p::P2pError::Accept(e.to_string()))?;
-        let remote_node_id = connection
-            .remote_node_id()
-            .map_err(|e| crate::p2p::P2pError::Accept(format!("Remote NodeId: {}", e)))?;
+        let remote_node_id = connection.remote_id();
         let peer_id = crate::p2p::PeerId::new(*remote_node_id.as_bytes());
         let (send, recv) = connection
             .accept_bi()
@@ -405,22 +437,21 @@ mod tests {
         assert!(load_or_create_node_secret(&path).is_err());
     }
 
-    /// `--discovery local` wires mDNS into the endpoint builder: an endpoint
-    /// constructs successfully with the `discovery-local-network` feature on
-    /// and yields a stable NodeId. Guards the feature flag + builder call;
-    /// actual LAN resolution needs two real nodes and isn't exercised here.
+    /// `--discovery local` (mDNS) is temporarily unsupported on the iroh 1.0
+    /// transport: 1.0 removed local-network discovery from core and no iroh-1.0
+    /// mDNS adapter exists yet (re-implementation over swarm-discovery is tracked
+    /// separately). Until then `Local` must fail loudly rather than silently
+    /// downgrade to `None`, while the default `None` still builds.
     #[tokio::test]
     #[serial]
-    async fn endpoint_builds_with_local_discovery() {
+    async fn local_discovery_is_rejected_on_iroh_1_0() {
         let mut config = CryptoConfig::default();
         config.transport = crate::config::TransportKind::Iroh;
         config.discovery = crate::config::DiscoveryMode::Local;
         config.no_relay = true;
-        let ep = IrohEndpoint::new(&config, true).await;
         assert!(
-            ep.is_ok(),
-            "endpoint with mDNS discovery must build: {:?}",
-            ep.err()
+            IrohEndpoint::new(&config, true).await.is_err(),
+            "--discovery local must fail loudly until mDNS is re-implemented on iroh 1.0"
         );
         // None is the historical default and must still build (no discovery).
         let mut plain = CryptoConfig::default();

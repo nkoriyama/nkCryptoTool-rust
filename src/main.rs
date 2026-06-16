@@ -115,7 +115,8 @@ struct Args {
     /// discovery so a NodeId resolves to its current LAN addresses even when a
     /// ticket's addresses go stale (e.g. after an IP change) — useful for the
     /// async inbox/prekey flow under --no-relay. Presence is advertised on the
-    /// local segment only, never to a public service.
+    /// local segment only, never to a public service. NOTE: `local` is
+    /// temporarily unsupported on iroh 1.0 and currently errors at startup.
     #[arg(long, value_enum, default_value = "none")]
     discovery: nk_crypto_tool::config::DiscoveryMode,
 
