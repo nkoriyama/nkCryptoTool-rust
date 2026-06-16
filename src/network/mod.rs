@@ -96,11 +96,201 @@ pub trait IOProvider: Send + Sync + 'static {
 pub struct DefaultIOProvider;
 impl IOProvider for DefaultIOProvider {
     fn stdin(&self) -> Box<dyn tokio::io::AsyncRead + Unpin + Send> {
-        Box::new(tokio::io::stdin())
+        Box::new(open_stdin())
     }
     fn stdout(&self) -> Box<dyn tokio::io::AsyncWrite + Unpin + Send> {
         Box::new(tokio::io::stdout())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Detached-thread stdin reader.
+//
+// `tokio::io::stdin()` parks a blocking task on a `read(2)` syscall that the
+// runtime *joins* during shutdown. The syscall cannot be cancelled, so after
+// the chat loop returns on a peer disconnect the process would hang until the
+// user pressed a key — the runtime's drop waits for that parked read. We move
+// the blocking read onto a plain `std::thread` instead: when `main` unwinds,
+// every `Drop` (hence every `Zeroizing`/`ZeroizeOnDrop` secret) still runs and
+// the process exits immediately, because a plain thread does not keep the
+// process alive once `main` returns.
+//
+// CRITICAL invariant: there is exactly ONE reader thread for the whole process,
+// spawned lazily on first use. A naive "one thread per `stdin()` call" leaks a
+// thread per connection — the previous reader stays parked in `read(2)` holding
+// the `std::io::stdin()` lock, so the next connection's thread blocks forever on
+// `lock()`. The persistent `--listen` server calls `stdin()` once per accepted
+// connection (`processor::run_listen_loop`), so repeated connect/disconnect
+// would otherwise exhaust threads (DoS). The single reader forwards bytes to the
+// *currently registered* consumer (a chat session); when no consumer is
+// registered the bytes are discarded. A generation counter makes a consumer's
+// `Drop` deregister only its own sink, never a newer one's.
+// ---------------------------------------------------------------------------
+
+/// `(generation, sender)` of the currently registered stdin consumer.
+///
+/// The channel is *bounded*: when it fills, the reader thread's `blocking_send`
+/// applies backpressure instead of queueing without limit (which a malicious or
+/// careless huge stdin redirect could otherwise grow into an OOM). Blocking the
+/// reader is benign here because chat is serialised to one session at a time by
+/// [`CHAT_ACTIVE`] — there is never a second consumer being starved — and the
+/// block self-heals: when the lone consumer's connection ends it drops its
+/// receiver, so `blocking_send` returns `Err` and the reader resumes. Payloads
+/// are `Zeroizing` so transient chat plaintext is wiped when each chunk drops.
+type StdinSink = Option<(u64, tokio::sync::mpsc::Sender<Zeroizing<Vec<u8>>>)>;
+
+/// Bounded depth of the stdin delivery channel (see [`StdinSink`]).
+const STDIN_CHAN_CAP: usize = 64;
+
+/// The currently registered stdin consumer (see [`StdinSink`]).
+static STDIN_SINK: std::sync::Mutex<StdinSink> = std::sync::Mutex::new(None);
+/// Spawns the single reader thread exactly once.
+static STDIN_THREAD: std::sync::Once = std::sync::Once::new();
+/// Monotonic generation handed to each consumer so `Drop` is self-targeted.
+static STDIN_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Set once the reader thread observes stdin EOF; later consumers get EOF too.
+/// Written and read only while holding the [`STDIN_SINK`] lock, so EOF latching
+/// and consumer registration cannot race (a sender registered into a sink the
+/// reader is tearing down would never be dropped, hanging that consumer).
+static STDIN_EOF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// stdin reader surfaced as an `AsyncRead`, fed by the single global reader
+/// thread over an mpsc channel. The consumer (`read_line_secure`) reads one
+/// byte at a time, so a delivered chunk is held in `buffered` with a read
+/// cursor until drained. `buffered` is a single `Zeroizing<Vec<u8>>` that is
+/// never grown — when it is fully consumed (or dropped) its whole allocation is
+/// wiped, leaving no drained-region or reallocation residue. The authoritative
+/// wipe of the assembled line and keys also stays in `chat_loop`.
+struct ThreadStdin {
+    generation: u64,
+    rx: tokio::sync::mpsc::Receiver<Zeroizing<Vec<u8>>>,
+    /// Leftover from the last delivered chunk and the read offset into it.
+    buffered: Option<(Zeroizing<Vec<u8>>, usize)>,
+}
+
+impl Drop for ThreadStdin {
+    fn drop(&mut self) {
+        // Deregister, but only if we are still the active sink — a later
+        // consumer may have replaced us (it bumped the generation).
+        let mut sink = STDIN_SINK.lock().unwrap();
+        if matches!(sink.as_ref(), Some((cur, _)) if *cur == self.generation) {
+            *sink = None;
+        }
+        // `buffered` is `Zeroizing`, so any unconsumed bytes wipe on drop.
+    }
+}
+
+impl tokio::io::AsyncRead for ThreadStdin {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+
+        // Serve leftover bytes from the last chunk first.
+        if let Some((data, pos)) = this.buffered.as_mut() {
+            let n = std::cmp::min(buf.remaining(), data.len() - *pos);
+            buf.put_slice(&data[*pos..*pos + n]);
+            *pos += n;
+            if *pos >= data.len() {
+                this.buffered = None; // drops Zeroizing → wipes the allocation
+            }
+            return std::task::Poll::Ready(Ok(()));
+        }
+
+        match this.rx.poll_recv(cx) {
+            std::task::Poll::Ready(Some(data)) => {
+                let n = std::cmp::min(buf.remaining(), data.len());
+                buf.put_slice(&data[..n]);
+                if n < data.len() {
+                    // Keep the remainder; `data` stays `Zeroizing`.
+                    this.buffered = Some((data, n));
+                }
+                // else `data` is fully consumed and dropped here → wiped.
+                std::task::Poll::Ready(Ok(()))
+            }
+            // Sender dropped = our turn ended / stdin hit EOF. Clean EOF.
+            std::task::Poll::Ready(None) => std::task::Poll::Ready(Ok(())),
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Register a fresh consumer of the global stdin reader and return its
+/// `AsyncRead`. Spawns the single reader thread on first call.
+fn open_stdin() -> ThreadStdin {
+    ensure_stdin_thread();
+    let (tx, rx) = tokio::sync::mpsc::channel::<Zeroizing<Vec<u8>>>(STDIN_CHAN_CAP);
+
+    // Check EOF and register under the same lock the reader uses to latch EOF +
+    // clear the sink. This closes the race where the reader hits EOF between an
+    // unlocked check and the registration: there we would store a sender the
+    // (now-exited) reader never drops, so `rx` would never yield `None` and the
+    // consumer would hang on `Pending` forever.
+    let mut sink = STDIN_SINK.lock().unwrap();
+    if STDIN_EOF.load(std::sync::atomic::Ordering::Acquire) {
+        // stdin already closed: drop `tx` now (don't register) so `rx` yields
+        // `None` immediately. Sentinel generation 0 never matches a real
+        // consumer (those are >= 1), so `Drop` won't clobber a live sink.
+        drop(tx);
+        drop(sink);
+        return ThreadStdin { generation: 0, rx, buffered: None };
+    }
+    let generation = STDIN_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    *sink = Some((generation, tx));
+    drop(sink);
+    ThreadStdin { generation, rx, buffered: None }
+}
+
+/// Spawn the process-wide stdin reader thread exactly once. It reads global
+/// stdin forever, forwarding each chunk to the currently registered consumer
+/// (or discarding it if none). On EOF/read-error it drops the active sink (so
+/// that consumer sees EOF) and latches `STDIN_EOF`, then exits.
+fn ensure_stdin_thread() {
+    STDIN_THREAD.call_once(|| {
+        std::thread::Builder::new()
+            .name("nkct-stdin".to_string())
+            .spawn(|| {
+                use std::io::Read;
+                let stdin = std::io::stdin();
+                let mut lock = stdin.lock();
+                let mut buf = [0u8; 4096];
+                loop {
+                    match lock.read(&mut buf) {
+                        Ok(0) => break, // EOF
+                        Ok(n) => {
+                            // Clone the sender out under the lock, then release
+                            // it before the (bounded) send so we never hold the
+                            // mutex across backpressure. `blocking_send` blocks
+                            // only while the lone registered consumer is alive
+                            // but not draining, and returns `Err` the moment it
+                            // drops its receiver — see `StdinSink`.
+                            let sink = STDIN_SINK.lock().unwrap().clone();
+                            if let Some((_, tx)) = sink {
+                                // `Zeroizing::new` moves (does not copy) the
+                                // `to_vec` allocation, so that single allocation
+                                // is exactly what gets wiped on drop — no second
+                                // un-zeroized heap copy is created.
+                                let _ = tx.blocking_send(Zeroizing::new(buf[..n].to_vec()));
+                            }
+                            // Wipe the plaintext keystrokes from the stack buffer.
+                            buf[..n].zeroize();
+                        }
+                        Err(_) => break,
+                    }
+                }
+                // Latch EOF and clear the active sink under the same lock
+                // `open_stdin` checks, so a concurrent registration cannot leak
+                // a sender into a dead reader. Dropping the active sender makes
+                // the current consumer observe EOF.
+                let mut sink = STDIN_SINK.lock().unwrap();
+                STDIN_EOF.store(true, std::sync::atomic::Ordering::Release);
+                *sink = None;
+                drop(sink);
+            })
+            .expect("spawn nkct-stdin reader thread");
+    });
 }
 
 #[cfg(feature = "gui")]
