@@ -127,7 +127,12 @@ backend-rustcrypto = [
 
 # MLS group chat (P1: non-PQC base passthrough). P1.5 adds PQC adapter.
 # Off by default; enable explicitly with `--features mls`.
+# Requires the OpenSSL backend: the at-rest/rollback layer (group::at_rest,
+# group::rollback) uses `openssl::` directly and the suite uses
+# mls-rs-crypto-openssl, so `mls` pulls in `backend-openssl` even under
+# `--no-default-features` (it is not compatible with rustcrypto-only).
 mls = [
+    "backend-openssl",
     "mls-rs",
     "mls-rs-core",
     "mls-rs-codec",
