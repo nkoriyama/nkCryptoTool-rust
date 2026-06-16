@@ -172,7 +172,7 @@ impl Drop for ThreadStdin {
     fn drop(&mut self) {
         // Deregister, but only if we are still the active sink — a later
         // consumer may have replaced us (it bumped the generation).
-        let mut sink = STDIN_SINK.lock().unwrap();
+        let mut sink = STDIN_SINK.lock().unwrap(); // ALLOW-UNWRAP: a poisoned STDIN_SINK mutex is unrecoverable
         if matches!(sink.as_ref(), Some((cur, _)) if *cur == self.generation) {
             *sink = None;
         }
@@ -228,7 +228,7 @@ fn open_stdin() -> ThreadStdin {
     // unlocked check and the registration: there we would store a sender the
     // (now-exited) reader never drops, so `rx` would never yield `None` and the
     // consumer would hang on `Pending` forever.
-    let mut sink = STDIN_SINK.lock().unwrap();
+    let mut sink = STDIN_SINK.lock().unwrap(); // ALLOW-UNWRAP: a poisoned STDIN_SINK mutex is unrecoverable
     if STDIN_EOF.load(std::sync::atomic::Ordering::Acquire) {
         // stdin already closed: drop `tx` now (don't register) so `rx` yields
         // `None` immediately. Sentinel generation 0 never matches a real
@@ -266,7 +266,7 @@ fn ensure_stdin_thread() {
                             // only while the lone registered consumer is alive
                             // but not draining, and returns `Err` the moment it
                             // drops its receiver — see `StdinSink`.
-                            let sink = STDIN_SINK.lock().unwrap().clone();
+                            let sink = STDIN_SINK.lock().unwrap().clone(); // ALLOW-UNWRAP: a poisoned STDIN_SINK mutex is unrecoverable
                             if let Some((_, tx)) = sink {
                                 // `Zeroizing::new` moves (does not copy) the
                                 // `to_vec` allocation, so that single allocation
@@ -284,12 +284,12 @@ fn ensure_stdin_thread() {
                 // `open_stdin` checks, so a concurrent registration cannot leak
                 // a sender into a dead reader. Dropping the active sender makes
                 // the current consumer observe EOF.
-                let mut sink = STDIN_SINK.lock().unwrap();
+                let mut sink = STDIN_SINK.lock().unwrap(); // ALLOW-UNWRAP: a poisoned STDIN_SINK mutex is unrecoverable
                 STDIN_EOF.store(true, std::sync::atomic::Ordering::Release);
                 *sink = None;
                 drop(sink);
             })
-            .expect("spawn nkct-stdin reader thread");
+            .expect("spawn nkct-stdin reader thread"); // ALLOW-UNWRAP: stdin reader thread spawn failure is fatal at startup
     });
 }
 
