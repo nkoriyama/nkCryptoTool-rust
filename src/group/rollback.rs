@@ -38,7 +38,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use openssl::hash::{hash, MessageDigest};
+use sha2::{Digest, Sha256};
 use rand_core::{OsRng, RngCore};
 
 use crate::group::types::GroupError;
@@ -166,8 +166,7 @@ impl SoftwareCounter {
     /// `inbox.db`) on independent counters.
     pub fn for_db(db_path: &Path) -> Result<Self, GroupError> {
         let abs = absolutize(db_path);
-        let digest = hash(MessageDigest::sha256(), abs.as_os_str().as_encoded_bytes())
-            .map_err(|e| GroupError::Storage(format!("rollback path hash: {e}")))?;
+        let digest = Sha256::digest(abs.as_os_str().as_encoded_bytes());
         let name = format!("{}.ctr", hex::encode(&digest[..16]));
         let dir = state_dir().join("nkct").join("rollback");
         Ok(Self {
@@ -304,8 +303,7 @@ impl TpmCounter {
     /// (≈1/65536 per pair) — acceptable for the single-user, few-DB target.
     pub fn for_db(db_path: &Path) -> Result<Self, GroupError> {
         let abs = absolutize(db_path);
-        let digest = hash(MessageDigest::sha256(), abs.as_os_str().as_encoded_bytes())
-            .map_err(|e| GroupError::Backend(format!("tpm index hash: {e}")))?;
+        let digest = Sha256::digest(abs.as_os_str().as_encoded_bytes());
         let sub = u32::from_be_bytes([0, digest[0], digest[1], digest[2]]) & TPM_NV_SUB_MASK;
         Ok(Self::with_index(TPM_NV_BASE | sub))
     }

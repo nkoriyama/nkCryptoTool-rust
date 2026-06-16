@@ -88,9 +88,9 @@ use std::path::{Path, PathBuf};
 use mls_rs::CipherSuiteProvider;
 use mls_rs_codec::{MlsDecode, MlsEncode};
 use mls_rs_core::crypto::{HpkeCiphertext, HpkePublicKey, HpkeSecretKey};
-use openssl::hash::MessageDigest;
-use openssl::pkcs5::pbkdf2_hmac;
-use openssl::symm::{Cipher, Crypter, Mode};
+use aes_gcm::aead::{Aead as _, Payload};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+use sha2::Sha512;
 use rand_core::{OsRng, RngCore};
 use zeroize::Zeroizing;
 
@@ -1113,14 +1113,10 @@ fn derive_aead_key(
     iters: u32,
 ) -> Result<Zeroizing<[u8; ATREST_AEAD_KEY_LEN]>, GroupError> {
     let mut key = Zeroizing::new([0u8; ATREST_AEAD_KEY_LEN]);
-    pbkdf2_hmac(
-        passphrase.as_bytes(),
-        salt,
-        iters as usize,
-        MessageDigest::sha512(),
-        key.as_mut_slice(),
-    )
-    .map_err(|e| GroupError::Storage(format!("at-rest PBKDF2: {e}")))?;
+    // PBKDF2-HMAC-SHA512, identical algorithm/iterations/salt/output length to
+    // the previous `openssl::pkcs5::pbkdf2_hmac` call, so the derived key — and
+    // therefore the at-rest.key envelope — is byte-compatible. Infallible.
+    pbkdf2::pbkdf2_hmac::<Sha512>(passphrase.as_bytes(), salt, iters, key.as_mut_slice());
     Ok(key)
 }
 
@@ -1130,26 +1126,21 @@ fn aes256gcm_encrypt(
     aad: &[u8],
     plaintext: &[u8],
 ) -> Result<(Vec<u8>, [u8; ATREST_TAG_LEN]), GroupError> {
-    let mut crypter = Crypter::new(Cipher::aes_256_gcm(), Mode::Encrypt, key, Some(nonce))
+    // `aes-gcm`'s `encrypt` returns `ciphertext || tag(16)`; split the trailing
+    // tag so the envelope layout (ciphertext, then 16-byte tag) is unchanged.
+    let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| GroupError::Storage(format!("at-rest aes init: {e}")))?;
-    crypter
-        .aad_update(aad)
-        .map_err(|e| GroupError::Storage(format!("at-rest aes aad: {e}")))?;
-
-    let mut out = vec![0u8; plaintext.len() + Cipher::aes_256_gcm().block_size()];
-    let n1 = crypter
-        .update(plaintext, &mut out)
-        .map_err(|e| GroupError::Storage(format!("at-rest aes update: {e}")))?;
-    let n2 = crypter
-        .finalize(&mut out[n1..])
-        .map_err(|e| GroupError::Storage(format!("at-rest aes finalize: {e}")))?;
-    out.truncate(n1 + n2);
-
+    let mut buf = cipher
+        .encrypt(Nonce::from_slice(nonce), Payload { msg: plaintext, aad })
+        .map_err(|_| GroupError::Storage("at-rest aes encrypt failed".into()))?;
+    if buf.len() < ATREST_TAG_LEN {
+        return Err(GroupError::Storage("at-rest aes output too short".into()));
+    }
+    let tag_start = buf.len() - ATREST_TAG_LEN;
     let mut tag = [0u8; ATREST_TAG_LEN];
-    crypter
-        .get_tag(&mut tag)
-        .map_err(|e| GroupError::Storage(format!("at-rest aes get_tag: {e}")))?;
-    Ok((out, tag))
+    tag.copy_from_slice(&buf[tag_start..]);
+    buf.truncate(tag_start);
+    Ok((buf, tag))
 }
 
 fn aes256gcm_decrypt(
@@ -1159,33 +1150,33 @@ fn aes256gcm_decrypt(
     ciphertext: &[u8],
     tag: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, GroupError> {
-    let mut crypter = Crypter::new(Cipher::aes_256_gcm(), Mode::Decrypt, key, Some(nonce))
+    // Tag must be exactly the GCM tag length; otherwise `combined` would carry
+    // a wrong-length trailer and `decrypt` would split the tag boundary in the
+    // wrong place. Reject explicitly (the envelope parser always slices 16, so
+    // this only fires on a malformed/injected file).
+    if tag.len() != ATREST_TAG_LEN {
+        return Err(GroupError::Storage(
+            "at-rest decrypt failed (bad passphrase or corrupted file)".into(),
+        ));
+    }
+    let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| GroupError::Storage(format!("at-rest aes init: {e}")))?;
-    crypter
-        .aad_update(aad)
-        .map_err(|e| GroupError::Storage(format!("at-rest aes aad: {e}")))?;
-    crypter
-        .set_tag(tag)
-        .map_err(|e| GroupError::Storage(format!("at-rest aes set_tag: {e}")))?;
-
-    let mut out = Zeroizing::new(vec![
-        0u8;
-        ciphertext.len() + Cipher::aes_256_gcm().block_size()
-    ]);
-    // A bad passphrase, tampered ciphertext, or tampered AAD all fail at
-    // `finalize` time (GCM tag mismatch). Don't reveal which it was.
-    let n1 = crypter.update(ciphertext, &mut out).map_err(|_| {
-        GroupError::Storage(
-            "at-rest decrypt failed (bad passphrase or corrupted file)".into(),
-        )
-    })?;
-    let n2 = crypter.finalize(&mut out[n1..]).map_err(|_| {
-        GroupError::Storage(
-            "at-rest decrypt failed (bad passphrase or corrupted file)".into(),
-        )
-    })?;
-    out.truncate(n1 + n2);
-    Ok(out)
+    // `aes-gcm`'s `decrypt` expects `ciphertext || tag(16)`; reassemble the
+    // split envelope fields. (Only ciphertext+tag — not secret — so no
+    // zeroizing needed for `combined`; the recovered plaintext is wrapped.)
+    let mut combined = Vec::with_capacity(ciphertext.len() + tag.len());
+    combined.extend_from_slice(ciphertext);
+    combined.extend_from_slice(tag);
+    // A bad passphrase, tampered ciphertext, or tampered AAD all fail at GCM
+    // tag verification. Don't reveal which it was.
+    let pt = cipher
+        .decrypt(Nonce::from_slice(nonce), Payload { msg: &combined, aad })
+        .map_err(|_| {
+            GroupError::Storage(
+                "at-rest decrypt failed (bad passphrase or corrupted file)".into(),
+            )
+        })?;
+    Ok(Zeroizing::new(pt))
 }
 
 /// Write `data` to `path` atomically with `0o600` permissions on Unix.
@@ -1663,6 +1654,39 @@ mod tests {
         // new KEK matches the rekeyed pages).
         let storage = open_at_rest_storage(&paths, &pass).expect("reopen after rekey");
         assert!(storage.list_group_ids().expect("list").is_empty());
+    }
+
+    /// Cross-implementation interop: `at-rest.key` (PBKDF2-HMAC-SHA512 +
+    /// AES-256-GCM), `groups.db.kek` (HPKE X-Wing seal of the DEK), and
+    /// `groups.db` (SQLCipher) in `tests/fixtures/at_rest_openssl/` were all
+    /// written by the **OpenSSL-backed** build (see that dir's README). This
+    /// proves the pure-Rust crypto opens them byte-for-byte — if any RustCrypto
+    /// primitive (PBKDF2/AES-GCM/X25519/HKDF/HPKE) diverged from the standard
+    /// bytes, the DEK would be wrong and `list_group_ids` would fail.
+    ///
+    /// The fixtures are copied to a temp dir first: `resolve_dek` does on-disk
+    /// housekeeping, so the committed fixtures must never be mutated.
+    #[test]
+    fn openssl_written_fixtures_open_with_rustcrypto() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/at_rest_openssl");
+        let dir = tempdir().expect("tempdir");
+        for name in ["at-rest.key", "groups.db", "groups.db.kek"] {
+            fs::copy(fixtures.join(name), dir.path().join(name))
+                .unwrap_or_else(|e| panic!("copy fixture {name}: {e}"));
+        }
+
+        let paths = AtRestPaths::from_db_path(dir.path().join("groups.db"));
+        let pass = Zeroizing::new("fixture-pass-123".to_string());
+
+        let storage = open_at_rest_storage(&paths, &pass)
+            .expect("OpenSSL-written at-rest files must open with pure-Rust crypto");
+        let groups = storage.list_group_ids().expect("list group ids");
+        assert_eq!(
+            groups.len(),
+            1,
+            "fixture was created with exactly one group (fixturegroup)"
+        );
     }
 
     #[test]

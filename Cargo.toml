@@ -74,6 +74,15 @@ ecdsa = { version = "0.16", optional = true }
 signature = { version = "2.2", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
 
+# Pure-Rust classical primitives for the OpenSSL-free MLS cipher suite
+# (X25519 + Ed25519) and the at-rest KDF/MAC. These replace what
+# `mls-rs-crypto-openssl` and `openssl::{pkcs5,symm,hash}` used to provide, so
+# the `mls` feature can build/link on mobile (Android/iOS) with zero OpenSSL.
+x25519-dalek = { version = "2", optional = true, features = ["static_secrets"] }
+ed25519-dalek = { version = "2", optional = true, features = ["rand_core"] }
+pbkdf2 = { version = "0.12", optional = true }
+hmac = { version = "0.12", optional = true }
+
 # Low-level primitives for streaming GCM
 aes = { version = "0.8", features = ["zeroize"], optional = true }
 ctr = { version = "0.9", features = ["zeroize"], optional = true }
@@ -127,20 +136,31 @@ backend-rustcrypto = [
 
 # MLS group chat (P1: non-PQC base passthrough). P1.5 adds PQC adapter.
 # Off by default; enable explicitly with `--features mls`.
-# Requires the OpenSSL backend: the at-rest/rollback layer (group::at_rest,
-# group::rollback) uses `openssl::` directly and the suite uses
-# mls-rs-crypto-openssl, so `mls` pulls in `backend-openssl` even under
-# `--no-default-features` (it is not compatible with rustcrypto-only).
+# Fully pure-Rust (no OpenSSL): the cipher suite is built in-repo on RustCrypto
+# primitives (see `group::crypto_adapter::rc_*`) and the at-rest/rollback layer
+# uses `pbkdf2`/`aes-gcm`/`sha2`. This lets `mls` build/link on mobile. It is
+# compatible with either default backend; the mobile target is
+# `--no-default-features --features "backend-rustcrypto mls"`.
 mls = [
-    "backend-openssl",
+    "mls-crypto-rustcrypto",
     "mls-rs",
     "mls-rs-core",
     "mls-rs-codec",
     "mls-rs-crypto-traits",
-    "mls-rs-crypto-openssl",
     "mls-rs-crypto-hpke",
     "mls-rs-provider-sqlite",
     "rusqlite",
+]
+
+# Pure-Rust crypto bundle backing the `mls` cipher suite + at-rest layer.
+# (sha2/sha3/hkdf/fips203/fips204 are non-optional deps, so they need no
+# listing here — only the genuinely-optional crates are enabled.)
+mls-crypto-rustcrypto = [
+    "aes-gcm",
+    "x25519-dalek",
+    "ed25519-dalek",
+    "pbkdf2",
+    "hmac",
 ]
 
 [dev-dependencies]

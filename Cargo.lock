@@ -5109,6 +5109,7 @@ dependencies = [
  "data-encoding",
  "der",
  "ecdsa",
+ "ed25519-dalek",
  "fips203",
  "fips204",
  "foreign-types 0.3.2",
@@ -5116,6 +5117,7 @@ dependencies = [
  "ghash",
  "hex",
  "hkdf",
+ "hmac",
  "i-slint-backend-testing",
  "image 0.24.9",
  "iroh",
@@ -5138,6 +5140,7 @@ dependencies = [
  "openssl-sys",
  "p256",
  "parking_lot",
+ "pbkdf2",
  "pkcs8",
  "poly1305",
  "qrcode",
@@ -5160,6 +5163,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "windows 0.52.0",
+ "x25519-dalek",
  "zeroize",
 ]
 
@@ -10043,6 +10047,18 @@ name = "x11rb-protocol"
 version = "0.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+
+[[package]]
+name = "x25519-dalek"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c7e468321c81fb07fa7f4c636c3972b9100f0346e5b6a9f2bd0603a52f7ed277"
+dependencies = [
+ "curve25519-dalek",
+ "rand_core 0.6.4",
+ "serde",
+ "zeroize",
+]
 
 [[package]]
 name = "xattr"

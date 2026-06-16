@@ -4,11 +4,14 @@
 //! - **P1**: passthrough only — every method delegated to base.
 //! - **P1.5.a**: signature methods overridden to use
 //!   `Ed25519 || ML-DSA-65` concatenated keys/signatures.
-//! - **P1.5.b (this revision)**: KEM/HPKE override via a
+//! - **P1.5.b**: KEM/HPKE override via a
 //!   `CombinedKem<X25519 DhKem, ML-KEM-768, SHA-256, SHAKE-256>` plugged
-//!   into a freshly-built `OpensslCipherSuite`. The hybrid cipher suite
-//!   is now a fully-self-standing cipher suite — not a thin wrapper
-//!   around the classical one.
+//!   into a freshly-built cipher suite. The hybrid cipher suite is now a
+//!   fully-self-standing cipher suite — not a thin wrapper around the
+//!   classical one.
+//! - **OpenSSL-free**: the base suite is the in-repo pure-Rust
+//!   [`rc_suite::RustCryptoSuite`] (RustCrypto X25519/Ed25519/AES-GCM/HKDF),
+//!   so `mls` builds with zero OpenSSL — see `rc_*` submodules.
 //!
 //! ## Hybrid Cipher Suite
 //!
@@ -23,16 +26,16 @@
 //! `cipher_suite_provider(0xF101)` builds:
 //!
 //! ```text
-//! OpensslCipherSuite<
+//! RustCryptoSuite<
 //!     CombinedKem<
-//!         DhKem<Ecdh, Kdf>,         // X25519 (from base)
+//!         DhKem<RcEcdh, RcKdf>,     // X25519 (x25519-dalek)
 //!         MlKem768Kem,              // ML-KEM-768 (fips203)
 //!         Sha256Hasher,             // SHA-256 (sha2)
 //!         Shake256Vlh,              // SHAKE-256 (sha3)
 //!         XWingSharedSecretHashInput, // X-Wing combiner SS mixing
 //!     >,
-//!     Kdf,                          // SHA-256 HKDF (from base)
-//!     Aead,                         // AES-128-GCM (from base)
+//!     RcKdf,                        // SHA-256 HKDF (hkdf)
+//!     RcAead,                       // AES-128-GCM (aes-gcm)
 //! >
 //! ```
 //!
@@ -65,6 +68,16 @@
 pub mod hash_adapter;
 pub mod ml_kem_768;
 
+// Pure-Rust (OpenSSL-free) cipher-suite primitives + composition. These
+// replace what `mls-rs-crypto-openssl` used to provide so `mls` builds on
+// mobile. See `rc_suite::RustCryptoSuite`.
+pub mod rc_aead;
+pub mod rc_dh;
+pub mod rc_hash;
+pub mod rc_kdf;
+pub mod rc_signer;
+pub mod rc_suite;
+
 use fips204::ml_dsa_65;
 use fips204::traits::{SerDes, Signer, Verifier};
 use mls_rs::CipherSuite;
@@ -75,14 +88,14 @@ use mls_rs_core::crypto::{
 use mls_rs_core::error::IntoAnyError;
 use mls_rs_crypto_hpke::dhkem::DhKem;
 use mls_rs_crypto_hpke::kem_combiner::xwing::{CombinedKem, XWingSharedSecretHashInput};
-use mls_rs_crypto_openssl::aead::Aead;
-use mls_rs_crypto_openssl::ecdh::Ecdh;
-use mls_rs_crypto_openssl::kdf::Kdf;
-use mls_rs_crypto_openssl::{OpensslCipherSuite, OpensslCryptoError};
 use mls_rs_crypto_traits::KemId;
 
 use self::hash_adapter::{Sha256Hasher, Shake256Vlh};
 use self::ml_kem_768::MlKem768Kem;
+use self::rc_aead::RcAead;
+use self::rc_dh::RcEcdh;
+use self::rc_kdf::RcKdf;
+use self::rc_suite::{RustCryptoSuite, RustCryptoSuiteError};
 
 // -----------------------------------------------------------------------------
 // Cipher-suite identifiers.
@@ -141,10 +154,10 @@ const HYBRID_SIG_LEN: usize = ED25519_SIG_LEN + ml_dsa_65::SIG_LEN;
 // Type aliases for the composed hybrid cipher suite.
 // -----------------------------------------------------------------------------
 
-/// The hybrid KEM: X25519 (from the base provider) combined with
+/// The hybrid KEM: X25519 (pure-Rust `RcEcdh`) combined with
 /// ML-KEM-768 via the X-Wing shared-secret combiner.
 pub type HybridKem = CombinedKem<
-    DhKem<Ecdh, Kdf>,
+    DhKem<RcEcdh, RcKdf>,
     MlKem768Kem,
     Sha256Hasher,
     Shake256Vlh,
@@ -153,8 +166,9 @@ pub type HybridKem = CombinedKem<
 
 /// The bare hybrid cipher suite (KEM/KDF/AEAD only — signatures still
 /// come from the base Ed25519 path). [`HybridCipherSuiteProvider`]
-/// wraps this to add the hybrid signature scheme on top.
-pub type HybridSuite = OpensslCipherSuite<HybridKem, Kdf, Aead>;
+/// wraps this to add the hybrid signature scheme on top. Built on the
+/// pure-Rust [`RustCryptoSuite`] (no OpenSSL).
+pub type HybridSuite = RustCryptoSuite<HybridKem, RcKdf, RcAead>;
 
 // -----------------------------------------------------------------------------
 // HybridCryptoProvider — exposes only the hybrid suite.
@@ -204,14 +218,14 @@ impl HybridCryptoProvider {
 fn build_hybrid_suite_with(
     aead_kdf_suite: CipherSuite,
 ) -> Option<HybridCipherSuiteProvider<HybridSuite>> {
-    let kem_kdf = Kdf::new(PARAM_SOURCE_SUITE)?;
-    let ecdh = Ecdh::new(PARAM_SOURCE_SUITE)?;
+    let kem_kdf = RcKdf::new(PARAM_SOURCE_SUITE)?;
+    let ecdh = RcEcdh::new();
     let kem_id = KemId::new(PARAM_SOURCE_SUITE)?;
-    // X25519 DhKem with SHA-256 KDF — identical to what the base
-    // provider builds for `CURVE25519_AES128`, just kept separately
-    // so we can hand it to `CombinedKem`. Kept on SHA-256 for *every*
-    // variant so the KEM shared-secret derivation (and thus keypair
-    // interchangeability) does not depend on the AEAD/KDF choice.
+    // X25519 DhKem with SHA-256 KDF — the same DhKem the standards define
+    // for `CURVE25519_AES128`, kept separately so we can hand it to
+    // `CombinedKem`. Kept on SHA-256 for *every* variant so the KEM
+    // shared-secret derivation (and thus keypair interchangeability) does
+    // not depend on the AEAD/KDF choice.
     let x25519 = DhKem::new(ecdh, kem_kdf, kem_id as u16, kem_id.n_secret());
     // X-Wing combiner: the IETF draft's recommended shared-secret
     // mixing for X25519 + ML-KEM-768. See
@@ -219,20 +233,19 @@ fn build_hybrid_suite_with(
     let hybrid_kem = CombinedKem::new_xwing(x25519, MlKem768Kem, Sha256Hasher, Shake256Vlh);
 
     // HPKE key-schedule KDF + AEAD come from `aead_kdf_suite`.
-    let kdf = Kdf::new(aead_kdf_suite)?;
-    let aead = Aead::new(aead_kdf_suite)?;
+    let kdf = RcKdf::new(aead_kdf_suite)?;
+    let aead = RcAead::new(aead_kdf_suite)?;
 
-    // OpensslCipherSuite::new internally constructs `Hash::new` and
-    // `EcSigner::new` against the passed cipher_suite — both reject
-    // unknown IDs, so we cannot pass `0xF101` here. We pass the
-    // parameter-source suite (`CURVE25519_AES128`) which configures
-    // the inner Hash to SHA-256 and the inner EcSigner to Ed25519.
-    // Neither is exercised by the at-rest HPKE path, and for the MLS
-    // path they are exactly the non-PQC halves we want.
-    // `HybridCipherSuiteProvider::cipher_suite()` overrides the
-    // reported ID back to `0xF101` so mls-rs serialises the right
-    // suite into KeyPackages / GroupContext.
-    let inner = OpensslCipherSuite::new(PARAM_SOURCE_SUITE, hybrid_kem, kdf, aead)?;
+    // RustCryptoSuite::new (like the OpenSSL provider it replaces) builds an
+    // inner Hash (SHA-256/512) and an Ed25519 signer from the passed
+    // cipher_suite, so we pass the parameter-source suite
+    // (`CURVE25519_AES128`) → inner Hash = SHA-256, signer = Ed25519.
+    // Neither is exercised by the at-rest HPKE path, and for the MLS path
+    // they are exactly the non-PQC halves we want.
+    // `HybridCipherSuiteProvider::cipher_suite()` overrides the reported ID
+    // back to `0xF101` so mls-rs serialises the right suite into
+    // KeyPackages / GroupContext.
+    let inner = RustCryptoSuite::new(PARAM_SOURCE_SUITE, hybrid_kem, kdf, aead)?;
     Some(HybridCipherSuiteProvider::new(inner))
 }
 
@@ -294,9 +307,9 @@ impl CryptoProvider for HybridCryptoProvider {
 ///
 /// Generic in `B` so the same wrapper works for any base
 /// `CipherSuiteProvider` — in practice we only instantiate it on
-/// [`HybridSuite`] (i.e. `OpensslCipherSuite<HybridKem, Kdf, Aead>`),
-/// but the generic shape makes unit-testing against the bare classical
-/// `OpensslCipherSuite` straightforward.
+/// [`HybridSuite`] (i.e. `RustCryptoSuite<HybridKem, RcKdf, RcAead>`),
+/// but the generic shape makes unit-testing against a bare classical
+/// suite straightforward.
 #[derive(Clone)]
 pub struct HybridCipherSuiteProvider<B> {
     inner: B,
@@ -722,7 +735,7 @@ impl std::error::Error for SimpleStringError {}
 
 /// Canonical concrete error type emitted by the hybrid suite as wired
 /// in production (i.e. on top of [`HybridSuite`]).
-pub type HybridProductionError = HybridSuiteError<OpensslCryptoError>;
+pub type HybridProductionError = HybridSuiteError<RustCryptoSuiteError>;
 
 #[cfg(test)]
 mod tests {
