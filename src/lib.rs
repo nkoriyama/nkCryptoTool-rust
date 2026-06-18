@@ -11,7 +11,7 @@ pub mod key;
 pub mod network;
 pub mod p2p;
 pub mod processor;
-#[cfg(feature = "mls")]
+#[cfg(any(feature = "mls", feature = "mls-redb"))]
 pub mod group;
 #[cfg(feature = "mls")]
 pub mod prekey;

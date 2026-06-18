@@ -148,13 +148,20 @@ backend-rustcrypto = [
 # uses `pbkdf2`/`aes-gcm`/`sha2`. This lets `mls` build/link on mobile. It is
 # compatible with either default backend; the mobile target is
 # `--no-default-features --features "backend-rustcrypto mls"`.
-mls = [
+# Backend-agnostic MLS core: the mls-rs crates + our pure-Rust hybrid cipher
+# suite, with NO storage backend. Both `mls` (sqlite) and `mls-redb` (pure-Rust
+# redb) build on this. Splitting it out lets `mls-redb` link without the
+# SQLCipher/libcrypto dependency that `mls` pulls in.
+mls-base = [
     "mls-crypto-rustcrypto",
     "mls-rs",
     "mls-rs-core",
     "mls-rs-codec",
     "mls-rs-crypto-traits",
     "mls-rs-crypto-hpke",
+]
+mls = [
+    "mls-base",
     "mls-rs-provider-sqlite",
     "rusqlite",
 ]
@@ -174,7 +181,7 @@ mls-crypto-rustcrypto = [
 # Implements the mls-rs-core storage traits over redb + app-layer
 # XChaCha20-Poly1305. Opt-in and additive; does not yet replace the sqlite
 # provider (that is P4). See DB_PURERUST_DESIGN.md.
-mls-redb = ["mls", "redb", "hmac"]
+mls-redb = ["mls-base", "redb", "hmac"]
 
 [dev-dependencies]
 i-slint-backend-testing = "=1.16.1"
