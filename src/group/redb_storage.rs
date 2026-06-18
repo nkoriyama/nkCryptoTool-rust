@@ -82,6 +82,7 @@ const TID_EPOCH: u8 = 2;
 const TID_KEY_PACKAGE: u8 = 3;
 const TID_PSK: u8 = 4;
 const TID_APP: u8 = 8;
+const TID_SENTINEL: u8 = 9;
 
 const TBL_GROUP: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_group_state");
 const TBL_EPOCH: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_epoch");
@@ -100,6 +101,23 @@ const TBL_CHECKPOINT: TableDefinition<&[u8], &[u8]> = TableDefinition::new("inbo
 /// Plaintext meta table: monotonic row-id counter (`b"next_id"` → u64 BE).
 /// The counter value is not secret, so it is stored unencrypted.
 const TBL_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("inbox_meta");
+
+/// Sentinel table: a single encrypted record used to verify the DEK is correct
+/// on open (and to probe candidate DEKs during rekey recovery). Present in both
+/// group and inbox databases.
+const TBL_SENTINEL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dek_sentinel");
+const SENTINEL_KEY: &[u8] = b"dek-check";
+const SENTINEL_PLAINTEXT: &[u8] = b"nkct-redb-sentinel-v1";
+
+/// Group-DB encrypted tables and their AAD ids — the set DEK rotation re-seals.
+const GROUP_ENCRYPTED_TABLES: [(TableDefinition<&[u8], &[u8]>, u8); 6] = [
+    (TBL_GROUP, TID_GROUP),
+    (TBL_EPOCH, TID_EPOCH),
+    (TBL_KEY_PACKAGE, TID_KEY_PACKAGE),
+    (TBL_PSK, TID_PSK),
+    (TBL_APP, TID_APP),
+    (TBL_SENTINEL, TID_SENTINEL),
+];
 
 const BLIND_INDEX_LEN: usize = 32;
 /// Envelope value header: `sender(32) ‖ created_at_be(8)` precedes the payload.
@@ -184,7 +202,15 @@ impl RedbBackend {
     pub fn open(path: impl AsRef<Path>, dek: &[u8; 32]) -> Result<Self, RedbStorageError> {
         let path = path.as_ref();
         let me = Self::new_core(path, dek)?;
-        me.create_tables_in(&[TBL_GROUP, TBL_EPOCH, TBL_KEY_PACKAGE, TBL_PSK, TBL_APP])?;
+        me.create_tables_in(&[
+            TBL_GROUP,
+            TBL_EPOCH,
+            TBL_KEY_PACKAGE,
+            TBL_PSK,
+            TBL_APP,
+            TBL_SENTINEL,
+        ])?;
+        me.ensure_sentinel()?;
         me.tighten_permissions(path)?;
         Ok(me)
     }
@@ -195,7 +221,8 @@ impl RedbBackend {
     pub fn open_inbox(path: impl AsRef<Path>, dek: &[u8; 32]) -> Result<Self, RedbStorageError> {
         let path = path.as_ref();
         let me = Self::new_core(path, dek)?;
-        me.create_tables_in(&[TBL_ENV, TBL_PREKEY, TBL_CHECKPOINT, TBL_META])?;
+        me.create_tables_in(&[TBL_ENV, TBL_PREKEY, TBL_CHECKPOINT, TBL_META, TBL_SENTINEL])?;
+        me.ensure_sentinel()?;
         me.tighten_permissions(path)?;
         Ok(me)
     }
@@ -282,14 +309,6 @@ impl RedbBackend {
         mac.finalize().into_bytes().into()
     }
 
-    fn aad(&self, table_id: u8, redb_key: &[u8]) -> Vec<u8> {
-        let mut aad = Vec::with_capacity(self.db_binding.len() + 1 + redb_key.len());
-        aad.extend_from_slice(&self.db_binding);
-        aad.push(table_id);
-        aad.extend_from_slice(redb_key);
-        aad
-    }
-
     /// Encrypt `plaintext` into a self-describing record bound to its slot.
     fn seal(
         &self,
@@ -297,19 +316,7 @@ impl RedbBackend {
         redb_key: &[u8],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, RedbStorageError> {
-        let cipher = XChaCha20Poly1305::new_from_slice(self.keys.k_value.as_slice())
-            .map_err(|_| RedbStorageError::Encrypt)?;
-        let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
-        let aad = self.aad(table_id, redb_key);
-        let ct = cipher
-            .encrypt(&nonce, Payload { msg: plaintext, aad: &aad })
-            .map_err(|_| RedbStorageError::Encrypt)?;
-
-        let mut out = Vec::with_capacity(1 + NONCE_LEN + ct.len());
-        out.push(RECORD_VERSION);
-        out.extend_from_slice(nonce.as_slice());
-        out.extend_from_slice(&ct);
-        Ok(out)
+        seal_value(&self.keys.k_value, &self.db_binding, table_id, redb_key, plaintext)
     }
 
     /// Decrypt a record produced by [`Self::seal`], verifying the slot binding.
@@ -319,24 +326,113 @@ impl RedbBackend {
         redb_key: &[u8],
         record: &[u8],
     ) -> Result<Zeroizing<Vec<u8>>, RedbStorageError> {
-        if record.len() < 1 + NONCE_LEN {
-            return Err(RedbStorageError::Malformed("record too short".into()));
+        open_value(&self.keys.k_value, &self.db_binding, table_id, redb_key, record)
+    }
+
+    /// On open: write the sentinel if absent, or verify it decrypts under the
+    /// current `k_value` if present. A wrong DEK surfaces here as a `Decrypt`
+    /// error, so the database fails fast on open instead of returning garbage.
+    fn ensure_sentinel(&self) -> Result<(), RedbStorageError> {
+        match self.get_raw(TBL_SENTINEL, SENTINEL_KEY)? {
+            Some(rec) => {
+                self.open_record(TID_SENTINEL, SENTINEL_KEY, &rec)
+                    .map_err(|_| RedbStorageError::Decrypt)?;
+                Ok(())
+            }
+            None => {
+                let sealed = self.seal(TID_SENTINEL, SENTINEL_KEY, SENTINEL_PLAINTEXT)?;
+                self.put(TBL_SENTINEL, SENTINEL_KEY, &sealed)
+            }
         }
-        if record[0] != RECORD_VERSION {
-            return Err(RedbStorageError::Malformed(format!(
-                "unknown record version {}",
-                record[0]
-            )));
+    }
+
+    /// Probe whether `dek` is the DEK an existing database at `path` was sealed
+    /// under, by decrypting its sentinel. Returns `Ok(false)` if the DEK is
+    /// wrong, the DB has no sentinel, or the DB does not exist — never an error
+    /// for a "wrong key" outcome. Used by the at-rest rekey recovery to decide
+    /// which DEK a crash left the DB under.
+    pub fn dek_opens(path: impl AsRef<Path>, dek: &[u8; 32]) -> Result<bool, RedbStorageError> {
+        let path = path.as_ref();
+        if !path.exists() {
+            return Ok(false);
         }
-        let nonce = XNonce::from_slice(&record[1..1 + NONCE_LEN]);
-        let ct = &record[1 + NONCE_LEN..];
-        let cipher = XChaCha20Poly1305::new_from_slice(self.keys.k_value.as_slice())
-            .map_err(|_| RedbStorageError::Decrypt)?;
-        let aad = self.aad(table_id, redb_key);
-        let pt = cipher
-            .decrypt(nonce, Payload { msg: ct, aad: &aad })
-            .map_err(|_| RedbStorageError::Decrypt)?;
-        Ok(Zeroizing::new(pt))
+        let db_binding = path
+            .file_name()
+            .map(|n| n.as_encoded_bytes().to_vec())
+            .unwrap_or_default();
+        let db = Database::create(path).map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let keys = RecordKeys::derive(dek);
+        let rtx = db
+            .begin_read()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let table = match rtx.open_table(TBL_SENTINEL) {
+            Ok(t) => t,
+            Err(_) => return Ok(false), // no sentinel table → can't verify
+        };
+        let got = table
+            .get(SENTINEL_KEY)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        match got {
+            None => Ok(false),
+            Some(g) => Ok(
+                open_value(&keys.k_value, &db_binding, TID_SENTINEL, SENTINEL_KEY, g.value())
+                    .is_ok(),
+            ),
+        }
+    }
+
+    /// Rotate the group database at `path` from `old_dek` to `new_dek`: re-seal
+    /// every encrypted record under the new `k_value`. Keys are cleartext logical
+    /// ids, so they are unchanged — only the ciphertext is rewritten. The whole
+    /// rotation runs in a single redb write transaction, so a crash leaves the
+    /// DB entirely on the old DEK (uncommitted) or entirely on the new one
+    /// (committed) — never half-rotated. Verifies `old_dek` is correct (the
+    /// records won't decrypt otherwise) before writing anything.
+    pub fn rotate_group_dek(
+        path: impl AsRef<Path>,
+        old_dek: &[u8; 32],
+        new_dek: &[u8; 32],
+    ) -> Result<(), RedbStorageError> {
+        let path = path.as_ref();
+        let db_binding = path
+            .file_name()
+            .map(|n| n.as_encoded_bytes().to_vec())
+            .unwrap_or_default();
+        let db = Database::create(path).map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let old = RecordKeys::derive(old_dek);
+        let new = RecordKeys::derive(new_dek);
+
+        let wtx = db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        for (def, tid) in GROUP_ENCRYPTED_TABLES {
+            let mut table = wtx
+                .open_table(def)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            // Decrypt every record under the old key first (this also proves
+            // old_dek is correct), collecting (key, plaintext).
+            let mut items: Vec<(Vec<u8>, Zeroizing<Vec<u8>>)> = Vec::new();
+            {
+                let range = table
+                    .range::<&[u8]>(..)
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                for entry in range {
+                    let (k, v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                    let key = k.value().to_vec();
+                    let pt = open_value(&old.k_value, &db_binding, tid, &key, v.value())?;
+                    items.push((key, pt));
+                }
+            }
+            // Re-seal each under the new key (same slot → same AAD).
+            for (key, pt) in items {
+                let sealed = seal_value(&new.k_value, &db_binding, tid, &key, &pt)?;
+                table
+                    .insert(key.as_slice(), sealed.as_slice())
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            }
+        }
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))
     }
 
     // --- typed get/put helpers -------------------------------------------
@@ -392,6 +488,64 @@ impl RedbBackend {
         wtx.commit()
             .map_err(|e| RedbStorageError::Backend(e.to_string()))
     }
+}
+
+/// AAD binding a record to its slot: `db_binding ‖ table_id ‖ redb_key`.
+fn aad_bytes(db_binding: &[u8], table_id: u8, redb_key: &[u8]) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(db_binding.len() + 1 + redb_key.len());
+    aad.extend_from_slice(db_binding);
+    aad.push(table_id);
+    aad.extend_from_slice(redb_key);
+    aad
+}
+
+/// Encrypt `plaintext` into a self-describing record bound to its slot, under
+/// the given value key. Record = `VERSION(1) ‖ nonce(24) ‖ ciphertext‖tag`.
+fn seal_value(
+    k_value: &[u8; 32],
+    db_binding: &[u8],
+    table_id: u8,
+    redb_key: &[u8],
+    plaintext: &[u8],
+) -> Result<Vec<u8>, RedbStorageError> {
+    let cipher = XChaCha20Poly1305::new_from_slice(k_value).map_err(|_| RedbStorageError::Encrypt)?;
+    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let aad = aad_bytes(db_binding, table_id, redb_key);
+    let ct = cipher
+        .encrypt(&nonce, Payload { msg: plaintext, aad: &aad })
+        .map_err(|_| RedbStorageError::Encrypt)?;
+    let mut out = Vec::with_capacity(1 + NONCE_LEN + ct.len());
+    out.push(RECORD_VERSION);
+    out.extend_from_slice(nonce.as_slice());
+    out.extend_from_slice(&ct);
+    Ok(out)
+}
+
+/// Decrypt a record produced by [`seal_value`], verifying the slot binding.
+fn open_value(
+    k_value: &[u8; 32],
+    db_binding: &[u8],
+    table_id: u8,
+    redb_key: &[u8],
+    record: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, RedbStorageError> {
+    if record.len() < 1 + NONCE_LEN {
+        return Err(RedbStorageError::Malformed("record too short".into()));
+    }
+    if record[0] != RECORD_VERSION {
+        return Err(RedbStorageError::Malformed(format!(
+            "unknown record version {}",
+            record[0]
+        )));
+    }
+    let nonce = XNonce::from_slice(&record[1..1 + NONCE_LEN]);
+    let ct = &record[1 + NONCE_LEN..];
+    let cipher = XChaCha20Poly1305::new_from_slice(k_value).map_err(|_| RedbStorageError::Decrypt)?;
+    let aad = aad_bytes(db_binding, table_id, redb_key);
+    let pt = cipher
+        .decrypt(nonce, Payload { msg: ct, aad: &aad })
+        .map_err(|_| RedbStorageError::Decrypt)?;
+    Ok(Zeroizing::new(pt))
 }
 
 /// Build the fixed-length composite key for the **inbox** (blind-indexed):
@@ -1151,7 +1305,7 @@ mod tests {
     }
 
     #[test]
-    fn wrong_dek_cannot_read() {
+    fn wrong_dek_fails_open_via_sentinel() {
         let dir = tempdir().expect("tempdir");
         let path = dir.path().join("groups.redb");
         {
@@ -1164,12 +1318,76 @@ mod tests {
             )
             .expect("write");
         }
-        // Reopen with a different DEK: the group key is the cleartext id, so
-        // the record is found, but AEAD verification fails under the wrong
-        // k_value — surfaced as a Decrypt error, never plaintext.
-        let b2 = RedbBackend::open(&path, &[0x02; 32]).expect("reopen");
+        // Reopen with a different DEK: the sentinel fails to decrypt, so open
+        // fails fast rather than returning garbage.
+        assert!(matches!(
+            RedbBackend::open(&path, &[0x02; 32]),
+            Err(RedbStorageError::Decrypt)
+        ));
+    }
+
+    #[test]
+    fn dek_opens_probe() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("groups.redb");
+        drop(RedbBackend::open(&path, &[0x01; 32]).expect("open"));
+        assert!(RedbBackend::dek_opens(&path, &[0x01; 32]).expect("probe ok"));
+        assert!(!RedbBackend::dek_opens(&path, &[0x02; 32]).expect("probe wrong"));
+        // Nonexistent DB → false, not an error.
+        assert!(!RedbBackend::dek_opens(dir.path().join("nope.redb"), &[0x01; 32]).expect("absent"));
+    }
+
+    #[test]
+    fn rotate_group_dek_reseals_under_new_key() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("groups.redb");
+        let old = [0x11u8; 32];
+        let new = [0x22u8; 32];
+        // Seed a group, epoch, key package, psk, and app value under `old`.
+        {
+            let b = RedbBackend::open(&path, &old).expect("open");
+            let mut gs = b.group_state_storage();
+            gs.write(
+                GroupState { id: vec![7; 32], data: Zeroizing::new(vec![0xab; 64]) },
+                vec![EpochRecord::new(0, Zeroizing::new(vec![1; 16]))],
+                vec![],
+            )
+            .expect("write");
+            let mut kp = b.key_package_storage();
+            kp.insert(vec![1, 2], KeyPackageData::new(vec![3], vec![4].into(), vec![5].into(), 9))
+                .expect("kp");
+            b.application_data_storage().insert("mls:identity:sk", &[0xcd; 32]).expect("app");
+        }
+        // Rotate old -> new.
+        RedbBackend::rotate_group_dek(&path, &old, &new).expect("rotate");
+        // Old DEK no longer opens; new DEK does, and all data survives.
+        assert!(!RedbBackend::dek_opens(&path, &old).expect("old probe"));
+        assert!(RedbBackend::dek_opens(&path, &new).expect("new probe"));
+        let b2 = RedbBackend::open(&path, &new).expect("open new");
         let gs2 = b2.group_state_storage();
-        assert!(matches!(gs2.state(&[1]), Err(RedbStorageError::Decrypt)));
+        assert_eq!(&*gs2.state(&[7; 32]).expect("state").unwrap(), &vec![0xab; 64]);
+        assert_eq!(&*gs2.epoch(&[7; 32], 0).expect("epoch").unwrap(), &vec![1; 16]);
+        assert!(b2.key_package_storage().get(&[1, 2]).expect("kp").is_some());
+        assert_eq!(
+            b2.application_data_storage().get("mls:identity:sk").expect("app").unwrap(),
+            vec![0xcd; 32]
+        );
+    }
+
+    #[test]
+    fn rotate_with_wrong_old_dek_fails() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("groups.redb");
+        {
+            let b = RedbBackend::open(&path, &[0x11; 32]).expect("open");
+            b.application_data_storage().insert("k", &[1, 2, 3]).expect("app");
+        }
+        // Wrong old DEK → the records won't decrypt → rotation errors, and the
+        // single-transaction design means nothing is committed.
+        assert!(RedbBackend::rotate_group_dek(&path, &[0x99; 32], &[0x22; 32]).is_err());
+        // Original DEK still opens and data is intact.
+        let b = RedbBackend::open(&path, &[0x11; 32]).expect("reopen old");
+        assert_eq!(b.application_data_storage().get("k").expect("app").unwrap(), vec![1, 2, 3]);
     }
 
     #[test]
