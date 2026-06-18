@@ -1122,6 +1122,43 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // One-time migration of a legacy SQLCipher `groups.db` to the pure-Rust
+    // redb backend. Local maintenance op — no network/processor needed. Only
+    // available in builds with the `legacy-sqlcipher-migration` feature.
+    if cmd_name == "migrate-from-sqlcipher" {
+        #[cfg(feature = "legacy-sqlcipher-migration")]
+        {
+            let storage_path: PathBuf = match args.mls_storage {
+                Some(p) => PathBuf::from(p),
+                None => cli::default_storage_path()?,
+            };
+            let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+                .map_err(|e| anyhow::anyhow!("read MLS storage passphrase: {e}"))?;
+            match nk_crypto_tool::group::migrate::migrate_groups_db_from_sqlcipher(
+                &storage_path,
+                &passphrase,
+            )
+            .map_err(|e| anyhow::anyhow!("migrate {storage_path:?}: {e}"))?
+            {
+                Some(report) => println!(
+                    "Migrated {storage_path:?} from SQLCipher to redb: {report}. \
+                     Original preserved as {storage_path:?}.sqlcipher.bak."
+                ),
+                None => println!(
+                    "{storage_path:?} is not a SQLCipher database (already redb?) — nothing to do."
+                ),
+            }
+            return Ok(());
+        }
+        #[cfg(not(feature = "legacy-sqlcipher-migration"))]
+        {
+            anyhow::bail!(
+                "--mls-cmd migrate-from-sqlcipher requires the `legacy-sqlcipher-migration` \
+                 cargo feature; rebuild with `--features legacy-sqlcipher-migration`"
+            );
+        }
+    }
+
     let cmd = match cmd_name {
         "create-group" => MlsCommand::CreateGroup {
             name: require(&args.mls_name, "mls-name")?,

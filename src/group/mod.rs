@@ -25,6 +25,8 @@ pub mod at_rest;
 pub mod cli;
 pub mod rollback;
 pub mod crypto_adapter;
+#[cfg(feature = "legacy-sqlcipher-migration")]
+pub mod migrate;
 pub mod processor;
 pub mod redb_storage;
 pub mod storage;

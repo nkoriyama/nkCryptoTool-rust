@@ -238,3 +238,9 @@ pub enum GroupError {
     #[error("backend: {0}")]
     Backend(String),
 }
+
+impl From<crate::group::redb_storage::RedbStorageError> for GroupError {
+    fn from(e: crate::group::redb_storage::RedbStorageError) -> Self {
+        GroupError::Storage(e.to_string())
+    }
+}
