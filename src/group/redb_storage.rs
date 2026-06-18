@@ -59,7 +59,8 @@ use mls_rs_core::group::{EpochRecord, GroupState, GroupStateStorage};
 use mls_rs_core::key_package::{KeyPackageData, KeyPackageStorage};
 use mls_rs_core::mls_rs_codec::{MlsDecode, MlsEncode};
 use mls_rs_core::psk::{ExternalPskId, PreSharedKey, PreSharedKeyStorage};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
+use std::ops::Bound;
 use sha2::Sha256;
 use zeroize::Zeroizing;
 
@@ -84,7 +85,22 @@ const TBL_EPOCH: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_epoch
 const TBL_KEY_PACKAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_key_package");
 const TBL_PSK: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_psk");
 
+// Inbox (store-and-forward) tables and their AAD table ids.
+const TID_ENVELOPE: u8 = 5;
+const TID_PREKEY: u8 = 6;
+const TID_CHECKPOINT: u8 = 7;
+const TBL_ENV: TableDefinition<&[u8], &[u8]> = TableDefinition::new("inbox_env");
+const TBL_PREKEY: TableDefinition<&[u8], &[u8]> = TableDefinition::new("inbox_prekey");
+const TBL_CHECKPOINT: TableDefinition<&[u8], &[u8]> = TableDefinition::new("inbox_checkpoint");
+/// Plaintext meta table: monotonic row-id counter (`b"next_id"` → u64 BE).
+/// The counter value is not secret, so it is stored unencrypted.
+const TBL_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("inbox_meta");
+
 const BLIND_INDEX_LEN: usize = 32;
+/// Envelope value header: `sender(32) ‖ created_at_be(8)` precedes the payload.
+const ENV_HEADER_LEN: usize = 32 + 8;
+/// Prekey value header: `created_at_be(8)` precedes the opaque blob.
+const PREKEY_HEADER_LEN: usize = 8;
 
 /// Errors from the redb storage backend.
 #[derive(Debug, thiserror::Error)]
@@ -154,44 +170,58 @@ impl std::fmt::Debug for RedbBackend {
 }
 
 impl RedbBackend {
-    /// Open (or create) the encrypted redb database at `path`, deriving the
+    /// Open (or create) the encrypted redb database at `path` for **MLS group
+    /// storage** (group state / key packages / psks), deriving the
     /// value/blind-index subkeys from the 32-byte at-rest `dek`.
     ///
-    /// All tables are created eagerly so later read transactions never hit
+    /// Tables are created eagerly so later read transactions never hit
     /// `TableDoesNotExist` on a fresh database.
     pub fn open(path: impl AsRef<Path>, dek: &[u8; 32]) -> Result<Self, RedbStorageError> {
         let path = path.as_ref();
+        let me = Self::new_core(path, dek)?;
+        me.create_tables_in(&[TBL_GROUP, TBL_EPOCH, TBL_KEY_PACKAGE, TBL_PSK])?;
+        me.tighten_permissions(path)?;
+        Ok(me)
+    }
+
+    /// Open (or create) the encrypted redb database at `path` for the
+    /// **store-and-forward inbox** (envelopes / prekeys / checkpoints / meta).
+    /// Same crypto core as [`Self::open`]; only the table set differs.
+    pub fn open_inbox(path: impl AsRef<Path>, dek: &[u8; 32]) -> Result<Self, RedbStorageError> {
+        let path = path.as_ref();
+        let me = Self::new_core(path, dek)?;
+        me.create_tables_in(&[TBL_ENV, TBL_PREKEY, TBL_CHECKPOINT, TBL_META])?;
+        me.tighten_permissions(path)?;
+        Ok(me)
+    }
+
+    fn new_core(path: &Path, dek: &[u8; 32]) -> Result<Self, RedbStorageError> {
         let db_binding = path
             .file_name()
             .map(|n| n.as_encoded_bytes().to_vec())
             .unwrap_or_default();
         let db = Database::create(path).map_err(|e| RedbStorageError::Backend(e.to_string()))?;
-
-        let me = Self {
+        Ok(Self {
             db: Arc::new(db),
             keys: Arc::new(RecordKeys::derive(dek)),
             db_binding: Arc::new(db_binding),
             max_epoch_retention: DEFAULT_EPOCH_RETENTION_LIMIT,
-        };
-        me.create_tables()?;
-        me.tighten_permissions(path)?;
-        Ok(me)
+        })
     }
 
-    fn create_tables(&self) -> Result<(), RedbStorageError> {
+    fn create_tables_in(
+        &self,
+        defs: &[TableDefinition<&'static [u8], &'static [u8]>],
+    ) -> Result<(), RedbStorageError> {
         let wtx = self
             .db
             .begin_write()
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         {
-            wtx.open_table(TBL_GROUP)
-                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
-            wtx.open_table(TBL_EPOCH)
-                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
-            wtx.open_table(TBL_KEY_PACKAGE)
-                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
-            wtx.open_table(TBL_PSK)
-                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            for def in defs {
+                wtx.open_table(*def)
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            }
         }
         wtx.commit()
             .map_err(|e| RedbStorageError::Backend(e.to_string()))
@@ -356,7 +386,7 @@ impl RedbBackend {
 }
 
 /// Build the fixed-length composite epoch key: `blind_index(group) ‖ epoch_be`.
-fn epoch_key(gkey: &[u8; BLIND_INDEX_LEN], epoch_id: u64) -> Vec<u8> {
+fn composite_key(gkey: &[u8; BLIND_INDEX_LEN], epoch_id: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(BLIND_INDEX_LEN + 8);
     k.extend_from_slice(gkey);
     k.extend_from_slice(&epoch_id.to_be_bytes());
@@ -401,7 +431,7 @@ impl RedbGroupStateStorage {
             let mut max_epoch_id: Option<u64> = None;
             for epoch in inserts.iter().chain(updates.iter()) {
                 max_epoch_id = Some(max_epoch_id.map_or(epoch.id, |m| m.max(epoch.id)));
-                let ekey = epoch_key(&gkey, epoch.id);
+                let ekey = composite_key(&gkey, epoch.id);
                 let sealed = b.seal(TID_EPOCH, &ekey, &epoch.data)?;
                 etable
                     .insert(ekey.as_slice(), sealed.as_slice())
@@ -412,8 +442,8 @@ impl RedbGroupStateStorage {
             if let Some(max_id) = max_epoch_id {
                 if max_id >= b.max_epoch_retention {
                     let delete_under = max_id - b.max_epoch_retention;
-                    let lo = epoch_key(&gkey, 0);
-                    let hi = epoch_key(&gkey, delete_under);
+                    let lo = composite_key(&gkey, 0);
+                    let hi = composite_key(&gkey, delete_under);
                     let mut to_delete: Vec<Vec<u8>> = Vec::new();
                     {
                         let range = etable
@@ -440,8 +470,8 @@ impl RedbGroupStateStorage {
     fn max_epoch_id_inner(&self, group_id: &[u8]) -> Result<Option<u64>, RedbStorageError> {
         let b = &self.0;
         let gkey = b.blind_index(group_id);
-        let lo = epoch_key(&gkey, 0);
-        let hi = epoch_key(&gkey, u64::MAX);
+        let lo = composite_key(&gkey, 0);
+        let hi = composite_key(&gkey, u64::MAX);
         let rtx = b
             .db
             .begin_read()
@@ -489,7 +519,7 @@ impl GroupStateStorage for RedbGroupStateStorage {
     ) -> Result<Option<Zeroizing<Vec<u8>>>, Self::Error> {
         let b = &self.0;
         let gkey = b.blind_index(group_id);
-        let ekey = epoch_key(&gkey, epoch_id);
+        let ekey = composite_key(&gkey, epoch_id);
         match b.get_raw(TBL_EPOCH, &ekey)? {
             None => Ok(None),
             Some(rec) => Ok(Some(b.open_record(TID_EPOCH, &ekey, &rec)?)),
@@ -581,6 +611,332 @@ impl RedbPreSharedKeyStorage {
         let sealed = b.seal(TID_PSK, &pkey, psk.deref())?;
         b.put(TBL_PSK, &pkey, &sealed)
     }
+}
+
+// ===================== Inbox (store-and-forward) =====================
+
+/// Outcome of a [`RedbInboxStore::checkpoint`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointOutcome {
+    /// Stored (or already at/above the supplied epoch).
+    Ok,
+    /// The supplied epoch was below the stored one — a rollback; not stored.
+    Rollback,
+}
+
+/// redb-backed store for the `nkct/inbox/1` store-and-forward relay
+/// ([`crate::network::inbox`]). Mirrors the SQLCipher schema's semantics
+/// (per-recipient monotonic cursor, prekey FIFO pool with a cap, rollback-safe
+/// checkpoints) but on pure-Rust redb with the same app-layer AEAD as the MLS
+/// storage. Every value (payload + sender + timestamps) is encrypted; only the
+/// `blind_index(recipient)` and the monotonic id remain in the clear.
+///
+/// Keys are `blind_index(recipient)(32) ‖ id_be(8)`, so a recipient's records
+/// form a contiguous, ordered range. The id is a global monotonic counter (the
+/// poll cursor), matching the sqlite `AUTOINCREMENT` rowid.
+#[derive(Clone, Debug)]
+pub struct RedbInboxStore {
+    b: RedbBackend,
+    /// Per-recipient prekey pool cap (newest win). Mirrors `MAX_PREKEYS_STORED`.
+    max_prekeys: usize,
+}
+
+const META_NEXT_ID: &[u8] = b"next_id";
+
+impl RedbInboxStore {
+    /// Open (or create) the encrypted inbox database at `path`.
+    pub fn open(
+        path: impl AsRef<Path>,
+        dek: &[u8; 32],
+        max_prekeys: usize,
+    ) -> Result<Self, RedbStorageError> {
+        Ok(Self {
+            b: RedbBackend::open_inbox(path, dek)?,
+            max_prekeys,
+        })
+    }
+
+    /// Reserve the next monotonic id within an open write transaction. Ids start
+    /// at 1 (so `since_cursor = 0` drains the whole backlog, like sqlite).
+    fn next_id(&self, wtx: &WriteTransaction) -> Result<u64, RedbStorageError> {
+        let mut meta = wtx
+            .open_table(TBL_META)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let cur = meta
+            .get(META_NEXT_ID)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+            .map(|g| {
+                let v = g.value();
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&v[..8.min(v.len())]);
+                u64::from_be_bytes(b)
+            })
+            .unwrap_or(0);
+        let id = cur + 1;
+        meta.insert(META_NEXT_ID, id.to_be_bytes().as_slice())
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        Ok(id)
+    }
+
+    /// DEPOSIT: store an envelope for `recipient`; returns the assigned cursor id.
+    pub fn deposit(
+        &self,
+        recipient: &[u8; 32],
+        sender: &[u8; 32],
+        payload: &[u8],
+        created_at: i64,
+    ) -> Result<u64, RedbStorageError> {
+        let bi = self.b.blind_index(recipient);
+        let wtx = self
+            .b
+            .db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let id = self.next_id(&wtx)?;
+        let key = composite_key(&bi, id);
+        let mut plain = Vec::with_capacity(ENV_HEADER_LEN + payload.len());
+        plain.extend_from_slice(sender);
+        plain.extend_from_slice(&created_at.to_be_bytes());
+        plain.extend_from_slice(payload);
+        let sealed = self.b.seal(TID_ENVELOPE, &key, &plain)?;
+        {
+            let mut t = wtx
+                .open_table(TBL_ENV)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            t.insert(key.as_slice(), sealed.as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        }
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        Ok(id)
+    }
+
+    /// POLL: return up to `max` envelopes for `recipient` with id > `since`,
+    /// oldest first, as `(cursor, payload)`.
+    pub fn poll(
+        &self,
+        recipient: &[u8; 32],
+        since: u64,
+        max: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, RedbStorageError> {
+        let bi = self.b.blind_index(recipient);
+        let lo = composite_key(&bi, since); // excluded → strictly id > since
+        let hi = composite_key(&bi, u64::MAX);
+        let rtx = self
+            .b
+            .db
+            .begin_read()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let table = rtx
+            .open_table(TBL_ENV)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let range = table
+            .range::<&[u8]>((Bound::Excluded(lo.as_slice()), Bound::Included(hi.as_slice())))
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let mut out = Vec::new();
+        for entry in range.take(max) {
+            let (k, v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let id = id_from_key(k.value())?;
+            let key = composite_key(&bi, id);
+            let pt = self.b.open_record(TID_ENVELOPE, &key, v.value())?;
+            if pt.len() < ENV_HEADER_LEN {
+                return Err(RedbStorageError::Malformed("envelope too short".into()));
+            }
+            out.push((id, pt[ENV_HEADER_LEN..].to_vec()));
+        }
+        Ok(out)
+    }
+
+    /// CHECKPOINT: advance `peer`'s stored epoch monotonically; reject rollbacks.
+    pub fn checkpoint(
+        &self,
+        peer: &[u8; 32],
+        epoch: u64,
+    ) -> Result<CheckpointOutcome, RedbStorageError> {
+        let key = self.b.blind_index(peer);
+        let wtx = self
+            .b
+            .db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        // Read the (encrypted) stored record into an owned buffer first so the
+        // table/guard borrow ends before we decrypt or reopen the table.
+        let raw: Option<Vec<u8>> = {
+            let t = wtx
+                .open_table(TBL_CHECKPOINT)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let got = t
+                .get(key.as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            got.map(|g| g.value().to_vec())
+        };
+        let stored: Option<u64> = match raw {
+            None => None,
+            Some(v) => {
+                let pt = self.b.open_record(TID_CHECKPOINT, &key, &v)?;
+                if pt.len() < 8 {
+                    return Err(RedbStorageError::Malformed("checkpoint too short".into()));
+                }
+                let mut b = [0u8; 8];
+                b.copy_from_slice(&pt[..8]);
+                Some(u64::from_be_bytes(b))
+            }
+        };
+        if let Some(s) = stored {
+            if epoch < s {
+                // Regression — drop the txn uncommitted (redb aborts on drop),
+                // leaving the stored value untouched.
+                drop(wtx);
+                return Ok(CheckpointOutcome::Rollback);
+            }
+        }
+        let newv = stored.map_or(epoch, |s| s.max(epoch));
+        let sealed = self.b.seal(TID_CHECKPOINT, &key, &newv.to_be_bytes())?;
+        {
+            let mut t = wtx
+                .open_table(TBL_CHECKPOINT)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            t.insert(key.as_slice(), sealed.as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        }
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        Ok(CheckpointOutcome::Ok)
+    }
+
+    /// PUBLISH: append signed prekey `blobs` to `recipient`'s pool, then evict
+    /// the oldest so at most `max_prekeys` remain (newest win).
+    pub fn publish_prekeys(
+        &self,
+        recipient: &[u8; 32],
+        blobs: &[Vec<u8>],
+        created_at: i64,
+    ) -> Result<(), RedbStorageError> {
+        let bi = self.b.blind_index(recipient);
+        let wtx = self
+            .b
+            .db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        for blob in blobs {
+            let id = self.next_id(&wtx)?;
+            let key = composite_key(&bi, id);
+            let mut plain = Vec::with_capacity(PREKEY_HEADER_LEN + blob.len());
+            plain.extend_from_slice(&created_at.to_be_bytes());
+            plain.extend_from_slice(blob);
+            let sealed = self.b.seal(TID_PREKEY, &key, &plain)?;
+            let mut t = wtx
+                .open_table(TBL_PREKEY)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            t.insert(key.as_slice(), sealed.as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        }
+        // Evict oldest beyond the cap.
+        {
+            let mut t = wtx
+                .open_table(TBL_PREKEY)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let lo = composite_key(&bi, 0);
+            let hi = composite_key(&bi, u64::MAX);
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            {
+                let range = t
+                    .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                for entry in range {
+                    let (k, _v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                    keys.push(k.value().to_vec());
+                }
+            }
+            if keys.len() > self.max_prekeys {
+                let drop_count = keys.len() - self.max_prekeys;
+                for k in keys.iter().take(drop_count) {
+                    t.remove(k.as_slice())
+                        .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                }
+            }
+        }
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))
+    }
+
+    /// FETCH: atomically pop the oldest prekey for `recipient` (one-time use).
+    pub fn fetch_prekey(
+        &self,
+        recipient: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, RedbStorageError> {
+        let bi = self.b.blind_index(recipient);
+        let lo = composite_key(&bi, 0);
+        let hi = composite_key(&bi, u64::MAX);
+        let wtx = self
+            .b
+            .db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let result = {
+            let mut t = wtx
+                .open_table(TBL_PREKEY)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            // Lowest-id entry in the recipient range.
+            let first: Option<(Vec<u8>, Vec<u8>)> = {
+                let mut range = t
+                    .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                match range.next() {
+                    None => None,
+                    Some(entry) => {
+                        let (k, v) =
+                            entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                        Some((k.value().to_vec(), v.value().to_vec()))
+                    }
+                }
+            };
+            match first {
+                None => None,
+                Some((k, v)) => {
+                    t.remove(k.as_slice())
+                        .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                    let pt = self.b.open_record(TID_PREKEY, &k, &v)?;
+                    if pt.len() < PREKEY_HEADER_LEN {
+                        return Err(RedbStorageError::Malformed("prekey too short".into()));
+                    }
+                    Some(pt[PREKEY_HEADER_LEN..].to_vec())
+                }
+            }
+        };
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        Ok(result)
+    }
+
+    /// COUNT: number of prekeys remaining in `recipient`'s pool.
+    pub fn count_prekeys(&self, recipient: &[u8; 32]) -> Result<usize, RedbStorageError> {
+        let bi = self.b.blind_index(recipient);
+        let lo = composite_key(&bi, 0);
+        let hi = composite_key(&bi, u64::MAX);
+        let rtx = self
+            .b
+            .db
+            .begin_read()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let table = rtx
+            .open_table(TBL_PREKEY)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let range = table
+            .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        Ok(range.count())
+    }
+}
+
+/// Extract the trailing 8-byte big-endian id from a `bi ‖ id_be` composite key.
+fn id_from_key(key: &[u8]) -> Result<u64, RedbStorageError> {
+    if key.len() != BLIND_INDEX_LEN + 8 {
+        return Err(RedbStorageError::Malformed("composite key length".into()));
+    }
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&key[BLIND_INDEX_LEN..]);
+    Ok(u64::from_be_bytes(id))
 }
 
 #[cfg(test)]
@@ -737,5 +1093,101 @@ mod tests {
         let b2 = RedbBackend::open(&path, &[0x02; 32]).expect("reopen");
         let gs2 = b2.group_state_storage();
         assert!(gs2.state(&[1]).expect("state").is_none());
+    }
+
+    // ---------------- inbox store ----------------
+
+    fn inbox(max_prekeys: usize) -> (tempfile::TempDir, RedbInboxStore) {
+        let dir = tempdir().expect("tempdir");
+        let s = RedbInboxStore::open(dir.path().join("inbox.redb"), &[0x55u8; 32], max_prekeys)
+            .expect("open inbox");
+        (dir, s)
+    }
+
+    #[test]
+    fn inbox_deposit_poll_cursor() {
+        let (_d, s) = inbox(100);
+        let rcpt = [0xa1u8; 32];
+        let sender = [0xb2u8; 32];
+        let id1 = s.deposit(&rcpt, &sender, b"m1", 100).expect("dep1");
+        let id2 = s.deposit(&rcpt, &sender, b"m2", 101).expect("dep2");
+        assert_eq!((id1, id2), (1, 2), "ids are monotonic from 1");
+
+        // Drain from cursor 0.
+        let all = s.poll(&rcpt, 0, 10).expect("poll");
+        assert_eq!(all, vec![(1, b"m1".to_vec()), (2, b"m2".to_vec())]);
+
+        // Incremental poll past the first cursor returns only the newer one.
+        let newer = s.poll(&rcpt, 1, 10).expect("poll since 1");
+        assert_eq!(newer, vec![(2, b"m2".to_vec())]);
+
+        // max limits the batch.
+        assert_eq!(s.poll(&rcpt, 0, 1).expect("poll max1").len(), 1);
+
+        // A different recipient sees nothing.
+        assert!(s.poll(&[0x00; 32], 0, 10).expect("poll other").is_empty());
+    }
+
+    #[test]
+    fn inbox_poll_isolates_recipients() {
+        let (_d, s) = inbox(100);
+        let a = [0x01u8; 32];
+        let b = [0x02u8; 32];
+        s.deposit(&a, &a, b"for-a", 1).expect("dep a");
+        s.deposit(&b, &b, b"for-b", 1).expect("dep b");
+        let pa = s.poll(&a, 0, 10).expect("poll a");
+        assert_eq!(pa.len(), 1);
+        assert_eq!(pa[0].1, b"for-a".to_vec());
+    }
+
+    #[test]
+    fn inbox_checkpoint_rollback() {
+        let (_d, s) = inbox(100);
+        let peer = [0xc3u8; 32];
+        assert_eq!(s.checkpoint(&peer, 5).expect("cp5"), CheckpointOutcome::Ok);
+        assert_eq!(s.checkpoint(&peer, 7).expect("cp7"), CheckpointOutcome::Ok);
+        // Regression is rejected and does not lower the stored epoch.
+        assert_eq!(
+            s.checkpoint(&peer, 6).expect("cp6"),
+            CheckpointOutcome::Rollback
+        );
+        // Re-advancing to the high-water mark or beyond still works.
+        assert_eq!(s.checkpoint(&peer, 7).expect("cp7b"), CheckpointOutcome::Ok);
+        assert_eq!(s.checkpoint(&peer, 9).expect("cp9"), CheckpointOutcome::Ok);
+    }
+
+    #[test]
+    fn inbox_prekey_fifo_and_cap() {
+        let (_d, s) = inbox(3); // cap = 3
+        let rcpt = [0xd4u8; 32];
+        // Publish 5; only the newest 3 survive the cap.
+        let blobs: Vec<Vec<u8>> = (0u8..5).map(|i| vec![i; 4]).collect();
+        s.publish_prekeys(&rcpt, &blobs, 10).expect("publish");
+        assert_eq!(s.count_prekeys(&rcpt).expect("count"), 3);
+
+        // FIFO pop returns the oldest surviving (blob #2, then #3, #4).
+        assert_eq!(s.fetch_prekey(&rcpt).expect("f1"), Some(vec![2u8; 4]));
+        assert_eq!(s.fetch_prekey(&rcpt).expect("f2"), Some(vec![3u8; 4]));
+        assert_eq!(s.fetch_prekey(&rcpt).expect("f3"), Some(vec![4u8; 4]));
+        assert_eq!(s.fetch_prekey(&rcpt).expect("f4"), None);
+        assert_eq!(s.count_prekeys(&rcpt).expect("count0"), 0);
+    }
+
+    #[test]
+    fn inbox_persists_across_reopen() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("inbox.redb");
+        let dek = [0x77u8; 32];
+        let rcpt = [0xe5u8; 32];
+        {
+            let s = RedbInboxStore::open(&path, &dek, 50).expect("open");
+            s.deposit(&rcpt, &rcpt, b"persisted", 1).expect("dep");
+        }
+        let s2 = RedbInboxStore::open(&path, &dek, 50).expect("reopen");
+        let got = s2.poll(&rcpt, 0, 10).expect("poll");
+        assert_eq!(got, vec![(1, b"persisted".to_vec())]);
+        // Cursor counter also persisted: next id is 2, not a reset to 1.
+        let id = s2.deposit(&rcpt, &rcpt, b"again", 2).expect("dep2");
+        assert_eq!(id, 2);
     }
 }
