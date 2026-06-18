@@ -25,10 +25,12 @@
 //!   derived with HKDF-SHA256 and distinct `info` labels:
 //!     - `k_value` — value encryption key.
 //!     - `k_bi` — HMAC-SHA256 key for the *blind index* used as the redb key.
-//! - **Blind index**: logical identifiers (group_id, key-package id, psk_id)
-//!   are not stored in the clear. Each becomes `HMAC-SHA256(k_bi, id)` — a
-//!   fixed 32-byte key. This (a) blinds identifiers at rest and (b) makes all
-//!   composite keys fixed-length, so epoch range scans are prefix-safe.
+//! - **Keys**: the **group DB** uses the *cleartext* logical id as the redb key
+//!   (group_id, key-package id, psk_id — all random, low-sensitivity values, so
+//!   blind-indexing buys ~no at-rest hygiene; keeping them cleartext lets DEK
+//!   rotation re-seal values without re-keying). The **inbox** instead uses a
+//!   **blind index** `HMAC-SHA256(k_bi, recipient)` because the recipient is a
+//!   real identity (NodeId) whose presence/correlation must be hidden at rest.
 //! - **AAD**: every value is sealed with
 //!   `aad = db_binding ‖ table_id ‖ redb_key`, binding the ciphertext to its
 //!   exact slot. A relay/attacker that copies one record's bytes into another
@@ -392,12 +394,38 @@ impl RedbBackend {
     }
 }
 
-/// Build the fixed-length composite epoch key: `blind_index(group) ‖ epoch_be`.
-fn composite_key(gkey: &[u8; BLIND_INDEX_LEN], epoch_id: u64) -> Vec<u8> {
+/// Build the fixed-length composite key for the **inbox** (blind-indexed):
+/// `blind_index(recipient) ‖ id_be`. The 32-byte blind-index prefix is fixed
+/// length, so per-recipient range scans are collision-free.
+fn composite_key(gkey: &[u8; BLIND_INDEX_LEN], id: u64) -> Vec<u8> {
     let mut k = Vec::with_capacity(BLIND_INDEX_LEN + 8);
     k.extend_from_slice(gkey);
+    k.extend_from_slice(&id.to_be_bytes());
+    k
+}
+
+/// Build the composite epoch key for the **group DB**, where the redb key is
+/// the *cleartext* group id (group ids are random, low-sensitivity values, so
+/// blind-indexing them buys ~no at-rest hygiene; keeping them cleartext lets
+/// DEK rotation re-seal values without re-keying — see DB_PURERUST_DESIGN.md).
+/// The group id is length-prefixed so variable-length ids cannot collide in a
+/// range scan: `gid_len(u16 BE) ‖ gid ‖ epoch_be(8)`.
+fn group_epoch_key(group_id: &[u8], epoch_id: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + group_id.len() + 8);
+    k.extend_from_slice(&(group_id.len() as u16).to_be_bytes());
+    k.extend_from_slice(group_id);
     k.extend_from_slice(&epoch_id.to_be_bytes());
     k
+}
+
+/// Recover the epoch id (trailing 8 bytes) from a [`group_epoch_key`].
+fn epoch_from_group_key(key: &[u8]) -> Result<u64, RedbStorageError> {
+    if key.len() < 8 {
+        return Err(RedbStorageError::Malformed("group epoch key too short".into()));
+    }
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&key[key.len() - 8..]);
+    Ok(u64::from_be_bytes(id))
 }
 
 // ===================== GroupStateStorage =============================
@@ -414,21 +442,21 @@ impl RedbGroupStateStorage {
         updates: Vec<EpochRecord>,
     ) -> Result<(), RedbStorageError> {
         let b = &self.0;
-        let gkey = b.blind_index(&state.id);
+        // Group DB keys are the *cleartext* group id (see `group_epoch_key`):
+        // random low-sensitivity ids, kept cleartext so DEK rotation re-seals
+        // values without re-keying.
+        let gkey = &state.id;
 
         let wtx = b
             .db
             .begin_write()
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         {
-            // Snapshot upsert. The group_id is embedded in the (encrypted)
-            // value so `list_group_ids` can recover it — the redb key is the
-            // blind index, from which the id is unrecoverable.
+            // Snapshot upsert. `list_group_ids` reads the key directly.
             let mut gtable = wtx
                 .open_table(TBL_GROUP)
                 .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
-            let plain = encode_group_value(&state.id, &state.data);
-            let sealed = b.seal(TID_GROUP, &gkey, &plain)?;
+            let sealed = b.seal(TID_GROUP, gkey, &state.data)?;
             gtable
                 .insert(gkey.as_slice(), sealed.as_slice())
                 .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
@@ -441,7 +469,7 @@ impl RedbGroupStateStorage {
             let mut max_epoch_id: Option<u64> = None;
             for epoch in inserts.iter().chain(updates.iter()) {
                 max_epoch_id = Some(max_epoch_id.map_or(epoch.id, |m| m.max(epoch.id)));
-                let ekey = composite_key(&gkey, epoch.id);
+                let ekey = group_epoch_key(&state.id, epoch.id);
                 let sealed = b.seal(TID_EPOCH, &ekey, &epoch.data)?;
                 etable
                     .insert(ekey.as_slice(), sealed.as_slice())
@@ -452,8 +480,8 @@ impl RedbGroupStateStorage {
             if let Some(max_id) = max_epoch_id {
                 if max_id >= b.max_epoch_retention {
                     let delete_under = max_id - b.max_epoch_retention;
-                    let lo = composite_key(&gkey, 0);
-                    let hi = composite_key(&gkey, delete_under);
+                    let lo = group_epoch_key(&state.id, 0);
+                    let hi = group_epoch_key(&state.id, delete_under);
                     let mut to_delete: Vec<Vec<u8>> = Vec::new();
                     {
                         let range = etable
@@ -479,9 +507,8 @@ impl RedbGroupStateStorage {
 
     fn max_epoch_id_inner(&self, group_id: &[u8]) -> Result<Option<u64>, RedbStorageError> {
         let b = &self.0;
-        let gkey = b.blind_index(group_id);
-        let lo = composite_key(&gkey, 0);
-        let hi = composite_key(&gkey, u64::MAX);
+        let lo = group_epoch_key(group_id, 0);
+        let hi = group_epoch_key(group_id, u64::MAX);
         let rtx = b
             .db
             .begin_read()
@@ -493,25 +520,18 @@ impl RedbGroupStateStorage {
             .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         // Keys are ordered; the last entry carries the max epoch id.
-        let last = range.next_back();
-        match last {
+        match range.next_back() {
             None => Ok(None),
             Some(entry) => {
                 let (k, _v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
-                let kb = k.value();
-                if kb.len() != BLIND_INDEX_LEN + 8 {
-                    return Err(RedbStorageError::Malformed("epoch key length".into()));
-                }
-                let mut id = [0u8; 8];
-                id.copy_from_slice(&kb[BLIND_INDEX_LEN..]);
-                Ok(Some(u64::from_be_bytes(id)))
+                Ok(Some(epoch_from_group_key(k.value())?))
             }
         }
     }
 
     /// Enumerate the group ids of all stored groups (replaces the sqlite
-    /// `SELECT group_id FROM mls_group`). Each id is recovered from the
-    /// encrypted value, since the redb key is an unrecoverable blind index.
+    /// `SELECT group_id FROM mls_group`). The redb key *is* the cleartext
+    /// group id, so this is a plain key scan.
     pub fn list_group_ids(&self) -> Result<Vec<Vec<u8>>, RedbStorageError> {
         let b = &self.0;
         let rtx = b
@@ -526,33 +546,11 @@ impl RedbGroupStateStorage {
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         let mut out = Vec::new();
         for entry in range {
-            let (k, v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
-            let plain = b.open_record(TID_GROUP, k.value(), v.value())?;
-            let (id, _data) = decode_group_value(&plain)?;
-            out.push(id.to_vec());
+            let (k, _v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            out.push(k.value().to_vec());
         }
         Ok(out)
     }
-}
-
-/// Group-state value framing: `gid_len(u16 BE) ‖ gid ‖ snapshot`.
-fn encode_group_value(group_id: &[u8], snapshot: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2 + group_id.len() + snapshot.len());
-    out.extend_from_slice(&(group_id.len() as u16).to_be_bytes());
-    out.extend_from_slice(group_id);
-    out.extend_from_slice(snapshot);
-    out
-}
-
-fn decode_group_value(plain: &[u8]) -> Result<(&[u8], &[u8]), RedbStorageError> {
-    if plain.len() < 2 {
-        return Err(RedbStorageError::Malformed("group value too short".into()));
-    }
-    let gid_len = u16::from_be_bytes([plain[0], plain[1]]) as usize;
-    if plain.len() < 2 + gid_len {
-        return Err(RedbStorageError::Malformed("group value gid truncated".into()));
-    }
-    Ok((&plain[2..2 + gid_len], &plain[2 + gid_len..]))
 }
 
 impl GroupStateStorage for RedbGroupStateStorage {
@@ -560,14 +558,9 @@ impl GroupStateStorage for RedbGroupStateStorage {
 
     fn state(&self, group_id: &[u8]) -> Result<Option<Zeroizing<Vec<u8>>>, Self::Error> {
         let b = &self.0;
-        let gkey = b.blind_index(group_id);
-        match b.get_raw(TBL_GROUP, &gkey)? {
+        match b.get_raw(TBL_GROUP, group_id)? {
             None => Ok(None),
-            Some(rec) => {
-                let plain = b.open_record(TID_GROUP, &gkey, &rec)?;
-                let (_id, data) = decode_group_value(&plain)?;
-                Ok(Some(Zeroizing::new(data.to_vec())))
-            }
+            Some(rec) => Ok(Some(b.open_record(TID_GROUP, group_id, &rec)?)),
         }
     }
 
@@ -577,8 +570,7 @@ impl GroupStateStorage for RedbGroupStateStorage {
         epoch_id: u64,
     ) -> Result<Option<Zeroizing<Vec<u8>>>, Self::Error> {
         let b = &self.0;
-        let gkey = b.blind_index(group_id);
-        let ekey = composite_key(&gkey, epoch_id);
+        let ekey = group_epoch_key(group_id, epoch_id);
         match b.get_raw(TBL_EPOCH, &ekey)? {
             None => Ok(None),
             Some(rec) => Ok(Some(b.open_record(TID_EPOCH, &ekey, &rec)?)),
@@ -609,27 +601,25 @@ impl KeyPackageStorage for RedbKeyPackageStorage {
     type Error = RedbStorageError;
 
     fn delete(&mut self, id: &[u8]) -> Result<(), Self::Error> {
-        let kkey = self.0.blind_index(id);
-        self.0.delete(TBL_KEY_PACKAGE, &kkey)
+        // Group DB keys are the cleartext logical id (kp id is random).
+        self.0.delete(TBL_KEY_PACKAGE, id)
     }
 
     fn insert(&mut self, id: Vec<u8>, pkg: KeyPackageData) -> Result<(), Self::Error> {
         let b = &self.0;
-        let kkey = b.blind_index(&id);
         let encoded = pkg
             .mls_encode_to_vec()
             .map_err(|e| RedbStorageError::Codec(e.to_string()))?;
-        let sealed = b.seal(TID_KEY_PACKAGE, &kkey, &encoded)?;
-        b.put(TBL_KEY_PACKAGE, &kkey, &sealed)
+        let sealed = b.seal(TID_KEY_PACKAGE, &id, &encoded)?;
+        b.put(TBL_KEY_PACKAGE, &id, &sealed)
     }
 
     fn get(&self, id: &[u8]) -> Result<Option<KeyPackageData>, Self::Error> {
         let b = &self.0;
-        let kkey = b.blind_index(id);
-        match b.get_raw(TBL_KEY_PACKAGE, &kkey)? {
+        match b.get_raw(TBL_KEY_PACKAGE, id)? {
             None => Ok(None),
             Some(rec) => {
-                let pt = b.open_record(TID_KEY_PACKAGE, &kkey, &rec)?;
+                let pt = b.open_record(TID_KEY_PACKAGE, id, &rec)?;
                 let pkg = KeyPackageData::mls_decode(&mut pt.as_slice())
                     .map_err(|e| RedbStorageError::Codec(e.to_string()))?;
                 Ok(Some(pkg))
@@ -649,11 +639,11 @@ impl PreSharedKeyStorage for RedbPreSharedKeyStorage {
 
     fn get(&self, id: &ExternalPskId) -> Result<Option<PreSharedKey>, Self::Error> {
         let b = &self.0;
-        let pkey = b.blind_index(id);
-        match b.get_raw(TBL_PSK, &pkey)? {
+        let pkey: &[u8] = id;
+        match b.get_raw(TBL_PSK, pkey)? {
             None => Ok(None),
             Some(rec) => {
-                let pt = b.open_record(TID_PSK, &pkey, &rec)?;
+                let pt = b.open_record(TID_PSK, pkey, &rec)?;
                 Ok(Some(PreSharedKey::new(pt.to_vec())))
             }
         }
@@ -666,9 +656,8 @@ impl RedbPreSharedKeyStorage {
     pub fn insert(&self, id: &[u8], psk: &PreSharedKey) -> Result<(), RedbStorageError> {
         use std::ops::Deref;
         let b = &self.0;
-        let pkey = b.blind_index(id);
-        let sealed = b.seal(TID_PSK, &pkey, psk.deref())?;
-        b.put(TBL_PSK, &pkey, &sealed)
+        let sealed = b.seal(TID_PSK, id, psk.deref())?;
+        b.put(TBL_PSK, id, &sealed)
     }
 }
 
@@ -676,26 +665,27 @@ impl RedbPreSharedKeyStorage {
 
 /// redb-backed application-data key-value store. Used by the processor for the
 /// persistent signing identity (`mls:identity:sk` / `:pk`). Mirrors the sqlite
-/// provider's `SqLiteApplicationStorage` get/insert API. Keys are blind-indexed
-/// and values encrypted like every other table.
+/// provider's `SqLiteApplicationStorage` get/insert API. The key (a fixed
+/// app-defined string like `mls:identity:sk`) is the cleartext redb key;
+/// values are encrypted like every other table.
 #[derive(Clone, Debug)]
 pub struct RedbApplicationStorage(RedbBackend);
 
 impl RedbApplicationStorage {
     pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, RedbStorageError> {
         let b = &self.0;
-        let bi = b.blind_index(key.as_bytes());
-        match b.get_raw(TBL_APP, &bi)? {
+        let k = key.as_bytes();
+        match b.get_raw(TBL_APP, k)? {
             None => Ok(None),
-            Some(rec) => Ok(Some(b.open_record(TID_APP, &bi, &rec)?.to_vec())),
+            Some(rec) => Ok(Some(b.open_record(TID_APP, k, &rec)?.to_vec())),
         }
     }
 
     pub fn insert(&self, key: &str, value: &[u8]) -> Result<(), RedbStorageError> {
         let b = &self.0;
-        let bi = b.blind_index(key.as_bytes());
-        let sealed = b.seal(TID_APP, &bi, value)?;
-        b.put(TBL_APP, &bi, &sealed)
+        let k = key.as_bytes();
+        let sealed = b.seal(TID_APP, k, value)?;
+        b.put(TBL_APP, k, &sealed)
     }
 }
 
@@ -1174,11 +1164,12 @@ mod tests {
             )
             .expect("write");
         }
-        // Reopen with a different DEK: blind index differs (so lookup misses)
-        // AND any matching record would fail AEAD — either way, no plaintext.
+        // Reopen with a different DEK: the group key is the cleartext id, so
+        // the record is found, but AEAD verification fails under the wrong
+        // k_value — surfaced as a Decrypt error, never plaintext.
         let b2 = RedbBackend::open(&path, &[0x02; 32]).expect("reopen");
         let gs2 = b2.group_state_storage();
-        assert!(gs2.state(&[1]).expect("state").is_none());
+        assert!(matches!(gs2.state(&[1]), Err(RedbStorageError::Decrypt)));
     }
 
     #[test]
