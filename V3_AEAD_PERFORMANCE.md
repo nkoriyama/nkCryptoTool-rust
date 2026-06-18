@@ -124,3 +124,35 @@ RustCrypto AEAD Optimization Proposal を検証するため、`backend-rustcrypt
 | セキュリティ／フォーマット | 完全に維持 |
 
 「チャンク毎 AEAD 認証（v3）」導入によるパフォーマンス低下懸念は、OpenSSL バックエンドに続き、**RustCrypto バックエンドにおいても「インプレース復号（Cause 1のみ）」の採用によって完全に解消された**。これにより、高いセキュリティレベルと高速な実行速度が、無駄なコードの複雑性を持ち込むことなく両立されていることを実証した。
+
+---
+
+## 8. 追補（2026-06-18）: デフォルト backend 変更時の OpenSSL vs RustCrypto 実測
+
+`default = ["backend-rustcrypto"]` への切り替え（OpenSSL を明示オプトイン化）に伴い、両
+バックエンドのバルク AEAD スループットを取り直した。Cause 1（in-place 復号）採用後でも
+両者の差がどの程度残るかを確認するのが目的。
+
+### 計測条件
+- データ: 2 GiB ランダムデータ、ECC モード、AES-256-GCM、実ディスク（`/var/home`）
+- 試行: 7 反復、OpenSSL↔RustCrypto を1反復ごと交互実行、**中央値**
+- ビルド: 両者とも `--release`。RustCrypto はデフォルト、OpenSSL は
+  `--no-default-features --features backend-openssl`
+- 環境: §1 と同一機（16 コア, AES-NI 有効）
+
+### 結果
+
+| 操作 | OpenSSL | RustCrypto | OpenSSL 優位 |
+|---|---|---|---|
+| 暗号化 | 0.766 s（2.61 GiB/s） | 1.960 s（1.02 GiB/s） | **約 2.6 倍** |
+| 復号（2パス） | 0.911 s（2.20 GiB/s） | 3.018 s（0.66 GiB/s） | **約 3.3 倍** |
+
+### 考察
+- §4 の in-place 最適化は v2↔v3 のギャップ（チャンク毎タグ方式によるアロケーション増）を
+  解消したものであり、**OpenSSL と RustCrypto の絶対性能差を埋めるものではない**。本実測の
+  差は AEAD 実装そのものの差（OpenSSL のハードウェアアセンブリ vs `aes-gcm` クレート）に起因する。
+- 復号で差が拡大するのは、2パス（検証→書込）で CPU 仕事量が約2倍になり、OpenSSL は I/O 律速の
+  ままなのに対し RustCrypto は CPU 律速に転じるため。
+- 結論: デフォルトの RustCrypto は**依存ゼロ・移植性（モバイル含む）を優先した選択**であり、
+  数十 GB 規模を日常的に扱うスループット重視用途では `backend-openssl` 系を推奨する。この方針は
+  README「バックエンド選択ガイド」にも反映済み。

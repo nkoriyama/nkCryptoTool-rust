@@ -92,19 +92,24 @@ Iroh トランスポート + V3.1 PQC ハンドシェイクによるチャット
 
 | バックエンド | 特徴 | 推奨ユースケース |
 | :--- | :--- | :--- |
-| **OpenSSL** (デフォルト) | 高度に最適化されたアセンブリ実装。OpenSSL 3.5+ で PQC (ML-KEM/ML-DSA) もネイティブサポート。 | サーバー、大規模データ処理、既存の C++ 版との併用 |
+| **RustCrypto** (デフォルト, 純 Rust) | 外部 C ライブラリ非依存。`fips203` / `fips204` クレート使用。バルク AEAD のスループットは OpenSSL より低い（下記注参照）。 | コンテナ、OpenSSL 未導入環境、セキュリティ監査重視、モバイル |
+| **OpenSSL** | 高度に最適化されたアセンブリ実装。OpenSSL 3.5+ で PQC (ML-KEM/ML-DSA) もネイティブサポート。大容量ファイル暗号化が最速。 | サーバー、大規模データ処理、既存の C++ 版との併用 |
 | **OpenSSL (Vendored)** | **[NEW]** OpenSSL 3.6.2 をソースからビルドして静的リンク。環境依存を排除。 | Windows、古い Linux (Ubuntu 24.04 等)、静的バイナリ配布 |
-| **RustCrypto** (純 Rust) | 外部 C ライブラリ非依存。`fips203` / `fips204` クレート使用。 | コンテナ、OpenSSL 未導入環境、セキュリティ監査重視 |
 
 ## **バックエンド選択ガイド**
 
-| 環境 | 推奨 backend |
+デフォルトの `backend-rustcrypto` は依存ゼロで全プラットフォームで動作するため、**まずはデフォルトのままで問題ありません**。下表は「あえて OpenSSL を選ぶ理由」がある場合の指針です。
+
+| 目的 / 環境 | 推奨 backend |
 |---|---|
-| Arch Linux / openSUSE Tumbleweed (rolling) | `backend-openssl` (system 3.5+) |
-| Ubuntu 24.04 / Debian 12 / RHEL 9 | `backend-openssl-vendored` または `backend-rustcrypto` |
-| Windows | `backend-openssl-vendored` または `backend-rustcrypto` |
-| macOS | `backend-openssl` (Homebrew) または `backend-openssl-vendored` |
-| 静的リンク + PQC 標準実装 | `backend-openssl-vendored` |
+| 既定（依存ゼロ・全 OS・モバイル・監査重視） | `backend-rustcrypto`（デフォルト） |
+| 大規模データ / サーバーで最大スループット（system OpenSSL 3.5+ あり） | `backend-openssl` |
+| 上記の性能を環境非依存・静的バイナリで得たい | `backend-openssl-vendored` |
+| 既存の C++ 版と鍵・暗号データを密に併用 | `backend-openssl` / `-vendored` |
+
+> 注: system OpenSSL が 3.5 未満の環境（Ubuntu 24.04 / Debian 12 / RHEL 9 等）で OpenSSL を使う場合は、PQC keygen が失敗するため `backend-openssl-vendored` を選んでください。
+>
+> 性能注: バルクファイル暗号化のスループットは OpenSSL が大きく上回ります。AES-NI 有効環境の実測（2 GiB, ECC, AES-256-GCM）で OpenSSL は暗号化で約 2.6 倍・復号で約 3.3 倍高速でした。数十 GB 規模を日常的に扱う用途では OpenSSL 系を推奨します。デフォルトの RustCrypto は依存ゼロ・移植性を優先した選択です。
 
 ## **ビルド方法**
 
@@ -116,23 +121,23 @@ Iroh トランスポート + V3.1 PQC ハンドシェイクによるチャット
 
 ### **ビルド手順**
 
-#### **1. OpenSSL バックエンド (Default)**
-ビルドには OpenSSL 3.0 以降の開発用ライブラリが必要です。
+#### **1. OpenSSL バックエンド**
+ビルドには OpenSSL 3.0 以降の開発用ライブラリが必要です。デフォルトは RustCrypto なので、OpenSSL を使うには `--no-default-features --features backend-openssl` を明示します。
 
 * **Ubuntu/Debian:**
     ```bash
     sudo apt update && sudo apt install build-essential libssl-dev
-    cargo build --release
+    cargo build --release --no-default-features --features backend-openssl
     ```
 * **Fedora/RHEL:**
     ```bash
     sudo dnf install gcc openssl-devel
-    cargo build --release
+    cargo build --release --no-default-features --features backend-openssl
     ```
 * **macOS (Homebrew):**
     ```bash
     brew install openssl@3
-    cargo build --release
+    cargo build --release --no-default-features --features backend-openssl
     ```
 
 ビルド成果物: `target/release/nk-crypto-tool`
@@ -148,10 +153,12 @@ cargo build --release --no-default-features --features backend-openssl-vendored
 
 ※ 初回ビルドには 10〜15 分程度かかります。
 
-#### **3. 純 Rust バックエンド (RustCrypto)**
-外部の C ライブラリに依存せず、Cargo のみでビルド可能です。
+#### **3. 純 Rust バックエンド (RustCrypto, Default)**
+外部の C ライブラリに依存せず、Cargo のみでビルド可能です。デフォルトバックエンドなので、フラグなしの `cargo build --release` でもこの構成になります。
 
 ```bash
+cargo build --release
+# あるいは明示的に:
 cargo build --release --no-default-features --features backend-rustcrypto
 ```
 

@@ -317,8 +317,8 @@ This guarantees that **no plaintext byte reaches the destination unless every ch
     - `clap`: Command-line interface.
 
 ### 5.2 Build Features
-- `backend-openssl` (Default): Uses OpenSSL for all cryptographic operations including PQC. **Requires OpenSSL 3.5 or later** for native ML-KEM/ML-DSA support. Earlier versions will fail at PQC keygen.
-- `backend-rustcrypto`: Pure-Rust implementations using `fips203` (ML-KEM), `fips204` (ML-DSA), `aes-gcm`, `chacha20poly1305`, `p256`, `sha3`, `pkcs8`. Supports all algorithms without external dependencies.
+- `backend-rustcrypto` (Default): Pure-Rust implementations using `fips203` (ML-KEM), `fips204` (ML-DSA), `aes-gcm`, `chacha20poly1305`, `p256`, `sha3`, `pkcs8`. Supports all algorithms without external dependencies.
+- `backend-openssl`: Uses OpenSSL for all cryptographic operations including PQC. **Requires OpenSSL 3.5 or later** for native ML-KEM/ML-DSA support. Earlier versions will fail at PQC keygen. Enable with `--no-default-features --features backend-openssl`.
 
 ---
 
