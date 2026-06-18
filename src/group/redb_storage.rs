@@ -79,11 +79,14 @@ const TID_GROUP: u8 = 1;
 const TID_EPOCH: u8 = 2;
 const TID_KEY_PACKAGE: u8 = 3;
 const TID_PSK: u8 = 4;
+const TID_APP: u8 = 8;
 
 const TBL_GROUP: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_group_state");
 const TBL_EPOCH: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_epoch");
 const TBL_KEY_PACKAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_key_package");
 const TBL_PSK: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_psk");
+/// Application-data KV (signing identity etc.), keyed by `blind_index(key)`.
+const TBL_APP: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_app");
 
 // Inbox (store-and-forward) tables and their AAD table ids.
 const TID_ENVELOPE: u8 = 5;
@@ -179,7 +182,7 @@ impl RedbBackend {
     pub fn open(path: impl AsRef<Path>, dek: &[u8; 32]) -> Result<Self, RedbStorageError> {
         let path = path.as_ref();
         let me = Self::new_core(path, dek)?;
-        me.create_tables_in(&[TBL_GROUP, TBL_EPOCH, TBL_KEY_PACKAGE, TBL_PSK])?;
+        me.create_tables_in(&[TBL_GROUP, TBL_EPOCH, TBL_KEY_PACKAGE, TBL_PSK, TBL_APP])?;
         me.tighten_permissions(path)?;
         Ok(me)
     }
@@ -261,6 +264,10 @@ impl RedbBackend {
 
     pub fn pre_shared_key_storage(&self) -> RedbPreSharedKeyStorage {
         RedbPreSharedKeyStorage(self.clone())
+    }
+
+    pub fn application_data_storage(&self) -> RedbApplicationStorage {
+        RedbApplicationStorage(self.clone())
     }
 
     // --- crypto helpers ---------------------------------------------------
@@ -414,11 +421,14 @@ impl RedbGroupStateStorage {
             .begin_write()
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         {
-            // Snapshot upsert.
+            // Snapshot upsert. The group_id is embedded in the (encrypted)
+            // value so `list_group_ids` can recover it — the redb key is the
+            // blind index, from which the id is unrecoverable.
             let mut gtable = wtx
                 .open_table(TBL_GROUP)
                 .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
-            let sealed = b.seal(TID_GROUP, &gkey, &state.data)?;
+            let plain = encode_group_value(&state.id, &state.data);
+            let sealed = b.seal(TID_GROUP, &gkey, &plain)?;
             gtable
                 .insert(gkey.as_slice(), sealed.as_slice())
                 .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
@@ -498,6 +508,51 @@ impl RedbGroupStateStorage {
             }
         }
     }
+
+    /// Enumerate the group ids of all stored groups (replaces the sqlite
+    /// `SELECT group_id FROM mls_group`). Each id is recovered from the
+    /// encrypted value, since the redb key is an unrecoverable blind index.
+    pub fn list_group_ids(&self) -> Result<Vec<Vec<u8>>, RedbStorageError> {
+        let b = &self.0;
+        let rtx = b
+            .db
+            .begin_read()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let table = rtx
+            .open_table(TBL_GROUP)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let range = table
+            .range::<&[u8]>(..)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let mut out = Vec::new();
+        for entry in range {
+            let (k, v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let plain = b.open_record(TID_GROUP, k.value(), v.value())?;
+            let (id, _data) = decode_group_value(&plain)?;
+            out.push(id.to_vec());
+        }
+        Ok(out)
+    }
+}
+
+/// Group-state value framing: `gid_len(u16 BE) ‖ gid ‖ snapshot`.
+fn encode_group_value(group_id: &[u8], snapshot: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + group_id.len() + snapshot.len());
+    out.extend_from_slice(&(group_id.len() as u16).to_be_bytes());
+    out.extend_from_slice(group_id);
+    out.extend_from_slice(snapshot);
+    out
+}
+
+fn decode_group_value(plain: &[u8]) -> Result<(&[u8], &[u8]), RedbStorageError> {
+    if plain.len() < 2 {
+        return Err(RedbStorageError::Malformed("group value too short".into()));
+    }
+    let gid_len = u16::from_be_bytes([plain[0], plain[1]]) as usize;
+    if plain.len() < 2 + gid_len {
+        return Err(RedbStorageError::Malformed("group value gid truncated".into()));
+    }
+    Ok((&plain[2..2 + gid_len], &plain[2 + gid_len..]))
 }
 
 impl GroupStateStorage for RedbGroupStateStorage {
@@ -508,7 +563,11 @@ impl GroupStateStorage for RedbGroupStateStorage {
         let gkey = b.blind_index(group_id);
         match b.get_raw(TBL_GROUP, &gkey)? {
             None => Ok(None),
-            Some(rec) => Ok(Some(b.open_record(TID_GROUP, &gkey, &rec)?)),
+            Some(rec) => {
+                let plain = b.open_record(TID_GROUP, &gkey, &rec)?;
+                let (_id, data) = decode_group_value(&plain)?;
+                Ok(Some(Zeroizing::new(data.to_vec())))
+            }
         }
     }
 
@@ -610,6 +669,33 @@ impl RedbPreSharedKeyStorage {
         let pkey = b.blind_index(id);
         let sealed = b.seal(TID_PSK, &pkey, psk.deref())?;
         b.put(TBL_PSK, &pkey, &sealed)
+    }
+}
+
+// ===================== Application data (KV) =========================
+
+/// redb-backed application-data key-value store. Used by the processor for the
+/// persistent signing identity (`mls:identity:sk` / `:pk`). Mirrors the sqlite
+/// provider's `SqLiteApplicationStorage` get/insert API. Keys are blind-indexed
+/// and values encrypted like every other table.
+#[derive(Clone, Debug)]
+pub struct RedbApplicationStorage(RedbBackend);
+
+impl RedbApplicationStorage {
+    pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, RedbStorageError> {
+        let b = &self.0;
+        let bi = b.blind_index(key.as_bytes());
+        match b.get_raw(TBL_APP, &bi)? {
+            None => Ok(None),
+            Some(rec) => Ok(Some(b.open_record(TID_APP, &bi, &rec)?.to_vec())),
+        }
+    }
+
+    pub fn insert(&self, key: &str, value: &[u8]) -> Result<(), RedbStorageError> {
+        let b = &self.0;
+        let bi = b.blind_index(key.as_bytes());
+        let sealed = b.seal(TID_APP, &bi, value)?;
+        b.put(TBL_APP, &bi, &sealed)
     }
 }
 
@@ -1093,6 +1179,43 @@ mod tests {
         let b2 = RedbBackend::open(&path, &[0x02; 32]).expect("reopen");
         let gs2 = b2.group_state_storage();
         assert!(gs2.state(&[1]).expect("state").is_none());
+    }
+
+    #[test]
+    fn list_group_ids_enumerates() {
+        let (_dir, b) = backend();
+        let mut gs = b.group_state_storage();
+        assert!(gs.list_group_ids().expect("list empty").is_empty());
+        for gid in [vec![1, 2, 3], vec![9; 32], vec![0xde, 0xad]] {
+            gs.write(
+                GroupState { id: gid.clone(), data: Zeroizing::new(vec![1u8; 8]) },
+                vec![],
+                vec![],
+            )
+            .expect("write");
+        }
+        let mut ids = gs.list_group_ids().expect("list");
+        ids.sort();
+        let mut want = vec![vec![1, 2, 3], vec![9; 32], vec![0xde, 0xad]];
+        want.sort();
+        assert_eq!(ids, want);
+        // state() still returns just the snapshot, not the embedded gid.
+        let s = gs.state(&[1, 2, 3]).expect("state").expect("present");
+        assert_eq!(&*s, &vec![1u8; 8]);
+    }
+
+    #[test]
+    fn application_data_roundtrip() {
+        let (_dir, b) = backend();
+        let app = b.application_data_storage();
+        assert!(app.get("mls:identity:sk").expect("get none").is_none());
+        app.insert("mls:identity:sk", &[0xaa; 32]).expect("insert");
+        app.insert("mls:identity:pk", &[0xbb; 32]).expect("insert");
+        assert_eq!(app.get("mls:identity:sk").expect("get").unwrap(), vec![0xaa; 32]);
+        assert_eq!(app.get("mls:identity:pk").expect("get").unwrap(), vec![0xbb; 32]);
+        // Overwrite.
+        app.insert("mls:identity:sk", &[0xcc; 32]).expect("insert");
+        assert_eq!(app.get("mls:identity:sk").expect("get").unwrap(), vec![0xcc; 32]);
     }
 
     // ---------------- inbox store ----------------
