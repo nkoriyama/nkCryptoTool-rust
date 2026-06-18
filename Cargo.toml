@@ -160,8 +160,18 @@ mls-base = [
     "mls-rs-crypto-traits",
     "mls-rs-crypto-hpke",
 ]
+# MLS with the pure-Rust redb storage backend (default). Links no SQLCipher /
+# libcrypto, so it cross-compiles to Android/iOS. See DB_PURERUST_DESIGN.md.
 mls = [
     "mls-base",
+    "redb",
+    "hmac",
+]
+# Adds the legacy SQLCipher reader for the one-time `migrate-from-sqlcipher`
+# tool (P3). Pulls rusqlite + the sqlite provider (hence system libcrypto), so
+# it is opt-in and excluded from normal / mobile builds.
+legacy-sqlcipher-migration = [
+    "mls",
     "mls-rs-provider-sqlite",
     "rusqlite",
 ]
@@ -177,11 +187,9 @@ mls-crypto-rustcrypto = [
     "hmac",
 ]
 
-# P1 prototype: pure-Rust redb storage backend for MLS (SQLCipher replacement).
-# Implements the mls-rs-core storage traits over redb + app-layer
-# XChaCha20-Poly1305. Opt-in and additive; does not yet replace the sqlite
-# provider (that is P4). See DB_PURERUST_DESIGN.md.
-mls-redb = ["mls-base", "redb", "hmac"]
+# Deprecated alias — `mls` is now the pure-Rust redb backend itself. Kept so
+# existing `--features mls-redb` invocations keep working.
+mls-redb = ["mls"]
 
 [dev-dependencies]
 i-slint-backend-testing = "=1.16.1"

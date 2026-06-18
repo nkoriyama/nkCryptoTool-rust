@@ -61,7 +61,10 @@ use mls_rs_core::group::{EpochRecord, GroupState, GroupStateStorage};
 use mls_rs_core::key_package::{KeyPackageData, KeyPackageStorage};
 use mls_rs_core::mls_rs_codec::{MlsDecode, MlsEncode};
 use mls_rs_core::psk::{ExternalPskId, PreSharedKey, PreSharedKeyStorage};
-use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, WriteTransaction};
+use redb::{
+    Database, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
+    WriteTransaction,
+};
 use std::ops::Bound;
 use sha2::Sha256;
 use zeroize::Zeroizing;
@@ -83,6 +86,8 @@ const TID_KEY_PACKAGE: u8 = 3;
 const TID_PSK: u8 = 4;
 const TID_APP: u8 = 8;
 const TID_SENTINEL: u8 = 9;
+const TID_PK_ONETIME: u8 = 10;
+const TID_PK_STATIC: u8 = 11;
 
 const TBL_GROUP: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_group_state");
 const TBL_EPOCH: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_epoch");
@@ -102,9 +107,19 @@ const TBL_CHECKPOINT: TableDefinition<&[u8], &[u8]> = TableDefinition::new("inbo
 /// The counter value is not secret, so it is stored unencrypted.
 const TBL_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("inbox_meta");
 
+// Prekey store (local one-time/static prekey secret keys; see `crate::prekey`).
+const TBL_PK_ONETIME: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pk_onetime");
+const TBL_PK_STATIC: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pk_static");
+/// Plaintext meta for the prekey store: monotonic id high-water mark
+/// (`b"seq_next"` → u64 BE) and the inbox poll cursor (`b"inbox_cursor"`).
+const TBL_PK_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pk_meta");
+const PK_SEQ_KEY: &[u8] = b"seq_next";
+const PK_CURSOR_KEY: &[u8] = b"inbox_cursor";
+const PK_STATIC_KEY: &[u8] = b"static";
+
 /// Sentinel table: a single encrypted record used to verify the DEK is correct
-/// on open (and to probe candidate DEKs during rekey recovery). Present in both
-/// group and inbox databases.
+/// on open (and to probe candidate DEKs during rekey recovery). Present in all
+/// (group / inbox / prekey) databases.
 const TBL_SENTINEL: TableDefinition<&[u8], &[u8]> = TableDefinition::new("dek_sentinel");
 const SENTINEL_KEY: &[u8] = b"dek-check";
 const SENTINEL_PLAINTEXT: &[u8] = b"nkct-redb-sentinel-v1";
@@ -1156,6 +1171,424 @@ impl RedbInboxStore {
             .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         Ok(range.count())
+    }
+}
+
+// ===================== Prekey store (local secret keys) ==============
+
+/// redb-backed store for a node's own one-time + static prekey secret keys
+/// ([`crate::prekey`]). Replaces the SQLCipher store; values are encrypted with
+/// the same app-layer AEAD as the rest.
+///
+/// **Forward secrecy / secure delete**: consuming a one-time prekey must
+/// physically retire its secret so a later DEK compromise cannot recover it to
+/// break a past session's FS. SQLCipher used `PRAGMA secure_delete`; redb is
+/// copy-on-write, so [`delete`](Self::delete) / [`delete_all`](Self::delete_all)
+/// follow the remove with [`Database::compact`], which rewrites the file
+/// dropping the freed pages — matching SQLCipher's *logical* guarantee. (Both
+/// are best-effort against physical recovery on wear-levelled SSDs.)
+///
+/// Holds the `Database` behind a `Mutex` so the `&self` API can still take the
+/// `&mut` that `compact` requires.
+pub struct RedbPrekeyStore {
+    db: std::sync::Mutex<Database>,
+    keys: RecordKeys,
+    db_binding: Vec<u8>,
+}
+
+impl std::fmt::Debug for RedbPrekeyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RedbPrekeyStore").finish_non_exhaustive()
+    }
+}
+
+impl RedbPrekeyStore {
+    pub fn open(path: impl AsRef<Path>, dek: &[u8; 32]) -> Result<Self, RedbStorageError> {
+        let path = path.as_ref();
+        let db_binding = path
+            .file_name()
+            .map(|n| n.as_encoded_bytes().to_vec())
+            .unwrap_or_default();
+        let db = Database::create(path).map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        // Create tables + write/verify the DEK sentinel.
+        {
+            let wtx = db
+                .begin_write()
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            for def in [TBL_PK_ONETIME, TBL_PK_STATIC, TBL_PK_META, TBL_SENTINEL] {
+                wtx.open_table(def)
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            }
+            wtx.commit()
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        }
+        let me = Self {
+            db: std::sync::Mutex::new(db),
+            keys: RecordKeys::derive(dek),
+            db_binding,
+        };
+        me.ensure_sentinel()?;
+        me.tighten(path)?;
+        Ok(me)
+    }
+
+    fn tighten(&self, path: &Path) -> Result<(), RedbStorageError> {
+        #[cfg(unix)]
+        if path.exists() {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(path)
+                .map_err(|e| RedbStorageError::Backend(format!("metadata: {e}")))?
+                .permissions();
+            perms.set_mode(0o600);
+            std::fs::set_permissions(path, perms)
+                .map_err(|e| RedbStorageError::Backend(format!("chmod: {e}")))?;
+        }
+        let _ = path;
+        Ok(())
+    }
+
+    fn ensure_sentinel(&self) -> Result<(), RedbStorageError> {
+        let db = self.db.lock().unwrap();
+        let existing = {
+            let rtx = db
+                .begin_read()
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let t = rtx
+                .open_table(TBL_SENTINEL)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            t.get(SENTINEL_KEY)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+                .map(|g| g.value().to_vec())
+        };
+        match existing {
+            Some(rec) => {
+                open_value(&self.keys.k_value, &self.db_binding, TID_SENTINEL, SENTINEL_KEY, &rec)
+                    .map_err(|_| RedbStorageError::Decrypt)?;
+                Ok(())
+            }
+            None => {
+                let sealed = seal_value(
+                    &self.keys.k_value,
+                    &self.db_binding,
+                    TID_SENTINEL,
+                    SENTINEL_KEY,
+                    SENTINEL_PLAINTEXT,
+                )?;
+                let wtx = db
+                    .begin_write()
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                {
+                    let mut t = wtx
+                        .open_table(TBL_SENTINEL)
+                        .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                    t.insert(SENTINEL_KEY, sealed.as_slice())
+                        .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                }
+                wtx.commit()
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))
+            }
+        }
+    }
+
+    fn meta_get_u64(&self, key: &[u8]) -> Result<Option<u64>, RedbStorageError> {
+        let db = self.db.lock().unwrap();
+        let rtx = db
+            .begin_read()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let t = rtx
+            .open_table(TBL_PK_META)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let got = t
+            .get(key)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        Ok(got.map(|g| {
+            let v = g.value();
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&v[..8.min(v.len())]);
+            u64::from_be_bytes(b)
+        }))
+    }
+
+    fn meta_set_u64(&self, key: &[u8], val: u64) -> Result<(), RedbStorageError> {
+        let db = self.db.lock().unwrap();
+        let wtx = db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        {
+            let mut t = wtx
+                .open_table(TBL_PK_META)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            t.insert(key, val.to_be_bytes().as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        }
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))
+    }
+
+    /// Reserve `count` consecutive ids, returning the first. The counter is a
+    /// persistent high-water mark that never rewinds (ids are never reused).
+    pub fn reserve_ids(&self, count: u32) -> Result<u32, RedbStorageError> {
+        let cur = self.meta_get_u64(PK_SEQ_KEY)?.unwrap_or(0);
+        let start = u32::try_from(cur)
+            .map_err(|_| RedbStorageError::Malformed("prekey id space exhausted".into()))?;
+        let new_next = cur
+            .checked_add(u64::from(count))
+            .ok_or_else(|| RedbStorageError::Malformed("prekey id overflow".into()))?;
+        u32::try_from(new_next)
+            .map_err(|_| RedbStorageError::Malformed("prekey id space exhausted".into()))?;
+        self.meta_set_u64(PK_SEQ_KEY, new_next)?;
+        Ok(start)
+    }
+
+    pub fn insert(&self, prekey_id: u32, xwing_priv: &[u8]) -> Result<(), RedbStorageError> {
+        let key = prekey_id.to_be_bytes();
+        let sealed = seal_value(
+            &self.keys.k_value,
+            &self.db_binding,
+            TID_PK_ONETIME,
+            &key,
+            xwing_priv,
+        )?;
+        let db = self.db.lock().unwrap();
+        let wtx = db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        {
+            let mut t = wtx
+                .open_table(TBL_PK_ONETIME)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            t.insert(key.as_slice(), sealed.as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        }
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))
+    }
+
+    pub fn count(&self) -> Result<u64, RedbStorageError> {
+        let db = self.db.lock().unwrap();
+        let rtx = db
+            .begin_read()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let t = rtx
+            .open_table(TBL_PK_ONETIME)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        t.len().map_err(|e| RedbStorageError::Backend(e.to_string()))
+    }
+
+    pub fn list_ids(&self) -> Result<Vec<u32>, RedbStorageError> {
+        let db = self.db.lock().unwrap();
+        let rtx = db
+            .begin_read()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let t = rtx
+            .open_table(TBL_PK_ONETIME)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let mut out = Vec::new();
+        for entry in t
+            .range::<&[u8]>(..)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+        {
+            let (k, _v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let kb = k.value();
+            if kb.len() != 4 {
+                return Err(RedbStorageError::Malformed("prekey id key length".into()));
+            }
+            out.push(u32::from_be_bytes([kb[0], kb[1], kb[2], kb[3]]));
+        }
+        Ok(out)
+    }
+
+    pub fn load(&self, prekey_id: u32) -> Result<Option<Vec<u8>>, RedbStorageError> {
+        let key = prekey_id.to_be_bytes();
+        let db = self.db.lock().unwrap();
+        let rtx = db
+            .begin_read()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let t = rtx
+            .open_table(TBL_PK_ONETIME)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let got = t
+            .get(key.as_slice())
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+            .map(|g| g.value().to_vec());
+        drop(t);
+        drop(rtx);
+        match got {
+            None => Ok(None),
+            Some(rec) => {
+                let pt = open_value(
+                    &self.keys.k_value,
+                    &self.db_binding,
+                    TID_PK_ONETIME,
+                    &key,
+                    &rec,
+                )?;
+                Ok(Some(pt.to_vec()))
+            }
+        }
+    }
+
+    /// Delete a consumed prekey and compact to physically reclaim its page
+    /// (logical secure-delete; see the struct doc). Returns whether a row went.
+    pub fn delete(&self, prekey_id: u32) -> Result<bool, RedbStorageError> {
+        let key = prekey_id.to_be_bytes();
+        let mut db = self.db.lock().unwrap();
+        let removed = {
+            let wtx = db
+                .begin_write()
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let existed = {
+                let mut t = wtx
+                    .open_table(TBL_PK_ONETIME)
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                // Bind to a `let` (ending the statement) so the `?` temporary
+                // holding the AccessGuard is dropped before `t` is.
+                let removed = t
+                    .remove(key.as_slice())
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+                    .is_some();
+                removed
+            };
+            wtx.commit()
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            existed
+        };
+        if removed {
+            db.compact()
+                .map_err(|e| RedbStorageError::Backend(format!("compact: {e}")))?;
+        }
+        Ok(removed)
+    }
+
+    /// Delete every one-time prekey and compact. Returns the number removed.
+    pub fn delete_all(&self) -> Result<u64, RedbStorageError> {
+        let mut db = self.db.lock().unwrap();
+        let n = {
+            let wtx = db
+                .begin_write()
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let count = {
+                let mut t = wtx
+                    .open_table(TBL_PK_ONETIME)
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                let keys: Vec<Vec<u8>> = {
+                    let range = t
+                        .range::<&[u8]>(..)
+                        .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                    let mut ks = Vec::new();
+                    for entry in range {
+                        let (k, _v) =
+                            entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                        ks.push(k.value().to_vec());
+                    }
+                    ks
+                };
+                for k in &keys {
+                    t.remove(k.as_slice())
+                        .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                }
+                keys.len() as u64
+            };
+            wtx.commit()
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            count
+        };
+        if n > 0 {
+            db.compact()
+                .map_err(|e| RedbStorageError::Backend(format!("compact: {e}")))?;
+        }
+        Ok(n)
+    }
+
+    /// Store the long-term static keypair (sealed `priv_len ‖ priv ‖ pub`).
+    /// Errors if one already exists (rotation is delete + re-init).
+    pub fn store_identity(&self, sk: &[u8], pk: &[u8]) -> Result<(), RedbStorageError> {
+        let db = self.db.lock().unwrap();
+        {
+            let rtx = db
+                .begin_read()
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let t = rtx
+                .open_table(TBL_PK_STATIC)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            if t.get(PK_STATIC_KEY)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+                .is_some()
+            {
+                return Err(RedbStorageError::Malformed(
+                    "a static identity already exists in this store".into(),
+                ));
+            }
+        }
+        let mut plain = Vec::with_capacity(4 + sk.len() + pk.len());
+        plain.extend_from_slice(&(sk.len() as u32).to_be_bytes());
+        plain.extend_from_slice(sk);
+        plain.extend_from_slice(pk);
+        let sealed = seal_value(
+            &self.keys.k_value,
+            &self.db_binding,
+            TID_PK_STATIC,
+            PK_STATIC_KEY,
+            &plain,
+        )?;
+        let wtx = db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        {
+            let mut t = wtx
+                .open_table(TBL_PK_STATIC)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            t.insert(PK_STATIC_KEY, sealed.as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        }
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))
+    }
+
+    /// Load the static keypair as `(priv, pub)`, or `None`.
+    pub fn load_identity(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>, RedbStorageError> {
+        let db = self.db.lock().unwrap();
+        let raw = {
+            let rtx = db
+                .begin_read()
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let t = rtx
+                .open_table(TBL_PK_STATIC)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            t.get(PK_STATIC_KEY)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+                .map(|g| g.value().to_vec())
+        };
+        match raw {
+            None => Ok(None),
+            Some(rec) => {
+                let pt = open_value(
+                    &self.keys.k_value,
+                    &self.db_binding,
+                    TID_PK_STATIC,
+                    PK_STATIC_KEY,
+                    &rec,
+                )?;
+                if pt.len() < 4 {
+                    return Err(RedbStorageError::Malformed("static identity too short".into()));
+                }
+                let sk_len = u32::from_be_bytes([pt[0], pt[1], pt[2], pt[3]]) as usize;
+                if pt.len() < 4 + sk_len {
+                    return Err(RedbStorageError::Malformed("static identity truncated".into()));
+                }
+                let sk = pt[4..4 + sk_len].to_vec();
+                let pk = pt[4 + sk_len..].to_vec();
+                Ok(Some((sk, pk)))
+            }
+        }
+    }
+
+    pub fn inbox_cursor(&self) -> Result<u64, RedbStorageError> {
+        Ok(self.meta_get_u64(PK_CURSOR_KEY)?.unwrap_or(0))
+    }
+
+    pub fn set_inbox_cursor(&self, cursor: u64) -> Result<(), RedbStorageError> {
+        self.meta_set_u64(PK_CURSOR_KEY, cursor)
     }
 }
 

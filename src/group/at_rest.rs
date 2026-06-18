@@ -609,16 +609,10 @@ pub(crate) fn resolve_dek_with(
         dek
     };
 
-    // 3. Migrate a pre-SQLCipher plaintext DB in place, if one is found.
-    //    Older builds shipped the DB as an unencrypted sqlite file (the
-    //    `sqlite-bundled` feature). Such a file cannot be opened with a
-    //    SQLCipher key, so on upgrade we transparently re-encrypt it under
-    //    the freshly-derived DEK before the caller opens it. A no-op when
-    //    the DB is absent or already SQLCipher-encrypted.
-    if is_plaintext_sqlite(&paths.db) {
-        migrate_plaintext_to_sqlcipher(&paths.db, &dek)?;
-    }
-
+    // (The old plaintext-sqlite -> SQLCipher in-place migration is gone: the
+    // redb backend has no plaintext-sqlite predecessor. Migrating an existing
+    // SQLCipher database to redb is the separate P3 `migrate-from-sqlcipher`
+    // tool behind the `legacy-sqlcipher-migration` feature.)
     Ok(dek)
 }
 
@@ -763,11 +757,6 @@ pub(crate) fn rotate_dek_with(
             "rekey requires an existing at-rest.key, groups.db.kek, and groups.db".into(),
         ));
     }
-    if is_plaintext_sqlite(&paths.db) {
-        return Err(GroupError::Storage(
-            "groups.db is not encrypted yet — open it once to migrate before rekey".into(),
-        ));
-    }
 
     let at_rest_key = AtRestKey::load_encrypted(&paths.key, passphrase.as_str())?;
 
@@ -785,39 +774,13 @@ pub(crate) fn rotate_dek_with(
     let pending = kek_pending_path(&paths.kek);
     write_atomic_secret(&pending, &new_kek_bytes)?;
 
-    // Re-encrypt the DB from old to new DEK. SQLCipher wraps `PRAGMA rekey`
-    // in its own transaction, so a failure here rolls back to the old DEK;
-    // the stale `.pending` is then discarded by the next open's recovery.
-    {
-        use rusqlite::Connection;
-        let old_hex = Zeroizing::new(hex::encode(old_dek.as_ref()));
-        let new_hex = Zeroizing::new(hex::encode(new_dek.as_ref()));
-        let conn = Connection::open_with_flags(&paths.db, db_rw_no_create_flags())
-            .map_err(|e| GroupError::Storage(format!("open {:?}: {e}", paths.db)))?;
-        let key_stmt = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", old_hex.as_str()));
-        conn.execute_batch(key_stmt.as_str())
-            .map_err(|e| GroupError::Storage(format!("rekey set old key: {e}")))?;
-        // Confirm the old key actually opens it before rekeying.
-        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
-            .map_err(|e| GroupError::Storage(format!("rekey verify old key: {e}")))?;
-        // Re-encrypt under a rollback journal rather than WAL: a WAL-mode
-        // rekey writes the new-key pages to the -wal and leaves the OLD-key
-        // pages in the main file until a checkpoint, so a failed checkpoint
-        // would leave old-DEK data readable in the main file. Switching to
-        // DELETE journalling first folds any pre-existing WAL frames into
-        // the main file and then writes the re-encrypted pages straight to
-        // it, with a rollback journal that is removed on commit — no -wal
-        // residue under either key. GroupStorage re-enables WAL on the next
-        // open.
-        conn.execute_batch("PRAGMA journal_mode=DELETE;")
-            .map_err(|e| GroupError::Storage(format!("rekey set rollback journal: {e}")))?;
-        let rekey_stmt = Zeroizing::new(format!("PRAGMA rekey = \"x'{}'\";", new_hex.as_str()));
-        conn.execute_batch(rekey_stmt.as_str())
-            .map_err(|e| GroupError::Storage(format!("PRAGMA rekey: {e}")))?;
-        // Confirm the new key is now active.
-        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
-            .map_err(|e| GroupError::Storage(format!("rekey verify new key: {e}")))?;
-    }
+    // Re-encrypt the DB from old to new DEK. The redb backend re-seals every
+    // record under the new value key in a single write transaction, so a
+    // failure/crash here leaves the DB wholly on the old DEK (uncommitted); the
+    // stale `.pending` is then discarded by the next open's recovery. It also
+    // verifies the old DEK by decrypting before writing.
+    crate::group::redb_storage::RedbBackend::rotate_group_dek(&paths.db, &old_dek, &new_dek)
+        .map_err(|e| GroupError::Storage(format!("redb rekey: {e}")))?;
 
     // Advance the rollback counter now that the DB is on the new DEK but
     // before promoting the KEK. This is the irreversible step; a crash
@@ -853,7 +816,7 @@ fn finalize_pending_rekey(
     current_dek: Zeroizing<[u8; DEK_LEN]>,
 ) -> Result<Zeroizing<[u8; DEK_LEN]>, GroupError> {
     let pending = kek_pending_path(&paths.kek);
-    if !pending.exists() || !paths.db.exists() || is_plaintext_sqlite(&paths.db) {
+    if !pending.exists() || !paths.db.exists() {
         return Ok(current_dek);
     }
 
@@ -891,161 +854,14 @@ fn finalize_pending_rekey(
     ))
 }
 
-/// Open flags for opening an **existing** database read-write without ever
-/// creating it. Used by probes and the rekey path so a file that vanished
-/// between an `exists()` check and the open surfaces as an error instead of
-/// silently leaving behind a stray empty sqlite file.
-fn db_rw_no_create_flags() -> rusqlite::OpenFlags {
-    rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-        | rusqlite::OpenFlags::SQLITE_OPEN_URI
-        | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-}
-
-/// Cheap probe: does `dek` unlock `db`? Opens a throwaway connection,
-/// applies the raw key, and reads `sqlite_master`. Returns `false` on any
-/// error (wrong key surfaces as `SQLITE_NOTADB`).
-///
-/// Opens without `SQLITE_OPEN_CREATE`, so probing a missing DB returns
-/// `false` rather than materialising an empty file.
+/// Cheap probe: does `dek` unlock the redb database at `db`? Delegates to the
+/// redb backend's DEK sentinel (see [`crate::group::redb_storage::RedbBackend::dek_opens`]).
+/// Returns `false` for a wrong key, a missing sentinel, or a missing file —
+/// never materialising anything.
 fn dek_opens_db(db: &Path, dek: &[u8; DEK_LEN]) -> bool {
-    use rusqlite::Connection;
-    let hex = Zeroizing::new(hex::encode(dek));
-    let probe = || -> rusqlite::Result<i64> {
-        let conn = Connection::open_with_flags(db, db_rw_no_create_flags())?;
-        let stmt = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex.as_str()));
-        conn.execute_batch(stmt.as_str())?;
-        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get(0))
-    };
-    probe().is_ok()
+    crate::group::redb_storage::RedbBackend::dek_opens(db, dek).unwrap_or(false)
 }
 
-/// Return `true` if `path` is an **unencrypted** sqlite database — i.e.
-/// its first 16 bytes are the literal `b"SQLite format 3\0"` header.
-///
-/// A SQLCipher-encrypted DB has those 16 bytes occupied by the random
-/// per-database salt instead, so the magic never matches. A missing,
-/// empty, or sub-16-byte file is treated as "not a plaintext DB" (the
-/// caller's normal open path then creates/initialises it).
-fn is_plaintext_sqlite(path: &Path) -> bool {
-    const SQLITE_MAGIC: &[u8; 16] = b"SQLite format 3\0";
-    let mut hdr = [0u8; 16];
-    match fs::File::open(path).and_then(|mut f| {
-        use std::io::Read as _;
-        f.read_exact(&mut hdr)
-    }) {
-        Ok(()) => &hdr == SQLITE_MAGIC,
-        Err(_) => false,
-    }
-}
-
-/// Re-encrypt the plaintext sqlite database at `db` into a SQLCipher
-/// database keyed by `dek`, replacing the original file atomically.
-///
-/// Uses SQLCipher's `sqlcipher_export()`: the plaintext DB is opened with
-/// no key, a fresh encrypted target is `ATTACH`ed under the raw DEK, all
-/// schema and data are copied across, and the target is then verified to
-/// open under the same key before it atomically replaces `db`. The
-/// original plaintext is only unlinked (via the rename) **after** the
-/// encrypted copy is proven readable, so a failure at any step leaves the
-/// plaintext untouched for a retry.
-///
-/// Stale rollback-journal / WAL sidecars of the old plaintext DB are
-/// removed afterwards so they cannot be mis-applied to the new encrypted
-/// file on the next open.
-fn migrate_plaintext_to_sqlcipher(
-    db: &Path,
-    dek: &[u8; 32],
-) -> Result<(), GroupError> {
-    use rusqlite::Connection;
-
-    // 64 lowercase hex digits — safe to splice into the SQL `KEY` clause.
-    let hex = Zeroizing::new(hex::encode(dek));
-    debug_assert_eq!(hex.len(), 64);
-
-    // Encrypted output goes to an unpredictable temp name beside the DB,
-    // matching write_atomic_secret's anti-symlink / anti-collision policy.
-    let mut rand_suffix = [0u8; 16];
-    OsRng.fill_bytes(&mut rand_suffix);
-    let tmp = {
-        let base = db.file_name().and_then(|s| s.to_str()).unwrap_or("groups.db");
-        let name = format!(".{base}.sqlcipher-mig.{}.tmp", hex::encode(rand_suffix));
-        match db.parent().filter(|p| !p.as_os_str().is_empty()) {
-            Some(dir) => dir.join(name),
-            None => PathBuf::from(name),
-        }
-    };
-    // ATTACH refuses to overwrite, and a stale temp would corrupt the
-    // export, so clear any leftover from a previous crashed run.
-    let _ = fs::remove_file(&tmp);
-
-    let export = || -> Result<(), GroupError> {
-        let conn = Connection::open(db)
-            .map_err(|e| GroupError::Storage(format!("open plaintext {db:?}: {e}")))?;
-        // Fold any committed WAL frames back into the main file so the
-        // export sees the complete committed state.
-        let _ = conn.pragma_update(None, "wal_checkpoint", "TRUNCATE");
-        // The assembled SQL embeds the raw key, so keep the whole
-        // statement string in a Zeroizing buffer — `hex` alone being
-        // Zeroizing is not enough once it is spliced into a plain String.
-        let attach = Zeroizing::new(format!(
-            "ATTACH DATABASE ?1 AS encrypted KEY \"x'{}'\"",
-            hex.as_str()
-        ));
-        conn.execute(attach.as_str(), rusqlite::params![tmp.to_string_lossy()])
-            .map_err(|e| GroupError::Storage(format!("attach encrypted target: {e}")))?;
-        conn.query_row("SELECT sqlcipher_export('encrypted')", [], |_| Ok(()))
-            .map_err(|e| GroupError::Storage(format!("sqlcipher_export: {e}")))?;
-        conn.execute_batch("DETACH DATABASE encrypted")
-            .map_err(|e| GroupError::Storage(format!("detach encrypted target: {e}")))?;
-        Ok(())
-    };
-
-    if let Err(e) = export() {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-
-    // Verify the encrypted copy actually opens under the DEK before we
-    // destroy the plaintext. A read of sqlite_master fails (NOTADB) if the
-    // key or file is wrong.
-    let verify = || -> Result<(), GroupError> {
-        let conn = Connection::open(&tmp)
-            .map_err(|e| GroupError::Storage(format!("verify open {tmp:?}: {e}")))?;
-        let pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex.as_str()));
-        conn.execute_batch(pragma.as_str())
-            .map_err(|e| GroupError::Storage(format!("verify key: {e}")))?;
-        conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
-            r.get::<_, i64>(0)
-        })
-        .map(|_| ())
-        .map_err(|e| GroupError::Storage(format!("verify read (bad migration?): {e}")))
-    };
-    if let Err(e) = verify() {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-
-    // Point of no return: atomically swap the encrypted copy over the
-    // plaintext original.
-    if let Err(e) = fs::rename(&tmp, db) {
-        let _ = fs::remove_file(&tmp);
-        return Err(GroupError::Storage(format!(
-            "replace {db:?} with migrated copy: {e}"
-        )));
-    }
-
-    // Drop now-stale plaintext sidecars (best-effort).
-    for suffix in ["-wal", "-shm", "-journal"] {
-        let mut sidecar = db.as_os_str().to_owned();
-        sidecar.push(suffix);
-        let _ = fs::remove_file(PathBuf::from(sidecar));
-    }
-
-    eprintln!(
-        "[at-rest] migrated plaintext {db:?} to SQLCipher (PQC-wrapped DEK)"
-    );
-    Ok(())
-}
 
 // -----------------------------------------------------------------------------
 // Internals
@@ -1540,89 +1356,6 @@ mod tests {
         assert_eq!(paths.key, PathBuf::from("/tmp/example/at-rest.key"));
     }
 
-    /// Create a plaintext (unencrypted) sqlite DB with one table + row.
-    fn make_plaintext_db(path: &Path) {
-        let conn = rusqlite::Connection::open(path).expect("open plaintext");
-        conn.execute_batch(
-            "CREATE TABLE legacy (id INTEGER PRIMARY KEY, note TEXT);
-             INSERT INTO legacy (note) VALUES ('pre-sqlcipher row');",
-        )
-        .expect("seed plaintext");
-    }
-
-    #[test]
-    fn is_plaintext_sqlite_detects_unencrypted_db() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("groups.db");
-        make_plaintext_db(&path);
-        assert!(is_plaintext_sqlite(&path), "fresh sqlite must be detected");
-
-        // Missing file is not plaintext.
-        assert!(!is_plaintext_sqlite(&dir.path().join("absent.db")));
-    }
-
-    #[test]
-    fn is_plaintext_sqlite_rejects_sqlcipher_db() {
-        // A SQLCipher-encrypted DB has a random salt where the magic
-        // header would be, so detection must return false.
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("groups.db");
-        let dek = [0x5Au8; 32];
-        drop(GroupStorage::open_at_with_raw_key(&path, &dek).expect("encrypted open"));
-        assert!(
-            !is_plaintext_sqlite(&path),
-            "encrypted DB must not be flagged as plaintext"
-        );
-    }
-
-    #[test]
-    fn migrate_plaintext_preserves_data_and_encrypts() {
-        let dir = tempdir().expect("tempdir");
-        let path = dir.path().join("groups.db");
-        make_plaintext_db(&path);
-        let dek = [0x11u8; 32];
-
-        migrate_plaintext_to_sqlcipher(&path, &dek).expect("migrate");
-
-        // No longer plaintext on disk.
-        assert!(!is_plaintext_sqlite(&path), "DB must be encrypted post-migration");
-
-        // Data survived and is readable only under the DEK.
-        let hex = hex::encode(dek);
-        let conn = rusqlite::Connection::open(&path).expect("reopen");
-        conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))
-            .expect("key");
-        let note: String = conn
-            .query_row("SELECT note FROM legacy WHERE id = 1", [], |r| r.get(0))
-            .expect("row survived");
-        assert_eq!(note, "pre-sqlcipher row");
-    }
-
-    #[test]
-    fn open_at_rest_storage_migrates_legacy_plaintext_db() {
-        let dir = tempdir().expect("tempdir");
-        let paths = AtRestPaths::from_db_path(dir.path().join("groups.db"));
-        // Simulate an upgrade: a plaintext groups.db with no at-rest.key
-        // or KEK alongside it.
-        make_plaintext_db(&paths.db);
-        assert!(is_plaintext_sqlite(&paths.db));
-
-        let pass = Zeroizing::new(TEST_PASS.to_string());
-        let storage = open_at_rest_storage(&paths, &pass).expect("open migrates");
-
-        // All three artefacts now exist and the DB is encrypted.
-        assert!(paths.key.exists() && paths.kek.exists());
-        assert!(!is_plaintext_sqlite(&paths.db));
-        // MLS schema initialised on top of the migrated tables.
-        assert!(storage.list_group_ids().expect("list").is_empty());
-
-        // Reopening with the same passphrase still works (DEK round-trips
-        // through the KEK we just wrote).
-        drop(storage);
-        let storage2 = open_at_rest_storage(&paths, &pass).expect("reopen");
-        assert!(storage2.list_group_ids().expect("list").is_empty());
-    }
-
     /// Open an at-rest storage, seed one application_data row, and return
     /// the paths so a test can rekey and re-verify the row survived.
     fn seed_storage(dir: &Path) -> (AtRestPaths, Zeroizing<String>) {
@@ -1656,58 +1389,6 @@ mod tests {
         assert!(storage.list_group_ids().expect("list").is_empty());
     }
 
-    /// Cross-implementation interop: `at-rest.key` (PBKDF2-HMAC-SHA512 +
-    /// AES-256-GCM), `groups.db.kek` (HPKE X-Wing seal of the DEK), and
-    /// `groups.db` (SQLCipher) in `tests/fixtures/at_rest_openssl/` were all
-    /// written by the **OpenSSL-backed** build (see that dir's README). This
-    /// proves the pure-Rust crypto opens them byte-for-byte — if any RustCrypto
-    /// primitive (PBKDF2/AES-GCM/X25519/HKDF/HPKE) diverged from the standard
-    /// bytes, the DEK would be wrong and `list_group_ids` would fail.
-    ///
-    /// The fixtures are copied to a temp dir first: `resolve_dek` does on-disk
-    /// housekeeping, so the committed fixtures must never be mutated.
-    #[test]
-    fn openssl_written_fixtures_open_with_rustcrypto() {
-        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/at_rest_openssl");
-        let dir = tempdir().expect("tempdir");
-        for name in ["at-rest.key", "groups.db", "groups.db.kek"] {
-            fs::copy(fixtures.join(name), dir.path().join(name))
-                .unwrap_or_else(|e| panic!("copy fixture {name}: {e}"));
-        }
-
-        let paths = AtRestPaths::from_db_path(dir.path().join("groups.db"));
-        let pass = Zeroizing::new("fixture-pass-123".to_string());
-
-        let storage = open_at_rest_storage(&paths, &pass)
-            .expect("OpenSSL-written at-rest files must open with pure-Rust crypto");
-        let groups = storage.list_group_ids().expect("list group ids");
-        assert_eq!(
-            groups.len(),
-            1,
-            "fixture was created with exactly one group (fixturegroup)"
-        );
-    }
-
-    #[test]
-    fn rotate_dek_rejects_plaintext_db() {
-        let dir = tempdir().expect("tempdir");
-        let paths = AtRestPaths::from_db_path(dir.path().join("groups.db"));
-        // at-rest.key + KEK exist (generate them), but groups.db is plaintext.
-        let key = AtRestKey::generate().expect("gen");
-        key.save_encrypted(&paths.key, TEST_PASS).expect("save key");
-        let (kek, _dek) = key.encapsulate_dek(&db_binding(&paths.db), None).expect("encap");
-        write_atomic_secret(&paths.kek, &kek).expect("write kek");
-        make_plaintext_db(&paths.db);
-
-        let err = rotate_dek(&paths, &Zeroizing::new(TEST_PASS.to_string()))
-            .expect_err("rekey on plaintext must fail");
-        match err {
-            GroupError::Storage(msg) => assert!(msg.contains("not encrypted")),
-            other => panic!("expected Storage error, got {other:?}"),
-        }
-    }
-
     #[test]
     fn finalize_pending_rekey_completes_committed_promotion() {
         // Simulate a crash *after* PRAGMA rekey committed but *before* the
@@ -1725,14 +1406,8 @@ mod tests {
         // Manually rekey the DB to a fresh dek and stage its KEK as pending,
         // leaving the live KEK on the old dek (the interrupted state).
         let (new_kek, new_dek) = at_rest_key.encapsulate_dek(&binding, None).expect("encap new");
-        {
-            use rusqlite::Connection;
-            let conn = Connection::open(&paths.db).expect("open db");
-            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(old_dek.as_ref())))
-                .expect("old key");
-            conn.execute_batch(&format!("PRAGMA rekey = \"x'{}'\";", hex::encode(new_dek.as_ref())))
-                .expect("rekey");
-        }
+        crate::group::redb_storage::RedbBackend::rotate_group_dek(&paths.db, &old_dek, &new_dek)
+            .expect("rekey db");
         write_atomic_secret(&kek_pending_path(&paths.kek), &new_kek).expect("stage pending");
 
         // Recovery: current (old) dek no longer opens the DB, so the
@@ -1871,12 +1546,8 @@ mod tests {
         // Stage a new KEK at c+1 and rekey the DB, but leave the counter at c
         // and do not promote (the 2b crash window).
         let (new_kek, new_dek) = key.encapsulate_dek(&binding, Some(c + 1)).expect("encap");
-        {
-            use rusqlite::Connection;
-            let conn = Connection::open(&paths.db).expect("open");
-            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(old_dek.as_ref()))).unwrap();
-            conn.execute_batch(&format!("PRAGMA rekey = \"x'{}'\";", hex::encode(new_dek.as_ref()))).unwrap();
-        }
+        crate::group::redb_storage::RedbBackend::rotate_group_dek(&paths.db, &old_dek, &new_dek)
+            .expect("rekey db");
         write_atomic_secret(&kek_pending_path(&paths.kek), &new_kek).expect("stage");
 
         let dek = resolve_kek_to_dek(&paths, &key, &binding, Some(&counter)).expect("recover");
@@ -1903,12 +1574,8 @@ mod tests {
         // Advance the counter to 1, seal pending at 1, rekey DB, no promote.
         let c1 = counter.advance().unwrap(); // 1
         let (new_kek, new_dek) = key.encapsulate_dek(&binding, Some(c1)).expect("encap");
-        {
-            use rusqlite::Connection;
-            let conn = Connection::open(&paths.db).expect("open");
-            conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex::encode(old_dek.as_ref()))).unwrap();
-            conn.execute_batch(&format!("PRAGMA rekey = \"x'{}'\";", hex::encode(new_dek.as_ref()))).unwrap();
-        }
+        crate::group::redb_storage::RedbBackend::rotate_group_dek(&paths.db, &old_dek, &new_dek)
+            .expect("rekey db");
         write_atomic_secret(&kek_pending_path(&paths.kek), &new_kek).expect("stage");
 
         let dek = resolve_kek_to_dek(&paths, &key, &binding, Some(&counter)).expect("recover");

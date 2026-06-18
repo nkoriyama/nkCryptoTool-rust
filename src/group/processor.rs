@@ -41,12 +41,12 @@ use mls_rs::identity::SigningIdentity;
 use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
 use mls_rs::{Client, ExtensionList, MlsMessage, WireFormat};
 use mls_rs_core::crypto::{CipherSuiteProvider, CryptoProvider};
-use mls_rs_provider_sqlite::storage::{
-    SqLiteGroupStateStorage, SqLiteKeyPackageStorage, SqLitePreSharedKeyStorage,
-};
 use zeroize::Zeroizing;
 
 use crate::group::crypto_adapter::{hybrid_cipher_suite, HybridCryptoProvider};
+use crate::group::redb_storage::{
+    RedbGroupStateStorage, RedbKeyPackageStorage, RedbPreSharedKeyStorage,
+};
 use crate::group::storage::GroupStorage;
 use crate::group::types::{
     AddMemberOutput, GroupError, GroupId, GroupSummary, IncomingGroupEvent, MemberInfo,
@@ -64,10 +64,10 @@ type MlsConfig = WithIdentityProvider<
     WithCryptoProvider<
         HybridCryptoProvider,
         WithPskStore<
-            SqLitePreSharedKeyStorage,
+            RedbPreSharedKeyStorage,
             WithKeyPackageRepo<
-                SqLiteKeyPackageStorage,
-                WithGroupStateStorage<SqLiteGroupStateStorage, BaseConfig>,
+                RedbKeyPackageStorage,
+                WithGroupStateStorage<RedbGroupStateStorage, BaseConfig>,
             >,
         >,
     >,

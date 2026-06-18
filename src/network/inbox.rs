@@ -208,11 +208,18 @@ pub enum InboxError {
     #[error("timed out: {0}")]
     Timeout(&'static str),
     #[cfg(feature = "mls")]
-    #[error("sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    #[error("storage: {0}")]
+    Storage(String),
     #[cfg(feature = "mls")]
     #[error("at-rest: {0}")]
     AtRest(String),
+}
+
+#[cfg(feature = "mls")]
+impl From<crate::group::redb_storage::RedbStorageError> for InboxError {
+    fn from(e: crate::group::redb_storage::RedbStorageError) -> Self {
+        InboxError::Storage(e.to_string())
+    }
 }
 
 async fn write_timed<S>(
@@ -534,12 +541,11 @@ pub async fn count_prekeys(
 #[cfg(feature = "mls")]
 mod server {
     use super::*;
-    use rusqlite::{params, Connection, OptionalExtension};
+    use crate::group::redb_storage::{CheckpointOutcome, RedbInboxStore};
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Mutex as StdMutex;
     use std::time::Instant;
-    use tokio::sync::Mutex as AsyncMutex;
     use zeroize::Zeroizing;
 
     /// A leaky-bucket throttle for one connecting NodeId: `tokens` refills
@@ -576,10 +582,9 @@ mod server {
         }
     }
 
-    /// Persistent inbox: sqlite-backed envelope storage + ALPN_INBOX
-    /// accept loop.
+    /// Persistent inbox: redb-backed envelope storage + ALPN_INBOX accept loop.
     pub struct InboxServer {
-        db: Arc<AsyncMutex<Connection>>,
+        store: RedbInboxStore,
         /// Per-NodeId FETCH rate limiters (prekey-depletion mitigation).
         /// A std mutex, not async: the critical section is a few map ops
         /// with no `.await`, so it never blocks the runtime meaningfully.
@@ -587,86 +592,30 @@ mod server {
     }
 
     impl InboxServer {
-        /// Open an inbox at `path`, creating the schema on first use.
-        /// WAL + NORMAL synchronous so concurrent DEPOSIT/POLL don't
-        /// block each other.
+        /// Open an inbox at `path`, creating the redb schema on first use.
         ///
-        /// The DB is SQLCipher-encrypted with a 256-bit DEK wrapped by the
-        /// same PQC at-rest layer as the MLS storage (see `group::at_rest`
-        /// and SECURITY_PROFILE.md §7.3). This matters even though every
-        /// `payload` is already MLS ciphertext: the `recipient`, `sender`,
-        /// and `created_at` columns are *metadata* that would otherwise sit
-        /// in plaintext on the relay's disk. `passphrase` decrypts the
-        /// hybrid key file; a legacy plaintext `inbox.db` is migrated in
-        /// place on first open.
+        /// The DB is encrypted with a 256-bit DEK wrapped by the same PQC
+        /// at-rest layer as the MLS storage (see `group::at_rest` and
+        /// SECURITY_PROFILE.md §7.3). This matters even though every `payload`
+        /// is already MLS ciphertext: the `recipient`/`sender`/`created_at`
+        /// metadata would otherwise sit in plaintext on the relay's disk. The
+        /// recipient is stored as a blind index and all values are encrypted;
+        /// see `group::redb_storage`. `passphrase` decrypts the hybrid key file.
+        ///
+        /// `beside_db` keeps the inbox's hybrid key in `inbox.db.at-rest.key`
+        /// rather than the shared `at-rest.key`, so an MLS client and a
+        /// co-located inbox server in the same directory never race to create
+        /// one key file.
         pub fn open<P: AsRef<Path>>(
             path: P,
             passphrase: &Zeroizing<String>,
         ) -> Result<Self, InboxError> {
-            // Recover (or initialise) the DEK via the at-rest layer, then
-            // hand it to SQLCipher as the page key. `PRAGMA key` MUST run
-            // before any other statement on the connection.
-            //
-            // `beside_db` keeps the inbox's hybrid key in `inbox.db.at-rest.key`
-            // rather than the shared `at-rest.key`, so an MLS client and a
-            // co-located inbox server in the same directory never race to
-            // create one key file.
             let at_rest_paths = crate::group::AtRestPaths::beside_db(path.as_ref());
             let dek = crate::group::resolve_dek(&at_rest_paths, passphrase)
                 .map_err(|e| InboxError::AtRest(e.to_string()))?;
-            let conn = Connection::open(path.as_ref()).map_err(InboxError::Sqlite)?;
-            let key_pragma =
-                Zeroizing::new(format!("PRAGMA key = \"x'{}'\";", hex::encode(dek.as_ref())));
-            conn.execute_batch(key_pragma.as_str())
-                .map_err(InboxError::Sqlite)?;
-            conn.execute_batch(
-                "
-                PRAGMA journal_mode = WAL;
-                PRAGMA synchronous = NORMAL;
-                PRAGMA busy_timeout = 5000;
-                CREATE TABLE IF NOT EXISTS envelopes (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    recipient   BLOB NOT NULL,
-                    sender      BLOB NOT NULL,
-                    payload     BLOB NOT NULL,
-                    created_at  INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS envelopes_recipient_id
-                    ON envelopes(recipient, id);
-                CREATE TABLE IF NOT EXISTS checkpoints (
-                    peer   BLOB PRIMARY KEY,
-                    epoch  INTEGER NOT NULL
-                );
-                -- One-Time Prekey pool. `blob` is an opaque
-                -- SignedPrekey::to_bytes(); the server never parses it. Keyed
-                -- by the recipient (= publisher's handshake NodeId); FETCH
-                -- pops the lowest id (FIFO) for one-time use.
-                CREATE TABLE IF NOT EXISTS prekeys (
-                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                    recipient   BLOB NOT NULL,
-                    blob        BLOB NOT NULL,
-                    created_at  INTEGER NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS prekeys_recipient_id
-                    ON prekeys(recipient, id);
-                ",
-            )
-            .map_err(InboxError::Sqlite)?;
-
-            // Defence in depth on top of SQLCipher: keep the ciphertext DB
-            // unreadable by other local users.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = std::fs::metadata(path.as_ref()) {
-                    let mut perms = meta.permissions();
-                    perms.set_mode(0o600);
-                    let _ = std::fs::set_permissions(path.as_ref(), perms);
-                }
-            }
-
+            let store = RedbInboxStore::open(path.as_ref(), &dek, MAX_PREKEYS_STORED as usize)?;
             Ok(Self {
-                db: Arc::new(AsyncMutex::new(conn)),
+                store,
                 fetch_rl: StdMutex::new(HashMap::new()),
             })
         }
@@ -766,19 +715,8 @@ mod server {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
-            {
-                let db = self.db.lock().await;
-                db.execute(
-                    "INSERT INTO envelopes(recipient, sender, payload, created_at) \
-                     VALUES(?, ?, ?, ?)",
-                    params![
-                        recipient.as_bytes().as_slice(),
-                        sender.as_bytes().as_slice(),
-                        payload,
-                        now,
-                    ],
-                )?;
-            }
+            self.store
+                .deposit(recipient.as_bytes(), sender.as_bytes(), &payload, now)?;
             write_timed(stream, &[REPLY_OK], "deposit reply (ok)").await?;
             tokio::time::timeout(IO_TIMEOUT, stream.flush())
                 .await
@@ -801,28 +739,15 @@ mod server {
             let mut max_buf = [0u8; 4];
             read_timed(stream, &mut max_buf, "poll max").await?;
             let max =
-                std::cmp::min(u32::from_le_bytes(max_buf), MAX_POLL_BATCH) as i64;
-            // SELECT recipient = handshake-authenticated NodeId, so no
-            // peer can read someone else's inbox even by crafting the
-            // request (there is no recipient field in the wire to
-            // override).
-            let rows: Vec<(i64, Vec<u8>)> = {
-                let db = self.db.lock().await;
-                let mut stmt = db.prepare(
-                    "SELECT id, payload FROM envelopes \
-                     WHERE recipient = ? AND id > ? \
-                     ORDER BY id ASC LIMIT ?",
-                )?;
-                let iter = stmt.query_map(
-                    params![recipient.as_bytes().as_slice(), since as i64, max],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
-                )?;
-                iter.collect::<Result<Vec<_>, _>>()?
-            };
+                std::cmp::min(u32::from_le_bytes(max_buf), MAX_POLL_BATCH) as usize;
+            // The recipient is the handshake-authenticated NodeId, so no peer
+            // can read someone else's inbox even by crafting the request (there
+            // is no recipient field on the wire to override).
+            let rows: Vec<(u64, Vec<u8>)> = self.store.poll(recipient.as_bytes(), since, max)?;
             let count = rows.len() as u32;
             write_timed(stream, &count.to_le_bytes(), "poll count").await?;
             for (id, payload) in &rows {
-                write_timed(stream, &(*id as u64).to_le_bytes(), "envelope cursor").await?;
+                write_timed(stream, &id.to_le_bytes(), "envelope cursor").await?;
                 write_timed(stream, &(payload.len() as u32).to_le_bytes(), "envelope len").await?;
                 write_timed(stream, payload, "envelope payload").await?;
             }
@@ -843,32 +768,12 @@ mod server {
         {
             let mut epoch_buf = [0u8; 8];
             read_timed(stream, &mut epoch_buf, "checkpoint epoch").await?;
-            // Counters fit comfortably in i63; clamp defensively so a bogus
-            // huge value can't wrap when stored as sqlite INTEGER.
-            let epoch = u64::from_le_bytes(epoch_buf).min(i64::MAX as u64) as i64;
+            let epoch = u64::from_le_bytes(epoch_buf);
             // `peer` is the handshake-authenticated NodeId, so a client can
             // only checkpoint its own record (no peer field on the wire).
-            let reply = {
-                let db = self.db.lock().await;
-                let stored: Option<i64> = db
-                    .query_row(
-                        "SELECT epoch FROM checkpoints WHERE peer = ?",
-                        params![peer.as_bytes().as_slice()],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
-                match stored {
-                    Some(s) if epoch < s => REPLY_ROLLBACK, // regression: do not update
-                    _ => {
-                        let newv = stored.map_or(epoch, |s| s.max(epoch));
-                        db.execute(
-                            "INSERT INTO checkpoints(peer, epoch) VALUES(?1, ?2) \
-                             ON CONFLICT(peer) DO UPDATE SET epoch = ?2",
-                            params![peer.as_bytes().as_slice(), newv],
-                        )?;
-                        REPLY_OK
-                    }
-                }
+            let reply = match self.store.checkpoint(peer.as_bytes(), epoch)? {
+                CheckpointOutcome::Rollback => REPLY_ROLLBACK,
+                CheckpointOutcome::Ok => REPLY_OK,
             };
             write_timed(stream, &[reply], "checkpoint reply").await?;
             tokio::time::timeout(IO_TIMEOUT, stream.flush())
@@ -915,27 +820,9 @@ mod server {
                 .unwrap_or_default()
                 .as_secs() as i64;
             // The slot is keyed by `recipient` = the handshake-authenticated
-            // NodeId, so a peer can only ever publish into its own pool.
-            {
-                let db = self.db.lock().await;
-                let tx = db.unchecked_transaction()?;
-                for blob in &blobs {
-                    tx.execute(
-                        "INSERT INTO prekeys(recipient, blob, created_at) VALUES(?, ?, ?)",
-                        params![recipient.as_bytes().as_slice(), blob, now],
-                    )?;
-                }
-                // Bound storage abuse: keep only the newest MAX_PREKEYS_STORED
-                // for this recipient, dropping the oldest by id.
-                tx.execute(
-                    "DELETE FROM prekeys WHERE recipient = ?1 AND id NOT IN (
-                         SELECT id FROM prekeys WHERE recipient = ?1
-                         ORDER BY id DESC LIMIT ?2
-                     )",
-                    params![recipient.as_bytes().as_slice(), MAX_PREKEYS_STORED as i64],
-                )?;
-                tx.commit()?;
-            }
+            // NodeId, so a peer can only ever publish into its own pool. The
+            // store appends the batch and evicts the oldest beyond the cap.
+            self.store.publish_prekeys(recipient.as_bytes(), &blobs, now)?;
             write_timed(stream, &[REPLY_OK], "publish reply (ok)").await?;
             tokio::time::timeout(IO_TIMEOUT, stream.flush())
                 .await
@@ -970,27 +857,9 @@ mod server {
                 return Ok(());
             }
 
-            // Pop the lowest-id prekey atomically: SELECT then DELETE under the
-            // single db mutex, so two concurrent FETCHes can never be handed
-            // the same one-time key.
-            let blob: Option<Vec<u8>> = {
-                let db = self.db.lock().await;
-                let row: Option<(i64, Vec<u8>)> = db
-                    .query_row(
-                        "SELECT id, blob FROM prekeys WHERE recipient = ? \
-                         ORDER BY id ASC LIMIT 1",
-                        params![recipient.as_bytes().as_slice()],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .optional()?;
-                match row {
-                    Some((id, blob)) => {
-                        db.execute("DELETE FROM prekeys WHERE id = ?", params![id])?;
-                        Some(blob)
-                    }
-                    None => None,
-                }
-            };
+            // Pop the lowest-id prekey atomically (single redb write txn), so
+            // two concurrent FETCHes can never be handed the same one-time key.
+            let blob: Option<Vec<u8>> = self.store.fetch_prekey(recipient.as_bytes())?;
 
             match blob {
                 Some(b) => {
@@ -1021,17 +890,10 @@ mod server {
         where
             S: AsyncReadExt + AsyncWriteExt + Unpin + ?Sized,
         {
-            let count: i64 = {
-                let db = self.db.lock().await;
-                db.query_row(
-                    "SELECT COUNT(*) FROM prekeys WHERE recipient = ?",
-                    params![caller.as_bytes().as_slice()],
-                    |r| r.get(0),
-                )?
-            };
+            let count = self.store.count_prekeys(caller.as_bytes())?;
             // The per-recipient pool is capped at MAX_PREKEYS_STORED, well
             // within u32; clamp defensively so the cast can never wrap.
-            let count = count.clamp(0, u32::MAX as i64) as u32;
+            let count = count.min(u32::MAX as usize) as u32;
             write_timed(stream, &[REPLY_OK], "count reply (ok)").await?;
             write_timed(stream, &count.to_le_bytes(), "count value").await?;
             tokio::time::timeout(IO_TIMEOUT, stream.flush())

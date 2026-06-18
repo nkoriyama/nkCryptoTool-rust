@@ -18,39 +18,25 @@
 //! Everything is gated behind `#[cfg(feature = "mls")]` so the default
 //! crate build (and all 1:1 chat / file transfer paths) are unaffected.
 
-// The sqlite-backed group stack. `mls-redb` (pure-Rust storage) compiles only
-// `redb_storage` from this module — the rest still assumes the sqlite provider
-// and is gated to `mls` until the P4 cutover rewires them onto redb.
-#[cfg(feature = "mls")]
+// `mls` is now backed by the pure-Rust redb storage (`redb_storage`); the
+// SQLCipher reader lives only under `legacy-sqlcipher-migration` for the P3
+// migration tool.
 pub mod at_rest;
-#[cfg(feature = "mls")]
 pub mod cli;
-#[cfg(feature = "mls")]
 pub mod rollback;
-#[cfg(feature = "mls")]
 pub mod crypto_adapter;
-#[cfg(feature = "mls")]
 pub mod processor;
-#[cfg(feature = "mls-redb")]
 pub mod redb_storage;
-#[cfg(feature = "mls")]
 pub mod storage;
-#[cfg(feature = "mls")]
 pub mod transport;
-#[cfg(feature = "mls")]
 pub mod types;
 
-#[cfg(feature = "mls")]
 pub use at_rest::{
     current_rollback_epoch, open_at_rest_storage, resolve_dek, rotate_dek, AtRestKey, AtRestPaths,
 };
-#[cfg(feature = "mls")]
 pub use crypto_adapter::{hybrid_cipher_suite, HYBRID_SUITE_ID};
-#[cfg(feature = "mls")]
 pub use processor::GroupChatProcessor;
-#[cfg(feature = "mls")]
-pub use storage::{GroupStorage, TunedFileStrategy};
-#[cfg(feature = "mls")]
+pub use storage::GroupStorage;
 pub use types::{
     AddMemberOutput, GroupError, GroupId, GroupMessage, GroupSummary, IncomingGroupEvent,
     MemberId, MemberInfo, Welcome,

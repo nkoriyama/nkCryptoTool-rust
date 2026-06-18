@@ -30,13 +30,11 @@
 //! the inbox `PUBLISH` / `FETCH` wire ops are phase 2.
 
 use crate::group::crypto_adapter::build_at_rest_suite;
-use data_encoding::HEXLOWER;
+use crate::group::redb_storage::RedbPrekeyStore;
 use mls_rs::CipherSuiteProvider;
 use mls_rs_core::crypto::{HpkeContextR, HpkeContextS, HpkePublicKey, HpkeSecretKey};
-use rusqlite::Connection;
 use sha3::{Digest, Sha3_256};
 use std::path::Path;
-use std::time::Duration;
 use zeroize::Zeroizing;
 
 /// X-Wing public key length: X25519 (32 B) ‖ ML-KEM-768 encap key (1184 B).
@@ -71,7 +69,7 @@ pub enum PrekeyError {
     #[error("prekey wire format: {0}")]
     Wire(String),
     #[error("prekey store: {0}")]
-    Storage(#[from] rusqlite::Error),
+    Storage(#[from] crate::group::redb_storage::RedbStorageError),
     #[error("HPKE: {0}")]
     Hpke(String),
 }
@@ -239,89 +237,20 @@ pub fn generate(count: u32, start_id: u32, dsa_priv: &[u8]) -> Result<Vec<Genera
 /// A single combined "consume" call is deliberately *not* offered,
 /// because it would force step 3 to happen before step 2 can run.
 pub struct PrekeyStore {
-    conn: Connection,
+    store: RedbPrekeyStore,
 }
 
 impl PrekeyStore {
-    /// Open (or create) the SQLCipher database at `path`, unlocked with a
-    /// raw 256-bit `dek` (the at-rest layer's derived key — SQLCipher
-    /// skips PBKDF2 for a raw key), and ensure the `onetime_prekeys`
-    /// table exists.
+    /// Open (or create) the encrypted redb prekey database at `path`, unlocked
+    /// with a raw 256-bit `dek` (the at-rest layer's derived key). Values are
+    /// sealed with XChaCha20-Poly1305; a DEK sentinel rejects a wrong key on
+    /// open. Consumed one-time prekeys are physically reclaimed via redb
+    /// compaction on delete (logical secure-delete; see
+    /// [`crate::group::redb_storage::RedbPrekeyStore`]).
     pub fn open(path: &Path, dek: &[u8; 32]) -> Result<Self> {
-        let conn = Connection::open(path)?;
-        // `PRAGMA key` must be the first statement on the connection.
-        // The key string embeds the raw DEK as an x'<hex>' literal (SQLite
-        // has no parameter binding for PRAGMA), so build it in a pre-sized
-        // Zeroizing String: pre-sizing avoids a `format!`-grown temporary
-        // that could leave DEK fragments in freed, un-zeroized heap, and
-        // the Zeroizing wrapper wipes the final buffer on drop.
-        const PRE: &str = "PRAGMA key = \"x'";
-        const POST: &str = "'\";";
-        let hex = Zeroizing::new(HEXLOWER.encode(dek));
-        let mut stmt = Zeroizing::new(String::with_capacity(PRE.len() + hex.len() + POST.len()));
-        stmt.push_str(PRE);
-        stmt.push_str(hex.as_str());
-        stmt.push_str(POST);
-        conn.execute_batch(stmt.as_str())?;
-        conn.busy_timeout(Duration::from_millis(5_000))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        // Keep the rollback journal in DELETE mode (the default) rather than
-        // WAL: a retired prekey secret must not linger in a -wal sidecar
-        // that secure_delete does not cover. Set explicitly so the FS
-        // guarantee does not depend on the ambient default.
-        conn.pragma_update(None, "journal_mode", "DELETE")?;
-        // secure_delete = ON makes SQLite overwrite deleted content with
-        // zeros instead of just marking the page free. This is load-bearing
-        // here: `delete` retiring a used One-Time Prekey must physically
-        // destroy the private key, else it survives in the freelist and an
-        // attacker with the DB file + DEK could recover it and defeat the
-        // forward secrecy that single-use deletion is meant to provide.
-        conn.pragma_update(None, "secure_delete", "ON")?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS onetime_prekeys (
-                 prekey_id   INTEGER PRIMARY KEY,
-                 xwing_priv  BLOB NOT NULL,
-                 created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-             );
-             -- Persistent monotonic id high-water mark. Single row (id=0).
-             -- Keeps prekey ids from ever being reused, even after the
-             -- onetime_prekeys table is fully drained.
-             CREATE TABLE IF NOT EXISTS prekey_seq (
-                 id    INTEGER PRIMARY KEY CHECK (id = 0),
-                 next  INTEGER NOT NULL
-             );
-             INSERT OR IGNORE INTO prekey_seq (id, next) VALUES (0, 0);
-             -- Long-term static X-Wing keypair (the reachability/fallback
-             -- target a sender always encapsulates to; the One-Time Prekeys
-             -- supply forward secrecy on top). Single row (id=0). Stored in
-             -- the same SQLCipher boundary as the prekeys.
-             CREATE TABLE IF NOT EXISTS static_keypair (
-                 id          INTEGER PRIMARY KEY CHECK (id = 0),
-                 xwing_priv  BLOB NOT NULL,
-                 xwing_pub   BLOB NOT NULL,
-                 created_at  INTEGER NOT NULL DEFAULT (strftime('%s','now'))
-             );
-             -- Small key/value scratch for receive-side state, currently the
-             -- inbox poll cursor so `recv` does not re-process old envelopes
-             -- (re-opening a consumed prekey would just fail noisily anyway).
-             CREATE TABLE IF NOT EXISTS prekey_meta (
-                 k  TEXT PRIMARY KEY,
-                 v  INTEGER NOT NULL
-             );",
-        )?;
-        // Tighten the DB file to owner-only — it holds (SQLCipher-encrypted)
-        // prekey private keys; 0600 matches how the at-rest key files are
-        // handled and keeps other local users from reading or clobbering it.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(path) {
-                let mut perms = meta.permissions();
-                perms.set_mode(0o600);
-                let _ = std::fs::set_permissions(path, perms);
-            }
-        }
-        Ok(Self { conn })
+        Ok(Self {
+            store: RedbPrekeyStore::open(path, dek)?,
+        })
     }
 
     /// Atomically reserve `count` consecutive prekey ids, returning the
@@ -329,58 +258,24 @@ impl PrekeyStore {
     /// rewinds — even when every prekey has been consumed and the table is
     /// empty — so an id is never reused for a different keypair.
     pub fn reserve_ids(&self, count: u32) -> Result<u32> {
-        let tx = self.conn.unchecked_transaction()?;
-        // UPDATE before reading back: the write takes the lock immediately,
-        // so two concurrent reservers serialize on it and can never read
-        // the same pre-increment value (a SELECT-then-UPDATE order would
-        // race and hand out a duplicate start id).
-        let changed = tx.execute(
-            "UPDATE prekey_seq SET next = next + ?1 WHERE id = 0",
-            rusqlite::params![i64::from(count)],
-        )?;
-        if changed != 1 {
-            return Err(PrekeyError::Wire("prekey_seq row missing".into()));
-        }
-        let new_next: i64 =
-            tx.query_row("SELECT next FROM prekey_seq WHERE id = 0", [], |r| r.get(0))?;
-        let start = new_next - i64::from(count);
-        // Reject overflow of the u32 id space (checked before commit so the
-        // transaction rolls back on error).
-        let start_u32 = u32::try_from(start)
-            .map_err(|_| PrekeyError::Wire("prekey id space exhausted".into()))?;
-        u32::try_from(new_next)
-            .map_err(|_| PrekeyError::Wire("prekey id space exhausted".into()))?;
-        tx.commit()?;
-        Ok(start_u32)
+        Ok(self.store.reserve_ids(count)?)
     }
 
     /// Persist one prekey private key under its id.
     pub fn insert(&self, prekey_id: u32, xwing_priv: &[u8]) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO onetime_prekeys (prekey_id, xwing_priv) VALUES (?1, ?2)",
-            rusqlite::params![prekey_id, xwing_priv],
-        )?;
+        self.store.insert(prekey_id, xwing_priv)?;
         Ok(())
     }
 
     /// Number of unused prekeys still held. Drives auto-refill (phase 2).
     pub fn count(&self) -> Result<u64> {
-        let n: i64 = self
-            .conn
-            .query_row("SELECT COUNT(*) FROM onetime_prekeys", [], |r| r.get(0))?;
-        Ok(n as u64)
+        Ok(self.store.count()?)
     }
 
     /// Ids of every unused prekey, ascending. The lowest unused id is the
     /// natural `start_id` for the next [`generate`] batch.
     pub fn list_ids(&self) -> Result<Vec<u32>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT prekey_id FROM onetime_prekeys ORDER BY prekey_id")?;
-        let ids = stmt
-            .query_map([], |r| r.get::<_, i64>(0).map(|v| v as u32))?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(ids)
+        Ok(self.store.list_ids()?)
     }
 
     /// Read (without deleting) the private key for `prekey_id`, returning
@@ -392,38 +287,21 @@ impl PrekeyStore {
     /// verified, so a forged ciphertext cannot drain the pool. See the
     /// struct-level lifecycle note.
     pub fn load(&self, prekey_id: u32) -> Result<Option<HpkeSecretKey>> {
-        let row: Option<Vec<u8>> = self
-            .conn
-            .query_row(
-                "SELECT xwing_priv FROM onetime_prekeys WHERE prekey_id = ?1",
-                rusqlite::params![prekey_id],
-                |r| r.get(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other),
-            })?;
-        // `priv_bytes` is moved into HpkeSecretKey::from, whose inner Vec
+        // The decrypted Vec is moved into HpkeSecretKey::from, whose inner Vec
         // is ZeroizeOnDrop — no separate unprotected copy is left behind.
-        Ok(row.map(HpkeSecretKey::from))
+        Ok(self.store.load(prekey_id)?.map(HpkeSecretKey::from))
     }
 
     /// Delete `prekey_id`. Call this after a successful decrypt+verify to
     /// retire the single-use key, or for operator revocation. Returns
-    /// `true` if a row was removed.
+    /// `true` if a row was removed. Compacts to physically reclaim the page.
     pub fn delete(&self, prekey_id: u32) -> Result<bool> {
-        let n = self.conn.execute(
-            "DELETE FROM onetime_prekeys WHERE prekey_id = ?1",
-            rusqlite::params![prekey_id],
-        )?;
-        Ok(n > 0)
+        Ok(self.store.delete(prekey_id)?)
     }
 
     /// Delete every prekey (operator revocation). Returns the number removed.
     pub fn delete_all(&self) -> Result<u64> {
-        let n = self.conn.execute("DELETE FROM onetime_prekeys", [])?;
-        Ok(n as u64)
+        Ok(self.store.delete_all()?)
     }
 
     /// Persist the long-term static X-Wing keypair (the reachability target
@@ -436,21 +314,14 @@ impl PrekeyStore {
         if pk.as_ref().len() != XWING_PK_LEN {
             return Err(PrekeyError::BadPublicKeyLen(0, pk.as_ref().len()));
         }
-        let changed = self.conn.execute(
-            "INSERT INTO static_keypair (id, xwing_priv, xwing_pub) VALUES (0, ?1, ?2)",
-            rusqlite::params![sk.as_ref(), pk.as_ref()],
-        );
-        match changed {
-            Ok(_) => Ok(()),
-            Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == rusqlite::ErrorCode::ConstraintViolation =>
-            {
-                Err(PrekeyError::Wire(
-                    "a static identity already exists in this store".into(),
-                ))
+        self.store.store_identity(sk.as_ref(), pk.as_ref()).map_err(|e| {
+            // Preserve the historical "already exists" error shape.
+            if matches!(e, crate::group::redb_storage::RedbStorageError::Malformed(_)) {
+                PrekeyError::Wire("a static identity already exists in this store".into())
+            } else {
+                PrekeyError::Storage(e)
             }
-            Err(e) => Err(e.into()),
-        }
+        })
     }
 
     /// Generate a fresh long-term static X-Wing keypair, persist it, and
@@ -469,46 +340,21 @@ impl PrekeyStore {
     /// generated yet. The private key arrives in a `ZeroizeOnDrop`
     /// [`HpkeSecretKey`].
     pub fn load_identity(&self) -> Result<Option<(HpkeSecretKey, HpkePublicKey)>> {
-        let row: Option<(Vec<u8>, Vec<u8>)> = self
-            .conn
-            .query_row(
-                "SELECT xwing_priv, xwing_pub FROM static_keypair WHERE id = 0",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other),
-            })?;
-        Ok(row.map(|(sk, pk)| (HpkeSecretKey::from(sk), HpkePublicKey::from(pk))))
+        Ok(self
+            .store
+            .load_identity()?
+            .map(|(sk, pk)| (HpkeSecretKey::from(sk), HpkePublicKey::from(pk))))
     }
 
     /// The last inbox poll cursor persisted by [`set_inbox_cursor`], or 0 if
     /// `recv` has never run against this store.
     pub fn inbox_cursor(&self) -> Result<u64> {
-        let v: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT v FROM prekey_meta WHERE k = 'inbox_cursor'",
-                [],
-                |r| r.get(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(other),
-            })?;
-        Ok(v.unwrap_or(0) as u64)
+        Ok(self.store.inbox_cursor()?)
     }
 
     /// Persist the inbox poll cursor so the next `recv` resumes after it.
     pub fn set_inbox_cursor(&self, cursor: u64) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO prekey_meta (k, v) VALUES ('inbox_cursor', ?1)
-             ON CONFLICT(k) DO UPDATE SET v = excluded.v",
-            rusqlite::params![cursor as i64],
-        )?;
+        self.store.set_inbox_cursor(cursor)?;
         Ok(())
     }
 }
