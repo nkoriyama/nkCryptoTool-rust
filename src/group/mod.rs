@@ -23,6 +23,8 @@ pub mod cli;
 pub mod rollback;
 pub mod crypto_adapter;
 pub mod processor;
+#[cfg(feature = "mls-redb")]
+pub mod redb_storage;
 pub mod storage;
 pub mod transport;
 pub mod types;
