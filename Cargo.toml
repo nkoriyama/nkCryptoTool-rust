@@ -4,6 +4,13 @@ version = "2.1.0"
 edition = "2021"
 license = "MIT"
 
+# `rlib` keeps the normal Rust library (used by the bin and integration tests);
+# `cdylib` additionally emits a C-ABI shared library (`libnk_crypto_tool.so`) so
+# the chat/crypto core can be loaded from a mobile app via JNI/UniFFI. See
+# BUILD_ANDROID.md.
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
 openssl = { version = "0.10", optional = true }

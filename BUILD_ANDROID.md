@@ -53,6 +53,25 @@ cargo ndk -t arm64-v8a build --release \
 リンカに設定する（手動なら `.cargo/config.toml` の
 `[target.aarch64-linux-android] linker = "<ndk>/.../aarch64-linux-android<API>-clang"`）。
 
+## アプリ組み込み（cdylib / JNI）
+
+`Cargo.toml` の `[lib] crate-type = ["rlib", "cdylib"]` により、上記ビルドは
+実行ファイルに加えて **`libnk_crypto_tool.so`（C-ABI 共有ライブラリ）**も生成する。
+
+検証済み（aarch64, NDK r27c）:
+```
+$ file target/aarch64-linux-android/debug/libnk_crypto_tool.so
+ELF 64-bit LSB shared object, ARM aarch64
+$ llvm-readelf -d <so> | grep NEEDED
+  libdl.so   libc.so          # libcrypto/libssl/libsqlite は無し
+```
+
+この `.so` を Android アプリ（Kotlin/Java）から `System.loadLibrary("nk_crypto_tool")` で
+ロードできる。実際にメソッドを呼ぶには、公開 API を `#[no_mangle] extern "C"` で出すか、
+**UniFFI**（推奨。Kotlin バインディングを自動生成）でブリッジを作る。チャットコア
+（`group::GroupChatProcessor` 等）はライブラリクレートに公開済みなので、その上に薄い FFI 層を
+被せるだけでよい。なお iroh の P2P ネットワークは実機/エミュレータでの動作確認が別途必要。
+
 ## 注意
 
 - **`legacy-sqlcipher-migration` feature を付けてはいけない**（rusqlite/SQLCipher を引き戻し、
