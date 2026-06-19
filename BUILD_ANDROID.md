@@ -88,12 +88,17 @@ cargo run --no-default-features --features "backend-rustcrypto mls mobile-ffi" \
 
 現状のエクスポート:
 - 関数: `libraryVersion()`, `hybridSuiteId()`, `sha3256Fingerprint(data)`
-- **`MobileChatClient`（UniFFI object, async）**: `open(storageDir, passphrase, displayName, disableRelay)`
-  でストレージ(redb)＋iroh エンドポイント＋`GroupChatProcessor` を構築し、`createGroup()` /
-  `listGroups()` を提供（ローカル MLS 操作）。Kotlin では `suspend fun` + `AutoCloseable`。
+- **`MobileChatClient`（UniFFI object, async, `suspend fun` + `AutoCloseable`）**:
+  `open(storageDir, passphrase, displayName, disableRelay)` でストレージ(redb)＋iroh
+  エンドポイント＋`GroupChatProcessor` を構築。
+  - ローカル: `createGroup()`, `listGroups()`, `localTicket()`, `exportKeyPackage()`
+  - 招待: `inviteMember(gidHex, keyPackage)→welcome`, `sendWelcome(ticket, welcome)`,
+    `joinGroup(welcome)→gidHex`
+  - メッセージ: `sendText(gidHex, text, recipientTickets)`,
+    `receiveNext()→FfiChatEvent`（NewGroup/Message/EpochAdvanced/RemovedFromGroup）
 
-未実装（次の増分）: ピア間の送受信（`sendApplicationMessage` / `acceptNext` 等の iroh P2P
-操作）。2ノード必要なため実機/エミュレータ前提で追加する。
+E2E 検証メモ: 単ノードのローカル操作（group 作成・ticket・KeyPackage）は headless テスト済み。
+ピア間の招待/送受信は **2ノード（実機/エミュレータ or 2プロセス）必要**で、その疎通確認が残課題。
 
 `bindings/` は生成物なのでコミットしない（`.gitignore` 済み、上記コマンドで再生成）。
 

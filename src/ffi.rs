@@ -62,6 +62,38 @@ pub fn sha3_256_fingerprint(data: Vec<u8>) -> Result<String, FfiError> {
 
 use std::sync::Arc;
 
+/// An incoming group event delivered by [`MobileChatClient::receive_next`].
+/// Mirrors `IncomingGroupEvent` with FFI-friendly types (hex group ids).
+#[derive(Debug, uniffi::Enum)]
+pub enum FfiChatEvent {
+    /// A Welcome was processed; we joined a new group.
+    NewGroup { group_id: String },
+    /// An application message arrived and was decrypted.
+    Message { group_id: String, sender_index: u32, body: Vec<u8> },
+    /// A Commit advanced an existing group by one epoch.
+    EpochAdvanced { group_id: String, new_epoch: u64 },
+    /// A Commit removed us from a group.
+    RemovedFromGroup { group_id: String, remover_index: u32 },
+}
+
+/// Parse a 32-byte group id from lowercase hex.
+fn gid_from_hex(s: &str) -> Result<crate::group::GroupId, FfiError> {
+    let bytes = hex::decode(s)
+        .map_err(|e| FfiError::InvalidInput { reason: format!("bad group id hex: {e}") })?;
+    let arr: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| FfiError::InvalidInput { reason: "group id must be 32 bytes".into() })?;
+    Ok(crate::group::GroupId::new(arr))
+}
+
+/// Resolve a peer ticket string to a transport address.
+fn peer_from_ticket(s: &str) -> Result<crate::p2p::PeerAddr, FfiError> {
+    use std::str::FromStr;
+    let ticket = crate::ticket::Ticket::from_str(s)
+        .map_err(|e| FfiError::InvalidInput { reason: format!("bad ticket: {e}") })?;
+    Ok(ticket.peer_addr())
+}
+
 /// A mobile-facing handle to the MLS group-chat engine: opens (or creates) the
 /// encrypted redb storage + at-rest keys under `storage_dir`, binds an iroh
 /// endpoint, and drives [`GroupChatProcessor`].
@@ -128,6 +160,98 @@ impl MobileChatClient {
         let ids = proc.list_groups().map_err(FfiError::chat)?;
         Ok(ids.iter().map(|g| hex::encode(g.as_bytes())).collect())
     }
+
+    /// This client's shareable connection ticket — hand it to a peer so they
+    /// can deliver a Welcome / messages back. Encodes the iroh address.
+    pub async fn local_ticket(&self) -> Result<String, FfiError> {
+        let proc = self.inner.lock().await;
+        let addr = proc.local_addr().await.map_err(FfiError::chat)?;
+        Ok(crate::ticket::Ticket::new(addr, None, None).to_string())
+    }
+
+    /// Produce a KeyPackage for *this* client so an inviter can add us to a
+    /// group (the invitee runs this and sends the bytes to the inviter).
+    pub async fn export_key_package(&self) -> Result<Vec<u8>, FfiError> {
+        let proc = self.inner.lock().await;
+        let kp = proc.export_key_package().await.map_err(FfiError::chat)?;
+        Ok(kp.to_vec())
+    }
+
+    /// Add a member to `group_id_hex` from their KeyPackage bytes; returns the
+    /// Welcome to deliver to them (via [`send_welcome`](Self::send_welcome)).
+    pub async fn invite_member(
+        &self,
+        group_id_hex: String,
+        key_package: Vec<u8>,
+    ) -> Result<Vec<u8>, FfiError> {
+        let gid = gid_from_hex(&group_id_hex)?;
+        let proc = self.inner.lock().await;
+        let out = proc.add_member(&gid, &key_package).await.map_err(FfiError::chat)?;
+        Ok(out.welcome.to_vec())
+    }
+
+    /// Deliver a Welcome blob to `recipient_ticket` over the network.
+    pub async fn send_welcome(
+        &self,
+        recipient_ticket: String,
+        welcome: Vec<u8>,
+    ) -> Result<(), FfiError> {
+        let peer = peer_from_ticket(&recipient_ticket)?;
+        let proc = self.inner.lock().await;
+        proc.send_welcome_to(&peer, &welcome).await.map_err(FfiError::chat)
+    }
+
+    /// Join the group described by a received `welcome` blob; returns the new
+    /// group's id (hex).
+    pub async fn join_group(&self, welcome: Vec<u8>) -> Result<String, FfiError> {
+        let proc = self.inner.lock().await;
+        let gid = proc.join_group_from_welcome(&welcome).await.map_err(FfiError::chat)?;
+        Ok(hex::encode(gid.as_bytes()))
+    }
+
+    /// Send a UTF-8 text message to `group_id_hex`, delivered to each peer in
+    /// `recipient_tickets`.
+    pub async fn send_text(
+        &self,
+        group_id_hex: String,
+        text: String,
+        recipient_tickets: Vec<String>,
+    ) -> Result<(), FfiError> {
+        let gid = gid_from_hex(&group_id_hex)?;
+        let peers: Vec<crate::p2p::PeerAddr> = recipient_tickets
+            .iter()
+            .map(|t| peer_from_ticket(t))
+            .collect::<Result<_, _>>()?;
+        let proc = self.inner.lock().await;
+        proc.send_application_message(&gid, text.as_bytes(), &peers)
+            .await
+            .map_err(FfiError::chat)?;
+        Ok(())
+    }
+
+    /// Block until the next inbound group event (a received message, a new
+    /// group from a Welcome, an epoch change, or our removal).
+    pub async fn receive_next(&self) -> Result<FfiChatEvent, FfiError> {
+        use crate::group::IncomingGroupEvent as E;
+        let proc = self.inner.lock().await;
+        let ev = proc.accept_next().await.map_err(FfiError::chat)?;
+        Ok(match ev {
+            E::NewGroup { id } => FfiChatEvent::NewGroup { group_id: hex::encode(id.as_bytes()) },
+            E::Message { group_id, sender_index, body } => FfiChatEvent::Message {
+                group_id: hex::encode(group_id.as_bytes()),
+                sender_index,
+                body,
+            },
+            E::EpochAdvanced { group_id, new_epoch } => FfiChatEvent::EpochAdvanced {
+                group_id: hex::encode(group_id.as_bytes()),
+                new_epoch,
+            },
+            E::RemovedFromGroup { group_id, remover_index } => FfiChatEvent::RemovedFromGroup {
+                group_id: hex::encode(group_id.as_bytes()),
+                remover_index,
+            },
+        })
+    }
 }
 
 #[cfg(test)]
@@ -159,6 +283,14 @@ mod tests {
         assert_eq!(gid.len(), 64, "group id is 32 bytes as hex");
         let groups = client.list_groups().await.expect("list");
         assert_eq!(groups, vec![gid]);
+
+        // Single-node surface used by the invite flow: a shareable ticket and
+        // an exportable KeyPackage (peer-to-peer delivery needs a 2nd node).
+        let ticket = client.local_ticket().await.expect("ticket");
+        assert!(!ticket.is_empty());
+        assert!(peer_from_ticket(&ticket).is_ok(), "own ticket round-trips");
+        let kp = client.export_key_package().await.expect("key package");
+        assert!(!kp.is_empty());
     }
 
     #[test]
