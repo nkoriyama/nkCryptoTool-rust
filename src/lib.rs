@@ -15,6 +15,12 @@ pub mod processor;
 pub mod group;
 #[cfg(feature = "mls")]
 pub mod prekey;
+#[cfg(feature = "mobile-ffi")]
+pub mod ffi;
+// UniFFI scaffolding must live at the crate root so the generated `UniFfiTag`
+// is visible to the `#[uniffi::export]` macros in `ffi`.
+#[cfg(feature = "mobile-ffi")]
+uniffi::setup_scaffolding!();
 #[cfg(feature = "mls")]
 pub mod one_shot;
 pub mod gui;

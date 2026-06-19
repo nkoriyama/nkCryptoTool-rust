@@ -11,6 +11,13 @@ license = "MIT"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
+# uniffi-bindgen CLI for generating Kotlin/Swift bindings. Only built with the
+# `mobile-ffi` feature so normal builds don't pull the uniffi CLI deps.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi_bindgen.rs"
+required-features = ["mobile-ffi"]
+
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
 openssl = { version = "0.10", optional = true }
@@ -80,6 +87,11 @@ rfd = { version = "0.14", optional = true }
 # to Android/iOS with no C crypto dependency. Values are encrypted at the
 # application layer with XChaCha20-Poly1305 (see `group::redb_storage`).
 redb = { version = "4", optional = true }
+
+# UniFFI: generates Kotlin/Swift bindings from `#[uniffi::export]` so the chat /
+# crypto core can be called from a mobile app. Opt-in via `mobile-ffi`; compiled
+# into the cdylib (see BUILD_ANDROID.md). `cli` powers the uniffi-bindgen bin.
+uniffi = { version = "0.31", optional = true, features = ["cli"] }
 
 # RustCrypto ecosystem
 aes-gcm = { version = "0.10", optional = true, features = ["zeroize"] }
@@ -197,6 +209,10 @@ mls-crypto-rustcrypto = [
 # Deprecated alias — `mls` is now the pure-Rust redb backend itself. Kept so
 # existing `--features mls-redb` invocations keep working.
 mls-redb = ["mls"]
+
+# Mobile FFI: UniFFI-exported surface over the MLS chat / crypto core, built
+# into the cdylib for Kotlin/Swift consumption. See src/ffi.rs, BUILD_ANDROID.md.
+mobile-ffi = ["uniffi", "mls"]
 
 [dev-dependencies]
 i-slint-backend-testing = "=1.16.1"

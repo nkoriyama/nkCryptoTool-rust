@@ -67,10 +67,29 @@ $ llvm-readelf -d <so> | grep NEEDED
 ```
 
 この `.so` を Android アプリ（Kotlin/Java）から `System.loadLibrary("nk_crypto_tool")` で
-ロードできる。実際にメソッドを呼ぶには、公開 API を `#[no_mangle] extern "C"` で出すか、
-**UniFFI**（推奨。Kotlin バインディングを自動生成）でブリッジを作る。チャットコア
-（`group::GroupChatProcessor` 等）はライブラリクレートに公開済みなので、その上に薄い FFI 層を
-被せるだけでよい。なお iroh の P2P ネットワークは実機/エミュレータでの動作確認が別途必要。
+ロードできる。なお iroh の P2P ネットワークは実機/エミュレータでの動作確認が別途必要。
+
+### UniFFI ブリッジ（`mobile-ffi` feature）
+
+`src/ffi.rs` に `#[uniffi::export]` でエクスポート面を定義し、`mobile-ffi` feature で
+cdylib に組み込む。Kotlin バインディングは同梱の `uniffi-bindgen` bin で生成する:
+
+```sh
+# cdylib をビルド（android なら上記 cargo ndk に mobile-ffi を足す）
+cargo build --no-default-features --features "backend-rustcrypto mls mobile-ffi"
+
+# 生成（--library モードで cdylib のメタデータから生成）
+cargo run --no-default-features --features "backend-rustcrypto mls mobile-ffi" \
+  --bin uniffi-bindgen -- generate \
+  --library target/debug/libnk_crypto_tool.so --language kotlin --out-dir bindings/kotlin
+# → bindings/kotlin/uniffi/nk_crypto_tool/nk_crypto_tool.kt
+# （ktlint があれば自動整形。無くても生成は成功する）
+```
+
+現状のエクスポート（スキャフォールディング）: `libraryVersion()`, `hybridSuiteId()`,
+`sha3256Fingerprint(data)`。チャット本体（`GroupChatProcessor` の作成・送受信）は今後
+UniFFI object として `src/ffi.rs` に追加していく。`bindings/` は生成物なので
+コミットしない（`.gitignore` 済み、上記コマンドで再生成）。
 
 ## 注意
 

@@ -27,3 +27,6 @@ test_file.txt
 # Network chat test artifacts
 ticket.txt
 ticket.log
+
+# Generated UniFFI bindings (regenerate with the uniffi-bindgen bin)
+/bindings/
