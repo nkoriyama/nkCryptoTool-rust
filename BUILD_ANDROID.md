@@ -86,10 +86,16 @@ cargo run --no-default-features --features "backend-rustcrypto mls mobile-ffi" \
 # （ktlint があれば自動整形。無くても生成は成功する）
 ```
 
-現状のエクスポート（スキャフォールディング）: `libraryVersion()`, `hybridSuiteId()`,
-`sha3256Fingerprint(data)`。チャット本体（`GroupChatProcessor` の作成・送受信）は今後
-UniFFI object として `src/ffi.rs` に追加していく。`bindings/` は生成物なので
-コミットしない（`.gitignore` 済み、上記コマンドで再生成）。
+現状のエクスポート:
+- 関数: `libraryVersion()`, `hybridSuiteId()`, `sha3256Fingerprint(data)`
+- **`MobileChatClient`（UniFFI object, async）**: `open(storageDir, passphrase, displayName, disableRelay)`
+  でストレージ(redb)＋iroh エンドポイント＋`GroupChatProcessor` を構築し、`createGroup()` /
+  `listGroups()` を提供（ローカル MLS 操作）。Kotlin では `suspend fun` + `AutoCloseable`。
+
+未実装（次の増分）: ピア間の送受信（`sendApplicationMessage` / `acceptNext` 等の iroh P2P
+操作）。2ノード必要なため実機/エミュレータ前提で追加する。
+
+`bindings/` は生成物なのでコミットしない（`.gitignore` 済み、上記コマンドで再生成）。
 
 ## 注意
 

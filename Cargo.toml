@@ -91,7 +91,7 @@ redb = { version = "4", optional = true }
 # UniFFI: generates Kotlin/Swift bindings from `#[uniffi::export]` so the chat /
 # crypto core can be called from a mobile app. Opt-in via `mobile-ffi`; compiled
 # into the cdylib (see BUILD_ANDROID.md). `cli` powers the uniffi-bindgen bin.
-uniffi = { version = "0.31", optional = true, features = ["cli"] }
+uniffi = { version = "0.31", optional = true, features = ["cli", "tokio"] }
 
 # RustCrypto ecosystem
 aes-gcm = { version = "0.10", optional = true, features = ["zeroize"] }
