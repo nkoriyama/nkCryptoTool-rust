@@ -52,6 +52,15 @@ Two-device chat (invite → send/receive) uses `exportKeyPackage` /
 next step. The end-to-end peer-to-peer flow is already covered by the Rust test
 `two_clients_invite_and_exchange_message`.
 
+## Verified
+
+`./stage.sh && gradle assembleDebug` (JDK 17, cmdline-tools + platforms;android-34
++ build-tools;34.0.0, Gradle 8.9, NDK r27c) produces a working
+`app/build/outputs/apk/debug/app-debug.apk` (~51 MB debug, 2 ABIs). The APK
+bundles `lib/{arm64-v8a,x86_64}/libnk_crypto_tool.so` (the Rust core) plus
+`libjnidispatch.so` (JNA). Installing/running on a device or emulator is the
+remaining manual step.
+
 ## Notes
 
 - UniFFI's Kotlin runtime uses **JNA** (`net.java.dev.jna:jna:*@aar`) to load
