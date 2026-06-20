@@ -1,0 +1,10 @@
+# Gradle / Android Studio
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+
+# Staged Rust artifacts (regenerate with ./stage.sh)
+app/src/main/jniLibs/
+app/src/main/java/uniffi/
