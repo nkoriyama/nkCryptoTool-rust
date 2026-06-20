@@ -293,6 +293,68 @@ mod tests {
         assert!(!kp.is_empty());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_clients_invite_and_exchange_message() {
+        // Full peer-to-peer path on one host: two clients, direct iroh
+        // (relay disabled), invite over a Welcome, then exchange a message.
+        let dir_a = tempfile::tempdir().expect("dir a");
+        let dir_b = tempfile::tempdir().expect("dir b");
+        let alice = MobileChatClient::open(
+            dir_a.path().to_string_lossy().into_owned(),
+            "pass-a".into(),
+            "alice".into(),
+            true,
+        )
+        .await
+        .expect("open alice");
+        let bob = MobileChatClient::open(
+            dir_b.path().to_string_lossy().into_owned(),
+            "pass-b".into(),
+            "bob".into(),
+            true,
+        )
+        .await
+        .expect("open bob");
+
+        let bob_ticket = bob.local_ticket().await.expect("bob ticket");
+
+        // Alice creates a group and invites Bob (from Bob's KeyPackage).
+        let gid = alice.create_group().await.expect("create group");
+        let kp = bob.export_key_package().await.expect("bob kp");
+        let welcome = alice.invite_member(gid.clone(), kp).await.expect("invite");
+
+        // Bob accepts the Welcome (background), Alice delivers it.
+        let join = {
+            let b = bob.clone();
+            tokio::spawn(async move { b.receive_next().await })
+        };
+        alice
+            .send_welcome(bob_ticket.clone(), welcome)
+            .await
+            .expect("send welcome");
+        match join.await.expect("join join").expect("welcome event") {
+            FfiChatEvent::NewGroup { group_id } => assert_eq!(group_id, gid),
+            other => panic!("expected NewGroup, got {other:?}"),
+        }
+
+        // Alice sends a text; Bob receives and decrypts it.
+        let recv = {
+            let b = bob.clone();
+            tokio::spawn(async move { b.receive_next().await })
+        };
+        alice
+            .send_text(gid.clone(), "hello bob".into(), vec![bob_ticket])
+            .await
+            .expect("send text");
+        match recv.await.expect("recv join").expect("message event") {
+            FfiChatEvent::Message { group_id, body, .. } => {
+                assert_eq!(group_id, gid);
+                assert_eq!(String::from_utf8_lossy(&body), "hello bob");
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+    }
+
     #[test]
     fn fingerprint_roundtrips() {
         // SHA3-256("") would be rejected; a non-empty input yields 64 hex chars.
