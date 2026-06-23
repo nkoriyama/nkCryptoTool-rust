@@ -485,6 +485,12 @@ impl NetworkProcessor {
                 };
 
                 let client_dsa_pub = backend::pqc_pub_from_priv_dsa(&self.config.pqc_dsa_algo, &raw_priv)?;
+                // Bind the client's identity key into the transcript before signing,
+                // matching the server's verification transcript (handle_server_connection
+                // adds client_dsa_pub before pqc_verify). Without this the signed and
+                // verified transcripts differ and verification always fails; it also keeps
+                // the key-derivation salt (Sha3 of server_transcript) identical on both ends.
+                CommonProcessor::update_transcript(&mut transcript, &client_dsa_pub);
                 let sig =
                     backend::pqc_sign(&self.config.pqc_dsa_algo, &raw_priv, &transcript, None)?;
                 CommonProcessor::write_vec(&mut stream, &sig).await?;
