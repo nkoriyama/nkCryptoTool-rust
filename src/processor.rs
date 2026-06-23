@@ -586,13 +586,13 @@ impl CryptoProcessor {
             use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
             // Pass 1: Verification (no disk writing)
+            let mut in_file = std::fs::File::open(&input_path)
+                .map_err(|e| CryptoError::FileRead(e.to_string()))?;
             {
-                let mut in_file = std::fs::File::open(&input_path)
-                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
                 in_file
                     .seek(SeekFrom::Start(header_size))
                     .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                let mut reader = BufReader::with_capacity(BUF_SIZE * 4, in_file);
+                let mut reader = BufReader::with_capacity(BUF_SIZE * 4, &in_file);
 
                 let mut in_buf = vec![0u8; BUF_SIZE];
                 // Defense-in-depth: Zeroize Pass 1 dummy buffer to prevent plaintext residue in memory
@@ -626,12 +626,10 @@ impl CryptoProcessor {
             // Pass 1 succeeded. Now Pass 2: Actually writing to temporary file.
             strategy.restart_decryption()?;
 
-            let mut in_file =
-                std::fs::File::open(&input_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
             in_file
                 .seek(SeekFrom::Start(header_size))
                 .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let mut reader = BufReader::with_capacity(BUF_SIZE * 4, in_file);
+            let mut reader = BufReader::with_capacity(BUF_SIZE * 4, &in_file);
 
             let out_file = OpenOptions::new()
                 .write(true)

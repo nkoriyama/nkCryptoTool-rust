@@ -59,40 +59,6 @@ impl Ticket {
         }
     }
 
-    pub fn to_string(&self) -> String {
-        let mut payload = Vec::new();
-        payload.push(self.version);
-        payload.extend_from_slice(&self.node_id);
-        
-        let relay = self.relay_url.as_deref().unwrap_or("");
-        payload.extend_from_slice(&(relay.len() as u16).to_le_bytes());
-        payload.extend_from_slice(relay.as_bytes());
-
-        payload.extend_from_slice(&(self.direct_addrs.len() as u16).to_le_bytes());
-        for addr in &self.direct_addrs {
-            match addr {
-                SocketAddr::V4(a) => {
-                    payload.push(4);
-                    payload.extend_from_slice(&a.ip().octets());
-                    payload.extend_from_slice(&a.port().to_le_bytes());
-                }
-                SocketAddr::V6(a) => {
-                    payload.push(6);
-                    payload.extend_from_slice(&a.ip().octets());
-                    payload.extend_from_slice(&a.port().to_le_bytes());
-                }
-            }
-        }
-
-        payload.push(self.pqc_fp_algo);
-        payload.extend_from_slice(&self.pqc_sign_fp);
-        payload.extend_from_slice(&self.pqc_enc_fp);
-
-        let checksum = CRC_ISO.checksum(&payload);
-        payload.extend_from_slice(&checksum.to_le_bytes());
-
-        format!("nkct1{}", BASE32_NOPAD.encode(&payload))
-    }
 }
 
 impl FromStr for Ticket {
@@ -174,6 +140,37 @@ impl FromStr for Ticket {
 
 impl std::fmt::Display for Ticket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.to_string())
+        let mut payload = Vec::new();
+        payload.push(self.version);
+        payload.extend_from_slice(&self.node_id);
+        
+        let relay = self.relay_url.as_deref().unwrap_or("");
+        payload.extend_from_slice(&(relay.len() as u16).to_le_bytes());
+        payload.extend_from_slice(relay.as_bytes());
+
+        payload.extend_from_slice(&(self.direct_addrs.len() as u16).to_le_bytes());
+        for addr in &self.direct_addrs {
+            match addr {
+                SocketAddr::V4(a) => {
+                    payload.push(4);
+                    payload.extend_from_slice(&a.ip().octets());
+                    payload.extend_from_slice(&a.port().to_le_bytes());
+                }
+                SocketAddr::V6(a) => {
+                    payload.push(6);
+                    payload.extend_from_slice(&a.ip().octets());
+                    payload.extend_from_slice(&a.port().to_le_bytes());
+                }
+            }
+        }
+
+        payload.push(self.pqc_fp_algo);
+        payload.extend_from_slice(&self.pqc_sign_fp);
+        payload.extend_from_slice(&self.pqc_enc_fp);
+
+        let checksum = CRC_ISO.checksum(&payload);
+        payload.extend_from_slice(&checksum.to_le_bytes());
+
+        write!(f, "nkct1{}", BASE32_NOPAD.encode(&payload))
     }
 }
