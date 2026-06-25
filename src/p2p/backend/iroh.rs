@@ -481,7 +481,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    #[ignore = "flaky on CI runners: 2s handshake_timeout insufficient for slow PQC handshake; tracked in PHASE5_ROADMAP §3.3"]
     async fn test_iroh_handshake_unauth() {
         reset_state();
         let (ticket_tx, ticket_rx) = tokio::sync::oneshot::channel();
@@ -489,7 +488,7 @@ mod tests {
         server_config.transport = crate::config::TransportKind::Iroh;
         server_config.chat_mode = false;
         server_config.allow_unauth = true;
-        server_config.handshake_timeout = 2;
+        server_config.handshake_timeout = 30;
         let server_task = tokio::spawn(async move {
             let mut processor = new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await;
             processor.preload_allowlist().await.unwrap();
@@ -497,14 +496,14 @@ mod tests {
                 let _ = ticket_tx.send(ticket.to_string());
             }).await;
         });
-        let ticket_str = tokio::time::timeout(Duration::from_secs(2), ticket_rx).await.unwrap().unwrap();
+        let ticket_str = tokio::time::timeout(Duration::from_secs(60), ticket_rx).await.unwrap().unwrap();
         let mut client_config = CryptoConfig::default();
         client_config.transport = crate::config::TransportKind::Iroh;
         client_config.connect_addr = Some(modify_ticket(&ticket_str, None, None));
         client_config.chat_mode = false;
         client_config.allow_unauth = true;
-        client_config.handshake_timeout = 2;
-        let client_res = tokio::time::timeout(Duration::from_secs(2), async {
+        client_config.handshake_timeout = 30;
+        let client_res = tokio::time::timeout(Duration::from_secs(60), async {
             let processor = new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await;
             processor.run_connect().await
         }).await;
@@ -514,7 +513,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    #[ignore = "flaky on CI runners: 2s handshake_timeout insufficient for slow PQC handshake; tracked in PHASE5_ROADMAP §3.3"]
     async fn test_iroh_handshake_auth_success() {
         reset_state();
         let dir = tempdir().unwrap();
@@ -536,7 +534,7 @@ mod tests {
         server_config.allow_unauth = false;
         server_config.signing_privkey = Some(s_key_path.to_str().unwrap().to_string());
         server_config.signing_pubkey = Some(c_pub_path.to_str().unwrap().to_string());
-        server_config.handshake_timeout = 2;
+        server_config.handshake_timeout = 30;
         let _server_task = tokio::spawn(async move {
             let mut processor = new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await;
             processor.preload_allowlist().await.unwrap();
@@ -552,8 +550,8 @@ mod tests {
         client_config.allow_unauth = false;
         client_config.signing_privkey = Some(c_key_path.to_str().unwrap().to_string());
         client_config.signing_pubkey = Some(s_pub_path.to_str().unwrap().to_string());
-        client_config.handshake_timeout = 2;
-        let client_res = tokio::time::timeout(Duration::from_secs(2), async {
+        client_config.handshake_timeout = 30;
+        let client_res = tokio::time::timeout(Duration::from_secs(60), async {
             let processor = new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await;
             processor.run_connect().await
         }).await;
@@ -562,7 +560,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    #[ignore = "flaky on CI runners: 2s handshake_timeout insufficient for slow PQC handshake; tracked in PHASE5_ROADMAP §3.3"]
     async fn test_iroh_handshake_auth_fail_fingerprint_mismatch() {
         reset_state();
         let dir = tempdir().unwrap();
@@ -579,7 +576,7 @@ mod tests {
         server_config.chat_mode = false;
         server_config.allow_unauth = true;
         server_config.signing_privkey = Some(s_key_path.to_str().unwrap().to_string());
-        server_config.handshake_timeout = 2;
+        server_config.handshake_timeout = 30;
         let _server_task = tokio::spawn(async move {
             let mut processor = new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await;
             processor.preload_allowlist().await.unwrap();
@@ -593,8 +590,8 @@ mod tests {
         client_config.connect_addr = Some(modify_ticket(&ticket_str, Some(wrong_fp), None));
         client_config.chat_mode = false;
         client_config.allow_unauth = true;
-        client_config.handshake_timeout = 2;
-        let client_res = tokio::time::timeout(Duration::from_secs(2), async {
+        client_config.handshake_timeout = 30;
+        let client_res = tokio::time::timeout(Duration::from_secs(60), async {
             let processor = new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await;
             processor.run_connect().await
         }).await;
@@ -603,7 +600,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    #[ignore = "flaky on CI runners: 2s handshake_timeout insufficient for slow PQC handshake; tracked in PHASE5_ROADMAP §3.3"]
     async fn test_iroh_handshake_auth_fail_invalid_sig() {
         reset_state();
         let dir = tempdir().unwrap();
@@ -621,7 +617,7 @@ mod tests {
         server_config.allow_unauth = false;
         server_config.signing_privkey = Some(s_key_path.to_str().unwrap().to_string());
         server_config.signing_pubkey = Some(c_pub_path.to_str().unwrap().to_string());
-        server_config.handshake_timeout = 2;
+        server_config.handshake_timeout = 30;
         let _server_task = tokio::spawn(async move {
             let mut processor = new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await;
             processor.preload_allowlist().await.unwrap();
@@ -635,7 +631,7 @@ mod tests {
         client_config.connect_addr = Some(modify_ticket(&ticket_str, None, None));
         client_config.chat_mode = false;
         client_config.allow_unauth = true;
-        let client_res = tokio::time::timeout(Duration::from_secs(2), async {
+        let client_res = tokio::time::timeout(Duration::from_secs(60), async {
             let processor = new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await;
             processor.run_connect().await
         }).await;
@@ -644,7 +640,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    #[ignore = "flaky on CI runners: 2s handshake_timeout insufficient for slow PQC handshake; tracked in PHASE5_ROADMAP §3.3"]
     async fn test_iroh_handshake_allowlist_reject() {
         reset_state();
         let dir = tempdir().unwrap();
@@ -656,7 +651,7 @@ mod tests {
         server_config.chat_mode = false;
         server_config.allow_unauth = true;
         server_config.peer_allowlist = Some(allowlist_path.to_str().unwrap().to_string());
-        server_config.handshake_timeout = 2;
+        server_config.handshake_timeout = 30;
         let _server_task = tokio::spawn(async move {
             let mut processor = new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await;
             processor.preload_allowlist().await.unwrap();
@@ -670,7 +665,7 @@ mod tests {
         client_config.connect_addr = Some(modify_ticket(&ticket_str, None, None));
         client_config.chat_mode = false;
         client_config.allow_unauth = true;
-        let client_res = tokio::time::timeout(Duration::from_secs(2), async {
+        let client_res = tokio::time::timeout(Duration::from_secs(60), async {
             let processor = new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await;
             processor.run_connect().await
         }).await;
@@ -679,7 +674,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    #[ignore = "flaky on CI runners: 2s handshake_timeout insufficient for slow PQC handshake; tracked in PHASE5_ROADMAP §3.3"]
     async fn test_iroh_handshake_multi_client_auth_success() {
         reset_state();
         let dir = tempdir().unwrap();
@@ -698,7 +692,7 @@ mod tests {
         server_config.allow_unauth = false;
         server_config.signing_privkey = Some(s_key_path.to_str().unwrap().to_string());
         server_config.peer_allowlist = Some(allowlist_path.to_str().unwrap().to_string());
-        server_config.handshake_timeout = 2;
+        server_config.handshake_timeout = 30;
         let _server_task = tokio::spawn(async move {
             let mut processor = new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await;
             processor.preload_allowlist().await.unwrap();
@@ -713,7 +707,7 @@ mod tests {
         client_config.chat_mode = false;
         client_config.allow_unauth = false;
         client_config.signing_privkey = Some(c_key_path.to_str().unwrap().to_string());
-        let client_res = tokio::time::timeout(Duration::from_secs(2), async {
+        let client_res = tokio::time::timeout(Duration::from_secs(60), async {
             let processor = new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await;
             processor.run_connect().await
         }).await;
@@ -722,7 +716,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    #[ignore = "flaky on CI runners: 2s handshake_timeout insufficient for slow PQC handshake; tracked in PHASE5_ROADMAP §3.3"]
     async fn test_iroh_chat_loop_smoke() {
         reset_state();
         let (ticket_tx, ticket_rx) = tokio::sync::oneshot::channel();
@@ -737,13 +730,13 @@ mod tests {
                 let _ = ticket_tx.send(ticket.to_string());
             }).await;
         });
-        let ticket_str = tokio::time::timeout(Duration::from_secs(2), ticket_rx).await.unwrap().unwrap();
+        let ticket_str = tokio::time::timeout(Duration::from_secs(60), ticket_rx).await.unwrap().unwrap();
         let mut client_config = CryptoConfig::default();
         client_config.transport = crate::config::TransportKind::Iroh;
         client_config.connect_addr = Some(modify_ticket(&ticket_str, None, None));
         client_config.chat_mode = true;
         client_config.allow_unauth = true;
-        let client_res = tokio::time::timeout(Duration::from_secs(5), async {
+        let client_res = tokio::time::timeout(Duration::from_secs(60), async {
             let processor = new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await;
             processor.run_connect().await
         }).await;
@@ -755,7 +748,6 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    #[ignore = "flaky on CI runners: 2s handshake_timeout insufficient for slow PQC handshake; tracked in PHASE5_ROADMAP §3.3"]
     async fn test_iroh_file_transfer_smoke() {
         reset_state();
         let (ticket_tx, ticket_rx) = tokio::sync::oneshot::channel();
@@ -770,13 +762,13 @@ mod tests {
                 let _ = ticket_tx.send(ticket.to_string());
             }).await;
         });
-        let ticket_str = tokio::time::timeout(Duration::from_secs(2), ticket_rx).await.unwrap().unwrap();
+        let ticket_str = tokio::time::timeout(Duration::from_secs(60), ticket_rx).await.unwrap().unwrap();
         let mut client_config = CryptoConfig::default();
         client_config.transport = crate::config::TransportKind::Iroh;
         client_config.connect_addr = Some(modify_ticket(&ticket_str, None, None));
         client_config.chat_mode = false;
         client_config.allow_unauth = true;
-        let client_res = tokio::time::timeout(Duration::from_secs(2), async {
+        let client_res = tokio::time::timeout(Duration::from_secs(60), async {
             let processor = new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await;
             processor.run_connect().await
         }).await;
