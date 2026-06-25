@@ -84,13 +84,13 @@ jobs:
         run: |
           cargo build --no-default-features --features "backend-openssl-vendored gui-camera gui-notifications gui-screen-protection gui-file-transfer"
 
-      # NOTE: -D warnings disabled in F4 due to pre-existing clippy debt
-      # in src/utils.rs, src/backend/, etc. (60+ warnings unrelated to
-      # Phase 4 work). Cleanup is a v2.2 task (PHASE5_ROADMAP §5 technical
-      # debt). For F4 we run clippy as advisory to surface NEW warnings
-      # introduced by F4 changes without blocking release on legacy debt.
-      - name: cargo clippy (advisory)
-        continue-on-error: true  # F4-X13 explicit allowance for advisory step
+      # Release-blocking (P1-R4): a non-zero clippy exit fails the job.
+      # `-D warnings` is intentionally NOT set — there is pre-existing clippy
+      # warning debt in src/utils.rs, src/backend/, etc. (60+ warnings, cleanup
+      # tracked in PHASE5_ROADMAP §5). Without -D warnings those remain
+      # non-fatal, but any clippy ERROR (e.g. a deny-by-default correctness
+      # lint) or compile failure now blocks the release as intended.
+      - name: cargo clippy (release-blocking)
         run: |
           cargo clippy --all-targets --no-default-features \
             --features "testing backend-openssl-vendored gui-camera gui-notifications gui-screen-protection gui-file-transfer"
