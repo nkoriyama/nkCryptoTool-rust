@@ -1,0 +1,30 @@
+# Dependabot configuration (P1-R7 / P1 commit 5).
+# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+version: 2
+updates:
+  # Rust crate dependencies (Cargo.toml / Cargo.lock).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      prefix-development: "deps(dev)"
+    groups:
+      # Batch routine patch/minor bumps into one PR to cut review noise; security
+      # advisories and major bumps still open on their own.
+      cargo-minor:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions used by our workflows (keeps actions/checkout, cache, etc.
+  # current — this is what the Node 20 deprecation bump would have surfaced).
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
