@@ -354,6 +354,11 @@ pub struct OpenSslHash {
     ctx: MdCtx,
     #[cfg(feature = "backend-openssl")]
     md: MessageDigest,
+    // OpenSSL 3.x rejects EVP_DigestSignUpdate on a verify-initialized context
+    // (and vice versa) with EVP_R_INITIALIZATION_ERROR, so `update` must call
+    // the matching update fn. Tracks which init was performed.
+    #[cfg(feature = "backend-openssl")]
+    verify_mode: bool,
 }
 
 impl HashBackend for OpenSslHash {
@@ -365,7 +370,11 @@ impl HashBackend for OpenSslHash {
                 algo
             )))?;
             let ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            Ok(Self { ctx, md })
+            Ok(Self {
+                ctx,
+                md,
+                verify_mode: false,
+            })
         }
         #[cfg(not(feature = "backend-openssl"))]
         {
@@ -378,10 +387,18 @@ impl HashBackend for OpenSslHash {
 
     fn update(&mut self, data: &[u8]) -> Result<()> {
         #[cfg(feature = "backend-openssl")]
-        return self
-            .ctx
-            .digest_sign_update(data)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()));
+        {
+            if self.verify_mode {
+                return self
+                    .ctx
+                    .digest_verify_update(data)
+                    .map_err(|e| CryptoError::OpenSSL(e.to_string()));
+            }
+            return self
+                .ctx
+                .digest_sign_update(data)
+                .map_err(|e| CryptoError::OpenSSL(e.to_string()));
+        }
         #[cfg(not(feature = "backend-openssl"))]
         {
             let _ = data;
@@ -445,6 +462,7 @@ impl HashBackend for OpenSslHash {
     fn init_sign(&mut self, key_der: &[u8], passphrase: Option<&str>) -> Result<()> {
         #[cfg(feature = "backend-openssl")]
         {
+            self.verify_mode = false;
             let pkey = load_private_key_robust(key_der, passphrase)?;
             unsafe {
                 if ffi::EVP_DigestSignInit(
@@ -474,6 +492,7 @@ impl HashBackend for OpenSslHash {
     fn init_verify(&mut self, key_der: &[u8]) -> Result<()> {
         #[cfg(feature = "backend-openssl")]
         {
+            self.verify_mode = true;
             let pkey = load_public_key_robust(key_der)?;
             unsafe {
                 if ffi::EVP_DigestVerifyInit(
