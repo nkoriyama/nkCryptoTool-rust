@@ -209,3 +209,94 @@ async fn test_e2e_file_transfer_large_10mib() {
     // BUF_SIZE iterations.
     run_e2e_transfer(10 * 1024 * 1024).await;
 }
+
+// --------------------------------------------------------------------------
+// Adversarial transfer tests (P1-R3): the wire bytes between sender and
+// receiver are attacker-controlled, so the receive path must reject any
+// in-flight mutation rather than surface corrupted plaintext. These drive the
+// exact framing the P2P file transfer uses — NetworkProcessor::{send_file,
+// receive_file} over an in-memory buffer — so a byte can be flipped/forged at
+// a precise offset without standing up an Iroh transport.
+//
+// Wire layout produced by send_file:
+//   repeat { [chunk_len: u32 LE] [AEAD ciphertext: chunk_len bytes] }
+//   [0u32]                      (terminator)
+//   [tag: 16 bytes]             (AEAD authentication tag over the stream)
+// --------------------------------------------------------------------------
+
+const ADV_AEAD: &str = "AES-256-GCM";
+
+async fn encrypt_to_wire(plaintext: &[u8], key: &[u8], iv: &[u8]) -> Vec<u8> {
+    let mut wire: Vec<u8> = Vec::new();
+    nk_crypto_tool::network::NetworkProcessor::send_file(plaintext, &mut wire, ADV_AEAD, key, iv)
+        .await
+        .expect("send_file (encrypt) should succeed");
+    wire
+}
+
+async fn decrypt_from_wire(
+    wire: &[u8],
+    key: &[u8],
+    iv: &[u8],
+) -> Result<Vec<u8>, nk_crypto_tool::CryptoError> {
+    let mut out: Vec<u8> = Vec::new();
+    nk_crypto_tool::network::NetworkProcessor::receive_file(wire, &mut out, ADV_AEAD, key, iv)
+        .await?;
+    Ok(out)
+}
+
+#[tokio::test]
+async fn test_e2e_aead_tampering() {
+    let key = [7u8; 32];
+    let iv = [3u8; 12];
+    let payload = build_payload(300_000);
+    let wire = encrypt_to_wire(&payload, &key, &iv).await;
+
+    // Baseline: the untampered wire round-trips back to the original bytes.
+    let clean = decrypt_from_wire(&wire, &key, &iv)
+        .await
+        .expect("untampered wire must decrypt");
+    assert_eq!(clean, payload, "untampered roundtrip mismatch");
+
+    // Flip one bit deep inside the ciphertext body (past the 4-byte length
+    // prefix at offset 0, well before the trailing terminator + tag).
+    let mut tampered = wire.clone();
+    let mid = tampered.len() / 2;
+    tampered[mid] ^= 0x01;
+
+    // AES-256-GCM authenticates the whole stream at finalize(): a single
+    // flipped ciphertext byte must surface as an error, never silent
+    // corruption.
+    let err = decrypt_from_wire(&tampered, &key, &iv)
+        .await
+        .expect_err("tampered ciphertext must fail AEAD authentication");
+    // Any error is acceptable here; the contract is "not Ok". Reference the
+    // value so the binding is not flagged as unused.
+    let _ = err;
+}
+
+#[tokio::test]
+async fn test_e2e_chunk_len_forgery() {
+    let key = [9u8; 32];
+    let iv = [5u8; 12];
+    let payload = build_payload(120_000);
+    let wire = encrypt_to_wire(&payload, &key, &iv).await;
+
+    // Forge the first chunk's length prefix to a value far beyond the
+    // receiver's per-chunk bound (BUF_SIZE + 256). receive_file must reject it
+    // immediately with a Parameter error, before allocating/reading the body.
+    let mut forged = wire.clone();
+    let huge: u32 = 200_000_000; // >> BUF_SIZE + 256
+    forged[0..4].copy_from_slice(&huge.to_le_bytes());
+
+    let err = decrypt_from_wire(&forged, &key, &iv)
+        .await
+        .expect_err("forged oversize chunk length must be rejected");
+    match err {
+        nk_crypto_tool::CryptoError::Parameter(msg) => assert!(
+            msg.contains("exceeds limit"),
+            "expected chunk-size bound error, got: {msg}"
+        ),
+        other => panic!("expected Parameter(chunk size) error, got: {other:?}"),
+    }
+}
