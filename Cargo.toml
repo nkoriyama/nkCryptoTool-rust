@@ -45,7 +45,6 @@ libc = "0.2"
 tempfile = "3.8"
 parking_lot = "0.12"
 hex = "0.4"
-serial_test = "3.0"
 slint = { version = "1.16", optional = true }
 arboard = { version = "3.4", optional = true }
 nokhwa = { version = "0.10", optional = true, features = ["input-native", "output-threaded"] }
@@ -216,3 +215,4 @@ mobile-ffi = ["uniffi", "mls"]
 
 [dev-dependencies]
 i-slint-backend-testing = "=1.16.1"
+serial_test = "3.0"
