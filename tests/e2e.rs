@@ -20,7 +20,6 @@ fn get_bin() -> String {
 const TEST_PASSPHRASE: &str = "test-passphrase-123";
 
 #[test]
-#[ignore = "subprocess-based e2e test fails on GitHub Actions ubuntu runner with non-zero exit, root cause unidentified; passes reliably in distrobox build-env. Tracked in PHASE5_ROADMAP §5.5.6 for v2.2 investigation."]
 fn test_ecc_e2e_cycle() {
     let bin = get_bin();
     let key_dir = "tests/temp_ecc_keys";
@@ -92,7 +91,7 @@ fn test_ecc_e2e_cycle() {
 }
 
 #[test]
-#[ignore = "subprocess-based e2e test fails on GitHub Actions ubuntu runner with non-zero exit, root cause unidentified; passes reliably in distrobox build-env. Tracked in PHASE5_ROADMAP §5.5.6 for v2.2 investigation."]
+#[ignore = "ECDSA signing fails under backend-openssl-vendored (OpenSSL 3.6.2) with EVP_DigestSignUpdate initialization error (crypto/evp/m_sigver.c). Reproduced locally against the vendored static build (host-independent, NOT a CI-only ubuntu idiosyncrasy); ECC/PQC/Hybrid encrypt cycles all pass. This is an openssl-backend ECDSA signing bug to fix separately before lifting. Tracked in PHASE5_ROADMAP §5.5.6."]
 fn test_ecc_signing_e2e() {
     let bin = get_bin();
     let key_dir = "tests/temp_ecc_sig_keys";
@@ -150,7 +149,6 @@ fn test_ecc_signing_e2e() {
 }
 
 #[test]
-#[ignore = "subprocess-based e2e test fails on GitHub Actions ubuntu runner with non-zero exit, root cause unidentified; passes reliably in distrobox build-env. Tracked in PHASE5_ROADMAP §3.x for v2.2 investigation."]
 fn test_pqc_e2e_cycle() {
     let bin = get_bin();
     let key_dir = "tests/temp_pqc_keys";
@@ -219,7 +217,6 @@ fn test_pqc_e2e_cycle() {
 }
 
 #[test]
-#[ignore = "subprocess-based e2e test fails on GitHub Actions ubuntu runner with non-zero exit, root cause unidentified; passes reliably in distrobox build-env. Tracked in PHASE5_ROADMAP §3.x for v2.2 investigation."]
 fn test_hybrid_e2e_cycle() {
     let bin = get_bin();
     let key_dir = "tests/temp_hybrid_keys";
