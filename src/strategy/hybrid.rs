@@ -178,7 +178,7 @@ impl CryptoStrategy for HybridStrategy {
                 use sha3::Sha3_256;
                 let mut okm = Zeroizing::new(vec![0u8; 32]);
                 let hk = Hkdf::<Sha3_256>::new(Some(&self.salt), &combined_ss);
-                hk.expand(b"hybrid-encryption", &mut *okm)
+                hk.expand(b"hybrid-encryption", &mut okm)
                     .map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
                 drop(hk);
                 self.encryption_key = okm;
@@ -235,7 +235,7 @@ impl CryptoStrategy for HybridStrategy {
                 use sha3::Sha3_256;
                 let mut okm = Zeroizing::new(vec![0u8; 32]);
                 let hk = Hkdf::<Sha3_256>::new(Some(&self.salt), &combined_ss);
-                hk.expand(b"hybrid-encryption", &mut *okm)
+                hk.expand(b"hybrid-encryption", &mut okm)
                     .map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
                 drop(hk);
                 self.encryption_key = okm;

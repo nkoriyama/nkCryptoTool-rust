@@ -525,7 +525,7 @@ pub fn hkdf_expand(prk_secret: &[u8], salt: &[u8], info: &[u8], out_len: usize) 
     use sha3::Sha3_256;
     let mut okm = Zeroizing::new(vec![0u8; out_len]);
     let hk = Hkdf::<Sha3_256>::new(Some(salt), prk_secret);
-    hk.expand(info, &mut *okm)
+    hk.expand(info, &mut okm)
         .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
     drop(hk);
     Ok(okm)

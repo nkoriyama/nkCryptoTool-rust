@@ -1017,7 +1017,7 @@ impl NetworkProcessor {
                     #[cfg(feature = "backend-rustcrypto")]
                     {
                         use rand_core::{RngCore, OsRng};
-                        OsRng.fill_bytes(&mut *nonce);
+                        OsRng.fill_bytes(&mut nonce);
                     }
 
                     let tx_aead = match tx_aead_opt.as_mut() {

@@ -139,7 +139,7 @@ impl PqcStrategy {
 
         let priv_bytes = Zeroizing::new(fs::read(privkey_path)?);
         let pem_str = Zeroizing::new(
-            std::str::from_utf8(&*priv_bytes)
+            std::str::from_utf8(&priv_bytes)
                 .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
                 .to_string(),
         );
@@ -406,7 +406,7 @@ impl CryptoStrategy for PqcStrategy {
     ) -> Result<()> {
         let priv_bytes = Zeroizing::new(fs::read(priv_key_path)?);
         let pem_str = Zeroizing::new(
-            std::str::from_utf8(&*priv_bytes)
+            std::str::from_utf8(&priv_bytes)
                 .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
                 .to_string(),
         );
@@ -431,7 +431,7 @@ impl CryptoStrategy for PqcStrategy {
     fn prepare_verification(&mut self, pub_key_path: &Path, _digest_algo: &str) -> Result<()> {
         let pub_bytes = Zeroizing::new(fs::read(pub_key_path)?);
         let pem_str = Zeroizing::new(
-            std::str::from_utf8(&*pub_bytes)
+            std::str::from_utf8(&pub_bytes)
                 .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
                 .to_string(),
         );

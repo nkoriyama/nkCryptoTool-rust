@@ -739,7 +739,7 @@ pub fn pqc_keygen_dsa(
         let seed = Zeroizing::new(xi.to_vec());
         match algo {
             "ML-DSA-44" => {
-                let (pk, sk) = fips204::ml_dsa_44::KG::keygen_from_seed(&*xi);
+                let (pk, sk) = fips204::ml_dsa_44::KG::keygen_from_seed(&xi);
                 Ok((
                     Zeroizing::new(sk.into_bytes().to_vec()),
                     pk.into_bytes().to_vec(),
@@ -747,7 +747,7 @@ pub fn pqc_keygen_dsa(
                 ))
             }
             "ML-DSA-65" => {
-                let (pk, sk) = fips204::ml_dsa_65::KG::keygen_from_seed(&*xi);
+                let (pk, sk) = fips204::ml_dsa_65::KG::keygen_from_seed(&xi);
                 Ok((
                     Zeroizing::new(sk.into_bytes().to_vec()),
                     pk.into_bytes().to_vec(),
@@ -755,7 +755,7 @@ pub fn pqc_keygen_dsa(
                 ))
             }
             "ML-DSA-87" => {
-                let (pk, sk) = fips204::ml_dsa_87::KG::keygen_from_seed(&*xi);
+                let (pk, sk) = fips204::ml_dsa_87::KG::keygen_from_seed(&xi);
                 Ok((
                     Zeroizing::new(sk.into_bytes().to_vec()),
                     pk.into_bytes().to_vec(),
@@ -1038,12 +1038,12 @@ pub fn hkdf(
         let mut okm = Zeroizing::new(vec![0u8; length]);
         if md_name.contains("256") {
             let h = Hkdf::<Sha3_256>::new(Some(salt), ikm);
-            h.expand(info.as_bytes(), &mut *okm)
+            h.expand(info.as_bytes(), &mut okm)
                 .map_err(|_| CryptoError::Parameter("HKDF expand failed".to_string()))?;
             drop(h); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
         } else {
             let h = Hkdf::<Sha3_512>::new(Some(salt), ikm);
-            h.expand(info.as_bytes(), &mut *okm)
+            h.expand(info.as_bytes(), &mut okm)
                 .map_err(|_| CryptoError::Parameter("HKDF expand failed".to_string()))?;
             drop(h); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
         }

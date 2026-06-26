@@ -92,7 +92,7 @@ impl EccStrategy {
         let mut okm = Zeroizing::new(vec![0u8; out_len]);
         use sha3::Sha3_256;
         let hk = Hkdf::<Sha3_256>::new(Some(salt), secret);
-        hk.expand(info.as_bytes(), &mut *okm)
+        hk.expand(info.as_bytes(), &mut okm)
             .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         drop(hk); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
         Ok(okm)
@@ -158,7 +158,7 @@ impl EccStrategy {
 
         let priv_bytes = Zeroizing::new(fs::read(privkey_path)?);
         let pem_str = Zeroizing::new(
-            std::str::from_utf8(&*priv_bytes)
+            std::str::from_utf8(&priv_bytes)
                 .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
                 .to_string(),
         );
@@ -274,7 +274,7 @@ impl CryptoStrategy for EccStrategy {
     ) -> Result<()> {
         let priv_bytes = Zeroizing::new(fs::read(priv_path)?);
         let pem_str = Zeroizing::new(
-            std::str::from_utf8(&*priv_bytes)
+            std::str::from_utf8(&priv_bytes)
                 .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
                 .to_string(),
         );
@@ -432,7 +432,7 @@ impl CryptoStrategy for EccStrategy {
     ) -> Result<()> {
         let priv_bytes = Zeroizing::new(fs::read(priv_key_path)?);
         let pem_str = Zeroizing::new(
-            std::str::from_utf8(&*priv_bytes)
+            std::str::from_utf8(&priv_bytes)
                 .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
                 .to_string(),
         );

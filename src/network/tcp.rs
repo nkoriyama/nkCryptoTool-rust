@@ -183,7 +183,7 @@ impl NetworkProcessor {
                             .map_err(|e| CryptoError::FileRead(e.to_string()))?,
                     );
                     let pubkey_pem = Zeroizing::new(
-                        std::str::from_utf8(&*pubkey_bytes)
+                        std::str::from_utf8(&pubkey_bytes)
                             .map_err(|_| {
                                 CryptoError::Parameter("Invalid UTF-8 in key".to_string())
                             })?
@@ -306,7 +306,7 @@ impl NetworkProcessor {
                             .map_err(|e| CryptoError::FileRead(e.to_string()))?,
                     );
                     let privkey_pem = Zeroizing::new(
-                        std::str::from_utf8(&*privkey_bytes)
+                        std::str::from_utf8(&privkey_bytes)
                             .map_err(|_| {
                                 CryptoError::Parameter("Invalid UTF-8 in key".to_string())
                             })?
@@ -472,7 +472,7 @@ impl NetworkProcessor {
                             .map_err(|e| CryptoError::FileRead(e.to_string()))?,
                     );
                     let privkey_pem = Zeroizing::new(
-                        std::str::from_utf8(&*privkey_bytes)
+                        std::str::from_utf8(&privkey_bytes)
                             .map_err(|_| {
                                 CryptoError::Parameter("Invalid UTF-8 in key".to_string())
                             })?
@@ -526,7 +526,7 @@ impl NetworkProcessor {
                             .map_err(|e| CryptoError::FileRead(e.to_string()))?,
                     );
                     let pubkey_pem = Zeroizing::new(
-                        std::str::from_utf8(&*pubkey_bytes)
+                        std::str::from_utf8(&pubkey_bytes)
                             .map_err(|_| {
                                 CryptoError::Parameter("Invalid UTF-8 in key".to_string())
                             })?
