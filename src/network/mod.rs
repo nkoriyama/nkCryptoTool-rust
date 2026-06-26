@@ -905,12 +905,13 @@ impl NetworkProcessor {
                         }
                     }
 
-                    if rx_aead_opt.is_none() {
-                        rx_aead_opt = Some(backend::new_decrypt(&aead_name_str, &rx_key, nonce)?);
-                    } else {
-                        rx_aead_opt.as_mut().unwrap().re_init(&rx_key, nonce)?;
-                    }
-                    let rx_aead = rx_aead_opt.as_mut().unwrap();
+                    let rx_aead = match rx_aead_opt.as_mut() {
+                        Some(aead) => {
+                            aead.re_init(&rx_key, nonce)?;
+                            aead
+                        }
+                        None => rx_aead_opt.insert(backend::new_decrypt(&aead_name_str, &rx_key, nonce)?),
+                    };
                     rx_aead.set_tag(tag)?;
 
                     let n = rx_aead.update(ciphertext, &mut out_buf)?;
@@ -1019,12 +1020,13 @@ impl NetworkProcessor {
                         OsRng.fill_bytes(&mut *nonce);
                     }
 
-                    if tx_aead_opt.is_none() {
-                        tx_aead_opt = Some(backend::new_encrypt(aead_name, &tx_key, &nonce)?);
-                    } else {
-                        tx_aead_opt.as_mut().unwrap().re_init(&tx_key, &nonce)?;
-                    }
-                    let tx_aead = tx_aead_opt.as_mut().unwrap();
+                    let tx_aead = match tx_aead_opt.as_mut() {
+                        Some(aead) => {
+                            aead.re_init(&tx_key, &nonce)?;
+                            aead
+                        }
+                        None => tx_aead_opt.insert(backend::new_encrypt(aead_name, &tx_key, &nonce)?),
+                    };
                     let mut encrypted = Zeroizing::new(vec![0u8; data.len() + 32]);
                     let n = tx_aead.update(data, &mut encrypted)?;
                     let final_n = tx_aead.finalize(&mut encrypted[n..])?;

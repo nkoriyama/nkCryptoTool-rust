@@ -69,7 +69,7 @@ impl FromStr for Ticket {
             return Err(CryptoError::Parameter("Invalid ticket prefix".to_string()));
         }
 
-        let data = BASE32_NOPAD.decode(s[5..].as_bytes())
+        let data = BASE32_NOPAD.decode(&s.as_bytes()[5..])
             .map_err(|e| CryptoError::Parameter(format!("Invalid ticket encoding: {}", e)))?;
 
         if data.len() < 1 + 32 + 2 + 2 + 1 + 32 + 32 + 4 {

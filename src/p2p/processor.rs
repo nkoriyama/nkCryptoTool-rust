@@ -638,7 +638,7 @@ impl NetworkProcessor {
                     let client_kem_priv_clone = client_kem_priv.clone();
                     let server_ecc_pub_clone = server_ecc_pub.clone();
                     let kem_ct_clone = kem_ct.clone();
-                    let passphrase = config.passphrase.as_ref().map(|s| s.clone());
+                    let passphrase = config.passphrase.clone();
                     let kem_algo_clone = kem_algo.clone();
 
                     let (ss_ecc, kem_ss) = tokio::task::spawn_blocking(move || {

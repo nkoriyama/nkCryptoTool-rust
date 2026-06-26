@@ -182,8 +182,7 @@ impl Drop for SecureBuffer {
 
 impl SecureBuffer {
     pub fn new(size: usize) -> Result<Self> {
-        let mut buf = Vec::with_capacity(size);
-        buf.resize(size, 0);
+        let buf = vec![0u8; size];
 
         // Lock memory to prevent swapping. munlock is paired in Drop.
         unsafe {
@@ -496,7 +495,7 @@ pub fn wrap_pqc_priv_to_pkcs8_encrypted(
 }
 
 pub fn wrap_to_pem_zeroizing(data: &[u8], label: &str) -> Zeroizing<String> {
-    let mut b64_buf = Zeroizing::new(vec![0u8; (data.len() + 2) / 3 * 4]);
+    let mut b64_buf = Zeroizing::new(vec![0u8; data.len().div_ceil(3) * 4]);
     let n = BASE64
         .encode_slice(data, &mut *b64_buf)
         .map_err(|e| CryptoError::Parameter(format!("Base64 encode error: {}", e)))

@@ -290,7 +290,7 @@ fn resolve_key_path(key_dir: &str, p: Option<String>) -> Option<String> {
         // Path (not a manual '/' check) makes this correct on every
         // platform's separator.
         let is_bare = !path.is_absolute()
-            && path.parent().map_or(true, |parent| parent.as_os_str().is_empty());
+            && path.parent().is_none_or(|parent| parent.as_os_str().is_empty());
         if is_bare {
             std::path::Path::new(key_dir).join(&v).to_string_lossy().into_owned()
         } else {
@@ -498,7 +498,7 @@ async fn main() -> anyhow::Result<()> {
             &config.signing_privkey,
         ]
         .into_iter()
-        .any(|p| private_key_file_is_encrypted(p));
+        .any(private_key_file_is_encrypted);
         if reads_private_key && encrypted_key_present {
             config.passphrase = Some(
                 nk_crypto_tool::utils::get_masked_passphrase()
