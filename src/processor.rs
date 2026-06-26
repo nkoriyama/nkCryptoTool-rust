@@ -641,7 +641,9 @@ impl CryptoProcessor {
             let mut writer = BufWriter::with_capacity(BUF_SIZE * 4, out_file);
 
             let mut in_buf = vec![0u8; BUF_SIZE];
-            let mut out_buf = vec![0u8; BUF_SIZE + AEAD_OVERHEAD];
+            // Pass 2 writes real plaintext; keep it in a Zeroizing buffer like
+            // Pass 1 so decrypted bytes do not linger on the heap after drop.
+            let mut out_buf = Zeroizing::new(vec![0u8; BUF_SIZE + AEAD_OVERHEAD]);
             let mut total_read_pass2 = 0u64;
 
             while total_read_pass2 < ciphertext_size {

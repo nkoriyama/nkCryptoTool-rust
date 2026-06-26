@@ -922,8 +922,9 @@ impl NetworkProcessor {
                     // message. Some peers' terminals/IMEs occasionally emit
                     // non-UTF-8 bytes, and showing a partial-but-readable
                     // message is more useful than a single placeholder line.
-                    let msg_content: String =
-                        String::from_utf8_lossy(&out_buf[..used]).into_owned();
+                    let msg_content: Zeroizing<String> = Zeroizing::new(
+                        String::from_utf8_lossy(&out_buf[..used]).into_owned(),
+                    );
                     let msg = Zeroizing::new(
                         msg_content
                             .chars()

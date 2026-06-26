@@ -111,6 +111,13 @@ const ATREST_KDF_PBKDF2_SHA512: u8 = 0x01;
 /// PBKDF2 iterations. Matches SQLCipher 4's own default so the user's
 /// passphrase enjoys the same brute-force resistance at both layers.
 const ATREST_KDF_ITERATIONS: u32 = 256_000;
+/// Accepted bounds for the header-declared PBKDF2 iteration count. The writer
+/// always emits `ATREST_KDF_ITERATIONS`; clamping the value read back rejects a
+/// tampered header that tries to force a trivially weak KDF (offline-crack
+/// downgrade) or an absurdly large one (decrypt-time DoS). The lower bound sits
+/// well below the 256k default so no genuine file is rejected.
+const ATREST_KDF_MIN_ITERATIONS: u32 = 100_000;
+const ATREST_KDF_MAX_ITERATIONS: u32 = 100_000_000;
 const ATREST_SALT_LEN: usize = 16;
 const ATREST_NONCE_LEN: usize = 12;
 const ATREST_TAG_LEN: usize = 16;
@@ -286,6 +293,12 @@ impl AtRestKey {
             )));
         }
         let iters = u32::from_be_bytes(bytes[10..14].try_into().unwrap());
+        if !(ATREST_KDF_MIN_ITERATIONS..=ATREST_KDF_MAX_ITERATIONS).contains(&iters) {
+            return Err(GroupError::Storage(format!(
+                "at-rest file: PBKDF2 iteration count {iters} outside accepted range \
+                 [{ATREST_KDF_MIN_ITERATIONS}, {ATREST_KDF_MAX_ITERATIONS}]"
+            )));
+        }
         let salt: [u8; ATREST_SALT_LEN] =
             bytes[14..14 + ATREST_SALT_LEN].try_into().unwrap();
         let nonce: [u8; ATREST_NONCE_LEN] = bytes
@@ -1228,6 +1241,33 @@ mod tests {
                     "expected at-rest decrypt error, got: {msg}"
                 );
             }
+            other => panic!("expected Storage error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tampered_low_iteration_count_is_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("at-rest.key");
+        AtRestKey::generate()
+            .expect("generate")
+            .save_encrypted(&path, TEST_PASS)
+            .expect("save");
+
+        // Force the header PBKDF2 iteration count (bytes 10..14, BE) to 1 — a
+        // downgrade an attacker with file-write access might attempt. It must be
+        // rejected before any key derivation, not silently honored.
+        let mut bytes = fs::read(&path).expect("read");
+        bytes[10..14].copy_from_slice(&1u32.to_be_bytes());
+        fs::write(&path, &bytes).expect("write");
+
+        let err = AtRestKey::load_encrypted(&path, TEST_PASS)
+            .expect_err("iters=1 must be rejected");
+        match err {
+            GroupError::Storage(msg) => assert!(
+                msg.contains("outside accepted range"),
+                "expected iteration-range error, got: {msg}"
+            ),
             other => panic!("expected Storage error, got {other:?}"),
         }
     }

@@ -27,4 +27,37 @@ Iroh file transfer currently only supports redirection via stdin/stdout. Direct 
 Automatic NKCT1 ticket reading via camera is not yet implemented.
 - **Workaround**: Manual copy-paste of connection tickets.
 
+## Security Audit Residuals (accepted, low/informational)
+
+A 2026-06 audit surfaced the items below. Each was verified against the code
+and is intentionally left as-is; the rationale is recorded here so the
+trade-off is explicit rather than forgotten.
+
+1. **TCP chat per-message random nonce** (`network/mod.rs`): AES-GCM with a
+   random 96-bit nonce has a birthday bound around 2^32 messages per key. A
+   single interactive chat session will not approach this, and the TCP
+   transport is already deprecated (Iroh is preferred). Not changed.
+2. **Chat replay window past the 100k nonce-history cap** (`network/mod.rs`):
+   the per-session seen-nonce set is bounded (memory-safety/DoS trade-off); a
+   replay of an *evicted* nonce within the same long-lived session would only
+   re-display one already-seen line — no key compromise or integrity break.
+3. **FETCH prekey rate-limit vs. fresh NodeIds** (`network/inbox.rs`): the
+   per-NodeId token bucket is bypassable by minting new NodeIds (cheap). This
+   is the documented residual; the `Require Prekey (Strict PQ-FS)` profile is
+   the real backstop against depletion downgrade.
+4. **Non-constant-time fingerprint / pinned-key comparison**
+   (`p2p/processor.rs`, `network/tcp.rs`): both operands are *public* values
+   (a peer public key and its SHA3-256), compared once per connection, so a
+   timing side-channel leaks nothing secret. Left as `!=` to avoid touching
+   auth-critical paths for no security gain.
+5. **Per-record at-rest rollback** (redb AAD binds slot but not a version):
+   whole-DB anti-rollback (`rollback.rs`, default Off) and MLS epoch
+   monotonicity cover this; see `ATREST_ANTIROLLBACK_DESIGN.md`.
+6. **redb create→chmod window** (`group/redb_storage.rs`): only AEAD ciphertext
+   exists in the brief window before the file is tightened to 0600.
+
+(Several other audit findings — the ECDSA verify bug, network-receive release
+of unverified plaintext, the `Ticket::from_str` DoS, plaintext ECC keys, and
+the weak PBKDF2 iteration count — were fixed; see the git history.)
+
 
