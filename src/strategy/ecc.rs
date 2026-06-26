@@ -180,11 +180,15 @@ impl EccStrategy {
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
 
-        self.shared_secret = backend::ecc_dh(
+        // Decrypt if the key is a passphrase-encrypted PKCS#8 (no-op for a
+        // plaintext key), so the backend always receives raw PKCS#8.
+        let priv_key_der = crate::utils::extract_raw_private_key(
             &priv_key_der,
-            &self.ephemeral_pubkey,
             passphrase.as_deref().map(|x| x.as_str()),
         )?;
+
+        // priv_key_der is already decrypted above, so no passphrase is needed.
+        self.shared_secret = backend::ecc_dh(&priv_key_der, &self.ephemeral_pubkey, None)?;
         Ok(())
     }
 }
@@ -232,7 +236,18 @@ impl CryptoStrategy for EccStrategy {
             let wrapped = provider.wrap_raw(&priv_der, passphrase)?;
             crate::utils::secure_write(priv_path, wrapped, force)?;
         } else {
-            let priv_pem = crate::utils::wrap_to_pem_zeroizing(&priv_der, "PRIVATE KEY");
+            // When a passphrase is supplied, encrypt the PKCS#8 key (PBES2)
+            // instead of writing it in the clear. `priv_der` is already PKCS#8.
+            // Previously the passphrase was silently ignored and the ECC private
+            // key was stored unencrypted — a false sense of protection.
+            let priv_pem = match passphrase.filter(|p| !p.is_empty()) {
+                Some(pass) => {
+                    let enc = Zeroizing::new(crate::utils::encrypt_pkcs8_der(&priv_der, pass)?);
+                    crate::utils::wrap_to_pem_zeroizing(&enc, "PRIVATE KEY")
+                }
+                // No extra plaintext copy: wrap the already-`Zeroizing` der.
+                None => crate::utils::wrap_to_pem_zeroizing(&priv_der, "PRIVATE KEY"),
+            };
             crate::utils::secure_write(priv_path, priv_pem.as_bytes(), force)?;
         }
 
@@ -281,8 +296,15 @@ impl CryptoStrategy for EccStrategy {
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
 
-        let pub_der =
-            backend::extract_public_key(&priv_key_der, passphrase.as_deref().map(|x| x.as_str()))?;
+        // Decrypt if the key is a passphrase-encrypted PKCS#8 (no-op for a
+        // plaintext key), so the backend always receives raw PKCS#8.
+        let priv_key_der = crate::utils::extract_raw_private_key(
+            &priv_key_der,
+            passphrase.as_deref().map(|x| x.as_str()),
+        )?;
+
+        // priv_key_der is already decrypted above, so no passphrase is needed.
+        let pub_der = backend::extract_public_key(&priv_key_der, None)?;
         crate::utils::secure_write(pub_path, crate::utils::wrap_to_pem(&pub_der, "PUBLIC KEY"), force)?;
         Ok(())
     }
@@ -432,8 +454,16 @@ impl CryptoStrategy for EccStrategy {
             crate::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY")?
         };
 
+        // Decrypt if the key is a passphrase-encrypted PKCS#8 (no-op for a
+        // plaintext key), so the signer always receives raw PKCS#8.
+        let priv_key_der = crate::utils::extract_raw_private_key(
+            &priv_key_der,
+            passphrase.as_deref().map(|x| x.as_str()),
+        )?;
+
+        // priv_key_der is already decrypted above, so no passphrase is needed.
         let mut ctx = backend::new_hash(digest_algo)?;
-        ctx.init_sign(&priv_key_der, passphrase.as_deref().map(|x| x.as_str()))?;
+        ctx.init_sign(&priv_key_der, None)?;
 
         self.sign_key_der = Some(priv_key_der);
         self.hash_ctx = Some(ctx);

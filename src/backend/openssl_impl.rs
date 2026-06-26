@@ -1105,8 +1105,12 @@ pub fn generate_ecc_key_pair(curve_name: &str) -> Result<(Zeroizing<Vec<u8>>, Ve
             EcGroup::from_curve_name(nid).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         let ec_key = EcKey::generate(&group).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         let pkey = PKey::from_ec_key(ec_key).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        // Emit PKCS#8 (not the traditional SEC1 `private_key_to_der`) so the
+        // format matches the RustCrypto backend and can be wrapped as a PBES2
+        // EncryptedPrivateKeyInfo when a passphrase is given. Existing on-disk
+        // SEC1 keys still load via the format-agnostic key loaders.
         let priv_der = pkey
-            .private_key_to_der()
+            .private_key_to_pkcs8()
             .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         let pub_der = pkey
             .public_key_to_der()

@@ -445,32 +445,34 @@ pub fn wrap_pqc_priv_to_pkcs8(
     Ok(wrap_der_sequence_zeroizing(&pkcs8))
 }
 
-pub fn wrap_pqc_priv_to_pkcs8_encrypted(
-    raw_priv: &[u8],
-    algo: &str,
-    passphrase: &str,
-) -> Result<Vec<u8>> {
-    let pkcs8_der = wrap_pqc_priv_to_pkcs8(raw_priv, algo)?;
+/// PBKDF2 iteration count for passphrase-encrypted private keys (PBES2).
+/// Raised from the legacy 2048 to meet OWASP 2023 guidance (≥600k for
+/// PBKDF2-HMAC-SHA256). Decryption reads the iteration count from the PBES2
+/// header, so existing keys encrypted with the old value still load.
+const PBKDF2_ITERATIONS: u32 = 600_000;
 
-    use pkcs8::PrivateKeyInfo;
-    use rand_core::OsRng;
-    let pki = PrivateKeyInfo::from_der(&pkcs8_der)
-        .map_err(|e| CryptoError::PrivateKeyLoad(format!("PKCS#8 parse failed: {}", e)))?;
-    
-    // F-57: Use PBKDF2-SHA256 + AES-256-CBC for maximum interoperability.
-    // Scrypt defaults can hit memory limits in some OpenSSL versions.
+/// Encrypt an existing PKCS#8 `PrivateKeyInfo` DER under `passphrase` using
+/// PBES2 (PBKDF2-HMAC-SHA256 + AES-256-CBC) with a random salt/IV. Shared by
+/// the ECC and PQC private-key writers so both get the same KDF strength.
+pub fn encrypt_pkcs8_der(pkcs8_der: &[u8], passphrase: &str) -> Result<Vec<u8>> {
     use pkcs8::pkcs5::pbes2;
+    use pkcs8::PrivateKeyInfo;
+    use rand_core::{OsRng, RngCore};
+
+    let pki = PrivateKeyInfo::from_der(pkcs8_der)
+        .map_err(|e| CryptoError::PrivateKeyLoad(format!("PKCS#8 parse failed: {}", e)))?;
+
+    // PBKDF2-SHA256 + AES-256-CBC for maximum interoperability (scrypt defaults
+    // can hit memory limits in some OpenSSL versions).
     let mut salt = [0u8; 16];
-    use rand_core::RngCore;
     OsRng.fill_bytes(&mut salt);
-    
     let mut iv = [0u8; 16];
     OsRng.fill_bytes(&mut iv);
 
     let params = pbes2::Parameters {
         kdf: pbes2::Kdf::Pbkdf2(pbes2::Pbkdf2Params {
             salt: &salt,
-            iteration_count: 2048,
+            iteration_count: PBKDF2_ITERATIONS,
             key_length: Some(32),
             prf: pbes2::Pbkdf2Prf::HmacWithSha256,
         }),
@@ -482,6 +484,15 @@ pub fn wrap_pqc_priv_to_pkcs8_encrypted(
         .map_err(|e| CryptoError::PrivateKeyLoad(format!("Encryption failed: {}", e)))?;
 
     Ok(encrypted.as_bytes().to_vec())
+}
+
+pub fn wrap_pqc_priv_to_pkcs8_encrypted(
+    raw_priv: &[u8],
+    algo: &str,
+    passphrase: &str,
+) -> Result<Vec<u8>> {
+    let pkcs8_der = wrap_pqc_priv_to_pkcs8(raw_priv, algo)?;
+    encrypt_pkcs8_der(&pkcs8_der, passphrase)
 }
 
 pub fn wrap_to_pem_zeroizing(data: &[u8], label: &str) -> Zeroizing<String> {
@@ -667,6 +678,30 @@ pub fn get_passphrase_if_needed(
 mod tests {
     use super::*;
     use crate::backend;
+
+    #[test]
+    fn ecc_private_key_encryption_roundtrip_and_wrong_pass_fails() {
+        use pkcs8::der::Decode;
+        let (priv_der, _pub) = backend::generate_ecc_key_pair("prime256v1").unwrap();
+
+        let enc = encrypt_pkcs8_der(&priv_der, "correct horse battery").unwrap();
+        // The blob must be a PBES2 EncryptedPrivateKeyInfo, not the plaintext
+        // key — i.e. the passphrase is actually applied (H1: previously ECC
+        // keys were written in the clear and the passphrase was ignored).
+        assert!(
+            pkcs8::EncryptedPrivateKeyInfo::from_der(&enc).is_ok(),
+            "encrypted key must be a PBES2 EncryptedPrivateKeyInfo"
+        );
+        assert_ne!(enc.as_slice(), priv_der.as_slice(), "must not be plaintext");
+
+        // Correct passphrase recovers the original PKCS#8.
+        let dec = extract_raw_private_key(&enc, Some("correct horse battery")).unwrap();
+        assert_eq!(dec.as_slice(), priv_der.as_slice());
+
+        // Wrong / missing passphrase fail cleanly (no panic).
+        assert!(extract_raw_private_key(&enc, Some("wrong")).is_err());
+        assert!(extract_raw_private_key(&enc, None).is_err());
+    }
 
     fn test_kem_roundtrip(algo: &str) {
         let (sk, pk, _) = backend::pqc_keygen_kem(algo).unwrap();
