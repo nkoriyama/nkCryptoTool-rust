@@ -412,6 +412,15 @@ mod tests {
         // Drop the writer reference before reading (file handle closes via Drop)
         drop(writer);
 
+        // Received bytes are staged to a temp file and only published to the
+        // destination once the AEAD tag verifies. finalize_recv(true) performs
+        // that atomic commit; before it, the destination must not exist.
+        assert!(
+            tokio::fs::metadata(&tmp).await.is_err(),
+            "destination must be empty until finalize_recv commits"
+        );
+        provider.finalize_recv(true).unwrap();
+
         let contents = tokio::fs::read(&tmp).await.unwrap();
         assert_eq!(contents, b"received-f2-content");
 
