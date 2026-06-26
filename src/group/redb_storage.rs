@@ -247,7 +247,7 @@ impl RedbBackend {
             .file_name()
             .map(|n| n.as_encoded_bytes().to_vec())
             .unwrap_or_default();
-        let db = Database::create(path).map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let db = open_db_secure(path)?;
         Ok(Self {
             db: Arc::new(db),
             keys: Arc::new(RecordKeys::derive(dek)),
@@ -375,7 +375,7 @@ impl RedbBackend {
             .file_name()
             .map(|n| n.as_encoded_bytes().to_vec())
             .unwrap_or_default();
-        let db = Database::create(path).map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let db = open_db_secure(path)?;
         let keys = RecordKeys::derive(dek);
         let rtx = db
             .begin_read()
@@ -413,7 +413,7 @@ impl RedbBackend {
             .file_name()
             .map(|n| n.as_encoded_bytes().to_vec())
             .unwrap_or_default();
-        let db = Database::create(path).map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let db = open_db_secure(path)?;
         let old = RecordKeys::derive(old_dek);
         let new = RecordKeys::derive(new_dek);
 
@@ -534,6 +534,32 @@ fn seal_value(
     out.extend_from_slice(nonce.as_slice());
     out.extend_from_slice(&ct);
     Ok(out)
+}
+
+/// Open (or create) a redb database, ensuring the file is `0o600` from the
+/// moment it exists. `Database::create` alone would create the file under the
+/// default umask (typically `0o644`) and leave a brief window before
+/// `tighten_permissions` chmods it; pre-creating with `create_new(0o600)`
+/// closes that window. An already-present DB is opened as-is (then still
+/// tightened by the caller). Best-effort/no-op on non-unix.
+fn open_db_secure(path: &Path) -> Result<Database, RedbStorageError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+        {
+            // Pre-created an empty 0o600 file; redb initializes it as a new DB.
+            Ok(_) => {}
+            // Existing DB — open it (race-safe: create_new is atomic).
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(RedbStorageError::Backend(format!("precreate db: {e}"))),
+        }
+    }
+    Database::create(path).map_err(|e| RedbStorageError::Backend(e.to_string()))
 }
 
 /// Decrypt a record produced by [`seal_value`], verifying the slot binding.
@@ -1209,7 +1235,7 @@ impl RedbPrekeyStore {
             .file_name()
             .map(|n| n.as_encoded_bytes().to_vec())
             .unwrap_or_default();
-        let db = Database::create(path).map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let db = open_db_secure(path)?;
         // Create tables + write/verify the DEK sentinel.
         {
             let wtx = db
@@ -1612,6 +1638,19 @@ mod tests {
         let dek = [0x37u8; 32];
         let b = RedbBackend::open(dir.path().join("groups.redb"), &dek).expect("open");
         (dir, b)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_db_file_is_private_from_creation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("groups.redb");
+        let _b = RedbBackend::open(&path, &[0x37u8; 32]).expect("open");
+        // open_db_secure pre-creates the file at 0o600, so it is never group/
+        // world readable — not even in the window before tighten_permissions.
+        let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
+        assert_eq!(mode & 0o077, 0, "redb DB file must not be group/other accessible (mode {mode:o})");
     }
 
     #[test]
