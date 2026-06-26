@@ -91,6 +91,19 @@ impl Drop for AbortGuard {
 pub trait IOProvider: Send + Sync + 'static {
     fn stdin(&self) -> Box<dyn tokio::io::AsyncRead + Unpin + Send>;
     fn stdout(&self) -> Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+
+    /// Called once by the file-receive flow after the transfer attempt.
+    /// `committed` is true only when decryption AND the trailing AEAD tag
+    /// verified (i.e. `receive_file` returned `Ok`). Implementations that stage
+    /// received plaintext to a temporary file MUST move it to its final
+    /// destination only when `committed`, and discard it otherwise, so that
+    /// unauthenticated plaintext is never persisted at the destination path.
+    /// The default is a no-op, which is correct for stdout-backed providers
+    /// (the bytes have already been streamed to the consumer).
+    fn finalize_recv(&self, committed: bool) -> std::io::Result<()> {
+        let _ = committed;
+        Ok(())
+    }
 }
 
 pub struct DefaultIOProvider;
@@ -398,6 +411,12 @@ impl tokio::io::AsyncWrite for GuiStdout {
 pub struct FileIOProvider {
     send_file: parking_lot::Mutex<Option<tokio::fs::File>>,
     recv_file: parking_lot::Mutex<Option<tokio::fs::File>>,
+    // Received plaintext is staged to `recv_temp` and only renamed to
+    // `recv_final` once the trailing AEAD tag verifies (`finalize_recv(true)`),
+    // so a tampered transfer never leaves unauthenticated bytes at the
+    // destination path. `None` for send-only providers.
+    recv_temp: Option<std::path::PathBuf>,
+    recv_final: Option<std::path::PathBuf>,
 }
 
 impl FileIOProvider {
@@ -406,14 +425,45 @@ impl FileIOProvider {
         Ok(Self {
             send_file: parking_lot::Mutex::new(Some(file)),
             recv_file: parking_lot::Mutex::new(None),
+            recv_temp: None,
+            recv_final: None,
         })
     }
 
     pub async fn new_recv(path: std::path::PathBuf) -> std::io::Result<Self> {
-        let file = tokio::fs::File::create(&path).await?;
+        use rand_core::RngCore;
+        // Stage to a sibling temp file in the destination directory so the final
+        // commit is an atomic same-filesystem rename. The plaintext is only
+        // moved into place after the AEAD tag verifies (see `finalize_recv`).
+        let fname = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "recv".to_string());
+        let temp_name = format!(".{}.tmp.{:016x}", fname, rand_core::OsRng.next_u64());
+        let temp = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.join(temp_name),
+            _ => std::path::PathBuf::from(temp_name),
+        };
+        // Create the staging file exclusively (create_new) and, on unix, with
+        // O_NOFOLLOW + mode 0600, so a pre-planted symlink/file at the temp path
+        // cannot redirect the write to or truncate another file. Mirrors the
+        // hardened temp creation in the local-file decrypt path (processor.rs).
+        let std_file = {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+            }
+            opts.open(&temp)?
+        };
+        let file = tokio::fs::File::from_std(std_file);
         Ok(Self {
             send_file: parking_lot::Mutex::new(None),
             recv_file: parking_lot::Mutex::new(Some(file)),
+            recv_temp: Some(temp),
+            recv_final: Some(path),
         })
     }
 }
@@ -429,6 +479,41 @@ impl IOProvider for FileIOProvider {
         match self.recv_file.lock().take() {
             Some(f) => Box::new(f),
             None => Box::new(tokio::io::sink()),
+        }
+    }
+
+    fn finalize_recv(&self, committed: bool) -> std::io::Result<()> {
+        // Drop any temp handle still held (e.g. if `stdout()` was never taken,
+        // such as a handshake failure before transfer) so the OS file is closed
+        // before we rename/remove it (required on Windows).
+        let _ = self.recv_file.lock().take();
+        let (temp, final_path) = match (self.recv_temp.as_ref(), self.recv_final.as_ref()) {
+            (Some(t), Some(f)) => (t, f),
+            // Send-only provider, or constructed without staging: nothing to do.
+            _ => return Ok(()),
+        };
+        if committed {
+            // Atomic same-directory rename publishes the verified plaintext.
+            std::fs::rename(temp, final_path)
+        } else {
+            // Discard unauthenticated bytes; tolerate an already-absent temp.
+            match std::fs::remove_file(temp) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
+    }
+}
+
+impl Drop for FileIOProvider {
+    fn drop(&mut self) {
+        // Safety net: if a staged recv temp file still exists (finalize_recv was
+        // never reached due to an early error/panic), best-effort remove it so
+        // decrypted-but-unauthenticated plaintext is not left on disk. After a
+        // successful commit the temp was renamed away, so this is a no-op.
+        if let Some(temp) = self.recv_temp.take() {
+            let _ = std::fs::remove_file(temp);
         }
     }
 }

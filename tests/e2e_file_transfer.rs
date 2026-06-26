@@ -300,3 +300,69 @@ async fn test_e2e_chunk_len_forgery() {
         other => panic!("expected Parameter(chunk size) error, got: {other:?}"),
     }
 }
+
+// --------------------------------------------------------------------------
+// FileIOProvider staging: a received file must only appear at its destination
+// path after the AEAD tag verifies. The receive flow stages plaintext to a
+// temp file and calls finalize_recv(committed) — true on a verified transfer,
+// false when decryption/auth failed — so unauthenticated bytes are never
+// persisted at the destination. (Addresses the streaming "release of
+// unverified plaintext" exposure on the network file-receive path.)
+// --------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_recv_finalize_discards_unverified_on_failure() {
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dest = dir.path().join("out.bin");
+
+    let io = FileIOProvider::new_recv(dest.clone())
+        .await
+        .expect("new_recv");
+    // Simulate the receive loop writing decrypted-but-unverified bytes.
+    {
+        let mut w = io.stdout();
+        w.write_all(b"unverified-bytes").await.unwrap();
+        w.flush().await.unwrap();
+    }
+    // Tag verification failed -> discard the staged file.
+    io.finalize_recv(false).expect("finalize_recv(false)");
+
+    assert!(
+        !dest.exists(),
+        "destination must not exist after an unauthenticated transfer"
+    );
+    // The staged temp file must be gone too (no silent leftovers).
+    let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temp file must be discarded, found: {leftovers:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_recv_finalize_commits_on_success() {
+    use tokio::io::AsyncWriteExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let dest = dir.path().join("out.bin");
+
+    let io = FileIOProvider::new_recv(dest.clone())
+        .await
+        .expect("new_recv");
+    {
+        let mut w = io.stdout();
+        w.write_all(b"verified-payload").await.unwrap();
+        w.flush().await.unwrap();
+    }
+    // Tag verified -> publish to the destination via atomic rename.
+    io.finalize_recv(true).expect("finalize_recv(true)");
+
+    assert_eq!(
+        std::fs::read(&dest).expect("destination present"),
+        b"verified-payload"
+    );
+}

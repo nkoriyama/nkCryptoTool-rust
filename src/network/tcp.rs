@@ -392,7 +392,7 @@ impl NetworkProcessor {
             .await
             .map_err(|_| CryptoError::Parameter("Chat session timed out".to_string()))??;
         } else {
-            tokio::time::timeout(CUMULATIVE_TIMEOUT, async {
+            let recv_res = tokio::time::timeout(CUMULATIVE_TIMEOUT, async {
                 CommonProcessor::receive_file(
                     stream,
                     io_provider.stdout(),
@@ -402,10 +402,18 @@ impl NetworkProcessor {
                 )
                 .await
             })
-            .await
-            .map_err(|e| {
-                CryptoError::Parameter(format!("Data transfer timed out or failed: {}", e))
-            })??;
+            .await;
+            // Publish the staged file only when the transfer completed AND the
+            // trailing AEAD tag verified; otherwise discard it so unauthenticated
+            // plaintext is never left at the destination path.
+            let committed = recv_res.as_ref().map(|r| r.is_ok()).unwrap_or(false);
+            io_provider
+                .finalize_recv(committed)
+                .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+            recv_res
+                .map_err(|e| {
+                    CryptoError::Parameter(format!("Data transfer timed out or failed: {}", e))
+                })??;
         }
         Ok(())
     }

@@ -459,7 +459,7 @@ impl NetworkProcessor {
             CHAT_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
             res?;
         } else {
-            tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
+            let recv_res = tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
                 CommonProcessor::receive_file_with_progress(
                     reader,
                     io_provider.stdout(),
@@ -468,7 +468,16 @@ impl NetworkProcessor {
                     &c2s_iv,
                     on_progress,
                 ).await
-            }).await.map_err(|e| CryptoError::Parameter(format!("File receive failed: {}", e)))??;
+            }).await;
+            // Publish the staged file only when the transfer completed AND the
+            // trailing AEAD tag verified; otherwise discard it so unauthenticated
+            // plaintext is never left at the destination path.
+            let committed = recv_res.as_ref().map(|r| r.is_ok()).unwrap_or(false);
+            io_provider
+                .finalize_recv(committed)
+                .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+            recv_res
+                .map_err(|e| CryptoError::Parameter(format!("File receive failed: {}", e)))??;
         }
         Ok(())
     }
