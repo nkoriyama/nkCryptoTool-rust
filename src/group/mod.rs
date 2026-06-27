@@ -22,6 +22,7 @@
 // SQLCipher reader lives only under `legacy-sqlcipher-migration` for the P3
 // migration tool.
 pub mod at_rest;
+pub mod binding;
 pub mod cli;
 pub mod rollback;
 pub mod crypto_adapter;

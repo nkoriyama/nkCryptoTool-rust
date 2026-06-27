@@ -60,33 +60,47 @@
 > 現状 `MemberInfo` は leaf index しか持たず、この対応付けが存在しない。
 > **これを定義しないと本設計全体が成立しない。** 初稿はこの点を欠いていた。
 
-### 2.1 バインディング方式
-- transport の identity は **ML-DSA 署名鍵** であり、`PeerId` / allowlist エントリは
-  その公開鍵の **SHA3-256 指紋 (`[u8;32]`)** (既存 `cached_allowlist` と同形式)。
-- MLS メンバーの **credential に同一の ML-DSA identity 公開鍵を埋め込む** (BasicCredential
-  の identity バイト列 = ML-DSA SPKI、もしくはその指紋)。これにより
-  `roster → {SHA3-256(member.credential.identity)} = allowed_peers` が一意に定まる。
-- **検証**: MLS ハンドシェイク (KeyPackage / Welcome) で受理する credential の
-  identity 公開鍵と、transport ハンドシェイクで署名検証に使う ML-DSA 公開鍵が
-  **同一であることを照合**する (なりすまし防止)。両者が食い違うメンバーは拒否。
+> [!IMPORTANT]
+> **【2026-06 訂正】初稿/前版は「同一の ML-DSA 鍵を両層で使う」前提だったが、
+> 現行コード調査で誤りと判明した。** 実際には 2 つの identity は**完全に別物**:
+> - **MLS 署名 identity**: Hybrid (`Ed25519 ‖ ML-DSA-65`)、redb `mls_app`
+>   (`mls:identity:sk/pk`)、グループ初期化時に生成 (`crypto_adapter.rs`)。
+> - **transport 認証 identity**: `ML-DSA-65` 単独、PKCS#8 PEM ファイル
+>   (`--signing-privkey`)、アプリ起動時に別途用意。
+>
+> 鍵の**種類すら異なる** (hybrid vs ML-DSA 単独) ため「同一鍵 + ドメイン分離」は
+> 成立しない。**ユーザー決定 (2026-06): 束縛署名方式を採用** (§7.6 確定)。
+
+### 2.1 バインディング方式 (束縛署名)
+2 つの独立した identity を、**MLS 署名 identity による束縛署名**で結ぶ:
+- transport identity = ML-DSA-65 公開鍵。allowlist/`PeerId` エントリはその
+  **SHA3-256 指紋 (`[u8;32]`)** (既存 `cached_allowlist` と同形式)。
+- **束縛署名**: メンバーは自分の **MLS hybrid 署名鍵**で、ドメイン分離コンテキスト付きの
+  メッセージ `BINDING_CONTEXT ‖ len ‖ transport_dsa_pub` に署名する
+  (`binding = Sign_MLS(transport_dsa_pub)`)。これは「この MLS identity は transport 鍵 F を
+  使う」という**MLS 側からの証明**。
+- **完全な対応付けの成立**:
+  1. MLS group が roster (= MLS 署名公開鍵の集合) を権威として保持 (Invariant 0)。
+  2. 各メンバーの束縛署名が「MLS member M ↔ transport 指紋 F」を MLS 側で attest。
+  3. transport ハンドシェイクで接続側が **F の秘密鍵支配を ML-DSA 署名で証明** (既存)。
+  → (1)+(2)+(3) で「現に F を支配して接続してきたのは roster 上の M である」が確定。
+- **なりすまし耐性**: 攻撃者メンバー M' が他人の F を束縛しても、transport ハンドシェイクで
+  F の支配を証明できないため接続不可 (自己 DoS にしかならず、他者の F を乗っ取れない)。
 
 ### 2.2 影響
-- `list_members` を拡張し `MemberInfo { index, peer_id: [u8;32] }` を返す
-  (credential から導出)。
-- これは **transport と MLS の信頼を結ぶ要**であり、フェーズ 0 として最初に実装する。
+- `list_members` を拡張し、各メンバーの **MLS 署名公開鍵**を取り出せるようにする
+  (`MemberInfo { index, signing_pub }`)。指紋投影はこの公開鍵と束縛署名から導出。
+- 束縛署名の生成/検証プリミティブ (`src/group/binding.rs`) を**フェーズ 0** として最初に
+  実装する (ネットワーク非依存・単体テスト可能)。束縛の交換/検証の配線はフェーズ 3/4。
 
-### 2.3 クロスプロトコル鍵共有のドメイン分離 (レビュー反映)
-> [!WARNING]
-> 同一の ML-DSA 鍵対を transport ハンドシェイク署名と MLS credential 署名の両方で
-> 使うため、**ドメイン分離が無いと一方の署名を他方へ転用されるクロスプロトコル攻撃**の
-> リスクがある。
-- **必須要件**: 両プロトコルの署名対象を**異なるコンテキストラベルで束縛**し、片方で
-  生成した署名がもう片方の検証で通用しないようにする。MLS は RFC 9420 のラベル付き
-  署名 (`SignContent`) を用いるため、**transport ハンドシェイク側も専用コンテキスト
-  文字列 (例 `"nkct-transport-handshake-v1"`) を必ず前置して署名/検証する**。
-- 代替案 (未決定論点 §7): identity 鍵を transport と MLS で**分離**し、credential に
-  transport 公開鍵 (指紋) を束縛署名で結ぶ。鍵コピー削減と引き換えに credential
-  フォーマットが複雑化する。どちらを採るかは §7 で確定する。
+### 2.3 ドメイン分離 (クロスプロトコル耐性)
+- 束縛署名は **MLS 署名鍵**で行うため、MLS フレーム署名 (RFC 9420 ラベル付き) と
+  混同されないよう、束縛メッセージは専用コンテキスト `"nkct-mls-transport-binding-v1"`
+  を必ず前置する (一方の署名が他方の検証で通用しない)。
+- transport ハンドシェイク署名 (ML-DSA-65) も従来どおり transcript 束縛されており、
+  束縛署名 (MLS hybrid 鍵, 別コンテキスト) とは鍵も対象も異なる。
+- 鍵が完全分離されたため、初版で懸念した「単一鍵多目的利用」リスクは**該当しない**
+  (§7.6 で分離を確定)。
 
 ---
 
@@ -272,8 +286,9 @@ const TID_GROUP_COMMITS: u8 = /* 次の未使用 ID */;
 4. **`active_conns` レジストリ**の iroh での実装 (接続ハンドルの保持と close API)。
 5. **後方互換**: allowlist 未設定 (`None`) 時は全許可 (現行挙動維持) とするか、MLS 群では
    必須化するか。
-6. **(レビュー反映) identity 鍵の共有 vs 分離**: transport と MLS で同一 ML-DSA 鍵 +
-   ドメイン分離 (§2.3 採用案) とするか、鍵を分離して credential に束縛署名で結ぶか。
+6. **(確定 2026-06) identity 鍵の共有 vs 分離**: → **分離で確定**。現行コードで MLS
+   (hybrid) と transport (ML-DSA 単独) は既に別鍵であり、§2 の束縛署名方式で結ぶ
+   (ユーザー決定)。credential フォーマットは変更せず後方互換を保つ。
 7. **(レビュー反映) Case C 再招待の主体**: 再 Add を誰が・どのレート制限で行うか
    (committer 権限・自動化の可否・straggler からの再招待要求プロトコル)。
 8. **(レビュー反映) 旧 epoch 受理窓の締め方**: Remove 適用時にエビクト済み leaf の
