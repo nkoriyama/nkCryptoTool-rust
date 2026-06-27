@@ -89,5 +89,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v5
+    - name: Install dependencies
+      # The unconditional dev-dependency `i-slint-backend-testing` pulls
+      # fontconfig-sys, which `cargo test` compiles even for --lib, so the build
+      # needs fontconfig headers (the mls subsystem crypto itself is C-free).
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends libfontconfig1-dev pkg-config
     - name: Build and test the MLS subsystem
       run: cargo test --verbose --no-default-features --features backend-rustcrypto,mls --lib
