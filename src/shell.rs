@@ -343,9 +343,221 @@ where
 }
 
 // ===========================================================================
+// Phase 2a: authorization policy, command restriction, audit log, rate limit.
+// (Per-user privilege drop / setuid is Phase 2b; here the shell still runs as
+// the server's own user.)
+// ===========================================================================
+
+/// One policy entry: what an authorized peer fingerprint may do.
+#[derive(Debug, Clone, Default)]
+pub struct PolicyEntry {
+    /// Local user this fingerprint maps to. Recorded/audited now; *enforced*
+    /// (setuid privilege drop) in Phase 2b.
+    pub user: Option<String>,
+    /// If set, the peer may only run one of these exact commands (ssh
+    /// `command=` style); an interactive/login shell is then refused.
+    pub cmd_allow: Option<Vec<String>>,
+}
+
+/// `fingerprint -> PolicyEntry` map loaded from `--shell-policy`. When a policy
+/// is configured, only listed fingerprints may obtain a shell at all.
+#[derive(Debug, Clone, Default)]
+pub struct ShellPolicy {
+    entries: std::collections::HashMap<[u8; 32], PolicyEntry>,
+}
+
+/// Outcome of authorizing a peer's OPEN against the policy.
+pub enum PolicyDecision {
+    Deny(String),
+    Allow { user: Option<String>, run_cmd: String },
+}
+
+impl ShellPolicy {
+    /// Parse a policy file. Each non-blank, non-`#` line is
+    /// `<sha3-256-hex> [user=NAME] [cmd-allow="c1,c2,..."]`.
+    pub fn load(path: &str) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| CryptoError::Parameter(format!("read shell policy {path}: {e}")))?;
+        let mut entries = std::collections::HashMap::new();
+        for (lineno, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut it = line.splitn(2, char::is_whitespace);
+            let fp_hex = it.next().unwrap_or("");
+            let fp = parse_fp_hex(fp_hex).ok_or_else(|| {
+                CryptoError::Parameter(format!(
+                    "shell policy line {}: bad SHA3-256 fingerprint", lineno + 1
+                ))
+            })?;
+            let rest = it.next().unwrap_or("");
+            // Pull out the quoted `cmd-allow="..."` value *and remove its span*
+            // before searching for `user=`, so a `user=` appearing inside a
+            // command in the allow list can never be mistaken for the user
+            // mapping (which would map the peer to an unintended local user).
+            let (cmd_allow, rest_wo_cmd) = match extract_quoted_span(rest, "cmd-allow=") {
+                Some((value, start, end)) => {
+                    let list = value
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect::<Vec<_>>();
+                    (Some(list), format!("{}{}", &rest[..start], &rest[end..]))
+                }
+                // Fail closed: if `cmd-allow=` is present but not a well-formed
+                // quoted value, treat it as a policy error rather than silently
+                // dropping the restriction (which would grant an unrestricted
+                // shell). A genuinely unrestricted entry simply omits cmd-allow.
+                None if rest.contains("cmd-allow=") => {
+                    return Err(CryptoError::Parameter(format!(
+                        "shell policy line {}: malformed cmd-allow (expected cmd-allow=\"...\")",
+                        lineno + 1
+                    )));
+                }
+                None => (None, rest.to_string()),
+            };
+            let user = extract_kv(&rest_wo_cmd, "user=").map(|s| s.to_string());
+            entries.insert(fp, PolicyEntry { user, cmd_allow });
+        }
+        Ok(Self { entries })
+    }
+
+    /// Authorize a `(fingerprint, requested_cmd)` (empty `requested_cmd` = login
+    /// shell). A fingerprint absent from the policy is denied; a `cmd-allow`
+    /// entry permits only its exact commands and refuses a login shell.
+    pub fn authorize(&self, fp: &[u8; 32], requested_cmd: &str) -> PolicyDecision {
+        let entry = match self.entries.get(fp) {
+            Some(e) => e,
+            None => return PolicyDecision::Deny("fingerprint not in shell policy".into()),
+        };
+        match &entry.cmd_allow {
+            Some(allowed) => {
+                if requested_cmd.is_empty() {
+                    PolicyDecision::Deny(
+                        "this fingerprint is restricted to specific commands (no login shell)".into(),
+                    )
+                } else if allowed.iter().any(|c| c == requested_cmd) {
+                    PolicyDecision::Allow { user: entry.user.clone(), run_cmd: requested_cmd.to_string() }
+                } else {
+                    PolicyDecision::Deny("command not in this fingerprint's cmd-allow list".into())
+                }
+            }
+            None => PolicyDecision::Allow { user: entry.user.clone(), run_cmd: requested_cmd.to_string() },
+        }
+    }
+}
+
+fn parse_fp_hex(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Extract the whitespace-terminated value of `key` (e.g. `user=`) from `rest`.
+fn extract_kv<'a>(rest: &'a str, key: &str) -> Option<&'a str> {
+    let i = rest.find(key)? + key.len();
+    let v = &rest[i..];
+    Some(v.split(char::is_whitespace).next().unwrap_or(v))
+}
+
+/// Extract the double-quoted value of `key` (e.g. `cmd-allow="a,b"`) from `rest`,
+/// returning the value plus the `[start, end)` byte span of the whole
+/// `key="..."` match so the caller can excise it.
+fn extract_quoted_span(rest: &str, key: &str) -> Option<(String, usize, usize)> {
+    let key_at = rest.find(key)?;
+    let after = rest[key_at + key.len()..].strip_prefix('"')?;
+    let close = after.find('"')?;
+    let value = after[..close].to_string();
+    let end = key_at + key.len() + 1 + close + 1; // past the closing quote
+    Some((value, key_at, end))
+}
+
+/// Hex of a fingerprint, for policy lookup logging / audit.
+fn fp_hex(fp: &[u8; 32]) -> String {
+    fp.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Per-fingerprint connection rate limit: reject a new shell within
+/// `SHELL_RATE_WINDOW` of the previous attempt by the same fingerprint.
+const SHELL_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn rate_limited(fp: &[u8; 32]) -> bool {
+    use std::sync::Mutex;
+    use std::time::Instant;
+    static LAST: Mutex<Option<std::collections::HashMap<[u8; 32], Instant>>> = Mutex::new(None);
+    // Recover from a poisoned lock instead of propagating the panic, so one
+    // panicking caller can't wedge rate limiting (and thus all shell auth) for
+    // the life of the process.
+    let mut guard = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    let now = Instant::now();
+    // Evict entries past the window so the map stays bounded by the number of
+    // fingerprints active *within* the window (a flood of distinct fingerprints
+    // can't grow it without bound).
+    map.retain(|_, t| now.duration_since(*t) < SHELL_RATE_WINDOW);
+    if map.contains_key(fp) {
+        return true;
+    }
+    map.insert(*fp, now);
+    false
+}
+
+/// Append one line to the audit log, off the async runtime thread. Returns the
+/// I/O result so a security-relevant record (the allow/deny decision) can be
+/// made *fail-closed* by the caller; best-effort records ignore it.
+async fn audit(path: Option<&str>, fp: &[u8; 32], event: &str) -> std::io::Result<()> {
+    let Some(path) = path else { return Ok(()) };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Neutralize control characters (notably newlines) in the event — part of
+    // it is client-supplied (the command), so a raw `\n` would let a peer forge
+    // additional audit records / erase its tracks.
+    let safe_event: String = event
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let line = format!("{ts} fp={} {safe_event}\n", fp_hex(fp));
+    let path = path.to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write as _;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        // Audit records (fingerprints, commands) are sensitive: create the file
+        // owner-only so other local users cannot read the access trail.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&path)?;
+        f.write_all(line.as_bytes())?;
+        f.flush()
+    })
+    .await
+    .map_err(std::io::Error::other)?
+}
+
+/// Audit a non-decision event (rate-limit, deny, session end). A failed write is
+/// not fail-closed (we are already denying / ending), but it is surfaced to
+/// stderr so the attempt is never lost completely silently.
+async fn audit_best_effort(path: Option<&str>, fp: &[u8; 32], event: &str) {
+    if let Err(e) = audit(path, fp, event).await {
+        eprintln!("[shell] audit write failed for {event:?}: {e}");
+    }
+}
+
+// ===========================================================================
 // Phase 1: single-user PTY bridge (unix). The server allocates a PTY and runs
 // the operator's shell as *its own* user (per-user mapping / privilege drop is
-// Phase 2); the client puts its terminal in raw mode and pumps both directions.
+// Phase 2b); the client puts its terminal in raw mode and pumps both directions.
 // ===========================================================================
 
 /// Server side of a real shell session: allocate a PTY, spawn the shell, and
@@ -353,12 +565,20 @@ where
 /// Authorization (who may reach this at all) is the transport allowlist / pinned
 /// key enforced before this runs; this still runs the shell as the server user.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+// allow(too_many_arguments): the secured stream halves + session keys + the
+// authenticated peer fingerprint + policy/audit paths are all genuinely needed
+// to authorize and audit one shell session; bundling them into a struct would
+// just move the noise. Future: fold transport+keys into a SecureChannel type.
 pub async fn run_pty_server<R, W>(
     mut reader: R,
     mut writer: W,
     aead_name: &str,
     s2c_key: &[u8],
     c2s_key: &[u8],
+    peer_fp: [u8; 32],
+    policy_path: Option<&str>,
+    audit_path: Option<&str>,
 ) -> Result<()>
 where
     R: AsyncReadExt + Unpin + Send + 'static,
@@ -368,6 +588,14 @@ where
 
     let (rx_key, tx_key) = role_keys(s2c_key, c2s_key, true);
     let (mut rx_ctr, mut tx_ctr) = (0u64, 0u64);
+
+    // Per-fingerprint rate limit before doing any work.
+    if rate_limited(&peer_fp) {
+        audit_best_effort(audit_path, &peer_fp, "deny: rate limited").await;
+        let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
+            &Frame::Error("rate limited; try again shortly".into())).await;
+        return Err(CryptoError::Parameter("shell: rate limited".into()));
+    }
 
     // First frame must be OPEN.
     let (cols, rows, term, cmd) =
@@ -379,6 +607,47 @@ where
                 return Err(CryptoError::Parameter("shell: first frame was not OPEN".into()));
             }
         };
+
+    // Authorize against the policy (when one is configured): an unlisted
+    // fingerprint, or a command outside its cmd-allow list, is refused.
+    // Resolve the audit record for the access decision; if a policy denies, the
+    // session never starts. The *allow* record is fail-closed: if it can't be
+    // written, refuse the session rather than run it untraced.
+    let allow_event = match policy_path {
+        Some(pp) => {
+            let pp = pp.to_string();
+            let policy = tokio::task::spawn_blocking(move || ShellPolicy::load(&pp))
+                .await
+                .map_err(std::io::Error::other)
+                .map_err(|e| CryptoError::Parameter(format!("load shell policy: {e}")))??;
+            match policy.authorize(&peer_fp, &cmd) {
+                PolicyDecision::Allow { user, run_cmd } => (
+                    run_cmd.clone(),
+                    format!(
+                        "allow user={} cmd={}",
+                        user.as_deref().unwrap_or("<server>"),
+                        if run_cmd.is_empty() { "<login>" } else { run_cmd.as_str() }
+                    ),
+                ),
+                PolicyDecision::Deny(reason) => {
+                    audit_best_effort(audit_path, &peer_fp, &format!("deny: {reason}")).await;
+                    let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
+                        &Frame::Error(reason.clone())).await;
+                    return Err(CryptoError::Parameter(format!("shell denied: {reason}")));
+                }
+            }
+        }
+        None => (
+            cmd.clone(),
+            format!("allow (no policy) cmd={}", if cmd.is_empty() { "<login>" } else { cmd.as_str() }),
+        ),
+    };
+    let run_cmd = allow_event.0;
+    if let Err(e) = audit(audit_path, &peer_fp, &allow_event.1).await {
+        let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
+            &Frame::Error("audit log unavailable; refusing".into())).await;
+        return Err(CryptoError::Parameter(format!("shell refused: audit write failed: {e}")));
+    }
 
     let pair = native_pty_system()
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
@@ -398,11 +667,11 @@ where
         "xterm".to_string()
     };
     builder.env("TERM", &safe_term);
-    if cmd.is_empty() {
+    if run_cmd.is_empty() {
         builder.arg("-l"); // login shell
     } else {
         builder.arg("-c");
-        builder.arg(&cmd);
+        builder.arg(&run_cmd);
     }
     let mut child = pair
         .slave
@@ -497,13 +766,16 @@ where
         .and_then(|r| r.ok())
         .map(|s| s.exit_code() as i32)
         .unwrap_or(-1);
+    audit_best_effort(audit_path, &peer_fp, &format!("session end exit={code}")).await;
     let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr, &Frame::Exit(code)).await;
     Ok(())
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
 pub async fn run_pty_server<R, W>(
     _reader: R, _writer: W, _aead_name: &str, _s2c_key: &[u8], _c2s_key: &[u8],
+    _peer_fp: [u8; 32], _policy_path: Option<&str>, _audit_path: Option<&str>,
 ) -> Result<()> {
     Err(CryptoError::Parameter("the P2P shell server is only supported on unix".into()))
 }
@@ -686,6 +958,84 @@ mod tests {
             let enc = f.encode();
             assert_eq!(Frame::decode(&enc).unwrap(), f);
         }
+    }
+
+    #[test]
+    fn policy_parse_and_authorize() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.txt");
+        let fp_a = "a".repeat(64); // all 0xaa
+        let fp_b = "b".repeat(64); // all 0xbb
+        std::fs::write(
+            &path,
+            format!(
+                "# comment\n\n{fp_a}  user=alice\n{fp_b} user=deploy cmd-allow=\"systemctl restart x, journalctl -u x\"\n"
+            ),
+        )
+        .unwrap();
+        let pol = ShellPolicy::load(path.to_str().unwrap()).unwrap();
+        let a = parse_fp_hex(&fp_a).unwrap();
+        let b = parse_fp_hex(&fp_b).unwrap();
+        let unknown = [0u8; 32];
+
+        // alice: no cmd-allow → login shell and any command allowed.
+        assert!(matches!(pol.authorize(&a, ""), PolicyDecision::Allow { .. }));
+        assert!(matches!(pol.authorize(&a, "whoami"), PolicyDecision::Allow { .. }));
+
+        // deploy: cmd-allow → only the exact listed commands; no login shell.
+        assert!(matches!(pol.authorize(&b, ""), PolicyDecision::Deny(_)));
+        assert!(matches!(
+            pol.authorize(&b, "systemctl restart x"),
+            PolicyDecision::Allow { .. }
+        ));
+        assert!(matches!(pol.authorize(&b, "rm -rf /"), PolicyDecision::Deny(_)));
+
+        // a fingerprint absent from the policy is denied outright.
+        assert!(matches!(pol.authorize(&unknown, ""), PolicyDecision::Deny(_)));
+
+        // the mapped user is surfaced for audit/Phase-2b privilege drop.
+        match pol.authorize(&a, "ls") {
+            PolicyDecision::Allow { user, .. } => assert_eq!(user.as_deref(), Some("alice")),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn cmd_allow_value_cannot_be_misparsed_as_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.txt");
+        let fp = "c".repeat(64);
+        // A `user=` substring *inside* the cmd-allow value must not become the
+        // user mapping (that would map the peer to an unintended local user).
+        std::fs::write(
+            &path,
+            format!("{fp} user=alice cmd-allow=\"echo user=root, id\"\n"),
+        )
+        .unwrap();
+        let pol = ShellPolicy::load(path.to_str().unwrap()).unwrap();
+        let f = parse_fp_hex(&fp).unwrap();
+        match pol.authorize(&f, "echo user=root") {
+            PolicyDecision::Allow { user, .. } => assert_eq!(user.as_deref(), Some("alice")),
+            _ => panic!("the exact allowed command should be permitted"),
+        }
+    }
+
+    #[test]
+    fn malformed_cmd_allow_is_rejected_not_silently_unrestricted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.txt");
+        let fp = "d".repeat(64);
+        // Missing quotes on cmd-allow must error, not silently drop the limit.
+        std::fs::write(&path, format!("{fp} user=x cmd-allow=echo\n")).unwrap();
+        assert!(ShellPolicy::load(path.to_str().unwrap()).is_err());
+    }
+
+    #[test]
+    fn fp_hex_parse_roundtrip() {
+        let fp = [0x0fu8; 32];
+        assert_eq!(parse_fp_hex(&fp_hex(&fp)), Some(fp));
+        assert_eq!(parse_fp_hex("xyz"), None);
+        assert_eq!(parse_fp_hex(&"a".repeat(63)), None);
     }
 
     #[test]

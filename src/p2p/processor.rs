@@ -449,6 +449,15 @@ impl NetworkProcessor {
 
         let (s2c_key, _s2c_iv, c2s_key, c2s_iv, peer_id) = handshake_result;
 
+        // For a shell session the peer must be cryptographically authenticated
+        // (PeerId::Pubkey = SHA3-256 of its ML-DSA key); that fingerprint keys
+        // the authorization policy / audit / rate limit. Captured (Copy) before
+        // `peer_id` may be moved into the chat guard below.
+        let shell_peer_fp: Option<[u8; 32]> = match peer_id {
+            PeerId::Pubkey(hash) => Some(hash),
+            _ => None,
+        };
+
         let mut on_handshake_done = on_handshake_done;
         if let Some(cb) = on_handshake_done.take() {
             cb();
@@ -481,9 +490,21 @@ impl NetworkProcessor {
         };
 
         if config.shell_mode {
-            // Phase 1: bridge a real PTY/shell to the client.
-            crate::shell::run_pty_server(reader, writer, &config.aead_algo, &s2c_key, &c2s_key)
-                .await?;
+            // Phase 1/2a: bridge a real PTY/shell to the authenticated peer.
+            let fp = shell_peer_fp.ok_or_else(|| {
+                CryptoError::Parameter("shell requires an authenticated peer".to_string())
+            })?;
+            crate::shell::run_pty_server(
+                reader,
+                writer,
+                &config.aead_algo,
+                &s2c_key,
+                &c2s_key,
+                fp,
+                config.shell_policy_path.as_deref(),
+                config.audit_log_path.as_deref(),
+            )
+            .await?;
         } else if config.chat_mode {
             let stdin = io_provider.stdin();
             let stdout = Arc::new(tokio::sync::Mutex::new(io_provider.stdout()));

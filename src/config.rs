@@ -143,6 +143,11 @@ pub struct CryptoConfig {
     /// Optional single command for the shell client (`--shell-cmd`): runs it on
     /// the remote and exits (ssh-style), instead of an interactive login shell.
     pub shell_command: Option<String>,
+    /// Shell server authorization policy file (`--shell-policy`): maps peer
+    /// fingerprints to a user and an optional command allowlist.
+    pub shell_policy_path: Option<String>,
+    /// Shell server audit log path (`--audit-log`): one line per session event.
+    pub audit_log_path: Option<String>,
     pub allow_unauth: bool,
     pub force: bool,
     pub handshake_timeout: u64,
@@ -208,6 +213,8 @@ impl Default for CryptoConfig {
             shell_mode: false,
             serve_shell: false,
             shell_command: None,
+            shell_policy_path: None,
+            audit_log_path: None,
             allow_unauth: false,
             force: false,
             handshake_timeout: 15,

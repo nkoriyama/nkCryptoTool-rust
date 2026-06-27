@@ -91,6 +91,16 @@ struct Args {
     #[arg(long)]
     shell_cmd: Option<String>,
 
+    /// Shell server authorization policy file: lines of
+    /// `<sha3-256-hex> [user=NAME] [cmd-allow="c1,c2"]`. When set, only listed
+    /// fingerprints may obtain a shell.
+    #[arg(long)]
+    shell_policy: Option<String>,
+
+    /// Shell server audit log path (one line per session/auth event).
+    #[arg(long)]
+    audit_log: Option<String>,
+
     #[arg(
         long,
         help = "Allow unauthenticated connections (SECURITY WARNING: Default is false since v49)"
@@ -494,6 +504,8 @@ async fn main() -> anyhow::Result<()> {
     config.shell_mode = args.serve_shell || args.shell || args.shell_cmd.is_some();
     config.serve_shell = args.serve_shell;
     config.shell_command = args.shell_cmd;
+    config.shell_policy_path = args.shell_policy;
+    config.audit_log_path = args.audit_log;
     // A remote shell is the highest-value attack surface: never run it without
     // peer authentication (see P2P_SHELL_DESIGN.md threat model). `--allow-unauth`
     // is rejected for shell mode; authenticate with --peer-allowlist and/or
