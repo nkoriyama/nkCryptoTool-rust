@@ -1243,6 +1243,16 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
     transport_config.no_relay = args.no_relay;
     transport_config.relay_url = args.relay_url;
     transport_config.discovery = args.discovery;
+    // Persist the transport node key beside the group store (unless overridden)
+    // so this member keeps a STABLE transport NodeId across MLS subcommands.
+    // Without this the endpoint mints an ephemeral key per process, so the
+    // NodeId embedded in an exported KeyPackage / credential would not match the
+    // NodeId a later `listen`/`send` runs under — breaking Welcome delivery, the
+    // member address book, and roster→PeerId resolution. Mirrors the prekey path.
+    transport_config.node_key_path = Some(match args.node_key.as_deref() {
+        Some(p) => PathBuf::from(p),
+        None => storage_path.with_file_name("node.key"),
+    });
 
     let endpoint: Arc<dyn P2pEndpoint> = match transport_config.transport {
         nk_crypto_tool::config::TransportKind::Iroh => Arc::new(
