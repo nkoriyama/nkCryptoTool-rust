@@ -526,14 +526,20 @@ async fn main() -> anyhow::Result<()> {
              to restrict who may obtain a shell"
         );
     }
-    // Phase 1 has no privilege separation yet (P2P_SHELL_DESIGN.md Phase 2), so a
-    // shell server running as root would hand an allowlisted peer a root shell.
-    // Refuse to serve a shell as uid 0 until privilege drop lands.
+    // A root shell server is only safe with a privilege-drop policy (Phase 2b):
+    // every allowed session then drops to the policy's mapped non-root user.
+    // Without a policy, refuse to serve as root (it would hand a peer a root
+    // shell). With a policy, the per-session `resolve_drop` enforces the drop and
+    // refuses any mapping that would still be root.
     #[cfg(unix)]
-    if args.serve_shell && unsafe { libc::geteuid() == 0 || libc::getuid() == 0 } {
+    if args.serve_shell
+        && config.shell_policy_path.is_none()
+        && unsafe { libc::geteuid() == 0 || libc::getuid() == 0 }
+    {
         anyhow::bail!(
-            "refusing to run --serve-shell as root: there is no privilege separation yet \
-             (P2P_SHELL_DESIGN.md Phase 2). Run the shell server as an unprivileged user."
+            "refusing to run --serve-shell as root without --shell-policy: there is no \
+             per-user privilege drop without a policy. Provide --shell-policy mapping \
+             fingerprints to non-root users, or run as an unprivileged user."
         );
     }
     config.allow_unauth = args.allow_unauth;

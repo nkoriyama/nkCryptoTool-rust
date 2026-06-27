@@ -555,9 +555,153 @@ async fn audit_best_effort(path: Option<&str>, fp: &[u8; 32], event: &str) {
 }
 
 // ===========================================================================
+// Phase 2b: per-user privilege drop (unix). The user/group resolution
+// (`getpwnam`/`getgrouplist`) runs in the parent; the post-fork `pre_exec`
+// closure then only makes async-signal-safe syscalls (`setgroups`/`setgid`/
+// `setuid`).
+// ===========================================================================
+
+/// Resolved drop target: the uid/gid/supplementary-groups to become, plus the
+/// user's own login shell (from `/etc/passwd`) to run instead of the operator's.
+#[cfg(unix)]
+#[derive(Clone)]
+struct DropTarget {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    groups: Vec<libc::gid_t>,
+    shell: Option<String>,
+}
+
+/// Look up a user's uid, primary gid, and supplementary groups by name.
+#[cfg(unix)]
+fn lookup_user(name: &str) -> std::result::Result<DropTarget, String> {
+    use std::ffi::CString;
+    let cname = CString::new(name).map_err(|_| "user name contains NUL".to_string())?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 8192];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwnam_r(cname.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+    };
+    if rc != 0 || result.is_null() {
+        return Err(format!("unknown user {name:?}"));
+    }
+    let (uid, gid) = (pwd.pw_uid, pwd.pw_gid);
+    // Copy the user's login shell out of the pwd buffer (a non-empty, absolute
+    // path); used so a dropped session runs that user's shell, not the operator's.
+    let shell = if pwd.pw_shell.is_null() {
+        None
+    } else {
+        let s = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) }
+            .to_string_lossy()
+            .into_owned();
+        if s.starts_with('/') { Some(s) } else { None }
+    };
+    // getgrouplist: query the count, then fetch.
+    let mut ngroups: libc::c_int = 64;
+    let mut gids = vec![0 as libc::gid_t; ngroups as usize];
+    let r = unsafe {
+        libc::getgrouplist(cname.as_ptr(), gid as _, gids.as_mut_ptr(), &mut ngroups)
+    };
+    if r < 0 {
+        gids = vec![0 as libc::gid_t; ngroups.max(0) as usize];
+        let r2 = unsafe {
+            libc::getgrouplist(cname.as_ptr(), gid as _, gids.as_mut_ptr(), &mut ngroups)
+        };
+        if r2 < 0 {
+            return Err(format!("getgrouplist failed for {name:?}"));
+        }
+    }
+    gids.truncate(ngroups.max(0) as usize);
+    Ok(DropTarget { uid, gid, groups: gids, shell })
+}
+
+/// Allocate a pty pair sized to `(cols, rows)`, returning `(master_fd,
+/// slave_fd)`. We use `libc::openpty` directly because we need the *slave* fd to
+/// hand the child as its controlling terminal/stdio under a `pre_exec` privilege
+/// drop (which the higher-level pty crate's spawn does not support).
+#[cfg(unix)]
+fn open_pty(cols: u16, rows: u16) -> Result<(std::os::fd::RawFd, std::os::fd::RawFd)> {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
+    let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    let r = unsafe {
+        libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &ws)
+    };
+    if r != 0 {
+        return Err(CryptoError::Parameter(format!(
+            "openpty: {}", std::io::Error::last_os_error()
+        )));
+    }
+    // Mark both ends close-on-exec so the spawned shell does not inherit the raw
+    // master/slave fds. The child's stdio is set up from separate `dup`s (which
+    // clear CLOEXEC), and the slave's controlling-terminal `ioctl` runs in
+    // `pre_exec` before `exec`, so CLOEXEC there is harmless.
+    for fd in [master, slave] {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+            let e = std::io::Error::last_os_error();
+            unsafe { libc::close(master); libc::close(slave); }
+            return Err(CryptoError::Parameter(format!("pty FD_CLOEXEC: {e}")));
+        }
+    }
+    Ok((master, slave))
+}
+
+/// Decide how (or whether) to drop privileges for `policy_user`:
+/// - **root server**: must drop to a mapped *non-root* user; a missing `user=`
+///   or a mapping to uid 0 is refused (never serve a root shell).
+/// - **non-root server**: cannot become another user; the mapped user (if any)
+///   must be ourselves, otherwise the session is refused (no privilege gain).
+///
+/// Returns `Ok(None)` when no drop is needed (already the right user).
+#[cfg(unix)]
+fn resolve_drop(policy_user: Option<&str>) -> std::result::Result<Option<DropTarget>, String> {
+    let cur = unsafe { libc::geteuid() };
+    // Treat the server as root if EITHER the real or effective uid is 0 (matching
+    // the startup gate in main.rs): a real uid of 0 with a non-zero effective uid
+    // could otherwise skip the drop entirely and leave a shell able to regain root
+    // via setuid(0). The actual drop below sets real/effective/saved ids.
+    let server_is_root = cur == 0 || unsafe { libc::getuid() } == 0;
+    match policy_user {
+        Some(u) => {
+            let t = lookup_user(u)?;
+            if server_is_root {
+                if t.uid == 0 {
+                    return Err(format!("policy maps {u:?} to root; refusing a root shell"));
+                }
+                // A non-root uid is not enough: a primary or supplementary GID of
+                // 0 (root/wheel) would still grant root-group file access and,
+                // on many systems, sudo/wheel privileges. Refuse any such mapping
+                // so the dropped shell holds no root-equivalent group.
+                if t.gid == 0 || t.groups.contains(&0) {
+                    return Err(format!(
+                        "policy maps {u:?} to a root group (gid 0); refusing a root-group shell"
+                    ));
+                }
+                Ok(Some(t))
+            } else if t.uid == cur {
+                Ok(None) // already this user
+            } else {
+                Err(format!("cannot run as {u:?} without root (server is uid {cur})"))
+            }
+        }
+        None => {
+            if server_is_root {
+                Err("server runs as root but no user= is mapped for this fingerprint; \
+                     refusing a root shell"
+                    .into())
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+// ===========================================================================
 // Phase 1: single-user PTY bridge (unix). The server allocates a PTY and runs
-// the operator's shell as *its own* user (per-user mapping / privilege drop is
-// Phase 2b); the client puts its terminal in raw mode and pumps both directions.
+// the shell, dropping to the policy's mapped user (Phase 2b) when configured;
+// the client puts its terminal in raw mode and pumps both directions.
 // ===========================================================================
 
 /// Server side of a real shell session: allocate a PTY, spawn the shell, and
@@ -584,8 +728,6 @@ where
     R: AsyncReadExt + Unpin + Send + 'static,
     W: AsyncWriteExt + Unpin + Send,
 {
-    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-
     let (rx_key, tx_key) = role_keys(s2c_key, c2s_key, true);
     let (mut rx_ctr, mut tx_ctr) = (0u64, 0u64);
 
@@ -623,6 +765,7 @@ where
             match policy.authorize(&peer_fp, &cmd) {
                 PolicyDecision::Allow { user, run_cmd } => (
                     run_cmd.clone(),
+                    user.clone(),
                     format!(
                         "allow user={} cmd={}",
                         user.as_deref().unwrap_or("<server>"),
@@ -639,22 +782,38 @@ where
         }
         None => (
             cmd.clone(),
+            None,
             format!("allow (no policy) cmd={}", if cmd.is_empty() { "<login>" } else { cmd.as_str() }),
         ),
     };
     let run_cmd = allow_event.0;
-    if let Err(e) = audit(audit_path, &peer_fp, &allow_event.1).await {
+    let drop_user = allow_event.1;
+    if let Err(e) = audit(audit_path, &peer_fp, &allow_event.2).await {
         let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
             &Frame::Error("audit log unavailable; refusing".into())).await;
         return Err(CryptoError::Parameter(format!("shell refused: audit write failed: {e}")));
     }
 
-    let pair = native_pty_system()
-        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
-        .map_err(|e| CryptoError::Parameter(format!("openpty: {e}")))?;
+    // Resolve privilege drop (Phase 2b). A failure here (e.g. server is root but
+    // the fingerprint maps to no user / to root) refuses the session.
+    let drop_target = match resolve_drop(drop_user.as_deref()) {
+        Ok(t) => t,
+        Err(reason) => {
+            audit_best_effort(audit_path, &peer_fp, &format!("deny: {reason}")).await;
+            let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
+                &Frame::Error(reason.clone())).await;
+            return Err(CryptoError::Parameter(format!("shell denied: {reason}")));
+        }
+    };
 
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut builder = CommandBuilder::new(&shell);
+    // When dropping to another user, run *that* user's login shell (from
+    // /etc/passwd) rather than the operator's `$SHELL`; otherwise fall back to the
+    // operator's `$SHELL`, then `/bin/sh`.
+    let shell = drop_target
+        .as_ref()
+        .and_then(|t| t.shell.clone())
+        .or_else(|| std::env::var("SHELL").ok())
+        .unwrap_or_else(|| "/bin/sh".to_string());
     // Sanitize the client-supplied TERM: it ends up in the shell's environment
     // and is looked up by terminfo, so restrict it to a safe, bounded name (else
     // fall back to a conservative default).
@@ -666,27 +825,115 @@ where
     } else {
         "xterm".to_string()
     };
-    builder.env("TERM", &safe_term);
-    if run_cmd.is_empty() {
-        builder.arg("-l"); // login shell
-    } else {
-        builder.arg("-c");
-        builder.arg(&run_cmd);
-    }
-    let mut child = pair
-        .slave
-        .spawn_command(builder)
-        .map_err(|e| CryptoError::Parameter(format!("spawn shell: {e}")))?;
-    drop(pair.slave); // close our copy so the child holds the only slave end
 
-    let mut pty_reader = pair
-        .master
-        .try_clone_reader()
-        .map_err(|e| CryptoError::Parameter(format!("pty reader: {e}")))?;
-    let mut pty_writer = pair
-        .master
-        .take_writer()
-        .map_err(|e| CryptoError::Parameter(format!("pty writer: {e}")))?;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let (master_fd, slave_fd) = open_pty(cols, rows)?;
+    // Own both pty ends immediately so any early return below (a failed `dup` or
+    // `spawn`) closes them instead of leaking an fd — repeated failed connections
+    // must not exhaust the server's fd table.
+    let master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
+    let slave_raw = slave.as_raw_fd();
+    // Child stdio = three dups of the slave (Command takes ownership of each).
+    // Use F_DUPFD_CLOEXEC so each dup is close-on-exec: otherwise, between this
+    // dup and our `spawn`, another thread spawning an unrelated child could leak
+    // this shell's pty slave into that child (i/o interception). Our own child
+    // gets it as stdio via std's `dup2` (which clears CLOEXEC), so it still works.
+    let dup_stdio = || -> Result<std::process::Stdio> {
+        let fd = unsafe { libc::fcntl(slave_raw, libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(CryptoError::Parameter(format!(
+                "dup pty slave: {}", std::io::Error::last_os_error()
+            )));
+        }
+        Ok(std::process::Stdio::from(unsafe { OwnedFd::from_raw_fd(fd) }))
+    };
+    let (sin, sout, serr) = (dup_stdio()?, dup_stdio()?, dup_stdio()?);
+
+    let mut command = std::process::Command::new(&shell);
+    command.env("TERM", &safe_term);
+    if run_cmd.is_empty() {
+        command.arg("-l");
+    } else {
+        command.arg("-c").arg(&run_cmd);
+    }
+    command.stdin(sin).stdout(sout).stderr(serr);
+
+    // After fork, before exec — async-signal-safe syscalls only: new session,
+    // make the pty our controlling terminal, then drop privileges in the
+    // required order (supplementary groups → gid → uid) and verify root cannot
+    // be regained. Any failure returns Err so exec never happens (no shell runs
+    // with the wrong privileges).
+    let ctty_fd = slave_raw;
+    // Flatten the drop target into a fixed-size, `Copy`-only value so the
+    // `pre_exec` closure captures NO heap-owning object: nothing is dropped in the
+    // child between fork and exec, so there is no chance of deadlocking on the
+    // allocator lock held by another parent thread. Refuse (fail-closed) a user
+    // with more supplementary groups than the inline array holds.
+    const MAX_DROP_GROUPS: usize = 64;
+    let drop_in_child: Option<([libc::gid_t; MAX_DROP_GROUPS], usize, libc::uid_t, libc::gid_t)> =
+        match &drop_target {
+            Some(t) => {
+                if t.groups.len() > MAX_DROP_GROUPS {
+                    return Err(CryptoError::Parameter(format!(
+                        "user has {} supplementary groups (max {MAX_DROP_GROUPS})",
+                        t.groups.len()
+                    )));
+                }
+                let mut arr = [0 as libc::gid_t; MAX_DROP_GROUPS];
+                arr[..t.groups.len()].copy_from_slice(&t.groups);
+                Some((arr, t.groups.len(), t.uid, t.gid))
+            }
+            None => None,
+        };
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(ctty_fd, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if let Some((groups, ngroups, uid, gid)) = &drop_in_child {
+                if libc::setgroups(*ngroups as _, groups.as_ptr()) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setgid(*gid) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::setuid(*uid) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // If we can still regain root, the drop did not stick — abort the
+                // exec. Use a raw-errno error (no heap allocation): allocating
+                // here, post-fork, could deadlock on the allocator lock held by
+                // another parent thread.
+                if libc::setuid(0) == 0 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                }
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|e| CryptoError::Parameter(format!("spawn shell: {e}")))?;
+    // Drop the Command so the parent's copies of the child's stdio (three dups of
+    // the pty slave, owned by `command`) are closed; otherwise the slave stays
+    // open in this process and the master never reaches EOF when the shell exits.
+    drop(command);
+    // Close our remaining slave end so the child holds the only slave (the master
+    // then sees EOF/EIO once the shell exits and closes its stdio).
+    drop(slave);
+    // `master` is kept for resize (TIOCSWINSZ); dup it for the blocking
+    // reader/writer threads.
+    let mut pty_reader = master
+        .try_clone()
+        .map_err(|e| CryptoError::Parameter(format!("clone pty master (read): {e}")))?;
+    let mut pty_writer = master
+        .try_clone()
+        .map_err(|e| CryptoError::Parameter(format!("clone pty master (write): {e}")))?;
 
     // Blocking PTY master → async, via a reader thread feeding a channel.
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -725,14 +972,9 @@ where
     let rx_key_v = Zeroizing::new(rx_key.to_vec());
     let reader_task = tokio::spawn(async move {
         let mut rx_ctr = rx_ctr;
-        loop {
-            match recv_frame(&mut reader, &aead_r, &rx_key_v, &mut rx_ctr).await {
-                Ok(Some(f)) => {
-                    if in_frame_tx.send(f).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(None) | Err(_) => break,
+        while let Ok(Some(f)) = recv_frame(&mut reader, &aead_r, &rx_key_v, &mut rx_ctr).await {
+            if in_frame_tx.send(f).await.is_err() {
+                break;
             }
         }
     });
@@ -747,7 +989,10 @@ where
             frame = in_frame_rx.recv() => match frame {
                 Some(Frame::Data(d)) => { let _ = in_tx.send(d).await; }
                 Some(Frame::Winsz { cols, rows }) => {
-                    let _ = pair.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                    let ws = libc::winsize {
+                        ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0,
+                    };
+                    unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws); }
                 }
                 Some(Frame::Exit(_)) | Some(Frame::Error(_)) | None => break,
                 Some(Frame::Open { .. }) => {} // ignore a duplicate OPEN
@@ -764,7 +1009,7 @@ where
         .await
         .ok()
         .and_then(|r| r.ok())
-        .map(|s| s.exit_code() as i32)
+        .and_then(|s| s.code())
         .unwrap_or(-1);
     audit_best_effort(audit_path, &peer_fp, &format!("session end exit={code}")).await;
     let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr, &Frame::Exit(code)).await;
