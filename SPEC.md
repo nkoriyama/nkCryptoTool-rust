@@ -547,6 +547,24 @@ PKCS#8 / SPKI parsing for PQC keys uses structured DER decoders via the `pkcs8` 
 
 ## 16. MLS Group Chat and P2P Transport Sync Invariants
 
+> **Status (2026-06-27): the transport-allowlist *gatekeeping/eviction projection*
+> (Invariants 1 and 2) is WITHDRAWN as a feature.** Investigation found that MLS
+> group content (chat/files) travels as MLS Application messages over `ALPN_MLS`,
+> which is cryptographically protected by MLS itself (confidentiality, integrity,
+> forward secrecy, post-compromise security) and must stay reachable by
+> not-yet-members for invitations (Welcome). The transport-layer data plane that a
+> `PeerId` allowlist would gate (`ALPN_CHAT`/`ALPN_FILE` 1:1 flows) is not used
+> between MLS group members, so projecting the roster onto a transport gate added
+> no security over MLS while introducing real availability and correctness hazards
+> (invitation/inbox blocking, wrong-identity gating on iroh node ids rather than
+> the ML-DSA fingerprint the rest of the system authenticates). What remains
+> implemented and tested: **Invariant 0** (MLS is the source of truth — there is
+> simply no weaker transport projection to contradict it), **Invariant 3** (mls-rs
+> advances the epoch and rekeys on `Remove`), and **Invariants 4–6** (the delta
+> **Resync Protocol** over committed commit-history, with the SYNC responder
+> rejecting non-members of the current roster). `update_allowed_peers` /
+> active-peer eviction (Invariants 1/2) are intentionally absent.
+
 This section defines the architectural invariants and sync strategies for linking the multi-party MLS (Messaging Layer Security) group state with the underlying P2P transport layer (`P2pEndpoint` / `NetworkProcessor` allowlists).
 
 ### 16.1 Invariant 0: Philosophy / Source of Truth

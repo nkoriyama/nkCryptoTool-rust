@@ -929,7 +929,7 @@ mod tests {
             PeerId::new([peer_byte; 32]),
             vec![P2pProtocol(crate::network::ALPN_MLS)],
         );
-        let proc = GroupChatProcessor::new(name, Arc::new(ep), storage).expect("processor");
+        let proc = GroupChatProcessor::new(name, Arc::new(ep), storage, None).expect("processor");
         (proc, dir)
     }
 

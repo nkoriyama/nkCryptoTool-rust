@@ -45,7 +45,7 @@ pub const BINDING_CONTEXT: &[u8] = b"nkct-mls-transport-binding-v1";
 pub const TRANSPORT_DSA_ALGO: &str = "ML-DSA-65";
 
 /// A member's MLS↔transport binding: the same message signed by both keys.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MemberBinding {
     /// Hybrid signature by the MLS identity key.
     pub mls_sig: Vec<u8>,
@@ -61,12 +61,12 @@ pub enum BindingError {
     TransportSign(String),
 }
 
-/// Exact bytes both keys sign: `CONTEXT ‖ epoch ‖ lp(mls_pub) ‖ lp(transport_pub)`
+/// Exact bytes both keys sign: `CONTEXT ‖ epoch ‖ lp(mls_pub) ‖ lp(transport_pub) ‖ peer_id`
 /// where `lp(x) = len(x) as be64 ‖ x`. The length prefixes and the embedded MLS
 /// public key remove field-boundary ambiguity and pin the binding's subject.
-fn binding_message(epoch: u64, mls_pub: &[u8], transport_dsa_pub: &[u8]) -> Vec<u8> {
+fn binding_message(epoch: u64, mls_pub: &[u8], transport_dsa_pub: &[u8], peer_id: &[u8; 32]) -> Vec<u8> {
     let mut m = Vec::with_capacity(
-        BINDING_CONTEXT.len() + 8 + 8 + mls_pub.len() + 8 + transport_dsa_pub.len(),
+        BINDING_CONTEXT.len() + 8 + 8 + mls_pub.len() + 8 + transport_dsa_pub.len() + 32,
     );
     m.extend_from_slice(BINDING_CONTEXT);
     m.extend_from_slice(&epoch.to_be_bytes());
@@ -74,6 +74,7 @@ fn binding_message(epoch: u64, mls_pub: &[u8], transport_dsa_pub: &[u8]) -> Vec<
     m.extend_from_slice(mls_pub);
     m.extend_from_slice(&(transport_dsa_pub.len() as u64).to_be_bytes());
     m.extend_from_slice(transport_dsa_pub);
+    m.extend_from_slice(peer_id);
     m
 }
 
@@ -87,8 +88,9 @@ pub fn create_binding<P: CipherSuiteProvider>(
     transport_dsa_priv: &[u8],
     transport_dsa_pub: &[u8],
     epoch: u64,
+    peer_id: &[u8; 32],
 ) -> Result<MemberBinding, BindingError> {
-    let msg = binding_message(epoch, mls_pub.as_bytes(), transport_dsa_pub);
+    let msg = binding_message(epoch, mls_pub.as_bytes(), transport_dsa_pub, peer_id);
     let mls_sig = suite
         .sign(mls_sk, &msg)
         .map_err(|e| BindingError::MlsSign(format!("{e:?}")))?;
@@ -101,16 +103,17 @@ pub fn create_binding<P: CipherSuiteProvider>(
 }
 
 /// Verify a binding: **both** the MLS-side and transport-side signatures must
-/// be valid for exactly this `(epoch, mls_pub, transport_pub)` triple.
+/// be valid for exactly this `(epoch, mls_pub, transport_pub, peer_id)` tuple.
 pub fn verify_binding<P: CipherSuiteProvider>(
     suite: &P,
     mls_pub: &SignaturePublicKey,
     transport_algo: &str,
     transport_dsa_pub: &[u8],
     epoch: u64,
+    peer_id: &[u8; 32],
     binding: &MemberBinding,
 ) -> bool {
-    let msg = binding_message(epoch, mls_pub.as_bytes(), transport_dsa_pub);
+    let msg = binding_message(epoch, mls_pub.as_bytes(), transport_dsa_pub, peer_id);
     let mls_ok = suite.verify(mls_pub, &binding.mls_sig, &msg).is_ok();
     let transport_ok = matches!(
         crate::backend::pqc_verify(transport_algo, transport_dsa_pub, &msg, &binding.transport_sig),
@@ -150,17 +153,19 @@ mod tests {
     fn binding_roundtrip_verifies() {
         let s = suite();
         let (msk, mpk, tsk, tpk) = member(&s);
-        let b = create_binding(&s, &msk, &mpk, TRANSPORT_DSA_ALGO, &tsk, &tpk, 7).unwrap();
-        assert!(verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &tpk, 7, &b));
+        let pid = [1u8; 32];
+        let b = create_binding(&s, &msk, &mpk, TRANSPORT_DSA_ALGO, &tsk, &tpk, 7, &pid).unwrap();
+        assert!(verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &tpk, 7, &pid, &b));
     }
 
     #[test]
     fn wrong_epoch_rejected() {
         let s = suite();
         let (msk, mpk, tsk, tpk) = member(&s);
-        let b = create_binding(&s, &msk, &mpk, TRANSPORT_DSA_ALGO, &tsk, &tpk, 7).unwrap();
+        let pid = [1u8; 32];
+        let b = create_binding(&s, &msk, &mpk, TRANSPORT_DSA_ALGO, &tsk, &tpk, 7, &pid).unwrap();
         assert!(
-            !verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &tpk, 8, &b),
+            !verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &tpk, 8, &pid, &b),
             "a binding must not verify under a different epoch"
         );
     }
@@ -170,8 +175,19 @@ mod tests {
         let s = suite();
         let (msk, mpk, tsk, tpk) = member(&s);
         let (_msk2, mpk2) = s.signature_key_generate().unwrap();
-        let b = create_binding(&s, &msk, &mpk, TRANSPORT_DSA_ALGO, &tsk, &tpk, 1).unwrap();
-        assert!(!verify_binding(&s, &mpk2, TRANSPORT_DSA_ALGO, &tpk, 1, &b));
+        let pid = [1u8; 32];
+        let b = create_binding(&s, &msk, &mpk, TRANSPORT_DSA_ALGO, &tsk, &tpk, 1, &pid).unwrap();
+        assert!(!verify_binding(&s, &mpk2, TRANSPORT_DSA_ALGO, &tpk, 1, &pid, &b));
+    }
+
+    #[test]
+    fn wrong_peer_id_rejected() {
+        let s = suite();
+        let (msk, mpk, tsk, tpk) = member(&s);
+        let pid1 = [1u8; 32];
+        let pid2 = [2u8; 32];
+        let b = create_binding(&s, &msk, &mpk, TRANSPORT_DSA_ALGO, &tsk, &tpk, 1, &pid1).unwrap();
+        assert!(!verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &tpk, 1, &pid2, &b));
     }
 
     #[test]
@@ -183,15 +199,16 @@ mod tests {
         let s = suite();
         let (msk, mpk, attacker_tsk, _attacker_tpk) = member(&s);
         let (_victim_tsk, victim_tpk, _) = crate::backend::pqc_keygen_dsa(TRANSPORT_DSA_ALGO).unwrap();
+        let pid = [1u8; 32];
         // Forge a binding claiming victim_tpk, but sign the transport half with
         // the attacker's own transport key (the best they can do).
-        let msg = binding_message(1, mpk.as_bytes(), &victim_tpk);
+        let msg = binding_message(1, mpk.as_bytes(), &victim_tpk, &pid);
         let mls_sig = s.sign(&msk, &msg).unwrap();
         let transport_sig =
             crate::backend::pqc_sign(TRANSPORT_DSA_ALGO, &attacker_tsk, &msg, None).unwrap();
         let forged = MemberBinding { mls_sig, transport_sig };
         assert!(
-            !verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &victim_tpk, 1, &forged),
+            !verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &victim_tpk, 1, &pid, &forged),
             "binding a transport key without its private key must not verify"
         );
     }
@@ -201,8 +218,9 @@ mod tests {
         let s = suite();
         let (msk, mpk, tsk, tpk) = member(&s);
         let (_o, other_tpk, _) = crate::backend::pqc_keygen_dsa(TRANSPORT_DSA_ALGO).unwrap();
-        let b = create_binding(&s, &msk, &mpk, TRANSPORT_DSA_ALGO, &tsk, &tpk, 1).unwrap();
-        assert!(!verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &other_tpk, 1, &b));
+        let pid = [1u8; 32];
+        let b = create_binding(&s, &msk, &mpk, TRANSPORT_DSA_ALGO, &tsk, &tpk, 1, &pid).unwrap();
+        assert!(!verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &other_tpk, 1, &pid, &b));
     }
 
     #[test]

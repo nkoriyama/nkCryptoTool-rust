@@ -130,6 +130,40 @@ impl GroupStorage {
         }
         Ok(out)
     }
+
+    pub fn store_commit(
+        &self,
+        group_id: &[u8],
+        epoch: u64,
+        commit_bytes: &[u8],
+    ) -> Result<(), GroupError> {
+        self.backend
+            .store_commit(group_id, epoch, commit_bytes)
+            .map_err(|e| GroupError::Storage(format!("store_commit: {e}")))
+    }
+
+    pub fn load_commits(
+        &self,
+        group_id: &[u8],
+        from_epoch_exclusive: u64,
+        to_epoch_inclusive: u64,
+    ) -> Result<Vec<(u64, Zeroizing<Vec<u8>>)>, GroupError> {
+        self.backend
+            .load_commits(group_id, from_epoch_exclusive, to_epoch_inclusive)
+            .map_err(|e| GroupError::Storage(format!("load_commits: {e}")))
+    }
+
+    pub fn oldest_retained_epoch(&self, group_id: &[u8]) -> Result<Option<u64>, GroupError> {
+        self.backend
+            .oldest_retained_epoch(group_id)
+            .map_err(|e| GroupError::Storage(format!("oldest_retained_epoch: {e}")))
+    }
+
+    pub fn prune_commits(&self, group_id: &[u8], keep: u64) -> Result<u64, GroupError> {
+        self.backend
+            .prune_commits(group_id, keep)
+            .map_err(|e| GroupError::Storage(format!("prune_commits: {e}")))
+    }
 }
 
 /// Derive a 256-bit value key from a passphrase for the convenience

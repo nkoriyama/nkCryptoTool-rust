@@ -16,6 +16,13 @@ use zeroize::{Zeroize, Zeroizing};
 pub const BUF_SIZE: usize = 1024 * 1024;
 pub const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024 * 1024; // 10GB
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Short timeout for *control-plane handshakes* (a small, fixed-size header /
+/// request a well-behaved peer sends immediately on connecting, and the short
+/// response). Distinct from [`IDLE_TIMEOUT`], which is sized for bulk transfer
+/// and is far too long for a control read: a peer that connects then stalls
+/// before sending its header must be dropped quickly so it cannot occupy a
+/// serialized accept loop (head-of-line DoS).
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CUMULATIVE_TIMEOUT: Duration = Duration::from_secs(7200);
 pub const CHAT_SESSION_TIMEOUT: Duration = Duration::from_secs(7200); // 2 hours
 

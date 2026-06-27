@@ -615,6 +615,30 @@ impl RedbBackend {
         Ok(out)
     }
 
+    pub fn oldest_retained_epoch(&self, group_id: &[u8]) -> Result<Option<u64>, RedbStorageError> {
+        if group_id.len() > u16::MAX as usize {
+            return Err(RedbStorageError::Malformed(
+                "group id exceeds 65535 bytes".into(),
+            ));
+        }
+        let lo = group_epoch_key(group_id, 0);
+        let hi = group_epoch_key(group_id, u64::MAX);
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let table = rtx
+            .open_table(TBL_GROUP_COMMITS)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let mut range = table
+            .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        match range.next().transpose().map_err(|e| RedbStorageError::Backend(e.to_string()))? {
+            Some((k, _)) => Ok(Some(epoch_from_group_key(k.value())?)),
+            None => Ok(None),
+        }
+    }
+
     /// Prune commit history for `group_id`, keeping only the newest `keep`
     /// epochs. Returns the number of commits deleted (so callers can log what
     /// was dropped rather than silently bounding coverage).

@@ -326,6 +326,7 @@ mod tests {
             "helper",
             std::sync::Arc::new(helper_ep),
             storage,
+            None,
         )
         .expect("processor");
         let kp_bytes = helper.export_key_package().await.expect("export kp");

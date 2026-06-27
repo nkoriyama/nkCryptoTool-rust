@@ -13,6 +13,21 @@
 
 # 設計提案 (改訂版): MLS グループ状態と P2P トランスポートの同期
 
+> [!CAUTION]
+> **2026-06-27 撤回**: 本書が設計する **transport allowlist へのゲートキーピング/エビクション投影
+> (Invariant 1/2)** は機能として**撤回**した。実装直前の精査で、MLS グループの本体
+> (チャット/ファイル) は `ALPN_MLS` 上の MLS Application メッセージとして流れ、**MLS 自身が
+> 暗号保護** (機密性・完全性・前方秘匿・PCS) しており、かつ招待 (Welcome) のため非メンバーにも
+> 到達可能でなければならないと判明した。`PeerId` allowlist が gate しうる transport データプレーン
+> (`ALPN_CHAT`/`ALPN_FILE` の 1:1 フロー) は**MLS グループメンバー間では使われない**ため、
+> ロスターを transport gate へ投影しても MLS 以上のセキュリティを足さず、むしろ可用性・正当性の
+> 実害 (招待/inbox 遮断、ML-DSA 指紋ではなく iroh ノード id で gate する同一性の取り違え) を
+> 生む。**実装として残すのは**: Invariant 0 (MLS が source of truth — 矛盾しうる弱い transport
+> 投影が存在しないだけ)、Invariant 3 (mls-rs が Remove で epoch 前進・鍵更新)、
+> Invariant 4〜6 (コミット履歴に基づく delta **Resync プロトコル**。SYNC 応答は現ロスター非メンバーを
+> 拒否)。`update_allowed_peers` / 能動エビクション (Invariant 1/2) は意図的に不在。
+> 以下の §3 (gate/eviction 設計) は**歴史的記録**であり、現行コードには対応しない。
+
 本書は `nkCryptoTool-rust` の MLS グループメンバーシップを P2P トランスポート層
 (`P2pEndpoint` / `NetworkProcessor` の allowlist) に同期させ、[SPEC.md §16](SPEC.md)
 の不変条件 (Invariant 0〜5) を満たすための実装設計である。
@@ -140,10 +155,16 @@ active_conns: Arc<Mutex<HashMap<[u8;32], Vec<ConnHandle>>>>,
 - **新接続のゲートキーピング (T=0)**: `accept()` 内、ML-DSA 認証で相手指紋が確定した
   **直後**に `allowed_peers` を照合し、集合が設定済みかつ不在なら**アプリ層ストリームを
   開く前に**接続を閉じる。
-- **能動切断 (T≤3s)**: `update_allowed_peers` で `old - new = evicted` を算出し、
-  各 evicted 指紋について `active_conns` のハンドルを grace 期間内に close。
-  - **猶予 T = 3 秒** (既存 cooldown 2s と整合)。**猶予は QUIC 接続のテアダウンのみ**を
-    対象とする。
+- **能動切断 (T=0, 猶予なし)**: `sync_transport_and_evict` で `old - new = evicted` を算出し、
+  各 evicted について **即時** `disconnect_peer` する (`disconnect_peer` は他群に残るピアには no-op)。
+  - **【レビュー反映・改訂】猶予窓は廃止**: 当初は QUIC テアダウンのため 3 秒の猶予を設けたが、
+    猶予中も evicted ピアは既存の**データプレーン (`ALPN_CHAT`/`ALPN_FILE`) 接続**で送信を続けられる。
+    データプレーンは生バイト列で **epoch 保護が無い** (MLS フレームと違い T=0 の epoch ローテで
+    切れない)。よって猶予を設けず **T=0 で接続を切る**。
+  - **【レビュー反映・重要】自己除外時の allowlist 失効**: 自ノードが群から Remove された
+    (`CommitEffect::Removed`) 場合、当該群の allowlist 投影を `remove_group_membership(group_id)` で
+    **即座に削除**し、`old_roster` の各ピアを `disconnect_peer` する (他群に残らないピアのみ切断される)。
+    これを怠ると、除外後も元同群メンバーが自ノードのデータプレーンに接続し続けられる。
   - **【レビュー反映・重要】旧 epoch メッセージ受理の即時停止**: Invariant 3 が保護するのは
     **新** epoch (E) の鍵のみ。エビクト済みピアは依然 **旧 epoch (E-1) の鍵を保持**しており、
     MLS の epoch 遷移窓 (リオーダ許容) を悪用して**有効な E-1 アプリメッセージを送れる**。
@@ -157,6 +178,57 @@ active_conns: Arc<Mutex<HashMap<[u8;32], Vec<ConnHandle>>>>,
     accept 側の**ゲートキーピング照合と `active_conns` 登録を同一ロック下**で実行する。
     これにより「close sweep 直後に evicted ピアの接続が登録されて切断対象から漏れる」
     隙間を塞ぐ (登録時に最新 `allowed_peers` を再照合し、不在なら登録せず即閉)。
+
+### 3.3 ゲート対象 ALPN スコープ (Invariant 2 の適用範囲) — 【レビュー反映・重要】
+allowlist ゲートは **アプリ・データプレーン (`ALPN_CHAT` / `ALPN_FILE`) の inbound 接続のみ**
+に適用する。**MLS 制御プレーン (`ALPN_MLS`: Welcome/Commit/Proposal) と inbox
+(`ALPN_INBOX`) はゲート対象外**とする。理由:
+- **`ALPN_MLS` をゲートすると multi-group 招待が壊れる**: 既に 1 つ以上の群に属する
+  ノードは allowlist が非空になる。別の群へ招く相手はまだ共有ロスターに居ないため、
+  全 ALPN をゲートすると inbound Welcome 接続まで拒否され、**新規群への参加が不可能**になる。
+  MLS 制御プレーンは **mls-rs 自身が認証**する (招待されていない Welcome は復号失敗、
+  非メンバーの Commit は検証失敗) ため、transport allowlist によるゲートは冗長かつ有害。
+- **`ALPN_INBOX` は設計上オープン** (誰でもオフライン宛の非同期メッセージを預けられる)。
+  ゲートすると非現メンバーからの store-and-forward 配送が壊れる。
+- データプレーン (`ALPN_CHAT`/`ALPN_FILE`) は MLS 暗号化されない生の 1:1 payload を運ぶため、
+  ここだけを「MLS 認証済みメンバーのみ」にゲートすれば目的を満たす。
+- SYNC 応答 (`ALPN_MLS` 上) 自体は **roster membership チェック** (`accept_next` 内) で
+  非メンバーを拒否するので、ゲート免除でも保護は維持される。
+
+### 3.4 能動接続レジストリの掃除と SYNC レート制限
+- **掃除**: `active_conns` への登録時に、既に閉じた接続 (`close_reason().is_some()`) を
+  全 peer から sweep し、空エントリを除去する。これがないと**通常クローズ**で切れた接続が
+  `disconnect_peer` まで残り続け、無制限リークになる (掃除コストは現存接続数で上限)。
+- **SYNC DoS (受容済みトレードオフ)**: SYNC 応答は roster 取得のため membership チェック前に
+  `load_group` を行うが、(a) 未知 group_id は redb の単純ミスで安価、(b) 実在 group_id でも
+  redb 読取 1 回 (ホットならページキャッシュ)、(c) 各要求は QUIC ハンドシェイク+bi-stream を
+  要し `accept_next` は直列・idle-timeout 済みで接続確立コストが自然なレート制限、
+  (d) delta は `DEFAULT_COMMIT_RETENTION`/`oldest_epoch` で上限。実害は低い。
+  **per-peer SYNC レート制限は将来のハードン候補**として残す。
+
+### 3.5 受容済みトレードオフ / 将来要件 — 【レビュー反映】
+- **HoL ブロッキング**: `accept_next` は直列ループで消費されるため、制御プレーンの読取・送信は
+  `IDLE_TIMEOUT`(300s, バルク用) ではなく `HANDSHAKE_TIMEOUT`(10s) で上限を付ける:
+  (a) ヘッダ読取、(b) SYNC 要求読取、(c) 標準 MLS フレーム body 読取
+  (ALPN_MLS は制御プレーンで小サイズ。バルクはデータプレーン)、(d) **SYNC 応答全体**
+  (OK マーカ+全コミットフレーム送信) を**単一の deadline**で囲む — per-write だけでは
+  N コミット × timeout で総占有時間が無制限になるため。これで 1 接続あたりの占有を ~10s に抑える。
+  接続確立 (QUIC) コスト+直列 accept が自然なレート制限。完全な並行化
+  (接続毎タスク spawn) は将来の改善候補。
+- **epoch = 0 (identity-level 束縛)**: `create_binding`/`verify_binding` は実装上 epoch=0
+  に固定する。束縛が固定するのは長期 ID 鍵 `(mls_pub, transport_pub, peer_id)` そのもので、
+  束縛の「リプレイ」= 自分の鍵での自 ID の再主張に過ぎず攻撃にならない。メンバーシップ権威は
+  MLS ロスターが握る。transport 鍵のローテーション+失効を将来導入する場合のみ join-epoch
+  束縛へ移行する。
+- **群参加後のデータプレーン gate 常時化**: 1 つでも群に参加すると `allowed_peers` が非空になり、
+  以後データプレーン (`ALPN_CHAT`/`ALPN_FILE`) は常にゲートされる (空=全許可は MLS 未参加時のみ)。
+  これは MLS モードの意図した保護姿勢。現状 **leave/delete-group 操作は存在しない**ため
+  「群を作成・削除して 1:1 を永久無効化」する DoS は到達不能。**将来 leave/delete-group を
+  追加する際は、当該 group_id の `allowed_peers` エントリを除去するエンドポイントメソッドを
+  必ず呼ぶこと** (さもないと stale エントリでデータプレーンが gate されたままになる)。
+- **署名鍵ファイルの `exists()`→open TOCTOU (main.rs)**: ローカル FS を制御できる攻撃者が
+  自ノードの署名鍵ファイルを差し替えるシナリオで、現状の脅威モデル外 (Windows ハードンも
+  別途見送り中)。優先度低。
 
 ---
 

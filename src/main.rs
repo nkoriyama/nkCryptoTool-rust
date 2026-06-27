@@ -1256,8 +1256,29 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
         }
     };
 
-    let mut processor = GroupChatProcessor::new(&args.mls_display_name, endpoint.clone(), storage)
-        .map_err(|e| anyhow::anyhow!("build GroupChatProcessor: {e}"))?;
+    let key_dir = args.key_dir.clone().unwrap_or_else(|| "keys".to_string());
+    let signing_key_path = resolve_key_path(&key_dir, args.signing_privkey.clone());
+    let mut transport_dsa_priv = None;
+    if let Some(signing_path) = &signing_key_path {
+        if std::path::Path::new(signing_path).exists() {
+            let mut dsa_passphrase = zeroize::Zeroizing::new(String::new());
+            if nk_crypto_tool::utils::private_key_file_is_encrypted(signing_path) {
+                dsa_passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+                    .map_err(|e| anyhow::anyhow!("read signing key passphrase: {e}"))?;
+            }
+            // Keep the secret in Zeroizing end-to-end (no plain-Vec copy that
+            // would linger un-wiped in freed heap).
+            transport_dsa_priv = Some(load_raw_dsa_priv(signing_path, &dsa_passphrase)?);
+        }
+    }
+
+    let mut processor = GroupChatProcessor::new(
+        &args.mls_display_name,
+        endpoint.clone(),
+        storage,
+        transport_dsa_priv,
+    )
+    .map_err(|e| anyhow::anyhow!("build GroupChatProcessor: {e}"))?;
     if let Some(url) = &args.inbox_url {
         let ticket: Ticket = url
             .parse()
@@ -1435,8 +1456,24 @@ async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
         }
     };
 
+    let key_dir = args.key_dir.clone().unwrap_or_else(|| "keys".to_string());
+    let signing_key_path = resolve_key_path(&key_dir, args.signing_privkey.clone());
+    let mut transport_dsa_priv = None;
+    if let Some(signing_path) = &signing_key_path {
+        if std::path::Path::new(signing_path).exists() {
+            let mut dsa_passphrase = zeroize::Zeroizing::new(String::new());
+            if nk_crypto_tool::utils::private_key_file_is_encrypted(signing_path) {
+                dsa_passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+                    .map_err(|e| anyhow::anyhow!("read signing key passphrase: {e}"))?;
+            }
+            // Keep the secret in Zeroizing end-to-end (no plain-Vec copy that
+            // would linger un-wiped in freed heap).
+            transport_dsa_priv = Some(load_raw_dsa_priv(signing_path, &dsa_passphrase)?);
+        }
+    }
+
     let processor = Arc::new(
-        GroupChatProcessor::new(&args.mls_display_name, endpoint, storage)
+        GroupChatProcessor::new(&args.mls_display_name, endpoint, storage, transport_dsa_priv)
             .map_err(|e| anyhow::anyhow!("build GroupChatProcessor: {e}"))?,
     );
 

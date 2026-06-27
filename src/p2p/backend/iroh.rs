@@ -358,6 +358,7 @@ impl crate::p2p::P2pEndpoint for IrohEndpoint {
             .map_err(|e| crate::p2p::P2pError::Accept(e.to_string()))?;
         let remote_node_id = connection.remote_id();
         let peer_id = crate::p2p::PeerId::new(*remote_node_id.as_bytes());
+
         let (send, recv) = connection
             .accept_bi()
             .await

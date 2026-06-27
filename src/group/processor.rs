@@ -38,7 +38,7 @@ use mls_rs::client_builder::{
     WithKeyPackageRepo, WithPskStore,
 };
 use mls_rs::identity::SigningIdentity;
-use mls_rs::identity::basic::{BasicCredential, BasicIdentityProvider};
+use mls_rs::identity::basic::BasicCredential;
 use mls_rs::{Client, ExtensionList, MlsMessage, WireFormat};
 use mls_rs_core::crypto::{CipherSuiteProvider, CryptoProvider};
 use zeroize::Zeroizing;
@@ -51,7 +51,7 @@ use crate::group::storage::GroupStorage;
 use crate::group::types::{
     AddMemberOutput, GroupError, GroupId, GroupSummary, IncomingGroupEvent, MemberInfo,
 };
-use crate::p2p::{P2pEndpoint, PeerAddr};
+use crate::p2p::{P2pEndpoint, PeerAddr, PeerId};
 
 /// MLS-RS `Config` shape after stacking our storage providers and
 /// crypto/identity providers on top of the base config.
@@ -60,7 +60,7 @@ use crate::p2p::{P2pEndpoint, PeerAddr};
 /// `.group_state_storage(..).key_package_repo(..).psk_store(..).crypto_provider(..).identity_provider(..)`,
 /// which composes outermost-first as `WithIdentityProvider<.., WithCryptoProvider<.., WithPskStore<.., WithKeyPackageRepo<.., WithGroupStateStorage<.., BaseConfig>>>>>`.
 type MlsConfig = WithIdentityProvider<
-    BasicIdentityProvider,
+    GroupIdentityProvider,
     WithCryptoProvider<
         HybridCryptoProvider,
         WithPskStore<
@@ -72,6 +72,162 @@ type MlsConfig = WithIdentityProvider<
         >,
     >,
 >;
+
+#[derive(Clone, Debug)]
+pub struct GroupIdentityProvider {
+    crypto: HybridCryptoProvider,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum GroupIdentityProviderError {
+    #[error("unsupported credential type: {0:?}")]
+    UnsupportedCredential(mls_rs::identity::CredentialType),
+    #[error("invalid MLS-transport binding: {0}")]
+    InvalidBinding(String),
+}
+
+impl mls_rs::error::IntoAnyError for GroupIdentityProviderError {
+    fn into_dyn_error(self) -> Result<Box<dyn std::error::Error + Send + Sync>, Self> {
+        Ok(self.into())
+    }
+}
+
+/// Parse the `NKCB` binding embedded in a BasicCredential identifier:
+/// `b"NKCB" ‖ peer_id(32) ‖ lp32(transport_pub) ‖ lp32(mls_sig) ‖ lp32(transport_sig) ‖ display_name`
+/// where `lp32(x) = (len(x) as u32 BE) ‖ x`. Returns `None` for a non-NKCB or
+/// malformed identifier. Bounds are checked via slice splitting (never
+/// `offset + len`), so a huge length field cannot overflow `usize` on 32-bit
+/// targets (an earlier in-place parser could panic there).
+fn parse_nkcb_binding(
+    id: &[u8],
+) -> Option<([u8; 32], Vec<u8>, crate::group::binding::MemberBinding)> {
+    let rest = id.strip_prefix(b"NKCB".as_slice())?;
+    if rest.len() < 32 {
+        return None;
+    }
+    let mut peer_id = [0u8; 32];
+    peer_id.copy_from_slice(&rest[..32]);
+    let mut cur = &rest[32..];
+
+    // Read one u32-length-prefixed field; advance the cursor. Overflow-safe:
+    // the length is only ever *compared* against the remaining slice length.
+    fn take_lp<'a>(cur: &mut &'a [u8]) -> Option<&'a [u8]> {
+        let len = u32::from_be_bytes(cur.get(..4)?.try_into().unwrap()) as usize;
+        let body = &cur[4..];
+        if body.len() < len {
+            return None;
+        }
+        let (field, after) = body.split_at(len);
+        *cur = after;
+        Some(field)
+    }
+
+    let transport_pub = take_lp(&mut cur)?.to_vec();
+    let mls_sig = take_lp(&mut cur)?.to_vec();
+    let transport_sig = take_lp(&mut cur)?.to_vec();
+    Some((
+        peer_id,
+        transport_pub,
+        crate::group::binding::MemberBinding {
+            mls_sig,
+            transport_sig,
+        },
+    ))
+}
+
+impl GroupIdentityProvider {
+    fn verify_credential_binding(
+        &self,
+        signing_identity: &SigningIdentity,
+    ) -> Result<(), GroupIdentityProviderError> {
+        let basic = signing_identity
+            .credential
+            .as_basic()
+            .ok_or_else(|| GroupIdentityProviderError::UnsupportedCredential(signing_identity.credential.credential_type()))?;
+
+        // Every MLS member MUST carry a valid NKCB transport binding. Reject a
+        // missing/malformed binding at join so no member exists without an
+        // authenticated transport identity (closes the non-NKCB bypass that
+        // would otherwise let an attacker join with a self-asserted PeerId).
+        let (peer_id_bytes, transport_dsa_pub, binding) = parse_nkcb_binding(&basic.identifier)
+            .ok_or_else(|| {
+                GroupIdentityProviderError::InvalidBinding(
+                    "missing or malformed NKCB transport binding".to_string(),
+                )
+            })?;
+
+        let provider = self
+            .crypto
+            .cipher_suite_provider(hybrid_cipher_suite())
+            .ok_or_else(|| {
+                GroupIdentityProviderError::InvalidBinding("unsupported cipher suite".to_string())
+            })?;
+
+        if !crate::group::binding::verify_binding(
+            &provider,
+            &signing_identity.signature_key,
+            "ML-DSA-65",
+            &transport_dsa_pub,
+            0, // identity-level binding
+            &peer_id_bytes,
+            &binding,
+        ) {
+            return Err(GroupIdentityProviderError::InvalidBinding(
+                "cryptographic verification failed".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl mls_rs_core::identity::IdentityProvider for GroupIdentityProvider {
+    type Error = GroupIdentityProviderError;
+
+    fn validate_member(
+        &self,
+        signing_identity: &SigningIdentity,
+        _timestamp: Option<mls_rs::time::MlsTime>,
+        _context: mls_rs_core::identity::MemberValidationContext<'_>,
+    ) -> Result<(), Self::Error> {
+        self.verify_credential_binding(signing_identity)
+    }
+
+    fn validate_external_sender(
+        &self,
+        signing_identity: &SigningIdentity,
+        _timestamp: Option<mls_rs::time::MlsTime>,
+        _extensions: Option<&ExtensionList>,
+    ) -> Result<(), Self::Error> {
+        self.verify_credential_binding(signing_identity)
+    }
+
+    fn identity(
+        &self,
+        signing_identity: &SigningIdentity,
+        _extensions: &ExtensionList,
+    ) -> Result<Vec<u8>, Self::Error> {
+        let basic = signing_identity
+            .credential
+            .as_basic()
+            .ok_or_else(|| GroupIdentityProviderError::UnsupportedCredential(signing_identity.credential.credential_type()))?;
+        Ok(basic.identifier.to_vec())
+    }
+
+    fn valid_successor(
+        &self,
+        predecessor: &SigningIdentity,
+        successor: &SigningIdentity,
+        _extensions: &ExtensionList,
+    ) -> Result<bool, Self::Error> {
+        let p = predecessor.credential.as_basic().ok_or_else(|| GroupIdentityProviderError::UnsupportedCredential(predecessor.credential.credential_type()))?;
+        let s = successor.credential.as_basic().ok_or_else(|| GroupIdentityProviderError::UnsupportedCredential(successor.credential.credential_type()))?;
+        Ok(p == s)
+    }
+
+    fn supported_types(&self) -> Vec<mls_rs::identity::CredentialType> {
+        vec![mls_rs::identity::CredentialType::BASIC]
+    }
+}
 
 type MlsClient = Client<MlsConfig>;
 
@@ -131,6 +287,7 @@ impl GroupChatProcessor {
         display_name: &str,
         endpoint: Arc<dyn P2pEndpoint>,
         storage: GroupStorage,
+        transport_dsa_priv: Option<zeroize::Zeroizing<Vec<u8>>>,
     ) -> Result<Self, GroupError> {
         let crypto = HybridCryptoProvider::new();
         let suite_id = hybrid_cipher_suite();
@@ -169,7 +326,48 @@ impl GroupChatProcessor {
             }
         };
 
-        let credential = BasicCredential::new(display_name.as_bytes().to_vec());
+        // Load or generate transport ML-DSA-65 private key for the binding.
+        // Keep it in Zeroizing so the raw secret is wiped on drop (a plain Vec
+        // would linger in freed heap memory).
+        let transport_priv_key: zeroize::Zeroizing<Vec<u8>> = match transport_dsa_priv {
+            Some(priv_key) => priv_key,
+            None => {
+                // `priv_key` is already `Zeroizing<Vec<u8>>`; move it (no
+                // `.to_vec()` copy that would leave an un-wiped plain Vec).
+                let (priv_key, _, _) = crate::backend::pqc_keygen_dsa("ML-DSA-65")
+                    .map_err(|e| GroupError::Backend(format!("generate ephemeral transport key: {e}")))?;
+                priv_key
+            }
+        };
+        let transport_pub_key = crate::backend::pqc_pub_from_priv_dsa("ML-DSA-65", &transport_priv_key)
+            .map_err(|e| GroupError::Backend(format!("unwrap pqc public key: {e}")))?;
+
+        // Create the MemberBinding
+        let b = crate::group::binding::create_binding(
+            &suite,
+            &signing_key,
+            &signing_pub,
+            "ML-DSA-65",
+            &transport_priv_key,
+            &transport_pub_key,
+            0, // identity-level binding (epoch = 0)
+            endpoint.local_id().as_bytes(),
+        ).map_err(|e| GroupError::Backend(format!("create binding: {e:?}")))?;
+
+        // Serialize it in credential_bytes:
+        // MAGIC (4 bytes) || PeerId (32 bytes) || pub_key_len (u32) || pub_key || mls_sig_len (u32) || mls_sig || transport_sig_len (u32) || transport_sig || display_name
+        let mut credential_bytes = Vec::new();
+        credential_bytes.extend_from_slice(b"NKCB");
+        credential_bytes.extend_from_slice(endpoint.local_id().as_bytes());
+        credential_bytes.extend_from_slice(&(transport_pub_key.len() as u32).to_be_bytes());
+        credential_bytes.extend_from_slice(&transport_pub_key);
+        credential_bytes.extend_from_slice(&(b.mls_sig.len() as u32).to_be_bytes());
+        credential_bytes.extend_from_slice(&b.mls_sig);
+        credential_bytes.extend_from_slice(&(b.transport_sig.len() as u32).to_be_bytes());
+        credential_bytes.extend_from_slice(&b.transport_sig);
+        credential_bytes.extend_from_slice(display_name.as_bytes());
+
+        let credential = BasicCredential::new(credential_bytes);
         let identity = SigningIdentity::new(credential.into_credential(), signing_pub);
 
         // The three storage components are fetched once each — each
@@ -184,8 +382,8 @@ impl GroupChatProcessor {
             .group_state_storage(group_state_storage)
             .key_package_repo(key_package_storage)
             .psk_store(psk_storage)
-            .crypto_provider(crypto)
-            .identity_provider(BasicIdentityProvider)
+            .crypto_provider(crypto.clone())
+            .identity_provider(GroupIdentityProvider { crypto })
             .signing_identity(identity, signing_key, suite_id)
             .build();
 
@@ -406,6 +604,17 @@ impl GroupChatProcessor {
             .commit_message
             .to_bytes()
             .map_err(|e| GroupError::Backend(format!("Commit encode: {e}")))?;
+
+        if let Err(e) =
+            self.storage
+                .store_commit(group.group_id(), group.current_epoch(), &commit_bytes)
+        {
+            // The MLS state is already persisted (write_to_storage); only the
+            // resync commit-history failed, so this epoch may need a full
+            // Welcome instead of a delta. Never silent.
+            eprintln!("[mls] failed to persist commit history (epoch advanced): {e}");
+        }
+
         Ok(AddMemberOutput {
             welcome: Zeroizing::new(welcome_bytes),
             commit: Zeroizing::new(commit_bytes),
@@ -707,7 +916,7 @@ impl GroupChatProcessor {
     ///
     /// [`accept_welcome`]: Self::accept_welcome
     pub async fn accept_next(&self) -> Result<IncomingGroupEvent, GroupError> {
-        let inc = self
+        let mut inc = self
             .endpoint
             .accept()
             .await
@@ -718,15 +927,325 @@ impl GroupChatProcessor {
                 inc.protocol
             ))));
         }
-        let (msg, raw) = crate::group::transport::recv_mls_message(inc.stream)
+
+        // Read first 4 bytes to distinguish standard message vs SYNC request
+        let mut header = [0u8; 4];
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Short handshake timeout (not the 5-minute bulk IDLE_TIMEOUT): a peer
+        // that connects then stalls before sending its small fixed header must
+        // be dropped quickly, because `accept_next` is consumed in a serialized
+        // loop and a long block here is a head-of-line DoS that stalls all MLS
+        // message processing (Welcome/Commit/Application) for every peer.
+        tokio::time::timeout(crate::network::HANDSHAKE_TIMEOUT, inc.stream.read_exact(&mut header))
             .await
-            .map_err(|e| match e {
-                crate::group::transport::FramingError::Transport(p) => {
-                    GroupError::Transport(p)
-                }
-                other => GroupError::InvalidWelcome(format!("recv_mls_message: {other}")),
+            .map_err(|_| {
+                GroupError::Transport(crate::p2p::P2pError::Accept(
+                    "read header: handshake timeout".into(),
+                ))
+            })?
+            .map_err(|e| {
+                GroupError::Transport(crate::p2p::P2pError::Accept(format!("read header: {e}")))
             })?;
-        self.process_mls_bytes(msg, raw).await
+
+        if &header == b"SYNC" {
+            // Read group_id (32 bytes) and claimed_epoch (8 bytes)
+            let mut req = [0u8; 40];
+            tokio::time::timeout(crate::network::HANDSHAKE_TIMEOUT, inc.stream.read_exact(&mut req))
+                .await
+                .map_err(|_| {
+                    GroupError::Transport(crate::p2p::P2pError::Accept(
+                        "read sync request: handshake timeout".into(),
+                    ))
+                })?
+                .map_err(|e| {
+                    GroupError::Transport(crate::p2p::P2pError::Accept(format!(
+                        "read sync request: {e}"
+                    )))
+                })?;
+            let mut gid_bytes = [0u8; 32];
+            gid_bytes.copy_from_slice(&req[0..32]);
+            let claimed_epoch = u64::from_le_bytes(req[32..40].try_into().unwrap());
+
+            // 1. Mutual Authentication Prove Node Identity
+            let peer_id = inc.peer_id;
+
+            // Load the group. This precedes the roster membership check because
+            // membership can only be decided *from* the roster (which loading
+            // produces). The resulting DoS surface is bounded and modest:
+            //   - an unknown/random group_id is a single redb key miss → cheap
+            //     `ERR` (no amplification);
+            //   - a real group_id costs one redb read (page-cached when hot);
+            //   - each request needs a full QUIC handshake + bi-stream and
+            //     `accept_next` is serialized, so connection setup is the
+            //     natural rate limiter, and idle timeouts (above) cap stalls;
+            //   - the delta below is bounded by `DEFAULT_COMMIT_RETENTION` and
+            //     the `oldest_epoch` floor.
+            // Per-peer SYNC rate-limiting remains a possible future hardening
+            // (see MLS_P2P_SYNC_DESIGN.md §3.3).
+            let group_opt = self.client.load_group(&gid_bytes).ok();
+            if group_opt.is_none() {
+                let _ = inc.stream.write_all(b"ERR\x01").await;
+                return Err(GroupError::NotFound);
+            }
+            let group = group_opt.unwrap();
+
+            // Verify the requester is a current member (Case A check). Match the
+            // connecting transport PeerId against a roster member, AND require
+            // that member's bidirectional NKCB binding to verify cryptographically
+            // — not just a PeerId-from-credential string match. Join-time
+            // (`verify_credential_binding`) already rejects members without a
+            // valid binding, so the roster should never hold one; this is
+            // defense-in-depth so the commit history (control-plane data) is
+            // never disclosed to a SYNC requester whose claimed identity is not
+            // cryptographically bound to its transport key.
+            let mut is_member = false;
+            for m in group.roster().members_iter() {
+                if let Some(pid) = Self::peer_id_from_credential(&m.signing_identity.credential) {
+                    if pid == peer_id && self.verify_member_binding(&m.signing_identity) {
+                        is_member = true;
+                        break;
+                    }
+                }
+            }
+
+            if !is_member {
+                let _ = inc.stream.write_all(b"ERR\x01").await;
+                return Err(GroupError::Backend("Sync rejected: peer not in roster".to_string()));
+            }
+
+            let local_epoch = group.current_epoch();
+            let oldest_epoch = self.storage.oldest_retained_epoch(&gid_bytes)?
+                .unwrap_or(0);
+
+            if claimed_epoch < oldest_epoch {
+                let _ = inc.stream.write_all(b"ERR\x02").await;
+                return Err(GroupError::Backend(format!(
+                    "Sync rejected: epoch {} is pruned (oldest retained is {})",
+                    claimed_epoch, oldest_epoch
+                )));
+            }
+
+            // Case B: Delta resync. Bound the *entire* response (the OK marker
+            // plus every commit frame) by a single HANDSHAKE_TIMEOUT deadline.
+            // A per-write timeout alone does not bound the loop's total time — a
+            // slow-reading peer could keep each individual write just under the
+            // limit across up to DEFAULT_COMMIT_RETENTION frames and still occupy
+            // the serialized accept loop for N x timeout (head-of-line DoS). The
+            // disk read (load_commits) happens before the deadline; only the
+            // network send is timed.
+            let commits = if claimed_epoch < local_epoch {
+                self.storage.load_commits(&gid_bytes, claimed_epoch, local_epoch)?
+            } else {
+                Vec::new()
+            };
+            let send_resp = async {
+                inc.stream.write_all(b"OK\x00\x00").await.map_err(|e| {
+                    GroupError::Transport(crate::p2p::P2pError::Accept(format!("write OK: {e}")))
+                })?;
+                for (_epoch, commit_bytes) in &commits {
+                    let len = (commit_bytes.len() as u32).to_le_bytes();
+                    inc.stream.write_all(&len).await.map_err(|e| {
+                        GroupError::Transport(crate::p2p::P2pError::Accept(format!("write commit length: {e}")))
+                    })?;
+                    inc.stream.write_all(commit_bytes).await.map_err(|e| {
+                        GroupError::Transport(crate::p2p::P2pError::Accept(format!("write commit bytes: {e}")))
+                    })?;
+                }
+                Ok::<(), GroupError>(())
+            };
+            tokio::time::timeout(crate::network::HANDSHAKE_TIMEOUT, send_resp)
+                .await
+                .map_err(|_| {
+                    GroupError::Transport(crate::p2p::P2pError::Accept(
+                        "write sync response: handshake timeout".into(),
+                    ))
+                })??;
+
+            let _ = inc.stream.shutdown().await;
+
+            return Ok(IncomingGroupEvent::EpochAdvanced {
+                group_id: GroupId::new(gid_bytes),
+                new_epoch: local_epoch,
+            });
+        }
+
+        // Standard MLS message processing:
+        let len = u32::from_le_bytes(header) as usize;
+        if len == 0 {
+            return Err(GroupError::InvalidWelcome("Empty MLS frame length".to_string()));
+        }
+        if len > crate::group::transport::MAX_MLS_FRAME_BYTES {
+            return Err(GroupError::InvalidWelcome(format!(
+                "MLS frame length {len} exceeds limit"
+            )));
+        }
+
+        let mut raw = vec![0u8; len];
+        // HANDSHAKE_TIMEOUT (not the 5-minute bulk IDLE_TIMEOUT): ALPN_MLS is the
+        // *control plane* (Welcome/Commit/Proposal/small app frames); bulk data
+        // rides the data plane (ALPN_CHAT/ALPN_FILE). A peer that sends a header
+        // then stalls the body must not occupy the serialized accept loop for
+        // minutes (head-of-line DoS). MAX_MLS_FRAME_BYTES caps the body size.
+        tokio::time::timeout(crate::network::HANDSHAKE_TIMEOUT, inc.stream.read_exact(&mut raw))
+            .await
+            .map_err(|_| {
+                GroupError::Transport(crate::p2p::P2pError::Accept(
+                    "read MLS frame body: handshake timeout".into(),
+                ))
+            })?
+            .map_err(|e| {
+                GroupError::Transport(crate::p2p::P2pError::Accept(format!("read MLS frame body: {e}")))
+            })?;
+
+        let msg = MlsMessage::from_bytes(&raw).map_err(|e| {
+            GroupError::InvalidWelcome(format!("MLS message decode: {e}"))
+        })?;
+
+        let res = self.process_mls_bytes(msg, raw).await;
+        let _ = inc.stream.write_all(&[1u8]).await;
+        let _ = inc.stream.shutdown().await;
+        res
+    }
+
+    pub async fn request_resync(&self, gid: &GroupId, peer_addr: &PeerAddr) -> Result<bool, GroupError> {
+        let group = self.client.load_group(gid.as_bytes()).map_err(|e| {
+            let m = format!("{e}");
+            if m.contains("GroupNotFound") || m.contains("group not found") {
+                GroupError::NotFound
+            } else {
+                GroupError::Backend(format!("load_group for resync: {e}"))
+            }
+        })?;
+
+        let claimed_epoch = group.current_epoch();
+
+        let mut stream = self.endpoint.connect(peer_addr, crate::group::transport::ALPN_MLS_PROTOCOL)
+            .await
+            .map_err(GroupError::Transport)?;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        stream.write_all(b"SYNC").await.map_err(|e| {
+            GroupError::Transport(crate::p2p::P2pError::Connect(format!("write SYNC header: {e}")))
+        })?;
+
+        let mut req = [0u8; 40];
+        req[0..32].copy_from_slice(gid.as_bytes());
+        req[32..40].copy_from_slice(&claimed_epoch.to_le_bytes());
+        stream.write_all(&req).await.map_err(|e| {
+            GroupError::Transport(crate::p2p::P2pError::Connect(format!("write SYNC request: {e}")))
+        })?;
+
+        let mut resp = [0u8; 4];
+        tokio::time::timeout(crate::network::IDLE_TIMEOUT, stream.read_exact(&mut resp))
+            .await
+            .map_err(|_| {
+                GroupError::Transport(crate::p2p::P2pError::Connect(
+                    "read SYNC response: idle timeout".into(),
+                ))
+            })?
+            .map_err(|e| {
+                GroupError::Transport(crate::p2p::P2pError::Connect(format!("read SYNC response: {e}")))
+            })?;
+
+        if &resp == b"ERR\x01" {
+            return Err(GroupError::Backend("Sync rejected: peer rejected roster or group".to_string()));
+        }
+        if &resp == b"ERR\x02" {
+            return Err(GroupError::Backend("Sync rejected: epoch too old, Welcome fallback needed".to_string()));
+        }
+        if &resp != b"OK\x00\x00" {
+            return Err(GroupError::Backend(format!("Sync rejected: unexpected response {:?}", resp)));
+        }
+
+        let mut applied_any = false;
+        let mut loop_count = 0;
+        loop {
+            loop_count += 1;
+            if loop_count > 1000 {
+                return Err(GroupError::Backend("Sync rejected: too many commits streamed (possible infinite loop or DoS)".to_string()));
+            }
+
+            let mut len_bytes = [0u8; 4];
+            let read_res =
+                match tokio::time::timeout(crate::network::IDLE_TIMEOUT, stream.read_exact(&mut len_bytes))
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return Err(GroupError::Transport(crate::p2p::P2pError::Connect(
+                            "read commit length: idle timeout".into(),
+                        )))
+                    }
+                };
+            if let Err(e) = read_res {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(GroupError::Transport(crate::p2p::P2pError::Connect(format!("read commit length: {e}"))));
+            }
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            if len == 0 {
+                return Err(GroupError::InvalidWelcome("Empty SYNC frame length".to_string()));
+            }
+            if len > crate::group::transport::MAX_MLS_FRAME_BYTES {
+                return Err(GroupError::InvalidWelcome(format!(
+                    "SYNC frame length {len} exceeds limit"
+                )));
+            }
+            let mut commit_bytes = vec![0u8; len];
+            tokio::time::timeout(crate::network::IDLE_TIMEOUT, stream.read_exact(&mut commit_bytes))
+                .await
+                .map_err(|_| {
+                    GroupError::Transport(crate::p2p::P2pError::Connect(
+                        "read commit bytes: idle timeout".into(),
+                    ))
+                })?
+                .map_err(|e| {
+                    GroupError::Transport(crate::p2p::P2pError::Connect(format!(
+                        "read commit bytes: {e}"
+                    )))
+                })?;
+
+            let msg = MlsMessage::from_bytes(&commit_bytes).map_err(|e| {
+                GroupError::InvalidWelcome(format!("SYNC commit decode: {e}"))
+            })?;
+
+            let mut group = self.client.load_group(gid.as_bytes()).map_err(|e| {
+                GroupError::Backend(format!("load_group during SYNC: {e}"))
+            })?;
+
+            let received = group.process_incoming_message(msg).map_err(|e| {
+                GroupError::Backend(format!("SYNC process commit: {e}"))
+            })?;
+
+            // A resync stream must carry only Commits. A malicious responder
+            // could otherwise return a valid non-Commit (e.g. an Application
+            // message); persisting it into the commit-history DB as if it were a
+            // Commit would corrupt future delta resyncs. Reject before any write
+            // (the non-Commit mutation stays in-memory only and is dropped).
+            if !matches!(received, mls_rs::group::ReceivedMessage::Commit(_)) {
+                return Err(GroupError::Backend(
+                    "SYNC stream carried a non-Commit MLS message; aborting resync".into(),
+                ));
+            }
+
+            group.write_to_storage().map_err(|e| {
+                GroupError::Storage(format!("SYNC write_to_storage: {e}"))
+            })?;
+
+            if let Err(e) =
+            self.storage
+                .store_commit(group.group_id(), group.current_epoch(), &commit_bytes)
+        {
+            // The MLS state is already persisted (write_to_storage); only the
+            // resync commit-history failed, so this epoch may need a full
+            // Welcome instead of a delta. Never silent.
+            eprintln!("[mls] failed to persist commit history (epoch advanced): {e}");
+        }
+            applied_any = true;
+        }
+
+        Ok(applied_any)
     }
 
     /// Process a single MLS payload that arrived through some channel
@@ -808,12 +1327,16 @@ impl GroupChatProcessor {
                         })
                     }
                     ReceivedMessage::Commit(desc) => {
-                        // CommitEffect::Removed is the load-bearing
-                        // PCS signal: this commit's effect on the
-                        // local member was "you are no longer in
-                        // the group". Surface it as a dedicated
-                        // event so the caller can stop polling this
-                        // group's stream.
+                        if let Err(e) = self.storage.store_commit(
+                            group.group_id(),
+                            group.current_epoch(),
+                            &raw,
+                        ) {
+                            eprintln!(
+                                "[mls] failed to persist commit history (epoch advanced): {e}"
+                            );
+                        }
+
                         match desc.effect {
                             CommitEffect::Removed { remover, .. } => {
                                 let remover_index = match remover {
@@ -848,6 +1371,54 @@ impl GroupChatProcessor {
             ))),
         }
     }
+
+    fn peer_id_from_credential(cred: &mls_rs::identity::Credential) -> Option<PeerId> {
+        if let mls_rs::identity::Credential::Basic(basic) = cred {
+            let id = &basic.identifier;
+            if id.starts_with(b"NKCB") {
+                if id.len() >= 36 {
+                    let mut bytes = [0u8; 32];
+                    bytes.copy_from_slice(&id[4..36]);
+                    return Some(PeerId::new(bytes));
+                }
+            } else if id.len() >= 32 {
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(&id[0..32]);
+                return Some(PeerId::new(bytes));
+            }
+        }
+        None
+    }
+
+    fn verify_member_binding(&self, signing_identity: &SigningIdentity) -> bool {
+        let crypto = HybridCryptoProvider::new();
+        let provider = match crypto.cipher_suite_provider(hybrid_cipher_suite()) {
+            Some(p) => p,
+            None => return false,
+        };
+        let basic = match signing_identity.credential.as_basic() {
+            Some(b) => b,
+            None => return false,
+        };
+        // Only a member with a valid bidirectional NKCB binding is projected
+        // onto the transport allowlist. Non-NKCB / malformed credentials are
+        // NOT projected (a self-asserted PeerId must never enter the allowlist
+        // — that is the poisoning hole). Backward-compat for non-MLS / 1:1 use
+        // is handled by the "empty allowlist = allow all" gate, not here.
+        match parse_nkcb_binding(&basic.identifier) {
+            Some((peer_id, transport_pub, binding)) => crate::group::binding::verify_binding(
+                &provider,
+                &signing_identity.signature_key,
+                "ML-DSA-65",
+                &transport_pub,
+                0, // identity-level binding
+                &peer_id,
+                &binding,
+            ),
+            None => false,
+        }
+    }
+
 
     /// Return this processor's own reachable address — typically what
     /// a peer would need to call [`send_welcome_to`] back to us.
@@ -965,6 +1536,17 @@ impl GroupChatProcessor {
             .commit_message
             .to_bytes()
             .map_err(|e| GroupError::Backend(format!("Commit encode after remove: {e}")))?;
+
+        if let Err(e) =
+            self.storage
+                .store_commit(group.group_id(), group.current_epoch(), &commit_bytes)
+        {
+            // The MLS state is already persisted (write_to_storage); only the
+            // resync commit-history failed, so this epoch may need a full
+            // Welcome instead of a delta. Never silent.
+            eprintln!("[mls] failed to persist commit history (epoch advanced): {e}");
+        }
+
         Ok(Zeroizing::new(commit_bytes))
     }
 
@@ -1117,7 +1699,7 @@ mod tests {
         let net = MockNetwork::new();
         let ep = net.register(PeerId::new([peer_byte; 32]), vec![PROTO_MLS]);
         let proc =
-            GroupChatProcessor::new(display_name, Arc::new(ep), storage).expect("builder");
+            GroupChatProcessor::new(display_name, Arc::new(ep), storage, None).expect("builder");
         (proc, dir)
     }
 
@@ -1138,7 +1720,7 @@ mod tests {
         .expect("storage");
         let ep = net.register(PeerId::new([peer_byte; 32]), vec![PROTO_MLS]);
         let proc =
-            GroupChatProcessor::new(display_name, Arc::new(ep), storage).expect("builder");
+            GroupChatProcessor::new(display_name, Arc::new(ep), storage, None).expect("builder");
         (proc, dir)
     }
 
@@ -1175,7 +1757,7 @@ mod tests {
             .expect("storage 1");
             let net = MockNetwork::new();
             let ep = net.register(PeerId::new([1; 32]), vec![PROTO_MLS]);
-            let proc = GroupChatProcessor::new("alice", Arc::new(ep), storage)
+            let proc = GroupChatProcessor::new("alice", Arc::new(ep), storage, None)
                 .expect("builder 1");
             gid_before = proc.create_group().await.expect("create_group");
             // Drop the whole processor — including its Client, signing
@@ -1195,7 +1777,7 @@ mod tests {
         // for read-only inspection; sending into the group from this
         // processor would fail authentication, but the round-trip we
         // care about is state reconstruction.
-        let proc = GroupChatProcessor::new("alice-reloaded", Arc::new(ep), storage)
+        let proc = GroupChatProcessor::new("alice-reloaded", Arc::new(ep), storage, None)
             .expect("builder 2");
 
         let listed = proc.list_groups().expect("list_groups");
@@ -1257,6 +1839,7 @@ mod tests {
             Arc::new(alice_ep),
             GroupStorage::open_at(&path_a, crate::group::storage::test_passphrase())
                 .expect("alice storage"),
+            None,
         )
         .expect("alice processor");
         let bob = GroupChatProcessor::new(
@@ -1264,6 +1847,7 @@ mod tests {
             Arc::new(bob_ep),
             GroupStorage::open_at(&path_b, crate::group::storage::test_passphrase())
                 .expect("bob storage"),
+            None,
         )
         .expect("bob processor");
 
@@ -1321,6 +1905,7 @@ mod tests {
             Arc::new(net.register(PeerId::new([3; 32]), vec![PROTO_MLS])),
             GroupStorage::open_at(&path_a, crate::group::storage::test_passphrase())
                 .expect("alice storage 2"),
+            None,
         )
         .expect("alice processor 2");
         let bob2 = GroupChatProcessor::new(
@@ -1328,6 +1913,7 @@ mod tests {
             Arc::new(net.register(PeerId::new([4; 32]), vec![PROTO_MLS])),
             GroupStorage::open_at(&path_b, crate::group::storage::test_passphrase())
                 .expect("bob storage 2"),
+            None,
         )
         .expect("bob processor 2");
 
@@ -2096,5 +2682,98 @@ mod tests {
         assert_eq!(bob_group.current_epoch(), 1);
         assert_eq!(bob_group.roster().members_iter().count(), 2);
         assert_eq!(bob_group.group_id(), alice_group.group_id());
+    }
+
+    #[tokio::test]
+    async fn test_resync_and_eviction_flow() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_proc_on_net(&net, "alice", 1);
+        let (bob, _dir_b) = build_proc_on_net(&net, "bob", 2);
+        let (carol, _dir_c) = build_proc_on_net(&net, "carol", 3);
+
+        let alice_addr = alice.local_addr().await.unwrap();
+        let bob_addr = bob.local_addr().await.unwrap();
+        let carol_addr = carol.local_addr().await.unwrap();
+
+        let bob_kp = bob.export_key_package().await.unwrap();
+        let carol_kp = carol.export_key_package().await.unwrap();
+
+        // Alice creates a group (epoch 1)
+        let gid = alice.create_group().await.unwrap();
+
+        // Alice adds Bob (epoch 1 -> 2)
+        let add_bob = alice.add_member(&gid, &bob_kp).await.unwrap();
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.unwrap();
+                bob
+            });
+            alice.send_welcome_to(&bob_addr, &add_bob.welcome).await.unwrap();
+            task.await.unwrap()
+        };
+
+        // Bob goes offline now (we don't broadcast epoch 3 commits to Bob)
+        // Alice adds Carol (epoch 2 -> 3)
+        let add_carol = alice.add_member(&gid, &carol_kp).await.unwrap();
+        let carol = {
+            let task = tokio::spawn(async move {
+                carol.accept_next().await.unwrap();
+                carol
+            });
+            alice.send_welcome_to(&carol_addr, &add_carol.welcome).await.unwrap();
+            task.await.unwrap()
+        };
+
+        // Bob is at epoch 1, Alice/Carol are at epoch 2.
+        let alice_summary = alice.load_group_summary(&gid).await.unwrap();
+        assert_eq!(alice_summary.epoch, 2);
+        let bob_summary = bob.load_group_summary(&gid).await.unwrap();
+        assert_eq!(bob_summary.epoch, 1);
+
+        // Bob requests resync from Alice (Client connects to Alice)
+        let alice_task = tokio::spawn(async move {
+            alice.accept_next().await.unwrap(); // handles resync request
+            alice
+        });
+
+        let resync_res = bob.request_resync(&gid, &alice_addr).await.unwrap();
+        assert!(resync_res, "Bob should have applied missing commits");
+
+        let alice = alice_task.await.unwrap();
+
+        let bob_summary_after = bob.load_group_summary(&gid).await.unwrap();
+        assert_eq!(bob_summary_after.epoch, 2);
+
+        // Test Case A: Evict Carol (epoch 2 -> 3)
+        let alice_members = alice.list_members(&gid).await.unwrap();
+        let carol_leaf = alice_members.iter().find(|m| m.index == 2).unwrap().index;
+        let _remove_carol_commit = alice.remove_member(&gid, carol_leaf).await.unwrap();
+
+        // Carol tries to sync but she is evicted (Case A check)
+        let alice_task_2 = tokio::spawn(async move {
+            let err = alice.accept_next().await.unwrap_err();
+            assert!(err.to_string().contains("Sync rejected") || err.to_string().contains("not in roster"));
+            alice
+        });
+
+        let resync_err = carol.request_resync(&gid, &alice_addr).await.unwrap_err();
+        assert!(resync_err.to_string().contains("peer rejected roster") || resync_err.to_string().contains("not in roster"));
+        let alice = alice_task_2.await.unwrap();
+
+        // Test Case C: welcome fallback (compaction pruning)
+        // Prune commits older than 1 on Alice's side (keep only current commit)
+        alice.storage.prune_commits(gid.as_bytes(), 0).unwrap();
+
+        // Bob is offline, Alice advances group to epoch 4
+        let _add_carol_again = alice.add_member(&gid, &carol_kp).await.unwrap();
+        let alice_task_3 = tokio::spawn(async move {
+            let err = alice.accept_next().await.unwrap_err();
+            assert!(err.to_string().contains("pruned") || err.to_string().contains("Welcome fallback"));
+            alice
+        });
+
+        let resync_err_c = bob.request_resync(&gid, &alice_addr).await.unwrap_err();
+        assert!(resync_err_c.to_string().contains("Welcome fallback") || resync_err_c.to_string().contains("pruned"));
+        let _ = alice_task_3.await.unwrap();
     }
 }
