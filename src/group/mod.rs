@@ -26,6 +26,7 @@ pub mod binding;
 pub mod cli;
 pub mod rollback;
 pub mod crypto_adapter;
+pub mod file_xfer;
 #[cfg(feature = "legacy-sqlcipher-migration")]
 pub mod migrate;
 pub mod processor;

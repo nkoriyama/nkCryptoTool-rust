@@ -178,6 +178,16 @@ struct Args {
     #[arg(long)]
     mls_key_package: Option<String>,
 
+    /// File to send to the group (for `--mls-cmd send-file`), framed
+    /// over MLS application messages.
+    #[arg(long)]
+    mls_file: Option<String>,
+
+    /// Directory received files are written to (for `--mls-cmd listen`).
+    /// Defaults to the current directory.
+    #[arg(long)]
+    mls_recv_dir: Option<String>,
+
     /// Recipient ticket(s) — accepts `print-local-address` output.
     /// Pass multiple times to broadcast to several recipients
     /// (e.g. `--mls-recipient-ticket A --mls-recipient-ticket B`).
@@ -1200,11 +1210,21 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
             MlsCommand::Listen {
                 group_id,
                 recipient_tickets: parse_tickets(&args.mls_recipient_ticket)?,
+                recv_dir: args
+                    .mls_recv_dir
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(".")),
             }
         }
         "send" => MlsCommand::Send {
             group_id: parse_group_id(&require(&args.mls_group_id, "mls-group-id")?)?,
             body: require(&args.mls_body, "mls-body")?,
+            recipient_tickets: parse_tickets(&args.mls_recipient_ticket)?,
+        },
+        "send-file" => MlsCommand::SendFile {
+            group_id: parse_group_id(&require(&args.mls_group_id, "mls-group-id")?)?,
+            path: PathBuf::from(require(&args.mls_file, "mls-file")?),
             recipient_tickets: parse_tickets(&args.mls_recipient_ticket)?,
         },
         "chat-group" => MlsCommand::ChatGroup {
@@ -1215,7 +1235,7 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
         other => anyhow::bail!(
             "unknown --mls-cmd {other:?}; expected one of \
              create-group, list-groups, list-members, export-key-package, \
-             add-member, remove-member, accept-one, listen, send, \
+             add-member, remove-member, accept-one, listen, send, send-file, \
              chat-group, print-local-address, rekey"
         ),
     };

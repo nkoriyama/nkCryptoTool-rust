@@ -96,11 +96,22 @@ pub enum MlsCommand {
         /// Initial recipient tickets. More can be added later via
         /// the `/peer` stdin command.
         recipient_tickets: Vec<Ticket>,
+        /// Directory received files are written to (file transfers framed
+        /// over MLS application messages).
+        recv_dir: PathBuf,
     },
     /// Send a single application message to the given recipients.
     Send {
         group_id: GroupId,
         body: String,
+        recipient_tickets: Vec<Ticket>,
+    },
+    /// Send a file to the whole group, framed over MLS application
+    /// messages (`START`/`DATA`/`END`). Recipients default to the
+    /// group's remembered address book when no ticket is supplied.
+    SendFile {
+        group_id: GroupId,
+        path: PathBuf,
         recipient_tickets: Vec<Ticket>,
     },
     /// Interactive chat loop: stdin lines are sent as application
@@ -420,9 +431,16 @@ pub async fn listen_loop(
     processor: Arc<GroupChatProcessor>,
     initial_group_id: Option<GroupId>,
     initial_recipients: Vec<PeerAddr>,
+    recv_dir: std::path::PathBuf,
 ) -> anyhow::Result<()> {
     use tokio::io::AsyncWriteExt;
     use tokio::sync::Mutex;
+
+    // Shared file-transfer reassembler: inbound app messages that are file
+    // frames are routed here (writing to `recv_dir`) by both the direct-accept
+    // task and the inbox-poll task, so a file delivered through either channel
+    // is reassembled into one staging file and committed on a verified END.
+    let reasm = Arc::new(Mutex::new(crate::group::file_xfer::Reassembler::new(recv_dir)));
 
     // Single shared writer so the inbound task and the stdin REPL don't
     // interleave each other's lines. (println! across threads has no
@@ -465,6 +483,7 @@ pub async fn listen_loop(
         let group_id = Arc::clone(&group_id);
         let stdout = Arc::clone(&stdout);
         let kill_tx = kill_tx.clone();
+        let reasm = Arc::clone(&reasm);
         Some(tokio::spawn(async move {
             let server = processor.inbox().expect("inbox checked above").clone();
             let mut cursor: u64 = 0;
@@ -507,12 +526,12 @@ pub async fn listen_loop(
                         *g = Some(*id);
                     }
                     let is_removed = matches!(evt, IncomingGroupEvent::RemovedFromGroup { .. });
-                    let line = render_event(&evt);
-                    let mut out = stdout.lock().await;
-                    let _ = out.write_all(line.as_bytes()).await;
-                    let _ = out.write_all(b"\n").await;
-                    let _ = out.flush().await;
-                    drop(out);
+                    if let Some(line) = event_to_line(&evt, &reasm).await {
+                        let mut out = stdout.lock().await;
+                        let _ = out.write_all(line.as_bytes()).await;
+                        let _ = out.write_all(b"\n").await;
+                        let _ = out.flush().await;
+                    }
                     if is_removed {
                         let _ = kill_tx.send(()).await;
                         return;
@@ -530,44 +549,11 @@ pub async fn listen_loop(
         let group_id = Arc::clone(&group_id);
         let kill_tx = kill_tx.clone();
         let stdout = Arc::clone(&stdout);
+        let reasm = Arc::clone(&reasm);
         tokio::spawn(async move {
             loop {
-                let line: String = match processor.accept_next().await {
-                    Ok(IncomingGroupEvent::NewGroup { id }) => {
-                        {
-                            let mut g = group_id.lock().await;
-                            *g = Some(id);
-                        }
-                        format!("[joined] {id}")
-                    }
-                    Ok(IncomingGroupEvent::Message {
-                        group_id: gid,
-                        sender_index,
-                        body,
-                    }) => {
-                        let text = String::from_utf8_lossy(&body).into_owned();
-                        format!("[leaf {sender_index} @ {gid}] {text}")
-                    }
-                    Ok(IncomingGroupEvent::EpochAdvanced {
-                        group_id: gid,
-                        new_epoch,
-                    }) => {
-                        format!("[epoch advanced] {gid} → {new_epoch}")
-                    }
-                    Ok(IncomingGroupEvent::RemovedFromGroup {
-                        group_id: gid,
-                        remover_index,
-                    }) => {
-                        let s = format!("[removed] {gid} (by leaf {remover_index})");
-                        // Emit the line through the shared writer, then
-                        // signal the kill channel.
-                        let mut out = stdout.lock().await;
-                        let _ = out.write_all(s.as_bytes()).await;
-                        let _ = out.write_all(b"\n").await;
-                        let _ = out.flush().await;
-                        let _ = kill_tx.send(()).await;
-                        break;
-                    }
+                let evt = match processor.accept_next().await {
+                    Ok(evt) => evt,
                     Err(e) => {
                         // Don't break on transient errors.
                         let mut out = stdout.lock().await;
@@ -578,10 +564,30 @@ pub async fn listen_loop(
                         continue;
                     }
                 };
-                let mut out = stdout.lock().await;
-                let _ = out.write_all(line.as_bytes()).await;
-                let _ = out.write_all(b"\n").await;
-                let _ = out.flush().await;
+                // Side effects: adopt the gid on join; on self-removal print,
+                // signal the outer loop, and stop.
+                match &evt {
+                    IncomingGroupEvent::NewGroup { id } => {
+                        *group_id.lock().await = Some(*id);
+                    }
+                    IncomingGroupEvent::RemovedFromGroup { .. } => {
+                        if let Some(line) = event_to_line(&evt, &reasm).await {
+                            let mut out = stdout.lock().await;
+                            let _ = out.write_all(line.as_bytes()).await;
+                            let _ = out.write_all(b"\n").await;
+                            let _ = out.flush().await;
+                        }
+                        let _ = kill_tx.send(()).await;
+                        break;
+                    }
+                    _ => {}
+                }
+                if let Some(line) = event_to_line(&evt, &reasm).await {
+                    let mut out = stdout.lock().await;
+                    let _ = out.write_all(line.as_bytes()).await;
+                    let _ = out.write_all(b"\n").await;
+                    let _ = out.flush().await;
+                }
             }
         })
     };
@@ -780,6 +786,38 @@ fn parse_gid_hex(hex: &str) -> anyhow::Result<GroupId> {
     Ok(GroupId::new(arr))
 }
 
+/// Turn an inbound event into a display line, reassembling file-transfer frames
+/// instead of printing them as chat. Returns `None` when there is nothing to
+/// print (per-chunk `DATA` progress is suppressed to avoid flooding the log).
+async fn event_to_line(
+    evt: &IncomingGroupEvent,
+    reasm: &tokio::sync::Mutex<crate::group::file_xfer::Reassembler>,
+) -> Option<String> {
+    use crate::group::file_xfer::{is_file_frame, FileStatus};
+    if let IncomingGroupEvent::Message { group_id, sender_index, body } = evt {
+        if is_file_frame(body) {
+            // Attribute the frame to the MLS-authenticated (group, sender) so a
+            // frame can only extend/finish a transfer opened by the same sender.
+            let g: [u8; 32] = *group_id.as_bytes();
+            return match reasm.lock().await.ingest(&g, *sender_index, body) {
+                Some(FileStatus::Started { name, size }) => Some(format!(
+                    "[file ⇩ {sender_index}@{group_id}] receiving {name:?} ({size} bytes)…"
+                )),
+                Some(FileStatus::Progress { .. }) => None,
+                Some(FileStatus::Completed { name, path }) => Some(format!(
+                    "[file ✓ {sender_index}@{group_id}] saved {name:?} → {}",
+                    path.display()
+                )),
+                Some(FileStatus::Error(e)) => {
+                    Some(format!("[file ✗ {sender_index}@{group_id}] {e}"))
+                }
+                None => None,
+            };
+        }
+    }
+    Some(render_event(evt))
+}
+
 fn render_event(evt: &IncomingGroupEvent) -> String {
     match evt {
         IncomingGroupEvent::NewGroup { id } => format!("[joined] {id}"),
@@ -906,6 +944,29 @@ pub async fn run(
             send_application_message(&processor, &group_id, body.as_bytes(), &addrs).await?;
             eprintln!("Sent to {} recipients", addrs.len());
         }
+        MlsCommand::SendFile {
+            group_id,
+            path,
+            recipient_tickets,
+        } => {
+            let addrs = resolve_recipients(&processor, &group_id, &recipient_tickets);
+            // Stream the file frame-by-frame so a large file is never fully
+            // resident in memory.
+            let mut outgoing = crate::group::file_xfer::OutgoingFile::open(&path)
+                .map_err(|e| anyhow!("open file {path:?}: {e}"))?;
+            let name = outgoing.name().to_string();
+            let mut frames = 0usize;
+            while let Some(frame) = outgoing
+                .next_frame()
+                .map_err(|e| anyhow!("read file {path:?}: {e}"))?
+            {
+                send_application_message(&processor, &group_id, &frame, &addrs)
+                    .await
+                    .with_context(|| format!("send file frame {}", frames + 1))?;
+                frames += 1;
+            }
+            eprintln!("Sent file {name:?} ({frames} frames) to {} recipients", addrs.len());
+        }
         MlsCommand::ChatGroup {
             group_id,
             recipient_tickets,
@@ -918,6 +979,7 @@ pub async fn run(
         MlsCommand::Listen {
             group_id,
             recipient_tickets,
+            recv_dir,
         } => {
             // Listen accepts a group_id only when one was supplied; the remembered
             // hints are looked up per group, so only resolve when we know which.
@@ -925,7 +987,7 @@ pub async fn run(
                 Some(gid) => resolve_recipients(&processor, &gid, &recipient_tickets),
                 None => tickets_to_peer_addrs(&recipient_tickets),
             };
-            listen_loop(Arc::new(processor), group_id, addrs).await?;
+            listen_loop(Arc::new(processor), group_id, addrs, recv_dir).await?;
         }
         MlsCommand::PrintLocalAddress => {
             let ticket = print_local_address(&processor).await?;
