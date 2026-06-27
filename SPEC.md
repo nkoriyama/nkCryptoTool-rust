@@ -542,3 +542,38 @@ The long-term signing private key cached in `Arc<SecureBuffer>` resides in proce
 PKCS#8 / SPKI parsing for PQC keys uses structured DER decoders via the `pkcs8` and `spki` crates.
 - **Improvement**: Strict validation of OIDs and DER structures is now performed, significantly increasing robustness against malformed or maliciously crafted keys.
 - **Future Roadmap**: Continuously update to the latest cryptographic standards as PQC specifications stabilize.
+
+---
+
+## 16. MLS Group Chat and P2P Transport Sync Invariants
+
+This section defines the architectural invariants and sync strategies for linking the multi-party MLS (Messaging Layer Security) group state with the underlying P2P transport layer (`P2pEndpoint` / `NetworkProcessor` allowlists).
+
+### 16.1 Invariant 0: Philosophy / Source of Truth
+The MLS group state is the single source of truth for authorization. The transport-layer allowlist (`cached_allowlist` or active peer filtering) is merely a projection of the current MLS membership. In case of any discrepancy or conflict between the MLS group state and the transport layer state, the **MLS group state ALWAYS prevails**.
+
+### 16.2 Invariant 1: Interface and Monotonicity
+The `P2pEndpoint` MUST expose a thread-safe method to update allowed peers:
+`update_allowed_peers(allowed_set: HashSet<PeerId>, current_epoch: u64)`
+To prevent race conditions (such as out-of-order asynchronous updates or rolling back to an older group state), the epoch is treated as a first-class citizen. The `P2pEndpoint` MUST discard any update where `current_epoch` is less than or equal to the currently applied epoch in the transport layer.
+
+### 16.3 Invariant 2: Gatekeeping vs. Eviction Separation
+When a member is evicted from the group (a `Remove` operation is committed):
+- **New Connections**: Any incoming connection or stream request from the evicted member's `PeerId` MUST be rejected immediately (latency $T = 0$).
+- **Existing Connections**: Active connection streams belonging to the evicted member are allowed to be closed asynchronously, but MUST be terminated within a maximum grace period of $T$ seconds.
+
+### 16.4 Invariant 3: Atomicity of Eviction and Key Update
+Any MLS Commit that contains a `Remove` operation MUST immediately advance the group epoch and derive new epoch keys. This minimizes the window during which the evicted member can read or decrypt active traffic using old epoch keys.
+
+### 16.5 Invariant 4: Network Partition Resilience & Resync
+When a peer connects claiming an outdated epoch:
+- The local node MUST NOT immediately treat it as malicious or permanently ban it.
+- **Membership Check Constraint**: The local node MUST verify if the peer's `PeerId` is present in the current (latest locally known) MLS group membership roster.
+    - **Authorized Resync**: If the peer is present in the current membership, the local node MUST initiate the **Resync Protocol**, allowing the straggling peer to receive missed Commits (provided they were part of the group when those Commits were generated) and monotonically catch up to the current epoch.
+    - **Final Rejection**: If the peer is **not** present in the current membership (i.e., they were evicted by a `Remove` commit in a newer epoch), the local node MUST terminate the connection immediately and permanently. This prevents evicted members from exploiting the resync mechanism by claiming old epochs.
+
+### 16.6 Sync Delivery Strategy: Optimistic Epoch Advancement
+To ensure high availability and prevent Group Denial of Service (DoS) under unstable network conditions (e.g., Japanese MAP-E NAT limitations, cellular CGNAT, or nodes temporarily offline):
+- **Optimistic Broadcast**: Commits (including Member Joins, Removals, and Key Updates) are applied locally and broadcast to all currently reachable online peers immediately. The sender does not block or wait for ACKs from offline members.
+- **Lazy Resynchronization**: Straggling or offline members catch up monotonically when they reconnect, via the Resync Protocol (Invariant 4), leveraging epoch monotonicity to determine the direction of state sync.
+- **Eventual Consistency Limitation (Eviction Under Partition)**: Because of optimistic delivery, the global enforcement of a `Remove` commit is eventually consistent. A `Remove` is only globally enforced once all partitioned nodes have reconnected and completed resynchronization. Until a partitioned node receives and applies the Commit, it remains unaware of the eviction and may still accept connections and communicate with the evicted member under the old epoch keys.
