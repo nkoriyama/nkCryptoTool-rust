@@ -79,3 +79,15 @@ jobs:
     - name: Run tests
       if: matrix.run_tests
       run: cargo test --verbose ${{ matrix.features }}
+
+  # MLS subsystem (group chat, PQ-FS prekeys, at-rest, redb storage, the
+  # MLS<->transport identity binding) lives behind the `mls` feature, which the
+  # backend matrix above does not enable — so none of it was covered in CI.
+  # This job exercises that pure-Rust (C-free: backend-rustcrypto + redb) path.
+  mls-tests:
+    needs: repo-integrity
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - name: Build and test the MLS subsystem
+      run: cargo test --verbose --no-default-features --features backend-rustcrypto,mls --lib
