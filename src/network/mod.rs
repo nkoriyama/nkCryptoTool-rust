@@ -821,6 +821,11 @@ impl NetworkProcessor {
         Ok(())
     }
 
+    // allow(clippy::too_many_arguments): each parameter is a distinct, required
+    // input (streams/keys/IVs/role flag); bundling into a struct adds field-swap
+    // risk in this security-critical loop for no functional benefit.
+    // Future: revisit only if a cohesive context type emerges naturally.
+    #[allow(clippy::too_many_arguments)]
     pub async fn chat_loop<R, W, SI, SO>(
         mut stream_rx: R,
         mut stream_tx: W,

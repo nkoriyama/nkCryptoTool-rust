@@ -489,6 +489,11 @@ impl CryptoProcessor {
         }
     }
 
+    // allow(clippy::too_many_arguments): each parameter is a distinct, required
+    // crypto input (strategy/paths/sizes/tag/flags); bundling into a struct adds
+    // field-swap risk in security-critical code for no functional benefit.
+    // Future: revisit only if a cohesive context type emerges naturally.
+    #[allow(clippy::too_many_arguments)]
     async fn run_streaming_encrypt(
         &self,
         mut strategy: Box<dyn CryptoStrategy>,
@@ -566,6 +571,11 @@ impl CryptoProcessor {
         .map_err(|e| CryptoError::OpenSSL(format!("Blocking task failed: {}", e)))?
     }
 
+    // allow(clippy::too_many_arguments): each parameter is a distinct, required
+    // crypto input (strategy/paths/sizes/tag/flags); bundling into a struct adds
+    // field-swap risk in security-critical code for no functional benefit.
+    // Future: revisit only if a cohesive context type emerges naturally.
+    #[allow(clippy::too_many_arguments)]
     async fn run_streaming_decrypt(
         &self,
         mut strategy: Box<dyn CryptoStrategy>,
@@ -701,6 +711,11 @@ impl CryptoProcessor {
         }
     }
 
+    // allow(clippy::too_many_arguments): each parameter is a distinct, required
+    // crypto input (strategy/paths/sizes/tag/flags); bundling into a struct adds
+    // field-swap risk in security-critical code for no functional benefit.
+    // Future: revisit only if a cohesive context type emerges naturally.
+    #[allow(clippy::too_many_arguments)]
     async fn run_chunked_encrypt(
         &self,
         mut strategy: Box<dyn CryptoStrategy>,
@@ -802,6 +817,11 @@ impl CryptoProcessor {
         .map_err(|e| CryptoError::OpenSSL(format!("Blocking task failed: {}", e)))?
     }
 
+    // allow(clippy::too_many_arguments): each parameter is a distinct, required
+    // crypto input (strategy/paths/sizes/tag/flags); bundling into a struct adds
+    // field-swap risk in security-critical code for no functional benefit.
+    // Future: revisit only if a cohesive context type emerges naturally.
+    #[allow(clippy::too_many_arguments)]
     async fn run_chunked_decrypt(
         &self,
         mut strategy: Box<dyn CryptoStrategy>,

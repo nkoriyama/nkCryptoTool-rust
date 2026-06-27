@@ -260,6 +260,11 @@ impl NetworkProcessor {
         ).await
     }
 
+    // allow(clippy::too_many_arguments): each parameter is a distinct, required
+    // handshake input (stream/config/keys/permit/allowlist/io); bundling into a
+    // struct adds field-swap risk in this security-critical path for no benefit.
+    // Future: revisit only if a cohesive context type emerges naturally.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_server_connection(
         stream: Box<dyn P2pStream>,
         config: &CryptoConfig,
