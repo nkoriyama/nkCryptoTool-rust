@@ -138,10 +138,23 @@ impl NetworkProcessor {
 
             tokio::spawn(async move {
                 let mut config = config_clone;
+                // The operator's startup opt-in (`--serve-shell`) is the only
+                // thing that authorizes serving a shell; a peer requesting the
+                // shell ALPN must not be able to turn an ordinary chat/file node
+                // into a shell server. Set the mode exclusively from the ALPN.
+                let shell_allowed = config.shell_mode;
+                config.shell_mode = false;
+                config.chat_mode = false;
                 if incoming.protocol.0 == ALPN_CHAT {
                     config.chat_mode = true;
                 } else if incoming.protocol.0 == ALPN_FILE {
-                    config.chat_mode = false;
+                    // file receive: both modes false
+                } else if incoming.protocol.0 == crate::network::ALPN_SHELL {
+                    if !shell_allowed {
+                        eprintln!("Rejecting nkct/shell/1: this node is not a shell server");
+                        return;
+                    }
+                    config.shell_mode = true;
                 } else {
                     eprintln!("Unknown ALPN: {:?}", String::from_utf8_lossy(incoming.protocol.0));
                     return;
@@ -232,10 +245,20 @@ impl NetworkProcessor {
             .map_err(|e| CryptoError::Parameter(format!("Accept failed: {}", e)))?;
 
         let mut config = self.config.clone();
+        let shell_allowed = config.shell_mode;
+        config.shell_mode = false;
+        config.chat_mode = false;
         if incoming.protocol.0 == ALPN_CHAT {
             config.chat_mode = true;
         } else if incoming.protocol.0 == ALPN_FILE {
-            config.chat_mode = false;
+            // file receive: both modes false
+        } else if incoming.protocol.0 == crate::network::ALPN_SHELL {
+            if !shell_allowed {
+                return Err(CryptoError::Parameter(
+                    "shell (nkct/shell/1) is not enabled on this node".to_string(),
+                ));
+            }
+            config.shell_mode = true;
         } else {
             return Err(CryptoError::Parameter(format!(
                 "Unknown ALPN: {:?}", String::from_utf8_lossy(incoming.protocol.0)
@@ -456,7 +479,11 @@ impl NetworkProcessor {
             None
         };
 
-        if config.chat_mode {
+        if config.shell_mode {
+            // Phase 0: echo server. Later phases bridge a PTY here.
+            crate::shell::run_echo_server(reader, writer, &config.aead_algo, &s2c_key, &c2s_key)
+                .await?;
+        } else if config.chat_mode {
             let stdin = io_provider.stdin();
             let stdout = Arc::new(tokio::sync::Mutex::new(io_provider.stdout()));
 
@@ -524,7 +551,13 @@ impl NetworkProcessor {
             config.target_enc_fp = Some(ticket.pqc_enc_fp);
         }
 
-        let alpn = if config.chat_mode { ALPN_CHAT } else { ALPN_FILE };
+        let alpn = if config.shell_mode {
+            crate::network::ALPN_SHELL
+        } else if config.chat_mode {
+            ALPN_CHAT
+        } else {
+            ALPN_FILE
+        };
         let protocol = P2pProtocol(alpn);
 
         let res = tokio::select! {
@@ -677,7 +710,20 @@ impl NetworkProcessor {
                     cb();
                 }
 
-                if config.chat_mode {
+                if config.shell_mode {
+                    // Phase 0: echo client (stdin → Data → echoed back → stdout).
+                    let mut out = self.io_provider.stdout();
+                    crate::shell::run_echo_client(
+                        reader,
+                        writer,
+                        &config.aead_algo,
+                        &s2c_key,
+                        &c2s_key,
+                        self.io_provider.stdin(),
+                        &mut out,
+                    )
+                    .await
+                } else if config.chat_mode {
                     let stdin = self.io_provider.stdin();
                     let stdout = Arc::new(tokio::sync::Mutex::new(self.io_provider.stdout()));
 

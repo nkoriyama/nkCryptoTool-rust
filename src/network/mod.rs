@@ -28,6 +28,9 @@ pub const CHAT_SESSION_TIMEOUT: Duration = Duration::from_secs(7200); // 2 hours
 
 pub const ALPN_CHAT: &[u8] = b"nkct/chat/1";
 pub const ALPN_FILE: &[u8] = b"nkct/file/1";
+/// P2P shell (bastion-less PQC SSH; see `P2P_SHELL_DESIGN.md`). Phase 0 carries
+/// an echo session; later phases carry a PTY bridge.
+pub const ALPN_SHELL: &[u8] = b"nkct/shell/1";
 /// MLS group chat ALPN (P4). Each accepted stream under this protocol
 /// carries exactly one length-prefixed `mls_rs::MlsMessage` per the
 /// [`crate::group::transport`] framing helpers — Welcome / Commit /

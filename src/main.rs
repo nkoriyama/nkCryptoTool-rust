@@ -77,6 +77,15 @@ struct Args {
     #[arg(long)]
     chat: bool,
 
+    /// Run a P2P shell server (Phase 0: echo) on ALPN `nkct/shell/1`.
+    /// Prints a ticket; pair with a client's `--shell --connect <ticket>`.
+    #[arg(long)]
+    serve_shell: bool,
+
+    /// Connect as a P2P shell client. Use together with `--connect <ticket>`.
+    #[arg(long)]
+    shell: bool,
+
     #[arg(
         long,
         help = "Allow unauthenticated connections (SECURITY WARNING: Default is false since v49)"
@@ -412,6 +421,8 @@ async fn main() -> anyhow::Result<()> {
         Operation::GenerateEncKey
     } else if args.gen_sign_key {
         Operation::GenerateSignKey
+    } else if args.serve_shell {
+        Operation::Listen
     } else if args.listen.is_some() {
         Operation::Listen
     } else if args.connect.is_some() {
@@ -475,6 +486,27 @@ async fn main() -> anyhow::Result<()> {
     config.listen_addr = args.listen;
     config.connect_addr = args.connect;
     config.chat_mode = args.chat;
+    config.shell_mode = args.serve_shell || args.shell;
+    // A remote shell is the highest-value attack surface: never run it without
+    // peer authentication (see P2P_SHELL_DESIGN.md threat model). `--allow-unauth`
+    // is rejected for shell mode; authenticate with --peer-allowlist and/or
+    // pinned --signing-pubkey instead.
+    if config.shell_mode && args.allow_unauth {
+        anyhow::bail!(
+            "--allow-unauth is not permitted with --serve-shell/--shell; \
+             authenticate the peer (--peer-allowlist and/or --signing-pubkey)"
+        );
+    }
+    // A shell *server* must also restrict WHO may connect: without a pinned key
+    // or an allowlist, any peer that merely presents some valid signature is
+    // accepted (authenticated but not authorized). Require an explicit
+    // restriction so `--serve-shell` is never an open shell.
+    if args.serve_shell && args.peer_allowlist.is_none() && config.signing_pubkey.is_none() {
+        anyhow::bail!(
+            "--serve-shell requires --peer-allowlist <file> and/or --signing-pubkey <key> \
+             to restrict who may obtain a shell"
+        );
+    }
     config.allow_unauth = args.allow_unauth;
     config.force = args.force;
     config.handshake_timeout = args.handshake_timeout;

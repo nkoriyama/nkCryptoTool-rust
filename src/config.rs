@@ -131,6 +131,9 @@ pub struct CryptoConfig {
     pub listen_addr: Option<String>,
     pub connect_addr: Option<String>,
     pub chat_mode: bool,
+    /// P2P shell mode (ALPN_SHELL). Mutually exclusive with chat/file; when set,
+    /// the post-handshake path runs the shell session instead of chat/file.
+    pub shell_mode: bool,
     pub allow_unauth: bool,
     pub force: bool,
     pub handshake_timeout: u64,
@@ -193,6 +196,7 @@ impl Default for CryptoConfig {
             listen_addr: None,
             connect_addr: None,
             chat_mode: false,
+            shell_mode: false,
             allow_unauth: false,
             force: false,
             handshake_timeout: 15,
