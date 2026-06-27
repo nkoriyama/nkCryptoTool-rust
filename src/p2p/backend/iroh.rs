@@ -184,6 +184,13 @@ pub struct IrohEndpoint {
     endpoint: iroh::Endpoint,
     local_id: crate::p2p::PeerId,
     protocols: Vec<crate::p2p::P2pProtocol>,
+    /// Whether this endpoint was built with a relay (n0 default or a custom
+    /// `--relay-url`). When true, `local_addr` waits for the home relay to be
+    /// assigned before producing the ticket address, so the relay URL — the
+    /// NAT-traversal fallback a cross-network peer needs — is embedded in the
+    /// ticket. When false (`--no-relay` / test mode) there is no relay to wait
+    /// for, so `local_addr` returns as soon as any direct address is known.
+    relay_enabled: bool,
 }
 
 impl IrohEndpoint {
@@ -198,6 +205,10 @@ impl IrohEndpoint {
             endpoint,
             local_id,
             protocols,
+            // Safe default for callers that build their own endpoint: assume a
+            // relay may be in use and wait for it (bounded by a timeout). `new`
+            // overrides this with the exact relay configuration.
+            relay_enabled: true,
         }
     }
 
@@ -272,7 +283,11 @@ impl IrohEndpoint {
             crate::p2p::P2pProtocol(ALPN_MLS),
             crate::p2p::P2pProtocol(ALPN_INBOX),
         ];
-        Ok(Self::from_endpoint(endpoint, protocols))
+        let mut ep = Self::from_endpoint(endpoint, protocols);
+        // Relay is in use unless explicitly disabled (test mode or `--no-relay`).
+        // A custom `--relay-url` and the n0 default both count as enabled.
+        ep.relay_enabled = !(is_test || config.no_relay);
+        Ok(ep)
     }
 
     /// Direct access to the underlying iroh endpoint. Intended for the
@@ -292,18 +307,48 @@ impl crate::p2p::P2pEndpoint for IrohEndpoint {
     async fn local_addr(
         &self,
     ) -> std::result::Result<crate::p2p::PeerAddr, crate::p2p::P2pError> {
-        // iroh 1.0's `watch_addr()` yields an `EndpointAddr` (not an
-        // `Option`), so there is no `initialized()`; wait until at least one
-        // address (direct or relay) is known, matching the old readiness wait.
+        // iroh 1.0's `watch_addr()` yields an `EndpointAddr` (not an `Option`),
+        // so there is no `initialized()`; we poll it until the address set is
+        // "ready enough" to put in a ticket.
+        //
+        // Readiness is NOT simply "any address known": iroh discovers local
+        // direct addresses almost immediately but assigns the home *relay* a
+        // beat later (it needs a round-trip to the relay server). If we returned
+        // on the first direct address we would publish a ticket with only
+        // LAN-private addresses and `relay_url = None` — unreachable from
+        // another network, which is exactly why callers previously had to pass
+        // `--relay-url` by hand. So when a relay is in use we wait for the relay
+        // address to appear (bounded by `RELAY_READY_TIMEOUT` so a relay outage
+        // can't hang us — we then ship whatever we have). With `--no-relay`
+        // there is no relay to wait for, so any direct address is enough.
+        const RELAY_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let want_relay = self.relay_enabled;
         let mut watcher = self.endpoint.watch_addr();
-        let node_addr = loop {
-            let addr = watcher.get();
-            if !addr.addrs.is_empty() {
-                break addr;
+        let wait = async {
+            loop {
+                let addr = watcher.get();
+                let has_relay = addr
+                    .addrs
+                    .iter()
+                    .any(|a| matches!(a, iroh::TransportAddr::Relay(_)));
+                let ready = if want_relay {
+                    has_relay
+                } else {
+                    !addr.addrs.is_empty()
+                };
+                if ready {
+                    break addr;
+                }
+                if watcher.updated().await.is_err() {
+                    break watcher.get();
+                }
             }
-            if watcher.updated().await.is_err() {
-                break watcher.get();
-            }
+        };
+        let node_addr = match tokio::time::timeout(RELAY_READY_TIMEOUT, wait).await {
+            Ok(addr) => addr,
+            // Relay never came up within the budget; fall back to whatever
+            // addresses are known so we still produce a (best-effort) ticket.
+            Err(_) => watcher.get(),
         };
         Ok(peer_addr_from_iroh(&node_addr))
     }
