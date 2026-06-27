@@ -42,6 +42,9 @@ openssl-src = { version = "300.6", optional = true }
 zeroize = { version = "1.0", features = ["derive"] }
 rpassword = "7.2"
 libc = "0.2"
+# PTY allocation/spawn/resize for the P2P shell server (P2P_SHELL_DESIGN.md).
+# Avoids hand-rolled fork/openpty unsafe; not in the security-critical dep set.
+portable-pty = "0.8"
 tempfile = "3.8"
 parking_lot = "0.12"
 hex = "0.4"

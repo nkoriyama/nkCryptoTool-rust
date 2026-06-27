@@ -86,6 +86,11 @@ struct Args {
     #[arg(long)]
     shell: bool,
 
+    /// Run a single command on the remote shell and exit (ssh-style), instead of
+    /// an interactive login shell. Implies `--shell`.
+    #[arg(long)]
+    shell_cmd: Option<String>,
+
     #[arg(
         long,
         help = "Allow unauthenticated connections (SECURITY WARNING: Default is false since v49)"
@@ -486,7 +491,9 @@ async fn main() -> anyhow::Result<()> {
     config.listen_addr = args.listen;
     config.connect_addr = args.connect;
     config.chat_mode = args.chat;
-    config.shell_mode = args.serve_shell || args.shell;
+    config.shell_mode = args.serve_shell || args.shell || args.shell_cmd.is_some();
+    config.serve_shell = args.serve_shell;
+    config.shell_command = args.shell_cmd;
     // A remote shell is the highest-value attack surface: never run it without
     // peer authentication (see P2P_SHELL_DESIGN.md threat model). `--allow-unauth`
     // is rejected for shell mode; authenticate with --peer-allowlist and/or
@@ -505,6 +512,16 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!(
             "--serve-shell requires --peer-allowlist <file> and/or --signing-pubkey <key> \
              to restrict who may obtain a shell"
+        );
+    }
+    // Phase 1 has no privilege separation yet (P2P_SHELL_DESIGN.md Phase 2), so a
+    // shell server running as root would hand an allowlisted peer a root shell.
+    // Refuse to serve a shell as uid 0 until privilege drop lands.
+    #[cfg(unix)]
+    if args.serve_shell && unsafe { libc::geteuid() == 0 || libc::getuid() == 0 } {
+        anyhow::bail!(
+            "refusing to run --serve-shell as root: there is no privilege separation yet \
+             (P2P_SHELL_DESIGN.md Phase 2). Run the shell server as an unprivileged user."
         );
     }
     config.allow_unauth = args.allow_unauth;

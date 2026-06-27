@@ -133,7 +133,16 @@ pub struct CryptoConfig {
     pub chat_mode: bool,
     /// P2P shell mode (ALPN_SHELL). Mutually exclusive with chat/file; when set,
     /// the post-handshake path runs the shell session instead of chat/file.
+    /// True for both the shell client and server.
     pub shell_mode: bool,
+    /// This node will *serve* shells (`--serve-shell`). Only when this is true
+    /// does an inbound shell-ALPN connection spawn a PTY — so a node running as a
+    /// shell *client* never serves a shell even if a peer dials its shell ALPN.
+    /// Startup validates authz (allowlist/pinned key) and refuses root for this.
+    pub serve_shell: bool,
+    /// Optional single command for the shell client (`--shell-cmd`): runs it on
+    /// the remote and exits (ssh-style), instead of an interactive login shell.
+    pub shell_command: Option<String>,
     pub allow_unauth: bool,
     pub force: bool,
     pub handshake_timeout: u64,
@@ -197,6 +206,8 @@ impl Default for CryptoConfig {
             connect_addr: None,
             chat_mode: false,
             shell_mode: false,
+            serve_shell: false,
+            shell_command: None,
             allow_unauth: false,
             force: false,
             handshake_timeout: 15,

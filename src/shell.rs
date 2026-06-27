@@ -342,6 +342,332 @@ where
     Ok(())
 }
 
+// ===========================================================================
+// Phase 1: single-user PTY bridge (unix). The server allocates a PTY and runs
+// the operator's shell as *its own* user (per-user mapping / privilege drop is
+// Phase 2); the client puts its terminal in raw mode and pumps both directions.
+// ===========================================================================
+
+/// Server side of a real shell session: allocate a PTY, spawn the shell, and
+/// bridge it to the client over the secured frame stream until the shell exits.
+/// Authorization (who may reach this at all) is the transport allowlist / pinned
+/// key enforced before this runs; this still runs the shell as the server user.
+#[cfg(unix)]
+pub async fn run_pty_server<R, W>(
+    mut reader: R,
+    mut writer: W,
+    aead_name: &str,
+    s2c_key: &[u8],
+    c2s_key: &[u8],
+) -> Result<()>
+where
+    R: AsyncReadExt + Unpin + Send + 'static,
+    W: AsyncWriteExt + Unpin + Send,
+{
+    use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+
+    let (rx_key, tx_key) = role_keys(s2c_key, c2s_key, true);
+    let (mut rx_ctr, mut tx_ctr) = (0u64, 0u64);
+
+    // First frame must be OPEN.
+    let (cols, rows, term, cmd) =
+        match recv_frame(&mut reader, aead_name, rx_key, &mut rx_ctr).await? {
+            Some(Frame::Open { cols, rows, term, cmd }) => (cols, rows, term, cmd),
+            _ => {
+                let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
+                    &Frame::Error("expected OPEN".into())).await;
+                return Err(CryptoError::Parameter("shell: first frame was not OPEN".into()));
+            }
+        };
+
+    let pair = native_pty_system()
+        .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| CryptoError::Parameter(format!("openpty: {e}")))?;
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut builder = CommandBuilder::new(&shell);
+    // Sanitize the client-supplied TERM: it ends up in the shell's environment
+    // and is looked up by terminfo, so restrict it to a safe, bounded name (else
+    // fall back to a conservative default).
+    let safe_term = if !term.is_empty()
+        && term.len() <= 64
+        && term.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        term.clone()
+    } else {
+        "xterm".to_string()
+    };
+    builder.env("TERM", &safe_term);
+    if cmd.is_empty() {
+        builder.arg("-l"); // login shell
+    } else {
+        builder.arg("-c");
+        builder.arg(&cmd);
+    }
+    let mut child = pair
+        .slave
+        .spawn_command(builder)
+        .map_err(|e| CryptoError::Parameter(format!("spawn shell: {e}")))?;
+    drop(pair.slave); // close our copy so the child holds the only slave end
+
+    let mut pty_reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| CryptoError::Parameter(format!("pty reader: {e}")))?;
+    let mut pty_writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| CryptoError::Parameter(format!("pty writer: {e}")))?;
+
+    // Blocking PTY master → async, via a reader thread feeding a channel.
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            match pty_reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if out_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    // Client DATA → PTY master, via a writer thread fed by a channel.
+    let (in_tx, mut in_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    std::thread::spawn(move || {
+        use std::io::Write;
+        while let Some(bytes) = in_rx.blocking_recv() {
+            if pty_writer.write_all(&bytes).is_err() || pty_writer.flush().is_err() {
+                break;
+            }
+        }
+    });
+
+    // Decode inbound frames in a dedicated task feeding a channel, so the main
+    // loop only ever `select!`s over channel receives (which are cancel-safe).
+    // Putting `recv_frame` directly in `select!` would drop a partially-read
+    // packet whenever the other branch fires, desyncing the stream and failing
+    // the next MAC — a client could trigger that just by producing output.
+    let (in_frame_tx, mut in_frame_rx) = tokio::sync::mpsc::channel::<Frame>(64);
+    let aead_r = aead_name.to_string();
+    let rx_key_v = Zeroizing::new(rx_key.to_vec());
+    let reader_task = tokio::spawn(async move {
+        let mut rx_ctr = rx_ctr;
+        loop {
+            match recv_frame(&mut reader, &aead_r, &rx_key_v, &mut rx_ctr).await {
+                Ok(Some(f)) => {
+                    if in_frame_tx.send(f).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+    });
+
+    loop {
+        tokio::select! {
+            chunk = out_rx.recv() => match chunk {
+                Some(bytes) => send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
+                    &Frame::Data(bytes)).await?,
+                None => break, // PTY closed (shell exited)
+            },
+            frame = in_frame_rx.recv() => match frame {
+                Some(Frame::Data(d)) => { let _ = in_tx.send(d).await; }
+                Some(Frame::Winsz { cols, rows }) => {
+                    let _ = pair.master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                }
+                Some(Frame::Exit(_)) | Some(Frame::Error(_)) | None => break,
+                Some(Frame::Open { .. }) => {} // ignore a duplicate OPEN
+            },
+        }
+    }
+
+    // Always reap the shell. If we are here because the client went away while
+    // the shell is still running, kill it so neither the process nor the PTY
+    // bridge threads leak (kill on an already-exited child is a harmless no-op).
+    reader_task.abort();
+    let _ = child.kill();
+    let code = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .map(|s| s.exit_code() as i32)
+        .unwrap_or(-1);
+    let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr, &Frame::Exit(code)).await;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub async fn run_pty_server<R, W>(
+    _reader: R, _writer: W, _aead_name: &str, _s2c_key: &[u8], _c2s_key: &[u8],
+) -> Result<()> {
+    Err(CryptoError::Parameter("the P2P shell server is only supported on unix".into()))
+}
+
+/// Restores terminal attributes on drop, so a panic or early return never leaves
+/// the user's terminal stuck in raw mode.
+#[cfg(unix)]
+struct RawModeGuard {
+    fd: std::os::fd::RawFd,
+    orig: libc::termios,
+}
+
+#[cfg(unix)]
+impl RawModeGuard {
+    /// Put `fd` (a tty) into raw mode; returns `None` if `fd` is not a terminal.
+    fn enable(fd: std::os::fd::RawFd) -> Option<Self> {
+        if unsafe { libc::isatty(fd) } != 1 {
+            return None;
+        }
+        let mut orig: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut orig) } != 0 {
+            return None;
+        }
+        let mut raw = orig;
+        unsafe { libc::cfmakeraw(&mut raw) };
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            return None;
+        }
+        Some(Self { fd, orig })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
+    }
+}
+
+/// Read the controlling terminal's window size, or `(80, 24)` if `fd` is not a
+/// tty (e.g. piped input for a scripted session).
+#[cfg(unix)]
+fn term_size(fd: std::os::fd::RawFd) -> (u16, u16) {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
+        (ws.ws_col, ws.ws_row)
+    } else {
+        (80, 24)
+    }
+}
+
+/// Client side of a real shell session: announce our terminal, go raw, and pump
+/// stdin↔stdout against the remote PTY until the remote shell exits.
+#[cfg(unix)]
+pub async fn run_pty_client<R, W>(
+    mut reader: R,
+    writer: W,
+    aead_name: &str,
+    s2c_key: &[u8],
+    c2s_key: &[u8],
+    cmd: &str,
+) -> Result<()>
+where
+    R: AsyncReadExt + Unpin + Send,
+    W: AsyncWriteExt + Unpin + Send + 'static,
+{
+    use std::os::fd::AsRawFd;
+    let stdin_fd = std::io::stdin().as_raw_fd();
+    let (cols, rows) = term_size(stdin_fd);
+    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
+
+    let (rx_key, tx_key) = role_keys(s2c_key, c2s_key, false);
+    let tx_key = Zeroizing::new(tx_key.to_vec());
+    let aead_owned = aead_name.to_string();
+    let (mut rx_ctr, tx_ctr) = (0u64, 0u64);
+
+    // One writer task serializes all outbound frames (DATA from stdin, WINSZ
+    // from SIGWINCH) so the send counter stays consistent.
+    let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Frame>(64);
+    frame_tx
+        .send(Frame::Open { cols, rows, term, cmd: cmd.to_string() })
+        .await
+        .map_err(|_| CryptoError::Parameter("shell: writer gone".into()))?;
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        let mut ctr = tx_ctr;
+        while let Some(f) = frame_rx.recv().await {
+            if send_frame(&mut writer, &aead_owned, &tx_key, &mut ctr, &f).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Raw mode for the duration of the session (restored on drop).
+    let _raw = RawModeGuard::enable(stdin_fd);
+
+    // stdin → DATA frames.
+    let stdin_tx = frame_tx.clone();
+    let stdin_task = tokio::spawn(async move {
+        let mut stdin = tokio::io::stdin();
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match stdin.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if stdin_tx.send(Frame::Data(buf[..n].to_vec())).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // SIGWINCH → WINSZ frames.
+    let winch_tx = frame_tx.clone();
+    let winch_task = tokio::spawn(async move {
+        if let Ok(mut sig) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        {
+            while sig.recv().await.is_some() {
+                let (cols, rows) = term_size(stdin_fd);
+                if winch_tx.send(Frame::Winsz { cols, rows }).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+
+    // Main loop: remote PTY output → stdout, until EXIT.
+    let mut stdout = tokio::io::stdout();
+    let exit_code = loop {
+        match recv_frame(&mut reader, aead_name, rx_key, &mut rx_ctr).await? {
+            Some(Frame::Data(d)) => {
+                stdout.write_all(&d).await.map_err(io_err)?;
+                stdout.flush().await.map_err(io_err)?;
+            }
+            Some(Frame::Exit(code)) => break code,
+            Some(Frame::Error(m)) => {
+                drop(_raw);
+                eprintln!("\r\n[shell] remote error: {m}");
+                break 1;
+            }
+            None => break 0,
+            Some(_) => {}
+        }
+    };
+
+    stdin_task.abort();
+    winch_task.abort();
+    drop(frame_tx);
+    let _ = writer_task.await;
+    if exit_code != 0 {
+        eprintln!("\r\n[shell] remote shell exited with code {exit_code}");
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+pub async fn run_pty_client<R, W>(
+    _reader: R, _writer: W, _aead_name: &str, _s2c_key: &[u8], _c2s_key: &[u8], _cmd: &str,
+) -> Result<()> {
+    Err(CryptoError::Parameter("the P2P shell client is only supported on unix".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

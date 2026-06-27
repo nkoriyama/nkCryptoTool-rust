@@ -138,11 +138,12 @@ impl NetworkProcessor {
 
             tokio::spawn(async move {
                 let mut config = config_clone;
-                // The operator's startup opt-in (`--serve-shell`) is the only
-                // thing that authorizes serving a shell; a peer requesting the
-                // shell ALPN must not be able to turn an ordinary chat/file node
-                // into a shell server. Set the mode exclusively from the ALPN.
-                let shell_allowed = config.shell_mode;
+                // Only a node started with `--serve-shell` (which validated
+                // authz and refused root at startup) may serve a shell; a peer
+                // requesting the shell ALPN must not be able to turn an ordinary
+                // chat/file node — or a shell *client* — into a shell server.
+                // Set the mode exclusively from the ALPN.
+                let shell_allowed = config.serve_shell;
                 config.shell_mode = false;
                 config.chat_mode = false;
                 if incoming.protocol.0 == ALPN_CHAT {
@@ -245,7 +246,7 @@ impl NetworkProcessor {
             .map_err(|e| CryptoError::Parameter(format!("Accept failed: {}", e)))?;
 
         let mut config = self.config.clone();
-        let shell_allowed = config.shell_mode;
+        let shell_allowed = config.serve_shell;
         config.shell_mode = false;
         config.chat_mode = false;
         if incoming.protocol.0 == ALPN_CHAT {
@@ -480,8 +481,8 @@ impl NetworkProcessor {
         };
 
         if config.shell_mode {
-            // Phase 0: echo server. Later phases bridge a PTY here.
-            crate::shell::run_echo_server(reader, writer, &config.aead_algo, &s2c_key, &c2s_key)
+            // Phase 1: bridge a real PTY/shell to the client.
+            crate::shell::run_pty_server(reader, writer, &config.aead_algo, &s2c_key, &c2s_key)
                 .await?;
         } else if config.chat_mode {
             let stdin = io_provider.stdin();
@@ -711,16 +712,14 @@ impl NetworkProcessor {
                 }
 
                 if config.shell_mode {
-                    // Phase 0: echo client (stdin → Data → echoed back → stdout).
-                    let mut out = self.io_provider.stdout();
-                    crate::shell::run_echo_client(
+                    // Phase 1: drive the local terminal against the remote PTY.
+                    crate::shell::run_pty_client(
                         reader,
                         writer,
                         &config.aead_algo,
                         &s2c_key,
                         &c2s_key,
-                        self.io_provider.stdin(),
-                        &mut out,
+                        config.shell_command.as_deref().unwrap_or(""),
                     )
                     .await
                 } else if config.chat_mode {
