@@ -89,6 +89,7 @@ const TID_SENTINEL: u8 = 9;
 const TID_PK_ONETIME: u8 = 10;
 const TID_PK_STATIC: u8 = 11;
 const TID_GROUP_COMMITS: u8 = 12;
+const TID_MEMBER_ADDR: u8 = 13;
 
 const TBL_GROUP: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_group_state");
 const TBL_EPOCH: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_epoch");
@@ -103,6 +104,14 @@ const TBL_GROUP_COMMITS: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("mls_group_commits");
 /// Number of newest commit-epochs retained for delta resync before pruning.
 pub const DEFAULT_COMMIT_RETENTION: u64 = 100;
+/// Per-group member *delivery hints* (an address book), keyed by
+/// `group_member_key` = `gid_len ‖ gid ‖ node_id(32)`. The value is the peer's
+/// ticket string. These are only hints used to default the recipient set when
+/// the user does not pass `--mls-recipient-ticket`; MLS still authenticates and
+/// encrypts every message, so a stale or wrong hint can at worst fail to deliver
+/// (it cannot leak plaintext to the wrong node).
+const TBL_MEMBER_ADDR: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("mls_member_addr");
 
 // Inbox (store-and-forward) tables and their AAD table ids.
 const TID_ENVELOPE: u8 = 5;
@@ -133,13 +142,14 @@ const SENTINEL_KEY: &[u8] = b"dek-check";
 const SENTINEL_PLAINTEXT: &[u8] = b"nkct-redb-sentinel-v1";
 
 /// Group-DB encrypted tables and their AAD ids — the set DEK rotation re-seals.
-const GROUP_ENCRYPTED_TABLES: [(TableDefinition<&[u8], &[u8]>, u8); 7] = [
+const GROUP_ENCRYPTED_TABLES: [(TableDefinition<&[u8], &[u8]>, u8); 8] = [
     (TBL_GROUP, TID_GROUP),
     (TBL_EPOCH, TID_EPOCH),
     (TBL_KEY_PACKAGE, TID_KEY_PACKAGE),
     (TBL_PSK, TID_PSK),
     (TBL_APP, TID_APP),
     (TBL_GROUP_COMMITS, TID_GROUP_COMMITS),
+    (TBL_MEMBER_ADDR, TID_MEMBER_ADDR),
     (TBL_SENTINEL, TID_SENTINEL),
 ];
 
@@ -233,6 +243,7 @@ impl RedbBackend {
             TBL_PSK,
             TBL_APP,
             TBL_GROUP_COMMITS,
+            TBL_MEMBER_ADDR,
             TBL_SENTINEL,
         ])?;
         me.ensure_sentinel()?;
@@ -699,6 +710,108 @@ impl RedbBackend {
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         Ok(deleted)
     }
+
+    /// Upsert a member's delivery hint (its ticket string) for `group_id`.
+    /// Overwriting is intended: a peer's reachable address changes over time, so
+    /// the newest hint wins.
+    pub fn put_member_addr(
+        &self,
+        group_id: &[u8],
+        node_id: &[u8; 32],
+        ticket: &str,
+    ) -> Result<(), RedbStorageError> {
+        if group_id.len() > u16::MAX as usize {
+            return Err(RedbStorageError::Malformed(
+                "group id exceeds 65535 bytes".into(),
+            ));
+        }
+        let key = group_member_key(group_id, node_id);
+        let sealed = self.seal(TID_MEMBER_ADDR, &key, ticket.as_bytes())?;
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        {
+            let mut t = wtx
+                .open_table(TBL_MEMBER_ADDR)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            t.insert(key.as_slice(), sealed.as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        }
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Forget a member's delivery hint (e.g. after the member is removed from
+    /// the group), so later auto-resolved sends do not keep targeting them.
+    /// A missing entry is not an error (idempotent).
+    pub fn forget_member_addr(
+        &self,
+        group_id: &[u8],
+        node_id: &[u8; 32],
+    ) -> Result<(), RedbStorageError> {
+        if group_id.len() > u16::MAX as usize {
+            return Err(RedbStorageError::Malformed(
+                "group id exceeds 65535 bytes".into(),
+            ));
+        }
+        let key = group_member_key(group_id, node_id);
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        {
+            let mut t = wtx
+                .open_table(TBL_MEMBER_ADDR)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            t.remove(key.as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        }
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        Ok(())
+    }
+
+    /// List all stored member delivery hints (ticket strings) for `group_id`.
+    /// A record whose ticket fails to decode as UTF-8 is skipped rather than
+    /// failing the whole lookup (one bad entry must not break delivery).
+    pub fn list_member_addrs(
+        &self,
+        group_id: &[u8],
+    ) -> Result<Vec<([u8; 32], String)>, RedbStorageError> {
+        if group_id.len() > u16::MAX as usize {
+            return Err(RedbStorageError::Malformed(
+                "group id exceeds 65535 bytes".into(),
+            ));
+        }
+        let lo = group_member_key(group_id, &[0u8; 32]);
+        let hi = group_member_key(group_id, &[0xffu8; 32]);
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let table = rtx
+            .open_table(TBL_MEMBER_ADDR)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        // The length-prefixed group id makes [lo, hi] a contiguous, group-scoped
+        // block (the 32-byte node id is the only thing that varies within it).
+        let range = table
+            .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let mut out = Vec::new();
+        for entry in range {
+            let (k, v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let kbytes = k.value();
+            let node_id = node_id_from_member_key(kbytes)?;
+            let pt = self.open_record(TID_MEMBER_ADDR, kbytes, v.value())?;
+            match std::str::from_utf8(&pt) {
+                Ok(s) => out.push((node_id, s.to_string())),
+                Err(_) => eprintln!("[redb] skipping member-addr hint with non-UTF8 ticket"),
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// AAD binding a record to its slot: `db_binding ‖ table_id ‖ redb_key`.
@@ -817,6 +930,26 @@ fn epoch_from_group_key(key: &[u8]) -> Result<u64, RedbStorageError> {
     let mut id = [0u8; 8];
     id.copy_from_slice(&key[key.len() - 8..]);
     Ok(u64::from_be_bytes(id))
+}
+
+/// Member-addr key: `gid_len(be16) ‖ gid ‖ node_id(32)`. The length-prefixed
+/// group id keeps one group's hints in a contiguous, non-colliding key range.
+fn group_member_key(group_id: &[u8], node_id: &[u8; 32]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(2 + group_id.len() + 32);
+    k.extend_from_slice(&(group_id.len() as u16).to_be_bytes());
+    k.extend_from_slice(group_id);
+    k.extend_from_slice(node_id);
+    k
+}
+
+/// Recover the 32-byte node id (trailing bytes) from a [`group_member_key`].
+fn node_id_from_member_key(key: &[u8]) -> Result<[u8; 32], RedbStorageError> {
+    if key.len() < 32 {
+        return Err(RedbStorageError::Malformed("member-addr key too short".into()));
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&key[key.len() - 32..]);
+    Ok(id)
 }
 
 // ===================== GroupStateStorage =============================
@@ -1868,6 +2001,52 @@ mod tests {
             .map(|(e, _)| *e)
             .collect();
         assert_eq!(delta, vec![2, 3]);
+    }
+
+    #[test]
+    fn member_addr_put_list_roundtrip_overwrite_and_group_scoped() {
+        let (_d, b) = backend();
+        let ga = b"group-A";
+        let gb = b"group-B";
+        let n1 = [0x11u8; 32];
+        let n2 = [0x22u8; 32];
+
+        b.put_member_addr(ga, &n1, "nkct1-bob").unwrap();
+        b.put_member_addr(ga, &n2, "nkct1-carol").unwrap();
+        b.put_member_addr(gb, &n1, "nkct1-other").unwrap();
+
+        // group-A has exactly its two members, keyed by node id.
+        let mut a = b.list_member_addrs(ga).unwrap();
+        a.sort();
+        assert_eq!(
+            a,
+            vec![(n1, "nkct1-bob".to_string()), (n2, "nkct1-carol".to_string())]
+        );
+
+        // group scoping: group-B is independent.
+        let bb = b.list_member_addrs(gb).unwrap();
+        assert_eq!(bb, vec![(n1, "nkct1-other".to_string())]);
+
+        // overwrite: a peer's address changes -> newest hint wins.
+        b.put_member_addr(ga, &n1, "nkct1-bob-moved").unwrap();
+        let a2 = b.list_member_addrs(ga).unwrap();
+        let bob = a2.iter().find(|(nid, _)| *nid == n1).unwrap();
+        assert_eq!(bob.1, "nkct1-bob-moved");
+        assert_eq!(a2.len(), 2, "overwrite must not add a duplicate entry");
+
+        // an empty group has no hints.
+        assert!(b.list_member_addrs(b"group-empty").unwrap().is_empty());
+
+        // forget removes only the targeted member; idempotent on a missing one.
+        b.forget_member_addr(ga, &n1).unwrap();
+        let a3 = b.list_member_addrs(ga).unwrap();
+        assert_eq!(a3, vec![(n2, "nkct1-carol".to_string())]);
+        b.forget_member_addr(ga, &n1).unwrap(); // no-op, must not error
+        // group-B (same node id n1) is untouched by group-A's forget.
+        assert_eq!(
+            b.list_member_addrs(gb).unwrap(),
+            vec![(n1, "nkct1-other".to_string())]
+        );
     }
 
     #[test]

@@ -1433,6 +1433,60 @@ impl GroupChatProcessor {
             .map_err(GroupError::Transport)
     }
 
+    /// Remember member delivery hints for a group: store each ticket string
+    /// keyed by its transport node id, so a later `send`/`chat-group` can target
+    /// these peers without the user re-supplying `--mls-recipient-ticket`.
+    ///
+    /// Only tickets whose node id matches an **actual current group member** are
+    /// stored. This stops a wrong or malicious ticket — supplied once by mistake
+    /// — from poisoning the address book and making every later auto-resolved
+    /// send connect to / leak ciphertext metadata at a non-member. Best-effort:
+    /// errors are logged, never fatal.
+    pub fn remember_member_tickets(&self, gid: &GroupId, tickets: &[crate::ticket::Ticket]) {
+        if tickets.is_empty() {
+            return;
+        }
+        let members: std::collections::HashSet<[u8; 32]> =
+            match self.client.load_group(gid.as_bytes()) {
+                Ok(group) => group
+                    .roster()
+                    .members_iter()
+                    .filter_map(|m| Self::peer_id_from_credential(&m.signing_identity.credential))
+                    .map(|pid| *pid.as_bytes())
+                    .collect(),
+                Err(e) => {
+                    eprintln!("[mls] cannot validate member tickets (group load failed): {e}");
+                    return;
+                }
+            };
+        for t in tickets {
+            let node_id = *t.peer_addr().peer_id.as_bytes();
+            if !members.contains(&node_id) {
+                eprintln!(
+                    "[mls] refusing to remember a ticket for a node that is not a current group member"
+                );
+                continue;
+            }
+            if let Err(e) = self.storage.put_member_addr(gid.as_bytes(), &node_id, &t.to_string()) {
+                eprintln!("[mls] failed to remember member address (non-fatal): {e}");
+            }
+        }
+    }
+
+    /// Return the remembered recipient addresses for a group (delivery hints).
+    /// A stored ticket that no longer parses is skipped rather than failing the
+    /// whole lookup.
+    pub fn known_member_addrs(&self, gid: &GroupId) -> Result<Vec<PeerAddr>, GroupError> {
+        let mut out = Vec::new();
+        for (_node_id, ticket_str) in self.storage.list_member_addrs(gid.as_bytes())? {
+            match ticket_str.parse::<crate::ticket::Ticket>() {
+                Ok(t) => out.push(t.peer_addr()),
+                Err(e) => eprintln!("[mls] skipping unparseable stored ticket: {e}"),
+            }
+        }
+        Ok(out)
+    }
+
     /// List the current members of a group (P6).
     ///
     /// Returns one [`MemberInfo`] per live leaf in the group's TreeKEM,
@@ -1511,6 +1565,17 @@ impl GroupChatProcessor {
             }
         })?;
 
+        // Resolve the removed member's transport node id from the roster while it
+        // is still present, but do NOT forget its address hint yet — only after
+        // the removal is durably applied below, so a mid-way failure can't drop a
+        // still-current member's hint (availability).
+        let removed_node_id = group
+            .roster()
+            .members_iter()
+            .find(|m| m.index == index)
+            .and_then(|m| Self::peer_id_from_credential(&m.signing_identity.credential))
+            .map(|pid| *pid.as_bytes());
+
         let commit_output = group
             .commit_builder()
             .remove_member(index)
@@ -1531,6 +1596,16 @@ impl GroupChatProcessor {
         group
             .write_to_storage()
             .map_err(|e| GroupError::Storage(format!("write_to_storage after remove: {e}")))?;
+
+        // The removal is now durably applied — forget the evicted member's
+        // delivery hint so a later auto-resolved send no longer targets it (the
+        // evicted peer can't decrypt the new epoch anyway, but we must not keep
+        // connecting to / leaking ciphertext metadata at it). Best-effort.
+        if let Some(node_id) = removed_node_id {
+            if let Err(e) = self.storage.forget_member_addr(gid.as_bytes(), &node_id) {
+                eprintln!("[mls] failed to forget removed member's address (non-fatal): {e}");
+            }
+        }
 
         let commit_bytes = commit_output
             .commit_message

@@ -134,6 +134,39 @@ pub fn tickets_to_peer_addrs(tickets: &[Ticket]) -> Vec<PeerAddr> {
     tickets.iter().map(|t| t.peer_addr()).collect()
 }
 
+/// Resolve the recipient set for a group messaging command.
+///
+/// First **remember** any tickets the user supplied (keyed by node id, per
+/// group) so a later invocation can omit `--mls-recipient-ticket`. Then use the
+/// supplied set if non-empty; otherwise fall back to the group's **remembered**
+/// delivery hints. MLS still authenticates/encrypts every message, so a stale
+/// hint can at worst fail to deliver — never misdeliver plaintext.
+fn resolve_recipients(
+    processor: &GroupChatProcessor,
+    gid: &GroupId,
+    supplied: &[Ticket],
+) -> Vec<PeerAddr> {
+    processor.remember_member_tickets(gid, supplied);
+    if !supplied.is_empty() {
+        return tickets_to_peer_addrs(supplied);
+    }
+    match processor.known_member_addrs(gid) {
+        Ok(addrs) => {
+            if addrs.is_empty() {
+                eprintln!(
+                    "[mls] no --mls-recipient-ticket given and no remembered addresses \
+                     for this group; nothing to deliver to"
+                );
+            }
+            addrs
+        }
+        Err(e) => {
+            eprintln!("[mls] failed to load remembered addresses: {e}");
+            Vec::new()
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Per-command handlers. Each takes a borrow of the processor so tests
 // can call them sequentially against the same processor instance.
@@ -805,7 +838,17 @@ pub async fn run(
             existing_member_tickets,
         } => {
             let recipient = recipient_ticket.peer_addr();
-            let existing = tickets_to_peer_addrs(&existing_member_tickets);
+            // Existing members (who must receive the Commit): use the supplied
+            // set if given, else the group's remembered hints — so you don't
+            // re-list every current member on each add. Exclude the new member
+            // (it gets a Welcome, not a Commit).
+            processor.remember_member_tickets(&group_id, &existing_member_tickets);
+            let mut existing = if !existing_member_tickets.is_empty() {
+                tickets_to_peer_addrs(&existing_member_tickets)
+            } else {
+                processor.known_member_addrs(&group_id).unwrap_or_default()
+            };
+            existing.retain(|a| a.peer_id != recipient.peer_id);
             add_member(
                 &processor,
                 &group_id,
@@ -814,14 +857,21 @@ pub async fn run(
                 &existing,
             )
             .await?;
-            eprintln!("Added member; Welcome delivered to {recipient:?}");
+            // Remember the freshly-added member for future sends/adds.
+            processor.remember_member_tickets(&group_id, std::slice::from_ref(&recipient_ticket));
+            eprintln!(
+                "Added member; Welcome delivered to {recipient:?}; Commit to {} existing member(s)",
+                existing.len()
+            );
         }
         MlsCommand::RemoveMember {
             group_id,
             index,
             recipient_tickets,
         } => {
-            let addrs = tickets_to_peer_addrs(&recipient_tickets);
+            // Refresh remembered hints for the remaining members from the
+            // supplied tickets; if none supplied, fall back to the stored book.
+            let addrs = resolve_recipients(&processor, &group_id, &recipient_tickets);
             remove_member(&processor, &group_id, index, &addrs).await?;
             eprintln!("Removed leaf {index} from {group_id}");
         }
@@ -852,7 +902,7 @@ pub async fn run(
             body,
             recipient_tickets,
         } => {
-            let addrs = tickets_to_peer_addrs(&recipient_tickets);
+            let addrs = resolve_recipients(&processor, &group_id, &recipient_tickets);
             send_application_message(&processor, &group_id, body.as_bytes(), &addrs).await?;
             eprintln!("Sent to {} recipients", addrs.len());
         }
@@ -860,7 +910,7 @@ pub async fn run(
             group_id,
             recipient_tickets,
         } => {
-            let addrs = tickets_to_peer_addrs(&recipient_tickets);
+            let addrs = resolve_recipients(&processor, &group_id, &recipient_tickets);
             let stdin = tokio::io::stdin();
             let stdout = Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
             chat_group_loop(Arc::new(processor), group_id, addrs, stdin, stdout).await?;
@@ -869,7 +919,12 @@ pub async fn run(
             group_id,
             recipient_tickets,
         } => {
-            let addrs = tickets_to_peer_addrs(&recipient_tickets);
+            // Listen accepts a group_id only when one was supplied; the remembered
+            // hints are looked up per group, so only resolve when we know which.
+            let addrs = match group_id {
+                Some(gid) => resolve_recipients(&processor, &gid, &recipient_tickets),
+                None => tickets_to_peer_addrs(&recipient_tickets),
+            };
             listen_loop(Arc::new(processor), group_id, addrs).await?;
         }
         MlsCommand::PrintLocalAddress => {

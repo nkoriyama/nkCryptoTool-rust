@@ -164,6 +164,33 @@ impl GroupStorage {
             .prune_commits(group_id, keep)
             .map_err(|e| GroupError::Storage(format!("prune_commits: {e}")))
     }
+
+    /// Remember a member's delivery hint (ticket string) for `group_id`, keyed
+    /// by its transport node id. See [`RedbBackend::put_member_addr`].
+    pub fn put_member_addr(
+        &self,
+        group_id: &[u8],
+        node_id: &[u8; 32],
+        ticket: &str,
+    ) -> Result<(), GroupError> {
+        self.backend
+            .put_member_addr(group_id, node_id, ticket)
+            .map_err(|e| GroupError::Storage(format!("put_member_addr: {e}")))
+    }
+
+    /// List remembered member delivery hints (ticket strings) for `group_id`.
+    pub fn list_member_addrs(&self, group_id: &[u8]) -> Result<Vec<([u8; 32], String)>, GroupError> {
+        self.backend
+            .list_member_addrs(group_id)
+            .map_err(|e| GroupError::Storage(format!("list_member_addrs: {e}")))
+    }
+
+    /// Forget a member's delivery hint (e.g. after removal from the group).
+    pub fn forget_member_addr(&self, group_id: &[u8], node_id: &[u8; 32]) -> Result<(), GroupError> {
+        self.backend
+            .forget_member_addr(group_id, node_id)
+            .map_err(|e| GroupError::Storage(format!("forget_member_addr: {e}")))
+    }
 }
 
 /// Derive a 256-bit value key from a passphrase for the convenience
