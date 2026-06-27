@@ -88,6 +88,7 @@ const TID_APP: u8 = 8;
 const TID_SENTINEL: u8 = 9;
 const TID_PK_ONETIME: u8 = 10;
 const TID_PK_STATIC: u8 = 11;
+const TID_GROUP_COMMITS: u8 = 12;
 
 const TBL_GROUP: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_group_state");
 const TBL_EPOCH: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_epoch");
@@ -95,6 +96,13 @@ const TBL_KEY_PACKAGE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls
 const TBL_PSK: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_psk");
 /// Application-data KV (signing identity etc.), keyed by `blind_index(key)`.
 const TBL_APP: TableDefinition<&[u8], &[u8]> = TableDefinition::new("mls_app");
+/// Applied-commit history for delta resync (MLS_P2P_SYNC_DESIGN.md §4), keyed
+/// by `group_epoch_key` = `gid_len ‖ gid ‖ epoch`. Only the canonical commit
+/// that advanced local state to `epoch` is stored.
+const TBL_GROUP_COMMITS: TableDefinition<&[u8], &[u8]> =
+    TableDefinition::new("mls_group_commits");
+/// Number of newest commit-epochs retained for delta resync before pruning.
+pub const DEFAULT_COMMIT_RETENTION: u64 = 100;
 
 // Inbox (store-and-forward) tables and their AAD table ids.
 const TID_ENVELOPE: u8 = 5;
@@ -125,12 +133,13 @@ const SENTINEL_KEY: &[u8] = b"dek-check";
 const SENTINEL_PLAINTEXT: &[u8] = b"nkct-redb-sentinel-v1";
 
 /// Group-DB encrypted tables and their AAD ids — the set DEK rotation re-seals.
-const GROUP_ENCRYPTED_TABLES: [(TableDefinition<&[u8], &[u8]>, u8); 6] = [
+const GROUP_ENCRYPTED_TABLES: [(TableDefinition<&[u8], &[u8]>, u8); 7] = [
     (TBL_GROUP, TID_GROUP),
     (TBL_EPOCH, TID_EPOCH),
     (TBL_KEY_PACKAGE, TID_KEY_PACKAGE),
     (TBL_PSK, TID_PSK),
     (TBL_APP, TID_APP),
+    (TBL_GROUP_COMMITS, TID_GROUP_COMMITS),
     (TBL_SENTINEL, TID_SENTINEL),
 ];
 
@@ -223,6 +232,7 @@ impl RedbBackend {
             TBL_KEY_PACKAGE,
             TBL_PSK,
             TBL_APP,
+            TBL_GROUP_COMMITS,
             TBL_SENTINEL,
         ])?;
         me.ensure_sentinel()?;
@@ -502,6 +512,168 @@ impl RedbBackend {
         }
         wtx.commit()
             .map_err(|e| RedbStorageError::Backend(e.to_string()))
+    }
+
+    // ---- MLS commit history (delta resync, MLS_P2P_SYNC_DESIGN.md §4) --------
+
+    /// Persist the canonical commit that advanced `group_id` to `epoch`, so a
+    /// straggler can later be replayed the commits it missed. The value is
+    /// AEAD-sealed like every other record; the key is `group_epoch_key`. Only
+    /// the commit actually applied to local state should be stored (one per
+    /// epoch). Auto-prunes to [`DEFAULT_COMMIT_RETENTION`].
+    pub fn store_commit(
+        &self,
+        group_id: &[u8],
+        epoch: u64,
+        commit_bytes: &[u8],
+    ) -> Result<(), RedbStorageError> {
+        // The key length-prefixes the group id as u16; a >64KiB id would
+        // truncate and could collide across groups, so reject it outright.
+        if group_id.len() > u16::MAX as usize {
+            return Err(RedbStorageError::Malformed(
+                "group id exceeds 65535 bytes".into(),
+            ));
+        }
+        let key = group_epoch_key(group_id, epoch);
+        // Each epoch has exactly one canonical commit. Re-storing identical
+        // bytes is a no-op; refusing *different* bytes stops a stored canonical
+        // commit from being silently replaced (fork / tamper guard).
+        if let Some(existing) = self.get_raw(TBL_GROUP_COMMITS, &key)? {
+            let existing_pt = self.open_record(TID_GROUP_COMMITS, &key, &existing)?;
+            if existing_pt.as_slice() == commit_bytes {
+                return Ok(());
+            }
+            return Err(RedbStorageError::Backend(format!(
+                "refusing to overwrite the canonical commit at epoch {epoch} with different bytes"
+            )));
+        }
+        let sealed = self.seal(TID_GROUP_COMMITS, &key, commit_bytes)?;
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        {
+            let mut t = wtx
+                .open_table(TBL_GROUP_COMMITS)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            t.insert(key.as_slice(), sealed.as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        }
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        // Prune is opportunistic cleanup; the commit is already durably stored,
+        // so a prune failure must not fail the store (it self-heals next call).
+        if let Err(e) = self.prune_commits(group_id, DEFAULT_COMMIT_RETENTION) {
+            eprintln!("[redb] commit-history prune failed (non-fatal): {e}");
+        }
+        Ok(())
+    }
+
+    /// Load applied commits for `group_id` with
+    /// `from_epoch_exclusive < epoch <= to_epoch_inclusive`, ascending by epoch
+    /// — the commits a straggler at `from_epoch_exclusive` must replay to reach
+    /// `to_epoch_inclusive` (Case B delta resync).
+    pub fn load_commits(
+        &self,
+        group_id: &[u8],
+        from_epoch_exclusive: u64,
+        to_epoch_inclusive: u64,
+    ) -> Result<Vec<(u64, Zeroizing<Vec<u8>>)>, RedbStorageError> {
+        if group_id.len() > u16::MAX as usize {
+            return Err(RedbStorageError::Malformed(
+                "group id exceeds 65535 bytes".into(),
+            ));
+        }
+        // An empty or inverted range has no commits — return early so the
+        // attacker-influenced `(from, to)` cannot reach redb's range() with
+        // start > end (which would panic).
+        if from_epoch_exclusive >= to_epoch_inclusive {
+            return Ok(Vec::new());
+        }
+        let lo = group_epoch_key(group_id, from_epoch_exclusive);
+        let hi = group_epoch_key(group_id, to_epoch_inclusive);
+        let rtx = self
+            .db
+            .begin_read()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let table = rtx
+            .open_table(TBL_GROUP_COMMITS)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        // The length-prefixed group id makes [lo, hi] a contiguous block of the
+        // same group, so the range is group-scoped.
+        let range = table
+            .range::<&[u8]>((Bound::Excluded(lo.as_slice()), Bound::Included(hi.as_slice())))
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let mut out = Vec::new();
+        for entry in range {
+            let (k, v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let kbytes = k.value();
+            let epoch = epoch_from_group_key(kbytes)?;
+            let pt = self.open_record(TID_GROUP_COMMITS, kbytes, v.value())?;
+            out.push((epoch, pt));
+        }
+        Ok(out)
+    }
+
+    /// Prune commit history for `group_id`, keeping only the newest `keep`
+    /// epochs. Returns the number of commits deleted (so callers can log what
+    /// was dropped rather than silently bounding coverage).
+    pub fn prune_commits(&self, group_id: &[u8], keep: u64) -> Result<u64, RedbStorageError> {
+        if group_id.len() > u16::MAX as usize {
+            return Err(RedbStorageError::Malformed(
+                "group id exceeds 65535 bytes".into(),
+            ));
+        }
+        let lo = group_epoch_key(group_id, 0);
+        let hi = group_epoch_key(group_id, u64::MAX);
+        let wtx = self
+            .db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let mut deleted = 0u64;
+        {
+            let mut t = wtx
+                .open_table(TBL_GROUP_COMMITS)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let max_epoch: Option<u64> = {
+                let mut range = t
+                    .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                match range
+                    .next_back()
+                    .transpose()
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+                {
+                    Some((k, _)) => Some(epoch_from_group_key(k.value())?),
+                    None => None,
+                }
+            };
+            if let Some(max_epoch) = max_epoch {
+                if max_epoch >= keep {
+                    let cutoff = max_epoch - keep; // delete epochs <= cutoff
+                    let del_hi = group_epoch_key(group_id, cutoff);
+                    let mut to_delete: Vec<Vec<u8>> = Vec::new();
+                    {
+                        let range = t
+                            .range::<&[u8]>(lo.as_slice()..=del_hi.as_slice())
+                            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                        for entry in range {
+                            let (k, _) =
+                                entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                            to_delete.push(k.value().to_vec());
+                        }
+                    }
+                    for k in &to_delete {
+                        t.remove(k.as_slice())
+                            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        Ok(deleted)
     }
 }
 
@@ -1638,6 +1810,93 @@ mod tests {
         let dek = [0x37u8; 32];
         let b = RedbBackend::open(dir.path().join("groups.redb"), &dek).expect("open");
         (dir, b)
+    }
+
+    #[test]
+    fn group_commits_store_load_roundtrip_and_range() {
+        let (_d, b) = backend();
+        let gid = b"group-A";
+        b.store_commit(gid, 1, b"commit-1").unwrap();
+        b.store_commit(gid, 2, b"commit-2").unwrap();
+        b.store_commit(gid, 3, b"commit-3").unwrap();
+
+        // (0, 3] -> all three, ascending by epoch.
+        let all: Vec<(u64, Vec<u8>)> = b
+            .load_commits(gid, 0, 3)
+            .unwrap()
+            .iter()
+            .map(|(e, c)| (*e, c.to_vec()))
+            .collect();
+        assert_eq!(
+            all,
+            vec![
+                (1, b"commit-1".to_vec()),
+                (2, b"commit-2".to_vec()),
+                (3, b"commit-3".to_vec()),
+            ]
+        );
+
+        // (1, 3] -> the delta a straggler at epoch 1 must replay: 2 and 3.
+        let delta: Vec<u64> = b
+            .load_commits(gid, 1, 3)
+            .unwrap()
+            .iter()
+            .map(|(e, _)| *e)
+            .collect();
+        assert_eq!(delta, vec![2, 3]);
+    }
+
+    #[test]
+    fn group_commits_are_group_scoped() {
+        let (_d, b) = backend();
+        b.store_commit(b"group-A", 1, b"a1").unwrap();
+        b.store_commit(b"group-B", 1, b"b1").unwrap();
+        let a = b.load_commits(b"group-A", 0, u64::MAX).unwrap();
+        assert_eq!(a.len(), 1, "range must not bleed into another group");
+        assert_eq!(a[0].1.to_vec(), b"a1".to_vec());
+    }
+
+    #[test]
+    fn group_commits_prune_keeps_newest() {
+        let (_d, b) = backend();
+        let gid = b"g";
+        for e in 1..=5u64 {
+            b.store_commit(gid, e, format!("c{e}").as_bytes()).unwrap();
+        }
+        // max=5, keep=2 -> cutoff=3, delete epochs <=3 (i.e. 1,2,3).
+        let deleted = b.prune_commits(gid, 2).unwrap();
+        assert_eq!(deleted, 3);
+        let remaining: Vec<u64> = b
+            .load_commits(gid, 0, u64::MAX)
+            .unwrap()
+            .iter()
+            .map(|(e, _)| *e)
+            .collect();
+        assert_eq!(remaining, vec![4, 5]);
+    }
+
+    #[test]
+    fn store_commit_is_idempotent_but_rejects_clobber() {
+        let (_d, b) = backend();
+        let gid = b"g";
+        b.store_commit(gid, 1, b"canonical").unwrap();
+        b.store_commit(gid, 1, b"canonical").unwrap(); // identical -> Ok (no-op)
+        assert!(
+            b.store_commit(gid, 1, b"forged").is_err(),
+            "must refuse to replace a stored canonical commit with different bytes"
+        );
+        let c = b.load_commits(gid, 0, 1).unwrap();
+        assert_eq!(c[0].1.to_vec(), b"canonical".to_vec(), "original intact");
+    }
+
+    #[test]
+    fn load_commits_empty_on_invalid_range() {
+        let (_d, b) = backend();
+        let gid = b"g";
+        b.store_commit(gid, 5, b"c5").unwrap();
+        // Empty / inverted ranges yield no commits and must not panic.
+        assert!(b.load_commits(gid, 5, 5).unwrap().is_empty());
+        assert!(b.load_commits(gid, 9, 3).unwrap().is_empty());
     }
 
     #[cfg(unix)]
