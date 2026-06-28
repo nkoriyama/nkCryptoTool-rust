@@ -137,9 +137,14 @@ nk-crypto-tool --shell --connect <server-ticket> ... -- systemctl restart myapp
   ストリーム/フレーミングを検証。
 - **Phase 1**: 単一ユーザ PTY ブリッジ（サーバ起動ユーザのシェルをそのまま起動）。raw 端末・WINSZ・EXIT。
   allowlist 必須。**まだ降格・cmd-allow 無し**＝信頼済み単一ユーザ前提。実機（rustdev/nkwire）で対話確認。
-- **Phase 2**: 認可ポリシー（指紋→user マップ）＋権限分離（setuid 降格）＋監査ログ＋レート制限。
-- **Phase 3**: 単発コマンド（cmd-allow ホワイトリスト）。
-- **Phase 4（任意）**: ポートフォワード（`-L/-R`、ストリーム多重化）。
+- **Phase 2** ✅: 認可ポリシー（指紋→user マップ）＋権限分離（setuid 降格）＋監査ログ＋レート制限。
+  実装は 2a（authz/cmd-allow/audit/rate-limit）＋2b（setuid 権限分離・自前 openpty）に分割済み。
+  ※ 当初 Phase 3 とした「単発コマンド（cmd-allow）」は 2a に取り込み済み。
+- **Phase 3**（実装名、当初 Phase 4）✅: ポートフォワード（local `-L`、チャネル多重化）。`src/forward.rs`、
+  ALPN `nkct/fwd/1`。1 接続が多数の TCP を channel として多重化。サーバは fingerprint→`host:port` 許可ポリシー
+  （default deny）で onward 接続を制御＋監査。`--serve-forward`/`--forward-policy`（サーバ）、
+  `--forward localport:host:remoteport`（クライアント、反復可）。remote `-R` は未実装。
+- **Phase 4（任意）**: remote forward（`-R`）、per-channel フロー制御（SSH 風 credit window）。
 - **Phase 5（任意）**: MLS グループでホスト群へのチーム権限（メンバーシップで shell-policy を投影）。
   ※ 過去の「MLS↔transport 投影」は層の取り違えで撤回した（[MLS_P2P_SYNC_DESIGN.md] 参照）。
     再挑戦するなら **認可は ML-DSA 指紋（既存の真の transport 同一性）で行う**こと。iroh ノード id で

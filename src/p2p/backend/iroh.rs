@@ -227,6 +227,7 @@ impl IrohEndpoint {
             ALPN_MLS.to_vec(),
             ALPN_INBOX.to_vec(),
             crate::network::ALPN_SHELL.to_vec(),
+            crate::network::ALPN_FWD.to_vec(),
         ]);
 
         // A persistent node key gives us a stable NodeId across runs, which
@@ -284,6 +285,7 @@ impl IrohEndpoint {
             crate::p2p::P2pProtocol(ALPN_MLS),
             crate::p2p::P2pProtocol(ALPN_INBOX),
             crate::p2p::P2pProtocol(crate::network::ALPN_SHELL),
+            crate::p2p::P2pProtocol(crate::network::ALPN_FWD),
         ];
         let mut ep = Self::from_endpoint(endpoint, protocols);
         // Relay is in use unless explicitly disabled (test mode or `--no-relay`).

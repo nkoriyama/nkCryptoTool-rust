@@ -150,20 +150,21 @@ impl Frame {
     }
 }
 
-/// Seal `frame` under `key` with the nonce derived from `ctr` (incremented on
-/// success) and write it as one length-prefixed AEAD packet (`ct ‖ tag`).
-pub async fn send_frame<W: AsyncWriteExt + Unpin>(
+/// Seal an arbitrary plaintext payload under `key` with the nonce derived from
+/// `ctr` (incremented on success) and write it as one length-prefixed AEAD packet
+/// (`len(u32 LE) ‖ ciphertext ‖ tag(16)`). The shared transport primitive behind
+/// both the shell [`Frame`]s and the port-forward channel frames.
+pub(crate) async fn send_packet<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     aead_name: &str,
     key: &[u8],
     ctr: &mut u64,
-    frame: &Frame,
+    pt: &[u8],
 ) -> Result<()> {
     let nonce = nonce_from_ctr(*ctr);
-    let pt = Zeroizing::new(frame.encode());
     let mut aead = backend::new_encrypt(aead_name, key, &nonce)?;
     let mut ct = Zeroizing::new(vec![0u8; pt.len() + 32]);
-    let n = aead.update(&pt, &mut ct)?;
+    let n = aead.update(pt, &mut ct)?;
     let fin = aead.finalize(&mut ct[n..])?;
     let mut tag = [0u8; TAG_LEN];
     aead.get_tag(&mut tag)?;
@@ -176,22 +177,21 @@ pub async fn send_frame<W: AsyncWriteExt + Unpin>(
     w.write_all(&packet).await.map_err(io_err)?;
     w.flush().await.map_err(io_err)?;
     *ctr = ctr.checked_add(1).ok_or_else(|| {
-        CryptoError::Parameter("shell send counter overflow".to_string())
+        CryptoError::Parameter("send counter overflow".to_string())
     })?;
     Ok(())
 }
 
-/// Read one length-prefixed AEAD packet, decrypt under `key` with the nonce
-/// derived from `ctr` (incremented on success), and decode the [`Frame`].
-/// Returns `Ok(None)` on a clean stream close (zero-length frame or EOF). A
-/// replayed/reordered/tampered packet decrypts under the wrong counter-nonce and
-/// surfaces as an authentication error.
-pub async fn recv_frame<R: AsyncReadExt + Unpin>(
+/// Read one length-prefixed AEAD packet and decrypt it under `key` with the nonce
+/// derived from `ctr` (incremented on success). Returns `Ok(None)` on a clean
+/// stream close (zero-length packet or EOF). A replayed/reordered/tampered packet
+/// decrypts under the wrong counter-nonce and surfaces as an authentication error.
+pub(crate) async fn recv_packet<R: AsyncReadExt + Unpin>(
     r: &mut R,
     aead_name: &str,
     key: &[u8],
     ctr: &mut u64,
-) -> Result<Option<Frame>> {
+) -> Result<Option<Zeroizing<Vec<u8>>>> {
     let mut len_bytes = [0u8; 4];
     match r.read_exact(&mut len_bytes).await {
         Ok(_) => {}
@@ -202,7 +202,7 @@ pub async fn recv_frame<R: AsyncReadExt + Unpin>(
         return Ok(None);
     }
     if !(MIN_PACKET..=MAX_PACKET).contains(&len) {
-        return Err(CryptoError::Parameter(format!("shell packet size {len} out of range")));
+        return Err(CryptoError::Parameter(format!("packet size {len} out of range")));
     }
     let mut packet = Zeroizing::new(vec![0u8; len]);
     r.read_exact(&mut packet).await.map_err(io_err)?;
@@ -215,18 +215,44 @@ pub async fn recv_frame<R: AsyncReadExt + Unpin>(
     let n = aead.update(ciphertext, &mut out)?;
     let fin = aead.finalize(&mut out[n..])?;
     *ctr = ctr.checked_add(1).ok_or_else(|| {
-        CryptoError::Parameter("shell recv counter overflow".to_string())
+        CryptoError::Parameter("recv counter overflow".to_string())
     })?;
-    Frame::decode(&out[..n + fin]).map(Some)
+    out.truncate(n + fin);
+    Ok(Some(out))
 }
 
-fn io_err(e: std::io::Error) -> CryptoError {
+/// Seal `frame` under `key` and write it as one AEAD packet (see [`send_packet`]).
+pub async fn send_frame<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    aead_name: &str,
+    key: &[u8],
+    ctr: &mut u64,
+    frame: &Frame,
+) -> Result<()> {
+    let pt = Zeroizing::new(frame.encode());
+    send_packet(w, aead_name, key, ctr, &pt).await
+}
+
+/// Read one AEAD packet (see [`recv_packet`]) and decode the [`Frame`].
+pub async fn recv_frame<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+    aead_name: &str,
+    key: &[u8],
+    ctr: &mut u64,
+) -> Result<Option<Frame>> {
+    match recv_packet(r, aead_name, key, ctr).await? {
+        Some(pt) => Frame::decode(&pt).map(Some),
+        None => Ok(None),
+    }
+}
+
+pub(crate) fn io_err(e: std::io::Error) -> CryptoError {
     CryptoError::FileRead(e.to_string())
 }
 
 /// Pick `(rx_key, tx_key)` from the session keys for our role, matching
 /// `chat_loop`: the server receives on c2s and sends on s2c.
-fn role_keys<'a>(s2c: &'a [u8], c2s: &'a [u8], is_server: bool) -> (&'a [u8], &'a [u8]) {
+pub(crate) fn role_keys<'a>(s2c: &'a [u8], c2s: &'a [u8], is_server: bool) -> (&'a [u8], &'a [u8]) {
     if is_server {
         (c2s, s2c)
     } else {
@@ -448,7 +474,7 @@ impl ShellPolicy {
     }
 }
 
-fn parse_fp_hex(s: &str) -> Option<[u8; 32]> {
+pub(crate) fn parse_fp_hex(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }
@@ -469,7 +495,7 @@ fn extract_kv<'a>(rest: &'a str, key: &str) -> Option<&'a str> {
 /// Extract the double-quoted value of `key` (e.g. `cmd-allow="a,b"`) from `rest`,
 /// returning the value plus the `[start, end)` byte span of the whole
 /// `key="..."` match so the caller can excise it.
-fn extract_quoted_span(rest: &str, key: &str) -> Option<(String, usize, usize)> {
+pub(crate) fn extract_quoted_span(rest: &str, key: &str) -> Option<(String, usize, usize)> {
     let key_at = rest.find(key)?;
     let after = rest[key_at + key.len()..].strip_prefix('"')?;
     let close = after.find('"')?;
@@ -479,7 +505,7 @@ fn extract_quoted_span(rest: &str, key: &str) -> Option<(String, usize, usize)> 
 }
 
 /// Hex of a fingerprint, for policy lookup logging / audit.
-fn fp_hex(fp: &[u8; 32]) -> String {
+pub(crate) fn fp_hex(fp: &[u8; 32]) -> String {
     fp.iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -487,7 +513,7 @@ fn fp_hex(fp: &[u8; 32]) -> String {
 /// `SHELL_RATE_WINDOW` of the previous attempt by the same fingerprint.
 const SHELL_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
-fn rate_limited(fp: &[u8; 32]) -> bool {
+pub(crate) fn rate_limited(fp: &[u8; 32]) -> bool {
     use std::sync::Mutex;
     use std::time::Instant;
     static LAST: Mutex<Option<std::collections::HashMap<[u8; 32], Instant>>> = Mutex::new(None);
@@ -511,7 +537,7 @@ fn rate_limited(fp: &[u8; 32]) -> bool {
 /// Append one line to the audit log, off the async runtime thread. Returns the
 /// I/O result so a security-relevant record (the allow/deny decision) can be
 /// made *fail-closed* by the caller; best-effort records ignore it.
-async fn audit(path: Option<&str>, fp: &[u8; 32], event: &str) -> std::io::Result<()> {
+pub(crate) async fn audit(path: Option<&str>, fp: &[u8; 32], event: &str) -> std::io::Result<()> {
     let Some(path) = path else { return Ok(()) };
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -548,7 +574,7 @@ async fn audit(path: Option<&str>, fp: &[u8; 32], event: &str) -> std::io::Resul
 /// Audit a non-decision event (rate-limit, deny, session end). A failed write is
 /// not fail-closed (we are already denying / ending), but it is surfaced to
 /// stderr so the attempt is never lost completely silently.
-async fn audit_best_effort(path: Option<&str>, fp: &[u8; 32], event: &str) {
+pub(crate) async fn audit_best_effort(path: Option<&str>, fp: &[u8; 32], event: &str) {
     if let Err(e) = audit(path, fp, event).await {
         eprintln!("[shell] audit write failed for {event:?}: {e}");
     }

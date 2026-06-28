@@ -31,6 +31,10 @@ pub const ALPN_FILE: &[u8] = b"nkct/file/1";
 /// P2P shell (bastion-less PQC SSH; see `P2P_SHELL_DESIGN.md`). Phase 0 carries
 /// an echo session; later phases carry a PTY bridge.
 pub const ALPN_SHELL: &[u8] = b"nkct/shell/1";
+/// P2P port forwarding (bastion-less `ssh -L`; see `P2P_SHELL_DESIGN.md` Phase 3).
+/// One connection multiplexes many TCP streams as channels; see
+/// [`crate::forward`].
+pub const ALPN_FWD: &[u8] = b"nkct/fwd/1";
 /// MLS group chat ALPN (P4). Each accepted stream under this protocol
 /// carries exactly one length-prefixed `mls_rs::MlsMessage` per the
 /// [`crate::group::transport`] framing helpers — Welcome / Commit /

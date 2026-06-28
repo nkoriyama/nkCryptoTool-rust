@@ -147,7 +147,20 @@ pub struct CryptoConfig {
     /// fingerprints to a user and an optional command allowlist.
     pub shell_policy_path: Option<String>,
     /// Shell server audit log path (`--audit-log`): one line per session event.
+    /// Also used by the port-forward server for its allow/deny records.
     pub audit_log_path: Option<String>,
+    /// P2P port-forward mode (ALPN_FWD). Mutually exclusive with chat/file/shell.
+    /// True for both the forward client and server.
+    pub forward_mode: bool,
+    /// This node will *serve* forwards (`--serve-forward`). Only when true does an
+    /// inbound forward-ALPN connection open onward TCP connections (per policy).
+    pub serve_forward: bool,
+    /// Forward client specs (`--forward localport:host:remoteport`, repeatable),
+    /// stored raw and parsed by [`crate::forward::ForwardSpec::parse`].
+    pub forward_specs: Vec<String>,
+    /// Forward server authorization policy file (`--forward-policy`): maps peer
+    /// fingerprints to allowed `host:port` targets. Default deny.
+    pub forward_policy_path: Option<String>,
     pub allow_unauth: bool,
     pub force: bool,
     pub handshake_timeout: u64,
@@ -215,6 +228,10 @@ impl Default for CryptoConfig {
             shell_command: None,
             shell_policy_path: None,
             audit_log_path: None,
+            forward_mode: false,
+            serve_forward: false,
+            forward_specs: Vec::new(),
+            forward_policy_path: None,
             allow_unauth: false,
             force: false,
             handshake_timeout: 15,

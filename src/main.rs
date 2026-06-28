@@ -98,8 +98,26 @@ struct Args {
     shell_policy: Option<String>,
 
     /// Shell server audit log path (one line per session/auth event).
+    /// Also used by the port-forward server for its allow/deny records.
     #[arg(long)]
     audit_log: Option<String>,
+
+    /// Run a P2P port-forward server on ALPN `nkct/fwd/1`. Prints a ticket; pair
+    /// with a client's `--forward ... --connect <ticket>`. Requires
+    /// `--forward-policy` (default deny).
+    #[arg(long)]
+    serve_forward: bool,
+
+    /// Connect as a port-forward client: bind `localport` on 127.0.0.1 and forward
+    /// each connection to `host:remoteport` reached from the server. Repeatable.
+    /// Format: `localport:host:remoteport`. Use with `--connect <ticket>`.
+    #[arg(long = "forward", value_name = "LPORT:HOST:RPORT")]
+    forward: Vec<String>,
+
+    /// Port-forward server authorization policy file: lines of
+    /// `<sha3-256-hex>  allow="host:port, host2:*, *:443"`. Default deny.
+    #[arg(long)]
+    forward_policy: Option<String>,
 
     #[arg(
         long,
@@ -438,6 +456,8 @@ async fn main() -> anyhow::Result<()> {
         Operation::GenerateSignKey
     } else if args.serve_shell {
         Operation::Listen
+    } else if args.serve_forward {
+        Operation::Listen
     } else if args.listen.is_some() {
         Operation::Listen
     } else if args.connect.is_some() {
@@ -506,6 +526,45 @@ async fn main() -> anyhow::Result<()> {
     config.shell_command = args.shell_cmd;
     config.shell_policy_path = args.shell_policy;
     config.audit_log_path = args.audit_log;
+    config.forward_mode = args.serve_forward || !args.forward.is_empty();
+    config.serve_forward = args.serve_forward;
+    config.forward_specs = args.forward;
+    config.forward_policy_path = args.forward_policy;
+    // Validate forward client specs early (fail fast on a bad spec) before any
+    // network setup.
+    for s in &config.forward_specs {
+        if let Err(e) = nk_crypto_tool::forward::ForwardSpec::parse(s) {
+            anyhow::bail!("bad --forward {s:?}: {e}");
+        }
+    }
+    // The shell and forward modes drive different post-handshake paths; refuse to
+    // combine them in one invocation.
+    if config.shell_mode && config.forward_mode {
+        anyhow::bail!("--shell/--serve-shell and --forward/--serve-forward are mutually exclusive");
+    }
+    // Port forwarding is as authorization-sensitive as a shell (it reaches the
+    // server's network): reject `--allow-unauth`, require an allowlist/pinned key
+    // on the server, and require a default-deny policy to serve at all.
+    if config.forward_mode && args.allow_unauth {
+        anyhow::bail!(
+            "--allow-unauth is not permitted with --serve-forward/--forward; \
+             authenticate the peer (--peer-allowlist and/or --signing-pubkey)"
+        );
+    }
+    if args.serve_forward {
+        if args.peer_allowlist.is_none() && config.signing_pubkey.is_none() {
+            anyhow::bail!(
+                "--serve-forward requires --peer-allowlist <file> and/or --signing-pubkey <key> \
+                 to restrict who may forward"
+            );
+        }
+        if config.forward_policy_path.is_none() {
+            anyhow::bail!(
+                "--serve-forward requires --forward-policy <file> (default deny); without it no \
+                 target is reachable"
+            );
+        }
+    }
     // A remote shell is the highest-value attack surface: never run it without
     // peer authentication (see P2P_SHELL_DESIGN.md threat model). `--allow-unauth`
     // is rejected for shell mode; authenticate with --peer-allowlist and/or
