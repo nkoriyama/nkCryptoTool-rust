@@ -114,6 +114,13 @@ struct Args {
     #[arg(long = "forward", value_name = "LPORT:HOST:RPORT")]
     forward: Vec<String>,
 
+    /// Remote forward (reverse, ssh `-R`): ask the server to bind `bindport` on its
+    /// 127.0.0.1 and forward each connection back to `host:destport` reached from
+    /// this client. Repeatable. Format: `bindport:host:destport`. The server must
+    /// allow the port via `bind=` in its `--forward-policy`.
+    #[arg(long = "remote-forward", value_name = "BPORT:HOST:DPORT")]
+    remote_forward: Vec<String>,
+
     /// Port-forward server authorization policy file: lines of
     /// `<sha3-256-hex>  allow="host:port, host2:*, *:443"`. Default deny.
     #[arg(long)]
@@ -526,15 +533,22 @@ async fn main() -> anyhow::Result<()> {
     config.shell_command = args.shell_cmd;
     config.shell_policy_path = args.shell_policy;
     config.audit_log_path = args.audit_log;
-    config.forward_mode = args.serve_forward || !args.forward.is_empty();
+    config.forward_mode =
+        args.serve_forward || !args.forward.is_empty() || !args.remote_forward.is_empty();
     config.serve_forward = args.serve_forward;
     config.forward_specs = args.forward;
+    config.remote_forward_specs = args.remote_forward;
     config.forward_policy_path = args.forward_policy;
     // Validate forward client specs early (fail fast on a bad spec) before any
     // network setup.
     for s in &config.forward_specs {
-        if let Err(e) = nk_crypto_tool::forward::ForwardSpec::parse(s) {
+        if let Err(e) = nk_crypto_tool::forward::ForwardSpec::parse_local(s) {
             anyhow::bail!("bad --forward {s:?}: {e}");
+        }
+    }
+    for s in &config.remote_forward_specs {
+        if let Err(e) = nk_crypto_tool::forward::ForwardSpec::parse_remote(s) {
+            anyhow::bail!("bad --remote-forward {s:?}: {e}");
         }
     }
     // The shell and forward modes drive different post-handshake paths; refuse to

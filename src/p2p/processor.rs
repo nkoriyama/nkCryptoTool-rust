@@ -780,13 +780,19 @@ impl NetworkProcessor {
                     )
                     .await
                 } else if config.forward_mode {
-                    // Phase 3: bind local ports and forward accepted connections.
-                    let specs = config
+                    // Phase 3/4: local (`-L`) and remote (`-R`) port forwards.
+                    let mut specs = config
                         .forward_specs
                         .iter()
-                        .map(|s| crate::forward::ForwardSpec::parse(s))
+                        .map(|s| crate::forward::ForwardSpec::parse_local(s))
                         .collect::<std::result::Result<Vec<_>, _>>()
                         .map_err(CryptoError::Parameter)?;
+                    for s in &config.remote_forward_specs {
+                        specs.push(
+                            crate::forward::ForwardSpec::parse_remote(s)
+                                .map_err(CryptoError::Parameter)?,
+                        );
+                    }
                     crate::forward::run_forward_client(
                         reader,
                         writer,

@@ -155,9 +155,12 @@ pub struct CryptoConfig {
     /// This node will *serve* forwards (`--serve-forward`). Only when true does an
     /// inbound forward-ALPN connection open onward TCP connections (per policy).
     pub serve_forward: bool,
-    /// Forward client specs (`--forward localport:host:remoteport`, repeatable),
-    /// stored raw and parsed by [`crate::forward::ForwardSpec::parse`].
+    /// Local-forward client specs (`--forward localport:host:remoteport`,
+    /// repeatable), parsed by [`crate::forward::ForwardSpec::parse_local`].
     pub forward_specs: Vec<String>,
+    /// Remote-forward client specs (`--remote-forward bindport:host:destport`,
+    /// repeatable), parsed by [`crate::forward::ForwardSpec::parse_remote`].
+    pub remote_forward_specs: Vec<String>,
     /// Forward server authorization policy file (`--forward-policy`): maps peer
     /// fingerprints to allowed `host:port` targets. Default deny.
     pub forward_policy_path: Option<String>,
@@ -231,6 +234,7 @@ impl Default for CryptoConfig {
             forward_mode: false,
             serve_forward: false,
             forward_specs: Vec::new(),
+            remote_forward_specs: Vec::new(),
             forward_policy_path: None,
             allow_unauth: false,
             force: false,
