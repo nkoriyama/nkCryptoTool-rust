@@ -69,6 +69,7 @@ const F_CLOSE: u8 = 0x06;
 const F_BINDREQ: u8 = 0x07;
 const F_BINDOK: u8 = 0x08;
 const F_BINDERR: u8 = 0x09;
+const F_WINADJ: u8 = 0x0a;
 
 /// Largest single forward DATA payload; bounds the per-frame allocation and keeps
 /// one channel from monopolizing the shared stream.
@@ -76,6 +77,17 @@ const MAX_FWD_DATA: usize = 64 * 1024;
 const TCP_READ_BUF: usize = 32 * 1024;
 /// Cap on simultaneously open channels per connection (DoS bound).
 const MAX_CHANNELS: usize = 256;
+/// Per-channel, per-direction flow-control window (bytes). A sender may have at
+/// most this many bytes in flight before the receiver acknowledges consumption
+/// via [`FwdFrame::WindowAdjust`]; the receiver enforces it, so a stuck channel
+/// buffers at most `WINDOW` bytes and never head-of-line-blocks other channels.
+/// Per-connection worst-case inbound buffering is `WINDOW * MAX_CHANNELS`.
+const WINDOW: usize = 256 * 1024;
+/// Hard cap on un-drained inbound messages per channel. The byte `WINDOW` keeps a
+/// well-behaved peer far below this (frames are read in `TCP_READ_BUF` chunks); it
+/// only fires on a peer that floods tiny data or control frames in violation of
+/// flow control, and then the connection is torn down.
+const MAX_INFLIGHT_MSGS: usize = 1024;
 /// First channel id for each originator; the high bit keeps the two ranges apart.
 const CLIENT_CHAN_BASE: u32 = 1;
 const SERVER_CHAN_BASE: u32 = 0x8000_0000;
@@ -96,6 +108,9 @@ pub enum FwdFrame {
     Eof { chan: u32 },
     /// Either direction: tear down `chan` completely.
     Close { chan: u32 },
+    /// Either direction: the receiver consumed `bytes` on `chan`, replenishing the
+    /// sender's flow-control credit by that much.
+    WindowAdjust { chan: u32, bytes: u32 },
     /// Client → server (`-R`): listen on `bind_port`; forward each connection to
     /// `host:port` on the client's side.
     BindRequest { req: u32, bind_port: u16, host: String, port: u16 },
@@ -144,6 +159,11 @@ impl FwdFrame {
             FwdFrame::Close { chan } => {
                 v.push(F_CLOSE);
                 v.extend_from_slice(&chan.to_be_bytes());
+            }
+            FwdFrame::WindowAdjust { chan, bytes } => {
+                v.push(F_WINADJ);
+                v.extend_from_slice(&chan.to_be_bytes());
+                v.extend_from_slice(&bytes.to_be_bytes());
             }
             FwdFrame::BindRequest { req, bind_port, host, port } => {
                 v.push(F_BINDREQ);
@@ -204,6 +224,13 @@ impl FwdFrame {
             }
             F_EOF => Ok(FwdFrame::Eof { chan: id }),
             F_CLOSE => Ok(FwdFrame::Close { chan: id }),
+            F_WINADJ => {
+                if rest.len() < 4 {
+                    return Err(bad());
+                }
+                let bytes = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+                Ok(FwdFrame::WindowAdjust { chan: id, bytes })
+            }
             F_BINDREQ => {
                 if rest.len() < 2 {
                     return Err(bad());
@@ -265,25 +292,50 @@ enum Inbound {
     Connected,
     Rejected(String),
     Data(Vec<u8>),
+    /// The peer consumed `bytes` of our outbound data: replenish send credit.
+    WindowAdjust(u32),
     Eof,
     Close,
 }
 
-/// The set of live channels: channel id → sender into that channel's task.
-type Registry = Arc<Mutex<HashMap<u32, mpsc::Sender<Inbound>>>>;
+/// One live channel as seen by the demultiplexer: where to deliver inbound
+/// messages, plus the remaining receive-window budget it enforces.
+#[derive(Clone)]
+struct Chan {
+    /// Bounded so a flood cannot grow it without bound; the demux `try_send`s and
+    /// treats a full queue as a flow-control violation (connection torn down).
+    in_tx: mpsc::Sender<Inbound>,
+    /// Bytes the peer may still send us before it must wait for a `WindowAdjust`.
+    /// Decremented by the demux on inbound `Data`, replenished by the channel task
+    /// as it drains to the local socket. Never legitimately negative.
+    recv_window: Arc<std::sync::atomic::AtomicI64>,
+}
+
+/// The set of live channels: channel id → handle.
+type Registry = Arc<Mutex<HashMap<u32, Chan>>>;
 
 /// Pump one connected channel: copy the local TCP socket to/from the multiplexed
 /// stream until either side ends, then send `Close` once and deregister.
+///
+/// Flow control: our `up` reader spends from a `credit` semaphore (initially
+/// [`WINDOW`]) before emitting `Data`, and refills it on the peer's
+/// `WindowAdjust`; symmetrically, after writing inbound `Data` to the socket we
+/// bump `recv_window` and send the peer a `WindowAdjust`. This bounds in-flight
+/// bytes per direction so a stuck socket never blocks the shared demultiplexer.
 async fn pump_channel(
     chan: u32,
     tcp: TcpStream,
     frame_tx: mpsc::Sender<FwdFrame>,
     mut in_rx: mpsc::Receiver<Inbound>,
     registry: Registry,
+    recv_window: Arc<std::sync::atomic::AtomicI64>,
 ) {
+    use std::sync::atomic::Ordering;
     let (mut rd, mut wr) = tcp.into_split();
 
+    let credit = Arc::new(Semaphore::new(WINDOW));
     let up_tx = frame_tx.clone();
+    let up_credit = credit.clone();
     let up = tokio::spawn(async move {
         let mut buf = vec![0u8; TCP_READ_BUF];
         loop {
@@ -293,6 +345,12 @@ async fn pump_channel(
                     break;
                 }
                 Ok(n) => {
+                    // Spend `n` bytes of send credit (waits if the peer's window is
+                    // full); `close()` on teardown unblocks this.
+                    match up_credit.acquire_many(n as u32).await {
+                        Ok(p) => p.forget(),
+                        Err(_) => break,
+                    }
                     if up_tx.send(FwdFrame::Data { chan, data: buf[..n].to_vec() }).await.is_err() {
                         break;
                     }
@@ -305,8 +363,25 @@ async fn pump_channel(
     while let Some(msg) = in_rx.recv().await {
         match msg {
             Inbound::Data(d) => {
+                let n = d.len();
                 if wr.write_all(&d).await.is_err() {
                     break;
+                }
+                // Consumed `n` bytes: give the budget back and tell the peer.
+                recv_window.fetch_add(n as i64, Ordering::SeqCst);
+                if frame_tx.send(FwdFrame::WindowAdjust { chan, bytes: n as u32 }).await.is_err() {
+                    break;
+                }
+            }
+            Inbound::WindowAdjust(n) => {
+                // Clamp so a malicious/oversized adjustment can never push credit
+                // above WINDOW (which would bypass flow control or overflow the
+                // semaphore's permit cap and panic). Only this task adds permits
+                // and the reader only spends them, so `available_permits` is a safe
+                // upper bound here.
+                let add = (n as usize).min(WINDOW.saturating_sub(credit.available_permits()));
+                if add > 0 {
+                    credit.add_permits(add);
                 }
             }
             Inbound::Eof => {
@@ -318,6 +393,7 @@ async fn pump_channel(
     }
 
     up.abort();
+    credit.close(); // unblock the reader if it is waiting on credit
     registry.lock().await.remove(&chan);
     let _ = frame_tx.send(FwdFrame::Close { chan }).await;
 }
@@ -362,8 +438,9 @@ impl Endpoint {
             }
         };
         let chan = self.alloc_chan();
-        let (in_tx, mut in_rx) = mpsc::channel::<Inbound>(64);
-        self.registry.lock().await.insert(chan, in_tx);
+        let (in_tx, mut in_rx) = mpsc::channel::<Inbound>(MAX_INFLIGHT_MSGS);
+        let recv_window = Arc::new(std::sync::atomic::AtomicI64::new(WINDOW as i64));
+        self.registry.lock().await.insert(chan, Chan { in_tx, recv_window: recv_window.clone() });
         if self.frame_tx.send(FwdFrame::Open { chan, host, port }).await.is_err() {
             self.registry.lock().await.remove(&chan);
             return;
@@ -371,7 +448,10 @@ impl Endpoint {
         // Wait for the connector's verdict, then pump or clean up.
         match in_rx.recv().await {
             Some(Inbound::Connected) => {
-                pump_channel(chan, tcp, self.frame_tx.clone(), in_rx, self.registry.clone()).await;
+                pump_channel(
+                    chan, tcp, self.frame_tx.clone(), in_rx, self.registry.clone(), recv_window,
+                )
+                .await;
             }
             Some(Inbound::Rejected(reason)) => {
                 eprintln!("[fwd] channel {chan} rejected: {reason}");
@@ -441,7 +521,8 @@ impl Endpoint {
 
         // Reserve the channel id under the lock so a peer cannot hijack/duplicate
         // an active channel (the opener controls the id).
-        let (in_tx, in_rx) = mpsc::channel::<Inbound>(64);
+        let (in_tx, in_rx) = mpsc::channel::<Inbound>(MAX_INFLIGHT_MSGS);
+        let recv_window = Arc::new(std::sync::atomic::AtomicI64::new(WINDOW as i64));
         {
             let mut reg = self.registry.lock().await;
             if reg.contains_key(&chan) {
@@ -449,7 +530,7 @@ impl Endpoint {
                 self.reject(chan, format!("channel {chan} already in use")).await;
                 return;
             }
-            reg.insert(chan, in_tx);
+            reg.insert(chan, Chan { in_tx, recv_window: recv_window.clone() });
         }
 
         // Server: audit the authorized access *before* connecting, fail-closed.
@@ -478,7 +559,8 @@ impl Endpoint {
             self.registry.lock().await.remove(&chan);
             return;
         }
-        pump_channel(chan, tcp, self.frame_tx.clone(), in_rx, self.registry.clone()).await;
+        pump_channel(chan, tcp, self.frame_tx.clone(), in_rx, self.registry.clone(), recv_window)
+            .await;
         drop(permit);
     }
 
@@ -529,11 +611,32 @@ impl Endpoint {
         self.bind_tasks.lock().await.push(task);
     }
 
-    /// Deliver `msg` to channel `chan` if it is still live.
-    async fn route(&self, chan: u32, msg: Inbound) {
-        let tx = self.registry.lock().await.get(&chan).cloned();
-        if let Some(tx) = tx {
-            let _ = tx.send(msg).await;
+    /// Deliver `msg` to channel `chan` if it is still live. Uses `try_send`, so the
+    /// demultiplexer never blocks on a slow channel. Inbound `Data` is charged
+    /// against the channel's receive window first; a peer that overruns the byte
+    /// window it was granted, or that floods past the bounded queue, is a
+    /// flow-control violation that tears the connection down (a well-behaved peer,
+    /// gated by its send credit, never reaches either bound).
+    async fn route(&self, chan: u32, msg: Inbound) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let h = match self.registry.lock().await.get(&chan) {
+            Some(h) => h.clone(),
+            None => return Ok(()), // unknown/closed channel: drop
+        };
+        if let Inbound::Data(d) = &msg {
+            let remaining = h.recv_window.fetch_sub(d.len() as i64, Ordering::SeqCst) - d.len() as i64;
+            if remaining < 0 {
+                return Err(CryptoError::Parameter(format!(
+                    "channel {chan} exceeded its receive window"
+                )));
+            }
+        }
+        match h.in_tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Closed(_)) => Ok(()), // channel gone: drop
+            Err(mpsc::error::TrySendError::Full(_)) => Err(CryptoError::Parameter(format!(
+                "channel {chan} inbound queue overflow (flow-control violation)"
+            ))),
         }
     }
 }
@@ -590,13 +693,16 @@ where
                 // accept loop itself runs on its own task, so this does not block.
                 endpoint.clone().handle_bind_request(req, bind_port, host, port).await;
             }
-            FwdFrame::Connected { chan } => endpoint.route(chan, Inbound::Connected).await,
+            FwdFrame::Connected { chan } => endpoint.route(chan, Inbound::Connected).await?,
             FwdFrame::Rejected { chan, reason } => {
-                endpoint.route(chan, Inbound::Rejected(reason)).await
+                endpoint.route(chan, Inbound::Rejected(reason)).await?
             }
-            FwdFrame::Data { chan, data } => endpoint.route(chan, Inbound::Data(data)).await,
-            FwdFrame::Eof { chan } => endpoint.route(chan, Inbound::Eof).await,
-            FwdFrame::Close { chan } => endpoint.route(chan, Inbound::Close).await,
+            FwdFrame::Data { chan, data } => endpoint.route(chan, Inbound::Data(data)).await?,
+            FwdFrame::WindowAdjust { chan, bytes } => {
+                endpoint.route(chan, Inbound::WindowAdjust(bytes)).await?
+            }
+            FwdFrame::Eof { chan } => endpoint.route(chan, Inbound::Eof).await?,
+            FwdFrame::Close { chan } => endpoint.route(chan, Inbound::Close).await?,
             FwdFrame::BindOk { req } => eprintln!("[fwd] remote bind #{req} established"),
             FwdFrame::BindErr { req, reason } => {
                 eprintln!("[fwd] remote bind #{req} failed: {reason}")
@@ -918,6 +1024,7 @@ mod tests {
             FwdFrame::Data { chan: 7, data: vec![0, 1, 2, 250, 255] },
             FwdFrame::Eof { chan: 7 },
             FwdFrame::Close { chan: 7 },
+            FwdFrame::WindowAdjust { chan: 7, bytes: 65536 },
             FwdFrame::BindRequest { req: 3, bind_port: 8080, host: "127.0.0.1".into(), port: 3000 },
             FwdFrame::BindOk { req: 3 },
             FwdFrame::BindErr { req: 3, reason: "nope".into() },
