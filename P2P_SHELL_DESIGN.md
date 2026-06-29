@@ -150,10 +150,12 @@ nk-crypto-tool --shell --connect <server-ticket> ... -- systemctl restart myapp
 - **Phase 5（任意）** ✅: per-channel フロー制御（SSH 風 credit window）。各方向 256KiB のバイト窓。送信側はクレジット
   分だけ先行送信し、受信側は TCP へ書き出した分を `WindowAdjust` で補充。受信キューは bounded（demux は try_send で
   非ブロッキング、満杯＝違反で切断）。これで 1 つの詰まったチャネルが他チャネルや制御フレームを HoL ブロックしない。
-- **Phase 5（任意）**: MLS グループでホスト群へのチーム権限（メンバーシップで shell-policy を投影）。
-  ※ 過去の「MLS↔transport 投影」は層の取り違えで撤回した（[MLS_P2P_SYNC_DESIGN.md] 参照）。
-    再挑戦するなら **認可は ML-DSA 指紋（既存の真の transport 同一性）で行う**こと。iroh ノード id で
-    gate しない。
+- **Phase 6（実装名、当初 Phase 5）** ✅: MLS グループでチーム権限（メンバーシップを shell/forward ポリシーに**投影**）。
+  `--mls-cmd project-policy --mls-group-id <gid> --mls-policy-template '<attrs>'` が、グループの**バインディング検証済み**
+  メンバーごとに `<transport指紋hex>  <attrs>` 行を出力。サーバはそれを既存の `--shell-policy`/`--forward-policy` として使う。
+  メンバー追加/削除は MLS 側で行い、再投影でポリシー更新。**認可は ML-DSA 指紋（NKCB の transport_pub = handshake 署名鍵、
+  `SHA3-256` が shell/forward 指紋と一致）で行い、iroh ノード id では gate しない**（過去の撤回の教訓を順守）。
+  ※ 過去の「MLS↔transport 投影（node id gate）」は層の取り違えで撤回（[MLS_P2P_SYNC_DESIGN.md]）。本 Phase は指紋層で実装。
 
 ## 10. セキュリティ考慮（チェックリスト）
 

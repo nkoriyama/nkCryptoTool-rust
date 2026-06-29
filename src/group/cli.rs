@@ -43,6 +43,12 @@ pub enum MlsCommand {
     ListGroups,
     /// List members (leaf indices) of a specific group.
     ListMembers { group_id: GroupId },
+    /// Project a group's verified members onto a shell/forward policy: print one
+    /// `<fingerprint-hex>  <template>` line per member to stdout, ready to redirect
+    /// into a `--shell-policy` / `--forward-policy` file. `template` is the common
+    /// per-member attribute string (e.g. `user=deploy cmd-allow="..."` or
+    /// `allow="db:5432" bind="8080"`).
+    ProjectPolicy { group_id: GroupId, template: String },
     /// Generate a fresh KeyPackage and write its raw MLS bytes to a file.
     ExportKeyPackage { output: PathBuf },
     /// Add the holder of `key_package_file` to `group_id` and ship
@@ -208,6 +214,28 @@ pub async fn list_members(
         .list_members(group_id)
         .await
         .map_err(|e| anyhow!("list_members {group_id}: {e}"))
+}
+
+pub async fn project_policy(
+    processor: &GroupChatProcessor,
+    group_id: &GroupId,
+    template: &str,
+) -> anyhow::Result<Vec<String>> {
+    let fps = processor
+        .projected_member_fingerprints(group_id)
+        .await
+        .map_err(|e| anyhow!("project_policy {group_id}: {e}"))?;
+    Ok(fps
+        .into_iter()
+        .map(|fp| {
+            let hex: String = fp.iter().map(|b| format!("{b:02x}")).collect();
+            if template.is_empty() {
+                hex
+            } else {
+                format!("{hex}  {template}")
+            }
+        })
+        .collect())
 }
 
 pub async fn export_key_package(
@@ -863,6 +891,16 @@ pub async fn run(
         MlsCommand::ListMembers { group_id } => {
             for m in list_members(&processor, &group_id).await? {
                 println!("index={}", m.index);
+            }
+        }
+        MlsCommand::ProjectPolicy { group_id, template } => {
+            let lines = project_policy(&processor, &group_id, &template).await?;
+            eprintln!(
+                "# projected {} verified member(s) of group {group_id}",
+                lines.len()
+            );
+            for line in lines {
+                println!("{line}");
             }
         }
         MlsCommand::ExportKeyPackage { output } => {

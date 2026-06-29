@@ -1522,6 +1522,52 @@ impl GroupChatProcessor {
         Ok(out)
     }
 
+    /// Return the transport ML-DSA fingerprints (`SHA3-256(transport pubkey)`) of
+    /// the group's current members whose NKCB binding verifies.
+    ///
+    /// These are exactly the 32-byte fingerprints the shell / port-forward
+    /// authorization layer compares a connecting peer against
+    /// (`PeerId::Pubkey(SHA3-256(signing pubkey))`), because a member's NKCB
+    /// binding ties its MLS identity to the *same* ML-DSA transport key it
+    /// authenticates the transport handshake with. So this list can be **projected**
+    /// into a `--shell-policy` / `--forward-policy` file: group membership becomes
+    /// the team's allow-list, managed by MLS add/remove rather than by hand-editing
+    /// every server's policy. Authorization stays on the ML-DSA fingerprint (the
+    /// real transport identity) — the group only *derives* the member set; we never
+    /// gate on the iroh node id.
+    ///
+    /// A member without a valid bidirectional binding is skipped (never projected),
+    /// so a self-asserted identity can never enter a policy.
+    pub async fn projected_member_fingerprints(
+        &self,
+        gid: &GroupId,
+    ) -> Result<Vec<[u8; 32]>, GroupError> {
+        let group = self.client.load_group(gid.as_bytes()).map_err(|e| {
+            let m = format!("{e}");
+            if m.contains("GroupNotFound") || m.contains("group not found") {
+                GroupError::NotFound
+            } else {
+                GroupError::Backend(format!("load_group for projection: {e}"))
+            }
+        })?;
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for m in group.roster().members_iter() {
+            if !self.verify_member_binding(&m.signing_identity) {
+                continue;
+            }
+            let Some(basic) = m.signing_identity.credential.as_basic() else { continue };
+            let Some((_peer_id, transport_pub, _b)) = parse_nkcb_binding(&basic.identifier) else {
+                continue;
+            };
+            let fp = crate::group::binding::transport_fingerprint(&transport_pub);
+            if seen.insert(fp) {
+                out.push(fp);
+            }
+        }
+        Ok(out)
+    }
+
     /// Remove a member from a group and return the Commit bytes to
     /// broadcast (P6).
     ///
@@ -2684,6 +2730,23 @@ mod tests {
         let members = alice.list_members(&gid).await.expect("list");
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].index, 0);
+    }
+
+    /// Projecting a fresh 1-member group yields exactly one 32-byte transport
+    /// fingerprint (the creator, whose NKCB binding verifies). This is the value
+    /// the shell/forward policy layer keys on, so the projection is a valid
+    /// membership-derived allow-list.
+    #[tokio::test]
+    async fn projection_yields_creator_transport_fingerprint() {
+        let (alice, _dir) = build_proc("alice", 1);
+        let gid = alice.create_group().await.expect("create_group");
+        let fps = alice
+            .projected_member_fingerprints(&gid)
+            .await
+            .expect("project");
+        assert_eq!(fps.len(), 1, "exactly the creator is projected");
+        // A real fingerprint, not all-zero.
+        assert_ne!(fps[0], [0u8; 32]);
     }
 
     /// P1.5.b round-trip: exercise the full MLS Add flow with the

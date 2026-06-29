@@ -222,6 +222,12 @@ struct Args {
     #[arg(long)]
     mls_output: Option<String>,
 
+    /// Per-member attribute template for `--mls-cmd project-policy`, appended after
+    /// each member's fingerprint (e.g. `user=deploy cmd-allow="systemctl restart app"`
+    /// for a shell policy, or `allow="db:5432" bind="8080"` for a forward policy).
+    #[arg(long)]
+    mls_policy_template: Option<String>,
+
     /// Input path of a peer's KeyPackage file (for
     /// `--mls-cmd add-member`).
     #[arg(long)]
@@ -1316,6 +1322,10 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
         "list-groups" => MlsCommand::ListGroups,
         "list-members" => MlsCommand::ListMembers {
             group_id: parse_group_id(&require(&args.mls_group_id, "mls-group-id")?)?,
+        },
+        "project-policy" => MlsCommand::ProjectPolicy {
+            group_id: parse_group_id(&require(&args.mls_group_id, "mls-group-id")?)?,
+            template: args.mls_policy_template.clone().unwrap_or_default(),
         },
         "export-key-package" => MlsCommand::ExportKeyPackage {
             output: PathBuf::from(require(&args.mls_output, "mls-output")?),
