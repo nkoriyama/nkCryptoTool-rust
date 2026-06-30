@@ -129,7 +129,51 @@ impl NetworkProcessor {
     }
 
     async fn run_listen_loop(&self) -> Result<()> {
-        while let Ok(incoming) = self.endpoint.accept().await {
+        // Note (serial accept): the backend `accept()` completes the per-connection
+        // handshake (ALPN + `accept_bi`) inline, so a peer that stalls mid-handshake
+        // can hold up new accepts — a pre-existing head-of-line limitation (see
+        // `network/mod.rs` "serialized accept loop"), not introduced here. Fully
+        // fixing it means splitting the idle-wait from the per-connection handshake
+        // in the P2p trait (a wait that must not itself be timed out); tracked as
+        // future work. Because the loop is serial, we must NOT add any fixed delay
+        // here (a backoff sleep would itself become a DoS an attacker could trigger
+        // by forcing errors) — on error we only `yield_now` to stay cooperative.
+        loop {
+            // One inbound connection per iteration. A per-connection failure
+            // (dropped mid-handshake, unknown ALPN, `accept_bi` error — all common
+            // over relay/NAT) must NOT tear down a long-running server: log it and
+            // keep accepting. Only a closed endpoint (shutdown / ctrl-c) ends the
+            // loop. (Previously `while let Ok(..)` exited on the first such error,
+            // so the server died after a single connection.)
+            let incoming = match self.endpoint.accept().await {
+                Ok(inc) => inc,
+                Err(crate::p2p::P2pError::Closed) => break,
+                Err(e) => {
+                    // Neutralize terminal-spoofing characters: the message can embed
+                    // remote-supplied bytes (e.g. an unknown ALPN) that would
+                    // otherwise inject escape sequences, or bidi/zero-width controls
+                    // that reorder an operator's terminal / log display.
+                    let unsafe_char = |c: char| {
+                        c.is_control()
+                            || ('\u{200B}'..='\u{200F}').contains(&c) // zero-width + bidi marks
+                            || ('\u{202A}'..='\u{202E}').contains(&c) // bidi embed/override
+                            || ('\u{2066}'..='\u{2069}').contains(&c) // bidi isolates
+                    };
+                    let msg: String = e
+                        .to_string()
+                        .chars()
+                        .map(|c| if unsafe_char(c) { ' ' } else { c })
+                        .collect();
+                    eprintln!("[nkct] accept error (continuing to serve): {msg}");
+                    // Cooperative yield only — no fixed delay (see the serial-accept
+                    // note above). Should `accept()` ever return errors without
+                    // blocking (e.g. fd exhaustion), this keeps the loop from
+                    // starving the spawned connection handlers without handing an
+                    // attacker a delay to weaponize.
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            };
             let config_clone = self.config.clone();
             let semaphore = self.semaphore.clone();
             let cached_allowlist = self.cached_allowlist.clone();
