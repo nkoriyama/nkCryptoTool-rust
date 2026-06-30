@@ -811,7 +811,7 @@ impl NetworkProcessor {
                         if !backend::pqc_verify(&config.pqc_dsa_algo, &server_dsa_pub, tb.snapshot(), &sig)? {
                             return Err(CryptoError::SignatureVerification);
                         }
-                        eprintln!("Server authenticated successfully.");
+                        eprintln!("Server authenticated successfully (auth: {}).", config.pqc_dsa_algo);
                         
                         if let Some(ref allowlist) = self.cached_allowlist {
                             let hash: [u8; 32] = Sha3_256::digest(&server_dsa_pub).into();
@@ -884,10 +884,19 @@ impl NetworkProcessor {
                             } else {
                                 nid
                             };
+                            // Live-channel secrecy stack, from the session's real
+                            // primitives that are all in hand at this point: the KEM
+                            // is the hybrid P-256 ECDH (the hardcoded "prime256v1"
+                            // used above) ‖ config.pqc_kem_algo, sealed under
+                            // config.aead_algo. Authentication (ML-DSA) is NOT shown
+                            // here — its real outcome (server_auth_flag) lives inside
+                            // the handshake block and is reported by the
+                            // "Server authenticated" log there, so the bar never has
+                            // to guess it or carry it out of the handshake.
                             crate::shell::ConnStatus {
                                 conn: crate::shell::ConnKind::P2p,
                                 latency_ms: None,
-                                crypto: format!("{}+{}", config.pqc_kem_algo, config.aead_algo),
+                                crypto: format!("P-256+{} / {}", config.pqc_kem_algo, config.aead_algo),
                                 node_short,
                                 stable: true,
                             }
