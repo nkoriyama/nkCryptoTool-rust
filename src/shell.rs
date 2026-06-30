@@ -1185,7 +1185,8 @@ where
             }
             Some(Frame::Exit(code)) => break code,
             Some(Frame::Error(m)) => {
-                drop(_raw);
+                // Terminal is restored uniformly after the loop; `\r\n` keeps this
+                // readable even while still in raw mode.
                 eprintln!("\r\n[shell] remote error: {m}");
                 break 1;
             }
@@ -1194,14 +1195,29 @@ where
         }
     };
 
+    // Flush any final output, then tear down. We do NOT await the writer task:
+    // the stdin task is parked in `tokio::io::stdin().read()`, an OS blocking read
+    // that cannot be cancelled, so its cloned frame sender never drops and
+    // `writer_task.await` (and even runtime shutdown) would hang until the user
+    // happens to press a key — leaving the terminal stuck after the remote shell
+    // exited. Abort everything and exit the process directly.
+    let _ = stdout.flush().await;
     stdin_task.abort();
     winch_task.abort();
+    writer_task.abort();
     drop(frame_tx);
-    let _ = writer_task.await;
+    // Restore the terminal explicitly (its `Drop` would not run after the
+    // `process::exit` below).
+    drop(_raw);
     if exit_code != 0 {
         eprintln!("\r\n[shell] remote shell exited with code {exit_code}");
     }
-    Ok(())
+    // The session is over and its keys are ephemeral; exit with the remote shell's
+    // status (like ssh) rather than returning through a runtime that would block on
+    // the un-cancellable stdin read.
+    use std::io::Write as _;
+    let _ = std::io::stdout().flush();
+    std::process::exit(exit_code & 0xff);
 }
 
 #[cfg(not(unix))]

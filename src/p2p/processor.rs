@@ -666,8 +666,28 @@ impl NetworkProcessor {
             r = async {
                 let local_peer_id = self.endpoint.local_id();
                 eprintln!("[nkct] Connecting to NodeId: {}", remote_peer_id);
-                let stream = self.endpoint.connect(&remote_peer_addr, protocol).await
-                    .map_err(|e| CryptoError::Parameter(e.to_string()))?;
+                // Hole punching across NAT/CGNAT is probabilistic — a single
+                // `connect` often times out before a path is found even though the
+                // peer is reachable. Retry a few times with a short pause so the
+                // common case "just works" instead of forcing the user to re-run.
+                const CONNECT_ATTEMPTS: u32 = 4;
+                let stream = {
+                    let mut attempt = 1;
+                    loop {
+                        match self.endpoint.connect(&remote_peer_addr, protocol).await {
+                            Ok(s) => break s,
+                            Err(e) if attempt < CONNECT_ATTEMPTS => {
+                                eprintln!(
+                                    "[nkct] connect attempt {attempt}/{CONNECT_ATTEMPTS} failed \
+                                     ({e}); retrying…"
+                                );
+                                attempt += 1;
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                            }
+                            Err(e) => return Err(CryptoError::Parameter(e.to_string())),
+                        }
+                    }
+                };
                 let (mut reader, mut writer) = tokio::io::split(stream);
 
                 let handshake_timeout = Duration::from_secs(config.handshake_timeout);
