@@ -113,6 +113,39 @@ MLS/転送系も別途、アドレス帳・グループファイル転送・3 �
 以下は**まだ計測していない**。各項目に計測の前提と手順だけ定義しておき、
 測定後に数値表へ置き換える。
 
+### 計測ツール: `--conn-metrics` プローブ
+
+シェルクライアントに `--conn-metrics` を付けると、接続・ハンドシェイク完了後に
+経路が落ち着くのを待ち（ホールパンチの relay→direct 昇格を見込んで数秒）、
+選択された経路種別と RTT を 1 行で出力してシェルを開かず終了する:
+
+```bash
+nk-crypto-tool --conn-metrics --connect 'nkct1...' --mode pqc \
+  --signing-privkey ~/nkkeys/private_sign_pqc.key \
+  --signing-pubkey  ./server_public_sign_pqc.key
+# => stderr: nkct-metrics relay=false rtt_ms=23
+```
+
+`relay=true/false` が直結かリレー経由か、`rtt_ms` が選択パスの RTT。これを N 回
+回せば 2.1〜2.3 が定量化できる。サーバ（`--serve-shell`）は通常どおり起動しておく。
+
+N サンプル収集の例（相手チケットを `$T` に入れて）:
+
+```bash
+for i in $(seq 1 50); do
+  nk-crypto-tool --conn-metrics --connect "$T" --mode pqc \
+    --signing-privkey ~/nkkeys/private_sign_pqc.key \
+    --signing-pubkey ./server_public_sign_pqc.key 2>&1 \
+    | grep -oE 'nkct-metrics .*'
+done | tee samples.txt
+# relay 率: grep -c 'relay=true' samples.txt
+# RTT 分布: grep -oE 'rtt_ms=[0-9]+' samples.txt | cut -d= -f2 | sort -n
+```
+
+> 注: 直結ホールパンチの成立可否は両端の NAT 種別に依存するため、代表値を出すには
+> 実機・実 NAT 環境での計測が要る（サンドボックス/同一ホストでは UDP・リレー到達が
+> 制限され connect が成立しないことがある）。
+
 ### 2.1 NAT 越え成功率（直結ホールパンチ成立率）
 
 - 目的: NAT 種別ごとに、relay を介さず**直接ホールパンチ**が成立する割合。

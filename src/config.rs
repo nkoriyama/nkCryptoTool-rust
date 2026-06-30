@@ -146,6 +146,11 @@ pub struct CryptoConfig {
     /// Show a status bar under the interactive shell (`--tui`): connection kind,
     /// cipher suite, NodeId, hint. Client-side only; ignored for `--shell-cmd`.
     pub shell_tui: bool,
+    /// Connection-metrics probe (`--conn-metrics`): as a shell client, connect and
+    /// complete the handshake, let the path settle, print the selected path kind
+    /// (direct/relay) and RTT in a parseable line, then exit without opening a
+    /// shell. Used to measure NAT-traversal / relay-fallback / latency.
+    pub print_conn_metrics: bool,
     /// Shell server authorization policy file (`--shell-policy`): maps peer
     /// fingerprints to a user and an optional command allowlist.
     pub shell_policy_path: Option<String>,
@@ -233,6 +238,7 @@ impl Default for CryptoConfig {
             serve_shell: false,
             shell_command: None,
             shell_tui: false,
+            print_conn_metrics: false,
             shell_policy_path: None,
             audit_log_path: None,
             forward_mode: false,

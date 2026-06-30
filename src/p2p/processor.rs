@@ -862,6 +862,25 @@ impl NetworkProcessor {
                     cb();
                 }
 
+                if config.print_conn_metrics {
+                    // Connection-metrics probe (`--conn-metrics`): the handshake is
+                    // done, so let the path settle (hole-punch upgrade from relay to
+                    // direct can take a moment), then report the selected path kind
+                    // and RTT in a parseable line and exit without opening a shell.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    match conn_metrics.as_ref().and_then(|m| m.snapshot()) {
+                        Some(s) => eprintln!(
+                            "nkct-metrics relay={} rtt_ms={}",
+                            s.relay,
+                            s.rtt_ms
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "na".into())
+                        ),
+                        None => eprintln!("nkct-metrics relay=na rtt_ms=na"),
+                    }
+                    return Ok(());
+                }
+
                 if config.shell_mode {
                     // Phase 1: drive the local terminal against the remote PTY.
                     // Status bar (`--tui`) only for the interactive shell, not for
