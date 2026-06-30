@@ -1233,13 +1233,17 @@ where
     // a lock keeps a status draw (save→move→print→restore) atomic w.r.t. PTY bytes.
     let stdout = std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
 
-    // TUI: install the scroll region (top `pty_rows` rows) and draw the bar once.
-    // The guard resets the region on a panic / early return (the normal exit path
+    // TUI: start on a clean screen — clear the viewport and scrollback so the
+    // session doesn't append below whatever was already in the terminal — then
+    // install the scroll region (top `pty_rows` rows) and draw the bar once. The
+    // guard resets the region on a panic / early return (the normal exit path
     // resets it explicitly before `process::exit`).
     let mut _region: Option<ScrollRegionGuard> = None;
     if let Some(st) = &tui {
         let mut o = stdout.lock().await;
-        let init = format!("\x1b[1;{pty_rows}r{}", st.render(rows));
+        // \x1b[2J clear screen, \x1b[3J clear scrollback, \x1b[H home, then the
+        // scroll region and the status bar.
+        let init = format!("\x1b[2J\x1b[3J\x1b[H\x1b[1;{pty_rows}r{}", st.render(rows));
         let _ = o.write_all(init.as_bytes()).await;
         let _ = o.flush().await;
         _region = Some(ScrollRegionGuard);
