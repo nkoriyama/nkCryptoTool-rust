@@ -834,6 +834,34 @@ impl NetworkProcessor {
 
                 if config.shell_mode {
                     // Phase 1: drive the local terminal against the remote PTY.
+                    // Status bar (`--tui`) only for the interactive shell, not for
+                    // a one-shot `--shell-cmd`. v1 shows the cipher suite + NodeId
+                    // statically; the path kind (Direct/Relay) and live latency are
+                    // filled in by v2 once iroh connection metrics are threaded here.
+                    let tui_status = (config.shell_tui && config.shell_command.is_none())
+                        .then(|| {
+                            // NodeId renders as ASCII hex, but slice on char
+                            // boundaries defensively so any future encoding can't
+                            // panic.
+                            let nid = remote_peer_id.to_string();
+                            let node_short = if nid.chars().count() > 12 {
+                                let head: String = nid.chars().take(6).collect();
+                                let tail: String = {
+                                    let t: Vec<char> = nid.chars().collect();
+                                    t[t.len() - 4..].iter().collect()
+                                };
+                                format!("{head}…{tail}")
+                            } else {
+                                nid
+                            };
+                            crate::shell::ConnStatus {
+                                conn: crate::shell::ConnKind::P2p,
+                                latency_ms: None,
+                                crypto: format!("{}+{}", config.pqc_kem_algo, config.aead_algo),
+                                node_short,
+                                stable: true,
+                            }
+                        });
                     crate::shell::run_pty_client(
                         reader,
                         writer,
@@ -841,6 +869,7 @@ impl NetworkProcessor {
                         &s2c_key,
                         &c2s_key,
                         config.shell_command.as_deref().unwrap_or(""),
+                        tui_status,
                     )
                     .await
                 } else if config.forward_mode {

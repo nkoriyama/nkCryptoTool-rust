@@ -143,6 +143,9 @@ pub struct CryptoConfig {
     /// Optional single command for the shell client (`--shell-cmd`): runs it on
     /// the remote and exits (ssh-style), instead of an interactive login shell.
     pub shell_command: Option<String>,
+    /// Show a status bar under the interactive shell (`--tui`): connection kind,
+    /// cipher suite, NodeId, hint. Client-side only; ignored for `--shell-cmd`.
+    pub shell_tui: bool,
     /// Shell server authorization policy file (`--shell-policy`): maps peer
     /// fingerprints to a user and an optional command allowlist.
     pub shell_policy_path: Option<String>,
@@ -229,6 +232,7 @@ impl Default for CryptoConfig {
             shell_mode: false,
             serve_shell: false,
             shell_command: None,
+            shell_tui: false,
             shell_policy_path: None,
             audit_log_path: None,
             forward_mode: false,

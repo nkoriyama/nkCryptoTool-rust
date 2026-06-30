@@ -91,6 +91,10 @@ struct Args {
     #[arg(long)]
     shell_cmd: Option<String>,
 
+    /// Show a status bar under the interactive shell (connection / cipher / NodeId).
+    #[arg(long)]
+    tui: bool,
+
     /// Shell server authorization policy file: lines of
     /// `<sha3-256-hex> [user=NAME] [cmd-allow="c1,c2"]`. When set, only listed
     /// fingerprints may obtain a shell.
@@ -537,6 +541,7 @@ async fn main() -> anyhow::Result<()> {
     config.shell_mode = args.serve_shell || args.shell || args.shell_cmd.is_some();
     config.serve_shell = args.serve_shell;
     config.shell_command = args.shell_cmd;
+    config.shell_tui = args.tui;
     config.shell_policy_path = args.shell_policy;
     config.audit_log_path = args.audit_log;
     config.forward_mode =

@@ -1098,8 +1098,86 @@ fn term_size(fd: std::os::fd::RawFd) -> (u16, u16) {
     }
 }
 
+// ===========================================================================
+// Optional status bar (`--tui`). tmux-style: reserve the bottom line with a
+// DECSTBM scroll region (so the remote PTY, sized one row shorter, never writes
+// there) and draw a status line into it with raw ANSI. No alternate screen, no
+// extra dependency — it composes with the raw byte passthrough and full-screen
+// TUIs (vim/top) and preserves scrollback.
+// ===========================================================================
+
+/// Reserved status rows at the bottom of the terminal.
+pub const STATUS_H: u16 = 1;
+
+/// How the P2P path is carried (drives the badge colour).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ConnKind {
+    /// Connected, exact path not yet known (v1 default).
+    #[default]
+    P2p,
+    /// Direct hole-punched path.
+    Direct,
+    /// Carried over a relay.
+    Relay,
+    /// Some streams direct, some relayed.
+    Mixed,
+}
+
+/// Snapshot of connection info shown on the status line.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ConnStatus {
+    pub conn: ConnKind,
+    pub latency_ms: Option<u32>,
+    pub crypto: String,
+    pub node_short: String,
+    pub stable: bool,
+}
+
+impl ConnStatus {
+    /// Build the ANSI to (re)draw the status line at the terminal's bottom row
+    /// `rows`, then return the cursor to where it was. The remote PTY's cursor
+    /// lives in the scroll region above, so save/restore (DECSC/DECRC) keeps it
+    /// undisturbed. Auto-wrap is disabled around the draw so an over-long line is
+    /// clipped at the right edge instead of scrolling the screen.
+    fn render(&self, rows: u16) -> String {
+        let (color, label) = match self.conn {
+            ConnKind::Direct => ("32", "Direct P2P"), // green
+            ConnKind::Relay => ("33", "Via Relay"),   // yellow
+            ConnKind::Mixed => ("36", "Mixed"),       // cyan
+            ConnKind::P2p => ("36", "P2P"),
+        };
+        let lat = self.latency_ms.map(|m| format!("{m}ms")).unwrap_or_else(|| "—".into());
+        let state = if self.stable { "stable" } else { "unstable" };
+        // \x1b7 save | go to bottom row | clear | no-wrap | reverse bar | badge in
+        // colour (\x1b[39m = default fg, keeps reverse on) | fields | reset |
+        // re-enable wrap | \x1b8 restore.
+        format!(
+            "\x1b7\x1b[{rows};1H\x1b[2K\x1b[?7l\x1b[7m \x1b[{color};1m●{label}\x1b[22;39m  \
+             Latency:{lat}  {crypto}  {node}  {state}   exit:Ctrl-D \x1b[0m\x1b[?7h\x1b8",
+            crypto = self.crypto,
+            node = self.node_short,
+        )
+    }
+}
+
+/// Releases the terminal scroll region on drop, so an early return or a panic
+/// never leaves the bottom rows reserved. (The normal exit path resets it
+/// explicitly too, since `process::exit` skips `Drop`.)
+#[cfg(unix)]
+struct ScrollRegionGuard;
+#[cfg(unix)]
+impl Drop for ScrollRegionGuard {
+    fn drop(&mut self) {
+        use std::io::Write as _;
+        let mut o = std::io::stdout();
+        let _ = o.write_all(b"\x1b[r"); // DECSTBM reset = whole screen
+        let _ = o.flush();
+    }
+}
+
 /// Client side of a real shell session: announce our terminal, go raw, and pump
-/// stdin↔stdout against the remote PTY until the remote shell exits.
+/// stdin↔stdout against the remote PTY until the remote shell exits. When
+/// `tui_status` is `Some`, reserve the bottom row for a status line.
 #[cfg(unix)]
 pub async fn run_pty_client<R, W>(
     mut reader: R,
@@ -1108,6 +1186,7 @@ pub async fn run_pty_client<R, W>(
     s2c_key: &[u8],
     c2s_key: &[u8],
     cmd: &str,
+    tui_status: Option<ConnStatus>,
 ) -> Result<()>
 where
     R: AsyncReadExt + Unpin + Send,
@@ -1118,6 +1197,13 @@ where
     let (cols, rows) = term_size(stdin_fd);
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
+    // With a status bar, give the remote PTY one row fewer and reserve the bottom
+    // row for the status line via a scroll region. Disable if the terminal is too
+    // short to spare a row.
+    let tui = tui_status.filter(|_| rows > STATUS_H + 1);
+    let status_h = if tui.is_some() { STATUS_H } else { 0 };
+    let pty_rows = rows.saturating_sub(status_h).max(1);
+
     let (rx_key, tx_key) = role_keys(s2c_key, c2s_key, false);
     let tx_key = Zeroizing::new(tx_key.to_vec());
     let aead_owned = aead_name.to_string();
@@ -1127,7 +1213,7 @@ where
     // from SIGWINCH) so the send counter stays consistent.
     let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Frame>(64);
     frame_tx
-        .send(Frame::Open { cols, rows, term, cmd: cmd.to_string() })
+        .send(Frame::Open { cols, rows: pty_rows, term, cmd: cmd.to_string() })
         .await
         .map_err(|_| CryptoError::Parameter("shell: writer gone".into()))?;
     let writer_task = tokio::spawn(async move {
@@ -1142,6 +1228,22 @@ where
 
     // Raw mode for the duration of the session (restored on drop).
     let _raw = RawModeGuard::enable(stdin_fd);
+
+    // Shared stdout: the PTY passthrough and the status redraw both write here, so
+    // a lock keeps a status draw (save→move→print→restore) atomic w.r.t. PTY bytes.
+    let stdout = std::sync::Arc::new(tokio::sync::Mutex::new(tokio::io::stdout()));
+
+    // TUI: install the scroll region (top `pty_rows` rows) and draw the bar once.
+    // The guard resets the region on a panic / early return (the normal exit path
+    // resets it explicitly before `process::exit`).
+    let mut _region: Option<ScrollRegionGuard> = None;
+    if let Some(st) = &tui {
+        let mut o = stdout.lock().await;
+        let init = format!("\x1b[1;{pty_rows}r{}", st.render(rows));
+        let _ = o.write_all(init.as_bytes()).await;
+        let _ = o.flush().await;
+        _region = Some(ScrollRegionGuard);
+    }
 
     // stdin → DATA frames.
     let stdin_tx = frame_tx.clone();
@@ -1160,28 +1262,54 @@ where
         }
     });
 
-    // SIGWINCH → WINSZ frames.
+    // SIGWINCH → WINSZ frames; with a status bar, recompute the reserved row,
+    // reinstall the scroll region, and redraw at the new size.
     let winch_tx = frame_tx.clone();
+    let winch_tui = tui.clone();
+    let winch_stdout = stdout.clone();
     let winch_task = tokio::spawn(async move {
         if let Ok(mut sig) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
         {
             while sig.recv().await.is_some() {
                 let (cols, rows) = term_size(stdin_fd);
-                if winch_tx.send(Frame::Winsz { cols, rows }).await.is_err() {
+                // The status bar only fits when there's a spare row. If the window
+                // shrank below that, drop the reservation for this size (full-screen
+                // scroll region, PTY gets every row) and re-enable it when it grows
+                // back — never install a degenerate `\x1b[1;1r` region.
+                let fits = winch_tui.is_some() && rows > STATUS_H + 1;
+                let status_h = if fits { STATUS_H } else { 0 };
+                let pty_rows = rows.saturating_sub(status_h).max(1);
+                if winch_tx.send(Frame::Winsz { cols, rows: pty_rows }).await.is_err() {
                     break;
+                }
+                if let Some(st) = &winch_tui {
+                    let s = if fits {
+                        format!("\x1b[1;{pty_rows}r{}", st.render(rows))
+                    } else {
+                        "\x1b[r".to_string() // too small: release the scroll region
+                    };
+                    let mut o = winch_stdout.lock().await;
+                    let _ = o.write_all(s.as_bytes()).await;
+                    let _ = o.flush().await;
                 }
             }
         }
     });
 
-    // Main loop: remote PTY output → stdout, until EXIT.
-    let mut stdout = tokio::io::stdout();
+    // Main loop: remote PTY output → stdout, until EXIT. A recv/write error breaks
+    // (rather than `?`-returning) so the terminal-restoring teardown always runs.
     let exit_code = loop {
-        match recv_frame(&mut reader, aead_name, rx_key, &mut rx_ctr).await? {
+        let frame = match recv_frame(&mut reader, aead_name, rx_key, &mut rx_ctr).await {
+            Ok(f) => f,
+            Err(_) => break 1,
+        };
+        match frame {
             Some(Frame::Data(d)) => {
-                stdout.write_all(&d).await.map_err(io_err)?;
-                stdout.flush().await.map_err(io_err)?;
+                let mut o = stdout.lock().await;
+                if o.write_all(&d).await.is_err() || o.flush().await.is_err() {
+                    break 1;
+                }
             }
             Some(Frame::Exit(code)) => break code,
             Some(Frame::Error(m)) => {
@@ -1195,13 +1323,20 @@ where
         }
     };
 
-    // Flush any final output, then tear down. We do NOT await the writer task:
-    // the stdin task is parked in `tokio::io::stdin().read()`, an OS blocking read
-    // that cannot be cancelled, so its cloned frame sender never drops and
-    // `writer_task.await` (and even runtime shutdown) would hang until the user
-    // happens to press a key — leaving the terminal stuck after the remote shell
-    // exited. Abort everything and exit the process directly.
-    let _ = stdout.flush().await;
+    // Tear down. We do NOT await the writer task: the stdin task is parked in
+    // `tokio::io::stdin().read()`, an OS blocking read that cannot be cancelled, so
+    // its cloned frame sender never drops and `writer_task.await` (and even runtime
+    // shutdown) would hang until the user happens to press a key. Abort everything,
+    // restore the terminal, and exit directly.
+    {
+        let mut o = stdout.lock().await;
+        if tui.is_some() {
+            // Release the scroll region and clear the status row.
+            let reset = format!("\x1b[r\x1b[{rows};1H\x1b[2K");
+            let _ = o.write_all(reset.as_bytes()).await;
+        }
+        let _ = o.flush().await;
+    }
     stdin_task.abort();
     winch_task.abort();
     writer_task.abort();
@@ -1223,6 +1358,7 @@ where
 #[cfg(not(unix))]
 pub async fn run_pty_client<R, W>(
     _reader: R, _writer: W, _aead_name: &str, _s2c_key: &[u8], _c2s_key: &[u8], _cmd: &str,
+    _tui_status: Option<ConnStatus>,
 ) -> Result<()> {
     Err(CryptoError::Parameter("the P2P shell client is only supported on unix".into()))
 }
@@ -1230,6 +1366,44 @@ pub async fn run_pty_client<R, W>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_render_positions_and_colours() {
+        let st = ConnStatus {
+            conn: ConnKind::Relay,
+            latency_ms: Some(42),
+            crypto: "ML-KEM-768+AES-256-GCM".into(),
+            node_short: "7f3abc…b191".into(),
+            stable: true,
+        };
+        let s = st.render(24);
+        // Saves the cursor, parks at the bottom row, and restores afterwards.
+        assert!(s.starts_with("\x1b7"));
+        assert!(s.ends_with("\x1b8"));
+        assert!(s.contains("\x1b[24;1H")); // bottom row of a 24-row terminal
+        // Relay badge is yellow (33) and the dynamic fields are present.
+        assert!(s.contains("\x1b[33;1m●Via Relay"));
+        assert!(s.contains("Latency:42ms"));
+        assert!(s.contains("ML-KEM-768+AES-256-GCM"));
+        assert!(s.contains("7f3abc…b191"));
+        // Auto-wrap is toggled off then back on around the draw.
+        assert!(s.contains("\x1b[?7l") && s.contains("\x1b[?7h"));
+    }
+
+    #[test]
+    fn status_render_latency_placeholder_and_colours() {
+        let st = ConnStatus {
+            conn: ConnKind::Direct,
+            latency_ms: None,
+            crypto: "x".into(),
+            node_short: "n".into(),
+            stable: false,
+        };
+        let s = st.render(10);
+        assert!(s.contains("\x1b[32;1m●Direct P2P")); // green badge
+        assert!(s.contains("Latency:—")); // unknown latency placeholder
+        assert!(s.contains("unstable"));
+    }
 
     #[test]
     fn frame_encode_decode_roundtrip() {
