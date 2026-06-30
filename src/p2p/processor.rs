@@ -971,6 +971,60 @@ impl NetworkProcessor {
     }
 }
 
+/// Accumulates the canonical handshake transcript so the client and server build
+/// the identical byte sequence from one source of truth (field order + encoding),
+/// instead of two hand-duplicated sequences that could drift.
+///
+/// `append_lp` delegates to [`CommonProcessor::update_transcript`] so the
+/// length-prefix encoding (u32 little-endian — the v3 wire format) is provably
+/// unchanged from the legacy inline construction. `snapshot()` returns the bytes
+/// so far (the client-signature view is a genuine *prefix* of the full
+/// transcript), and `finalize_salt()` is the HKDF salt = SHA3-256(full transcript).
+// allow(dead_code): the canonical builder, introduced ahead of wiring it into the
+// handshakes. In this commit only `handshake_transcript_kat` exercises it (proving
+// it reproduces the pinned byte layout), so a non-test build sees it as unused.
+// Future: the next commit replaces the hand-written transcript construction in the
+// server and client handshakes with this builder, after which this allow is removed.
+#[allow(dead_code)]
+#[derive(Default)]
+struct TranscriptBuilder {
+    buf: Vec<u8>,
+}
+
+// allow(dead_code): see the rationale on `TranscriptBuilder` above — these methods
+// are exercised by the transcript KAT in this commit and wired into the handshakes
+// in the next. Future: the allow is removed once the handshakes call them.
+#[allow(dead_code)]
+impl TranscriptBuilder {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Raw bytes with no length prefix (NodeIds, auth flags).
+    fn append_raw(&mut self, b: &[u8]) -> &mut Self {
+        self.buf.extend_from_slice(b);
+        self
+    }
+
+    /// Length-prefixed field (public keys, KEM ciphertext, signatures' targets).
+    /// Same encoding as the legacy `update_transcript`.
+    fn append_lp(&mut self, b: &[u8]) -> &mut Self {
+        CommonProcessor::update_transcript(&mut self.buf, b);
+        self
+    }
+
+    /// The transcript accumulated so far — a true prefix of any later state.
+    fn snapshot(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// HKDF salt: SHA3-256 over the full accumulated transcript.
+    fn finalize_salt(&self) -> [u8; 32] {
+        use sha3::Digest as _;
+        Sha3_256::digest(&self.buf).into()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -992,31 +1046,36 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
-    /// Build the canonical transcript for fixed inputs. `full=false` stops after
-    /// the client-auth block (#1–#6) — the slice the client signs.
-    fn kat_transcript(client_auth: bool, server_auth: bool, full: bool) -> Vec<u8> {
+    /// Build the canonical transcript for fixed inputs via `TranscriptBuilder`.
+    /// `full=false` stops after the client-auth block (#1–#6) — the slice the
+    /// client signs (returned as the builder's prefix snapshot).
+    fn kat_builder(client_auth: bool, server_auth: bool, full: bool) -> TranscriptBuilder {
         const CID: [u8; 32] = [0x11; 32];
         const SID: [u8; 32] = [0x22; 32];
-        let mut t = Vec::new();
-        t.extend_from_slice(&CID); // #1 raw  server:369 / client:723
-        t.extend_from_slice(&SID); // #2 raw  server:370 / client:724
-        CommonProcessor::update_transcript(&mut t, b"CECC"); // #3 lp server:375/client:741
-        CommonProcessor::update_transcript(&mut t, b"CKEM"); // #4 lp server:376/client:742
-        t.extend_from_slice(&[client_auth as u8]); // #5 raw server:380 / client:746
+        let mut tb = TranscriptBuilder::new();
+        tb.append_raw(&CID); // #1 raw  server:369 / client:723
+        tb.append_raw(&SID); // #2 raw  server:370 / client:724
+        tb.append_lp(b"CECC"); // #3 lp server:375/client:741
+        tb.append_lp(b"CKEM"); // #4 lp server:376/client:742
+        tb.append_raw(&[client_auth as u8]); // #5 raw server:380 / client:746
         if client_auth {
-            CommonProcessor::update_transcript(&mut t, b"CDSA"); // #6 lp server:384/client:759
+            tb.append_lp(b"CDSA"); // #6 lp server:384/client:759
         }
         if !full {
-            return t; // client-signature view ends at #6
+            return tb; // client-signature view ends at #6
         }
-        CommonProcessor::update_transcript(&mut t, b"SECC"); // #7 lp server:448/client:771
-        CommonProcessor::update_transcript(&mut t, b"KEMCT"); // #8 lp server:449/client:772
-        t.extend_from_slice(&[server_auth as u8]); // #9 raw server:452 / client:773
+        tb.append_lp(b"SECC"); // #7 lp server:448/client:771
+        tb.append_lp(b"KEMCT"); // #8 lp server:449/client:772
+        tb.append_raw(&[server_auth as u8]); // #9 raw server:452 / client:773
         if server_auth {
-            CommonProcessor::update_transcript(&mut t, b"SDSA"); // #10 lp server:479/client:777
-            CommonProcessor::update_transcript(&mut t, b"SKEM"); // #11 lp server:482/client:782
+            tb.append_lp(b"SDSA"); // #10 lp server:479/client:777
+            tb.append_lp(b"SKEM"); // #11 lp server:482/client:782
         }
-        t
+        tb
+    }
+
+    fn kat_transcript(client_auth: bool, server_auth: bool, full: bool) -> Vec<u8> {
+        kat_builder(client_auth, server_auth, full).snapshot().to_vec()
     }
 
     // Golden bytes of the canonical v3 transcript for the fixed KAT inputs above.
@@ -1039,9 +1098,8 @@ mod tests {
         assert_eq!(hex(&kat_transcript(true, true, false)), KAT_PARTIAL_AUTH);
         // Unauthenticated mode still binds the KEM ciphertext (#8).
         assert_eq!(hex(&kat_transcript(false, false, true)), KAT_FULL_NOAUTH);
-        // Salt = SHA3-256(full transcript).
-        let salt: [u8; 32] = Sha3_256::digest(kat_transcript(true, true, true)).into();
-        assert_eq!(hex(&salt), KAT_SALT_AUTH);
+        // Salt = SHA3-256(full transcript), via the builder's finalize_salt().
+        assert_eq!(hex(&kat_builder(true, true, true).finalize_salt()), KAT_SALT_AUTH);
         // The KEM ciphertext ("KEMCT") and both public keys MUST appear in the
         // salt's preimage — the property the hybrid combiner relies on.
         assert!(KAT_FULL_AUTH.contains(&hex(b"KEMCT")));
