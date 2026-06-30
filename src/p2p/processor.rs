@@ -668,13 +668,36 @@ impl NetworkProcessor {
                 eprintln!("[nkct] Connecting to NodeId: {}", remote_peer_id);
                 // Hole punching across NAT/CGNAT is probabilistic — a single
                 // `connect` often times out before a path is found even though the
-                // peer is reachable. Retry a few times with a short pause so the
-                // common case "just works" instead of forcing the user to re-run.
-                const CONNECT_ATTEMPTS: u32 = 4;
+                // peer is reachable. Bound EACH attempt to a short deadline and
+                // retry: a path that can be established is usually found within a
+                // few seconds (the relay fallback especially), so cutting a stuck
+                // attempt short and restarting converges much faster than waiting
+                // out iroh's full ~30 s handshake timeout once per try.
+                // Warm up our own relay home first: a fresh endpoint discovers
+                // local direct addresses immediately but assigns its home relay a
+                // beat later, and connecting before that means the relay fallback
+                // path isn't available yet — so the first attempt often times out
+                // and only a retry succeeds. Waiting here (bounded inside
+                // `local_addr`) lets the very first connect use the relay, usually
+                // removing the retry entirely.
+                let _ = self.endpoint.local_addr().await;
+                const CONNECT_ATTEMPTS: u32 = 5;
+                const PER_ATTEMPT: Duration = Duration::from_secs(12);
                 let stream = {
                     let mut attempt = 1;
                     loop {
-                        match self.endpoint.connect(&remote_peer_addr, protocol).await {
+                        let res = tokio::time::timeout(
+                            PER_ATTEMPT,
+                            self.endpoint.connect(&remote_peer_addr, protocol),
+                        )
+                        .await;
+                        // Flatten timeout(Ok/Err) and the inner connect Result.
+                        let outcome = match res {
+                            Ok(Ok(s)) => Ok(s),
+                            Ok(Err(e)) => Err(e.to_string()),
+                            Err(_) => Err("attempt timed out".to_string()),
+                        };
+                        match outcome {
                             Ok(s) => break s,
                             Err(e) if attempt < CONNECT_ATTEMPTS => {
                                 eprintln!(
@@ -682,9 +705,9 @@ impl NetworkProcessor {
                                      ({e}); retrying…"
                                 );
                                 attempt += 1;
-                                tokio::time::sleep(Duration::from_secs(2)).await;
+                                tokio::time::sleep(Duration::from_secs(1)).await;
                             }
-                            Err(e) => return Err(CryptoError::Parameter(e.to_string())),
+                            Err(e) => return Err(CryptoError::Parameter(e)),
                         }
                     }
                 };
