@@ -1046,6 +1046,15 @@ mod tests {
         // salt's preimage — the property the hybrid combiner relies on.
         assert!(KAT_FULL_AUTH.contains(&hex(b"KEMCT")));
         assert!(KAT_FULL_AUTH.contains(&hex(b"CECC")) && KAT_FULL_AUTH.contains(&hex(b"SECC")));
+        // The client-signature view MUST be a strict prefix of the full transcript
+        // (it is the same buffer up to #6). This pins the invariant that a future
+        // `TranscriptBuilder::snapshot()` returns a genuine prefix of the buffer —
+        // not a separately built / trailing-padded value, which the three equality
+        // checks above would not catch on their own.
+        assert!(
+            KAT_FULL_AUTH.starts_with(KAT_PARTIAL_AUTH)
+                && KAT_PARTIAL_AUTH.len() < KAT_FULL_AUTH.len()
+        );
     }
 
     #[tokio::test]
