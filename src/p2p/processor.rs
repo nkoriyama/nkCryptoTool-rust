@@ -977,6 +977,77 @@ mod tests {
     use crate::p2p::backend::mock::MockNetwork;
     use crate::network::TestIOProvider;
 
+    // ------------------------------------------------------------------
+    // Handshake transcript KAT (known-answer test).
+    //
+    // Pins the EXACT canonical byte layout of the v3 handshake transcript, so a
+    // later refactor (extracting a shared `TranscriptBuilder`) — or any accidental
+    // change to field order / length encoding — is caught at the byte level
+    // instead of only end-to-end. This golden is a faithful replica of the current
+    // hand-written construction (it uses the same `update_transcript` primitive,
+    // u32-LE length-prefix); each field is annotated with the source lines it
+    // mirrors on the server (listen) and client (connect) paths.
+    // ------------------------------------------------------------------
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Build the canonical transcript for fixed inputs. `full=false` stops after
+    /// the client-auth block (#1–#6) — the slice the client signs.
+    fn kat_transcript(client_auth: bool, server_auth: bool, full: bool) -> Vec<u8> {
+        const CID: [u8; 32] = [0x11; 32];
+        const SID: [u8; 32] = [0x22; 32];
+        let mut t = Vec::new();
+        t.extend_from_slice(&CID); // #1 raw  server:369 / client:723
+        t.extend_from_slice(&SID); // #2 raw  server:370 / client:724
+        CommonProcessor::update_transcript(&mut t, b"CECC"); // #3 lp server:375/client:741
+        CommonProcessor::update_transcript(&mut t, b"CKEM"); // #4 lp server:376/client:742
+        t.extend_from_slice(&[client_auth as u8]); // #5 raw server:380 / client:746
+        if client_auth {
+            CommonProcessor::update_transcript(&mut t, b"CDSA"); // #6 lp server:384/client:759
+        }
+        if !full {
+            return t; // client-signature view ends at #6
+        }
+        CommonProcessor::update_transcript(&mut t, b"SECC"); // #7 lp server:448/client:771
+        CommonProcessor::update_transcript(&mut t, b"KEMCT"); // #8 lp server:449/client:772
+        t.extend_from_slice(&[server_auth as u8]); // #9 raw server:452 / client:773
+        if server_auth {
+            CommonProcessor::update_transcript(&mut t, b"SDSA"); // #10 lp server:479/client:777
+            CommonProcessor::update_transcript(&mut t, b"SKEM"); // #11 lp server:482/client:782
+        }
+        t
+    }
+
+    // Golden bytes of the canonical v3 transcript for the fixed KAT inputs above.
+    // Decoded layout (auth mode): client_id(32 raw) ‖ server_id(32 raw) ‖
+    // u32LE(4)"CECC" ‖ u32LE(4)"CKEM" ‖ 01 ‖ u32LE(4)"CDSA" ‖ u32LE(4)"SECC" ‖
+    // u32LE(5)"KEMCT" ‖ 01 ‖ u32LE(4)"SDSA" ‖ u32LE(4)"SKEM". The length prefix is
+    // u32 little-endian (the v3 wire format); changing it would break compat.
+    const KAT_FULL_AUTH: &str = "11111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222040000004345434304000000434b454d0104000000434453410400000053454343050000004b454d435401040000005344534104000000534b454d";
+    const KAT_PARTIAL_AUTH: &str = "11111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222040000004345434304000000434b454d010400000043445341";
+    const KAT_FULL_NOAUTH: &str = "11111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222040000004345434304000000434b454d000400000053454343050000004b454d435400";
+    const KAT_SALT_AUTH: &str =
+        "31a595b0ad7dbdb582a31d2d4d72e5f249e7be7e02523b46d61bd017318e479e";
+
+    #[test]
+    fn handshake_transcript_kat() {
+        use sha3::Digest as _;
+        // Full transcript bound into the salt (auth mode) — #1..#11.
+        assert_eq!(hex(&kat_transcript(true, true, true)), KAT_FULL_AUTH);
+        // Partial transcript the client signs — #1..#6.
+        assert_eq!(hex(&kat_transcript(true, true, false)), KAT_PARTIAL_AUTH);
+        // Unauthenticated mode still binds the KEM ciphertext (#8).
+        assert_eq!(hex(&kat_transcript(false, false, true)), KAT_FULL_NOAUTH);
+        // Salt = SHA3-256(full transcript).
+        let salt: [u8; 32] = Sha3_256::digest(kat_transcript(true, true, true)).into();
+        assert_eq!(hex(&salt), KAT_SALT_AUTH);
+        // The KEM ciphertext ("KEMCT") and both public keys MUST appear in the
+        // salt's preimage — the property the hybrid combiner relies on.
+        assert!(KAT_FULL_AUTH.contains(&hex(b"KEMCT")));
+        assert!(KAT_FULL_AUTH.contains(&hex(b"CECC")) && KAT_FULL_AUTH.contains(&hex(b"SECC")));
+    }
+
     #[tokio::test]
     async fn test_mock_processor_handshake_unauth() {
         let net = MockNetwork::new();
