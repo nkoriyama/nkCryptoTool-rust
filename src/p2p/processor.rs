@@ -365,28 +365,28 @@ impl NetworkProcessor {
         let handshake_timeout = Duration::from_secs(config.handshake_timeout);
         
         let handshake_result = tokio::time::timeout(handshake_timeout, async {
-            let mut transcript = Vec::new();
-            transcript.extend_from_slice(remote_peer_id.as_bytes()); // Client
-            transcript.extend_from_slice(local_peer_id.as_bytes());  // Server
+            let mut tb = TranscriptBuilder::new();
+            tb.append_raw(remote_peer_id.as_bytes()); // #1 client id
+            tb.append_raw(local_peer_id.as_bytes()); // #2 server id
 
             let client_ecc_pub = CommonProcessor::read_vec(&mut reader).await?;
             let client_kem_pub = CommonProcessor::read_vec(&mut reader).await?;
 
-            CommonProcessor::update_transcript(&mut transcript, &client_ecc_pub);
-            CommonProcessor::update_transcript(&mut transcript, &client_kem_pub);
+            tb.append_lp(&client_ecc_pub); // #3
+            tb.append_lp(&client_kem_pub); // #4
 
             let mut client_auth_flag = [0u8; 1];
             reader.read_exact(&mut client_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            transcript.extend_from_slice(&client_auth_flag);
+            tb.append_raw(&client_auth_flag); // #5
 
             if client_auth_flag[0] == 1 {
                 let client_dsa_pub = CommonProcessor::read_vec(&mut reader).await?;
-                CommonProcessor::update_transcript(&mut transcript, &client_dsa_pub);
+                tb.append_lp(&client_dsa_pub); // #6
 
                 let sig = CommonProcessor::read_vec(&mut reader).await?;
-                
-                // Verify signature regardless of whether we have a pinned key
-                if !backend::pqc_verify(&config.pqc_dsa_algo, &client_dsa_pub, &transcript, &sig)? {
+
+                // Verify the client signature over the partial transcript (#1–#6).
+                if !backend::pqc_verify(&config.pqc_dsa_algo, &client_dsa_pub, tb.snapshot(), &sig)? {
                     return Err(CryptoError::SignatureVerification);
                 }
 
@@ -444,12 +444,11 @@ impl NetworkProcessor {
             combined_ss[..ss_ecc.len()].copy_from_slice(&ss_ecc);
             combined_ss[ss_ecc.len()..].copy_from_slice(&kem_ss);
 
-            let mut server_transcript = transcript.clone();
-            CommonProcessor::update_transcript(&mut server_transcript, &server_ecc_pub);
-            CommonProcessor::update_transcript(&mut server_transcript, &kem_ct);
+            tb.append_lp(&server_ecc_pub); // #7
+            tb.append_lp(&kem_ct); // #8
 
             let server_auth_flag = if config.signing_privkey.is_some() { [1u8] } else { [0u8] };
-            server_transcript.extend_from_slice(&server_auth_flag);
+            tb.append_raw(&server_auth_flag); // #9
 
             let mut server_sig = Vec::new();
             let mut server_dsa_pub = Vec::new();
@@ -476,16 +475,18 @@ impl NetworkProcessor {
                 };
                 
                 server_dsa_pub = backend::pqc_pub_from_priv_dsa(&config.pqc_dsa_algo, &raw_priv_dsa)?;
-                CommonProcessor::update_transcript(&mut server_transcript, &server_dsa_pub);
-                
-                server_kem_pub = raw_pub_kem;
-                CommonProcessor::update_transcript(&mut server_transcript, &server_kem_pub);
+                tb.append_lp(&server_dsa_pub); // #10
 
-                server_sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv_dsa, &server_transcript, None)?;
+                server_kem_pub = raw_pub_kem;
+                tb.append_lp(&server_kem_pub); // #11
+
+                // Sign the full transcript (#1–#11) — the same builder.
+                server_sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv_dsa, tb.snapshot(), None)?;
             }
 
-            use sha3::Digest as Sha3Digest;
-            let salt = Sha3_256::digest(&server_transcript).to_vec();
+            // Salt = SHA3-256(full transcript) via the SAME builder — no separate
+            // digest path that could drift from the bound bytes.
+            let salt = tb.finalize_salt();
             let okm = backend::hkdf(&combined_ss, 88, &salt, "nk-auth-v3", "SHA3-256")?;
             
             let keys = (
@@ -719,9 +720,9 @@ impl NetworkProcessor {
 
                 let handshake_timeout = Duration::from_secs(config.handshake_timeout);
                 let handshake_result = tokio::time::timeout(handshake_timeout, async {
-                    let mut transcript = Vec::new();
-                    transcript.extend_from_slice(local_peer_id.as_bytes());  // Client
-                    transcript.extend_from_slice(remote_peer_id.as_bytes()); // Server
+                    let mut tb = TranscriptBuilder::new();
+                    tb.append_raw(local_peer_id.as_bytes()); // #1 client id
+                    tb.append_raw(remote_peer_id.as_bytes()); // #2 server id
 
                     let kem_algo = config.pqc_kem_algo.clone();
                     let (client_ecc_priv, client_ecc_pub, client_kem_priv, client_kem_pub) = {
@@ -738,12 +739,12 @@ impl NetworkProcessor {
                     CommonProcessor::write_vec(&mut writer, &client_ecc_pub).await?;
                     CommonProcessor::write_vec(&mut writer, &client_kem_pub).await?;
 
-                    CommonProcessor::update_transcript(&mut transcript, &client_ecc_pub);
-                    CommonProcessor::update_transcript(&mut transcript, &client_kem_pub);
+                    tb.append_lp(&client_ecc_pub); // #3
+                    tb.append_lp(&client_kem_pub); // #4
 
                     let client_auth_flag = if config.signing_privkey.is_some() { [1u8] } else { [0u8] };
                     writer.write_all(&client_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                    transcript.extend_from_slice(&client_auth_flag);
+                    tb.append_raw(&client_auth_flag); // #5
 
                     if client_auth_flag[0] == 1 {
                         let raw_priv = {
@@ -756,9 +757,10 @@ impl NetworkProcessor {
                         };
                         let client_dsa_pub = backend::pqc_pub_from_priv_dsa(&config.pqc_dsa_algo, &raw_priv)?;
                         CommonProcessor::write_vec(&mut writer, &client_dsa_pub).await?;
-                        CommonProcessor::update_transcript(&mut transcript, &client_dsa_pub);
+                        tb.append_lp(&client_dsa_pub); // #6
 
-                        let sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, &transcript, None)?;
+                        // Sign the partial transcript (#1–#6).
+                        let sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, tb.snapshot(), None)?;
                         CommonProcessor::write_vec(&mut writer, &sig).await?;
                     }
 
@@ -767,19 +769,18 @@ impl NetworkProcessor {
                     let mut server_auth_flag = [0u8; 1];
                     reader.read_exact(&mut server_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
-                    let mut server_transcript = transcript.clone();
-                    CommonProcessor::update_transcript(&mut server_transcript, &server_ecc_pub);
-                    CommonProcessor::update_transcript(&mut server_transcript, &kem_ct);
-                    server_transcript.extend_from_slice(&server_auth_flag);
+                    tb.append_lp(&server_ecc_pub); // #7
+                    tb.append_lp(&kem_ct); // #8
+                    tb.append_raw(&server_auth_flag); // #9
 
                     if server_auth_flag[0] == 1 {
                         let server_dsa_pub = CommonProcessor::read_vec(&mut reader).await?;
-                        CommonProcessor::update_transcript(&mut server_transcript, &server_dsa_pub);
+                        tb.append_lp(&server_dsa_pub); // #10
 
                         let sig = CommonProcessor::read_vec(&mut reader).await?;
-                        
+
                         let server_kem_pub = CommonProcessor::read_vec(&mut reader).await?;
-                        CommonProcessor::update_transcript(&mut server_transcript, &server_kem_pub);
+                        tb.append_lp(&server_kem_pub); // #11
 
                         if let Some(ref pubkey_path) = config.signing_pubkey {
                             let pubkey_bytes = Zeroizing::new(std::fs::read(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
@@ -806,7 +807,8 @@ impl NetworkProcessor {
                             }
                         }
 
-                        if !backend::pqc_verify(&config.pqc_dsa_algo, &server_dsa_pub, &server_transcript, &sig)? {
+                        // Verify the server signature over the full transcript (#1–#11).
+                        if !backend::pqc_verify(&config.pqc_dsa_algo, &server_dsa_pub, tb.snapshot(), &sig)? {
                             return Err(CryptoError::SignatureVerification);
                         }
                         eprintln!("Server authenticated successfully.");
@@ -839,8 +841,9 @@ impl NetworkProcessor {
                     combined_ss[..ss_ecc.len()].copy_from_slice(&ss_ecc);
                     combined_ss[ss_ecc.len()..].copy_from_slice(&kem_ss);
 
-                    use sha3::Digest as Sha3Digest;
-                    let salt = Sha3_256::digest(&server_transcript).to_vec();
+                    // Salt = SHA3-256(full transcript) via the SAME builder — no
+                    // separate digest path that could drift from the bound bytes.
+                    let salt = tb.finalize_salt();
                     let okm = backend::hkdf(&combined_ss, 88, &salt, "nk-auth-v3", "SHA3-256")?;
 
                     let keys = (
@@ -980,21 +983,11 @@ impl NetworkProcessor {
 /// unchanged from the legacy inline construction. `snapshot()` returns the bytes
 /// so far (the client-signature view is a genuine *prefix* of the full
 /// transcript), and `finalize_salt()` is the HKDF salt = SHA3-256(full transcript).
-// allow(dead_code): the canonical builder, introduced ahead of wiring it into the
-// handshakes. In this commit only `handshake_transcript_kat` exercises it (proving
-// it reproduces the pinned byte layout), so a non-test build sees it as unused.
-// Future: the next commit replaces the hand-written transcript construction in the
-// server and client handshakes with this builder, after which this allow is removed.
-#[allow(dead_code)]
 #[derive(Default)]
 struct TranscriptBuilder {
     buf: Vec<u8>,
 }
 
-// allow(dead_code): see the rationale on `TranscriptBuilder` above — these methods
-// are exercised by the transcript KAT in this commit and wired into the handshakes
-// in the next. Future: the allow is removed once the handshakes call them.
-#[allow(dead_code)]
 impl TranscriptBuilder {
     fn new() -> Self {
         Self::default()
