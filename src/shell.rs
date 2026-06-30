@@ -1106,8 +1106,6 @@ fn term_size(fd: std::os::fd::RawFd) -> (u16, u16) {
 // TUIs (vim/top) and preserves scrollback.
 // ===========================================================================
 
-/// Reserved status rows at the bottom of the terminal.
-pub const STATUS_H: u16 = 1;
 
 /// How the P2P path is carried (drives the badge colour).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -1134,29 +1132,83 @@ pub struct ConnStatus {
 }
 
 impl ConnStatus {
-    /// Build the ANSI to (re)draw the status line at the terminal's bottom row
-    /// `rows`, then return the cursor to where it was. The remote PTY's cursor
-    /// lives in the scroll region above, so save/restore (DECSC/DECRC) keeps it
-    /// undisturbed. Auto-wrap is disabled around the draw so an over-long line is
-    /// clipped at the right edge instead of scrolling the screen.
-    fn render(&self, rows: u16) -> String {
-        let (color, label) = match self.conn {
+    fn badge(&self) -> (&'static str, &'static str) {
+        match self.conn {
             ConnKind::Direct => ("32", "Direct P2P"), // green
             ConnKind::Relay => ("33", "Via Relay"),   // yellow
             ConnKind::Mixed => ("36", "Mixed"),       // cyan
             ConnKind::P2p => ("36", "P2P"),
-        };
+        }
+    }
+
+    /// Rows the bar needs at width `cols`: one line if everything fits, two
+    /// otherwise. The estimate reserves worst-case widths for the *live* fields
+    /// (badge label, latency, stability) so a latency/kind update never flips the
+    /// line count — only `cols`, the cipher name and the NodeId (all fixed for a
+    /// session) do, so the reserved height changes only on an actual resize.
+    pub fn height(&self, cols: u16) -> u16 {
+        let worst = format!(
+            " ●Direct P2P  Latency:8888ms  {}  {}  unstable   exit:Ctrl-D ",
+            self.crypto, self.node_short
+        );
+        if worst.chars().count() <= cols as usize {
+            1
+        } else {
+            2
+        }
+    }
+
+    /// One reverse-video segment at absolute `row`: clear, no-wrap, draw `body`,
+    /// reset, restore wrap. `body` may carry colour SGRs.
+    fn bar(row: u16, body: &str) -> String {
+        format!("\x1b[{row};1H\x1b[2K\x1b[?7l\x1b[7m{body}\x1b[0m\x1b[?7h")
+    }
+
+    /// Neutralize control / bidi / zero-width characters before they reach the
+    /// terminal. The displayed fields are local (cipher names) or a hex NodeId, so
+    /// this is defense-in-depth, but it guarantees the bar can never inject escape
+    /// sequences or reorder the operator's display regardless of their source.
+    fn safe_field(s: &str) -> String {
+        s.chars()
+            .map(|c| {
+                if c.is_control()
+                    || ('\u{200B}'..='\u{200F}').contains(&c)
+                    || ('\u{202A}'..='\u{202E}').contains(&c)
+                    || ('\u{2066}'..='\u{2069}').contains(&c)
+                {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect()
+    }
+
+    /// Build the ANSI to (re)draw the status bar across its 1–2 rows ending at the
+    /// terminal's bottom row `rows`, then restore the cursor (the PTY's cursor
+    /// lives in the scroll region above, so DECSC/DECRC keeps it put).
+    fn render(&self, cols: u16, rows: u16) -> String {
+        let (color, label) = self.badge();
         let lat = self.latency_ms.map(|m| format!("{m}ms")).unwrap_or_else(|| "—".into());
         let state = if self.stable { "stable" } else { "unstable" };
-        // \x1b7 save | go to bottom row | clear | no-wrap | reverse bar | badge in
-        // colour (\x1b[39m = default fg, keeps reverse on) | fields | reset |
-        // re-enable wrap | \x1b8 restore.
-        format!(
-            "\x1b7\x1b[{rows};1H\x1b[2K\x1b[?7l\x1b[7m \x1b[{color};1m●{label}\x1b[22;39m  \
-             Latency:{lat}  {crypto}  {node}  {state}   exit:Ctrl-D \x1b[0m\x1b[?7h\x1b8",
-            crypto = self.crypto,
-            node = self.node_short,
-        )
+        let crypto = Self::safe_field(&self.crypto);
+        let node = Self::safe_field(&self.node_short);
+        // Colour the badge dot/label, then `\x1b[22;39m` (not-bold, default fg)
+        // returns to the bar's reverse video for the rest.
+        let badge = format!(" \x1b[{color};1m●{label}\x1b[22;39m");
+        if self.height(cols) == 1 {
+            let body = format!("{badge}  Latency:{lat}  {crypto}  {node}  {state}   exit:Ctrl-D ");
+            format!("\x1b7{}\x1b8", Self::bar(rows, &body))
+        } else {
+            // Live status on top, static identity on the bottom row.
+            let top = format!("{badge}  Latency:{lat}  {state} ");
+            let bot = format!(" {crypto}  {node}   exit:Ctrl-D ");
+            format!(
+                "\x1b7{}{}\x1b8",
+                Self::bar(rows.saturating_sub(1), &top),
+                Self::bar(rows, &bot),
+            )
+        }
     }
 }
 
@@ -1204,14 +1256,22 @@ where
     let (cols, rows) = term_size(stdin_fd);
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
-    // With a status bar, give the remote PTY one row fewer and reserve the bottom
-    // row for the status line via a scroll region. Disable if the terminal is too
-    // short to spare a row. The live status is shared so the metrics poller and the
-    // SIGWINCH redraw both see the latest values.
-    let status: Option<std::sync::Arc<tokio::sync::Mutex<ConnStatus>>> = tui_status
-        .filter(|_| rows > STATUS_H + 1)
-        .map(|s| std::sync::Arc::new(tokio::sync::Mutex::new(s)));
-    let status_h = if status.is_some() { STATUS_H } else { 0 };
+    // With a status bar, give the remote PTY fewer rows and reserve the bottom
+    // 1–2 rows (narrow terminals wrap the bar onto a second line) via a scroll
+    // region. Disable if the terminal is too short to spare the rows. The live
+    // status is shared so the metrics poller and the SIGWINCH redraw both see the
+    // latest values.
+    let status: Option<std::sync::Arc<tokio::sync::Mutex<ConnStatus>>> =
+        tui_status.map(|s| std::sync::Arc::new(tokio::sync::Mutex::new(s)));
+    let status_h = match &status {
+        Some(st) => {
+            let h = st.lock().await.height(cols);
+            if rows > h + 1 { h } else { 0 }
+        }
+        None => 0,
+    };
+    // No room (or no bar requested): fully disable the TUI path.
+    let status = if status_h > 0 { status } else { None };
     let pty_rows = rows.saturating_sub(status_h).max(1);
 
     let (rx_key, tx_key) = role_keys(s2c_key, c2s_key, false);
@@ -1250,7 +1310,7 @@ where
     // resets it explicitly before `process::exit`).
     let mut _region: Option<ScrollRegionGuard> = None;
     if let Some(st) = &status {
-        let bar = st.lock().await.render(rows);
+        let bar = st.lock().await.render(cols, rows);
         let mut o = stdout.lock().await;
         // \x1b[2J clear screen, \x1b[3J clear scrollback, \x1b[H home, then the
         // scroll region and the status bar.
@@ -1272,8 +1332,7 @@ where
             loop {
                 tick.tick().await;
                 let snap = m.snapshot();
-                let (_c, rows) = term_size(stdin_fd);
-                let fits = rows > STATUS_H + 1;
+                let (cols, rows) = term_size(stdin_fd);
                 let bar = {
                     let mut s = st.lock().await;
                     let mut changed = false;
@@ -1288,7 +1347,8 @@ where
                             changed = true;
                         }
                     }
-                    (changed && fits).then(|| s.render(rows))
+                    let fits = rows > s.height(cols) + 1;
+                    (changed && fits).then(|| s.render(cols, rows))
                 };
                 if let Some(bar) = bar {
                     let mut o = poll_stdout.lock().await;
@@ -1329,12 +1389,17 @@ where
         {
             while sig.recv().await.is_some() {
                 let (cols, rows) = term_size(stdin_fd);
-                // The status bar only fits when there's a spare row. If the window
-                // shrank below that, drop the reservation for this size (full-screen
-                // scroll region, PTY gets every row) and re-enable it when it grows
-                // back — never install a degenerate `\x1b[1;1r` region.
-                let fits = winch_status.is_some() && rows > STATUS_H + 1;
-                let status_h = if fits { STATUS_H } else { 0 };
+                // Recompute the bar height for the new width (1 or 2 rows). The bar
+                // only fits when there's a spare row above it; if the window shrank
+                // below that, drop the reservation for this size (full-screen scroll
+                // region, PTY gets every row) and re-enable it when it grows back —
+                // never install a degenerate `\x1b[1;1r` region.
+                let h = match &winch_status {
+                    Some(st) => st.lock().await.height(cols),
+                    None => 0,
+                };
+                let fits = winch_status.is_some() && h > 0 && rows > h + 1;
+                let status_h = if fits { h } else { 0 };
                 let pty_rows = rows.saturating_sub(status_h).max(1);
                 if winch_tx.send(Frame::Winsz { cols, rows: pty_rows }).await.is_err() {
                     break;
@@ -1342,7 +1407,7 @@ where
                 if let Some(st) = &winch_status {
                     // Redraw with the latest live status at the new geometry.
                     let s = if fits {
-                        format!("\x1b[1;{pty_rows}r{}", st.lock().await.render(rows))
+                        format!("\x1b[1;{pty_rows}r{}", st.lock().await.render(cols, rows))
                     } else {
                         "\x1b[r".to_string() // too small: release the scroll region
                     };
@@ -1388,8 +1453,11 @@ where
     {
         let mut o = stdout.lock().await;
         if status.is_some() {
-            // Release the scroll region and clear the status row.
-            let reset = format!("\x1b[r\x1b[{rows};1H\x1b[2K");
+            // Release the scroll region and clear the (up to two) status rows.
+            let reset = format!(
+                "\x1b[r\x1b[{};1H\x1b[2K\x1b[{rows};1H\x1b[2K",
+                rows.saturating_sub(1)
+            );
             let _ = o.write_all(reset.as_bytes()).await;
         }
         let _ = o.flush().await;
@@ -1437,11 +1505,14 @@ mod tests {
             node_short: "7f3abc…b191".into(),
             stable: true,
         };
-        let s = st.render(24);
+        // Wide terminal → single line at the bottom row.
+        assert_eq!(st.height(120), 1);
+        let s = st.render(120, 24);
         // Saves the cursor, parks at the bottom row, and restores afterwards.
         assert!(s.starts_with("\x1b7"));
         assert!(s.ends_with("\x1b8"));
         assert!(s.contains("\x1b[24;1H")); // bottom row of a 24-row terminal
+        assert!(!s.contains("\x1b[23;1H")); // and only one row used
         // Relay badge is yellow (33) and the dynamic fields are present.
         assert!(s.contains("\x1b[33;1m●Via Relay"));
         assert!(s.contains("Latency:42ms"));
@@ -1449,6 +1520,26 @@ mod tests {
         assert!(s.contains("7f3abc…b191"));
         // Auto-wrap is toggled off then back on around the draw.
         assert!(s.contains("\x1b[?7l") && s.contains("\x1b[?7h"));
+    }
+
+    #[test]
+    fn status_render_wraps_to_two_lines_when_narrow() {
+        let st = ConnStatus {
+            conn: ConnKind::Direct,
+            latency_ms: Some(7),
+            crypto: "ML-KEM-768+AES-256-GCM".into(),
+            node_short: "7f3abc…b191".into(),
+            stable: true,
+        };
+        // Narrow terminal → two rows (the bottom two of a 24-row screen).
+        assert_eq!(st.height(40), 2);
+        let s = st.render(40, 24);
+        assert!(s.contains("\x1b[23;1H")); // top status row
+        assert!(s.contains("\x1b[24;1H")); // bottom status row
+        // Live info on top, identity on the bottom.
+        assert!(s.contains("\x1b[32;1m●Direct P2P"));
+        assert!(s.contains("Latency:7ms"));
+        assert!(s.contains("ML-KEM-768+AES-256-GCM"));
     }
 
     #[test]
@@ -1460,7 +1551,7 @@ mod tests {
             node_short: "n".into(),
             stable: false,
         };
-        let s = st.render(10);
+        let s = st.render(120, 10);
         assert!(s.contains("\x1b[32;1m●Direct P2P")); // green badge
         assert!(s.contains("Latency:—")); // unknown latency placeholder
         assert!(s.contains("unstable"));
