@@ -688,6 +688,10 @@ impl NetworkProcessor {
                         }
                     }
                 };
+                // Capture live connection metrics (relay/direct + RTT) before the
+                // stream is split, for the shell status bar (`--tui`). `None` on
+                // backends that don't report them.
+                let conn_metrics = self.endpoint.last_connect_metrics();
                 let (mut reader, mut writer) = tokio::io::split(stream);
 
                 let handshake_timeout = Duration::from_secs(config.handshake_timeout);
@@ -862,6 +866,8 @@ impl NetworkProcessor {
                                 stable: true,
                             }
                         });
+                    // Live metrics only matter when the bar is shown.
+                    let metrics = tui_status.as_ref().and(conn_metrics);
                     crate::shell::run_pty_client(
                         reader,
                         writer,
@@ -870,6 +876,7 @@ impl NetworkProcessor {
                         &c2s_key,
                         config.shell_command.as_deref().unwrap_or(""),
                         tui_status,
+                        metrics,
                     )
                     .await
                 } else if config.forward_mode {

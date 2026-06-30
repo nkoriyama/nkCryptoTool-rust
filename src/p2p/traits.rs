@@ -58,4 +58,11 @@ pub trait P2pEndpoint: Send + Sync {
     /// Shut the endpoint down. Subsequent `connect` / `accept` calls
     /// return [`P2pError::Closed`].
     async fn close(&self) -> Result<(), P2pError>;
+
+    /// Pollable live metrics for the most recent outgoing [`connect`](Self::connect),
+    /// if the backend can report them (iroh reports relay/direct + RTT; others
+    /// return `None`). Queried right after a successful connect by the status bar.
+    fn last_connect_metrics(&self) -> Option<std::sync::Arc<dyn crate::p2p::ConnMetrics>> {
+        None
+    }
 }

@@ -106,3 +106,21 @@ pub enum P2pError {
     #[error("backend error: {0}")]
     Backend(String),
 }
+
+/// A point-in-time view of the live connection's selected path: whether it is
+/// relayed and its round-trip estimate. Backend-neutral so the UI layer (the
+/// shell status bar) does not depend on iroh types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConnSnapshot {
+    /// The selected path is carried over a relay (vs a direct hole-punched path).
+    pub relay: bool,
+    /// Round-trip time of the selected path, milliseconds.
+    pub rtt_ms: Option<u32>,
+}
+
+/// Pollable source of [`ConnSnapshot`]s for an established connection. A backend
+/// that can report live path metrics (iroh) provides one; others return `None`.
+pub trait ConnMetrics: Send + Sync {
+    /// Current selected-path snapshot, or `None` if no path is selected yet.
+    fn snapshot(&self) -> Option<ConnSnapshot>;
+}

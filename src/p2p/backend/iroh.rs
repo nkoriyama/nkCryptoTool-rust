@@ -191,6 +191,28 @@ pub struct IrohEndpoint {
     /// ticket. When false (`--no-relay` / test mode) there is no relay to wait
     /// for, so `local_addr` returns as soon as any direct address is known.
     relay_enabled: bool,
+    /// Live metrics for the most recent outgoing `connect` (selected-path
+    /// relay/direct + RTT), exposed via `last_connect_metrics` for the status bar.
+    last_metrics: std::sync::Mutex<Option<std::sync::Arc<dyn crate::p2p::ConnMetrics>>>,
+}
+
+/// [`crate::p2p::ConnMetrics`] over a live iroh `Connection`: reads the selected
+/// path's relay flag and RTT from a fresh `paths()` snapshot on each poll.
+struct IrohConnMetrics {
+    conn: iroh::endpoint::Connection,
+}
+
+impl crate::p2p::ConnMetrics for IrohConnMetrics {
+    fn snapshot(&self) -> Option<crate::p2p::ConnSnapshot> {
+        let paths = self.conn.paths();
+        // Prefer the path QUIC has selected for transmission; fall back to the
+        // first known path so a just-established connection still reports.
+        let chosen = paths.iter().find(|p| p.is_selected()).or_else(|| paths.iter().next())?;
+        Some(crate::p2p::ConnSnapshot {
+            relay: chosen.is_relay(),
+            rtt_ms: Some(chosen.rtt().as_millis().min(u32::MAX as u128) as u32),
+        })
+    }
 }
 
 impl IrohEndpoint {
@@ -209,6 +231,7 @@ impl IrohEndpoint {
             // relay may be in use and wait for it (bounded by a timeout). `new`
             // overrides this with the exact relay configuration.
             relay_enabled: true,
+            last_metrics: std::sync::Mutex::new(None),
         }
     }
 
@@ -373,7 +396,17 @@ impl crate::p2p::P2pEndpoint for IrohEndpoint {
             .open_bi()
             .await
             .map_err(|e| crate::p2p::P2pError::Connect(format!("open_bi: {}", e)))?;
+        // Retain a clone of the connection for live status metrics. iroh's
+        // `Connection` is an internal handle (cheap to clone) and stays alive as
+        // long as the streams do, so this does not extend its lifetime.
+        if let Ok(mut slot) = self.last_metrics.lock() {
+            *slot = Some(std::sync::Arc::new(IrohConnMetrics { conn: connection.clone() }));
+        }
         Ok(Box::new(IrohBiStream { send, recv }))
+    }
+
+    fn last_connect_metrics(&self) -> Option<std::sync::Arc<dyn crate::p2p::ConnMetrics>> {
+        self.last_metrics.lock().ok().and_then(|m| m.clone())
     }
 
     async fn accept(

@@ -1179,6 +1179,12 @@ impl Drop for ScrollRegionGuard {
 /// stdin↔stdout against the remote PTY until the remote shell exits. When
 /// `tui_status` is `Some`, reserve the bottom row for a status line.
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+// allow(too_many_arguments): the secured stream halves + AEAD name + session keys
+// + the optional one-shot command + the optional status-bar seed and live metrics
+// source are each genuinely needed to drive one client session; bundling them into
+// a struct would only move the noise. Future: a SecureChannel type could fold the
+// stream halves + keys together.
 pub async fn run_pty_client<R, W>(
     mut reader: R,
     writer: W,
@@ -1187,6 +1193,7 @@ pub async fn run_pty_client<R, W>(
     c2s_key: &[u8],
     cmd: &str,
     tui_status: Option<ConnStatus>,
+    metrics: Option<std::sync::Arc<dyn crate::p2p::ConnMetrics>>,
 ) -> Result<()>
 where
     R: AsyncReadExt + Unpin + Send,
@@ -1199,9 +1206,12 @@ where
 
     // With a status bar, give the remote PTY one row fewer and reserve the bottom
     // row for the status line via a scroll region. Disable if the terminal is too
-    // short to spare a row.
-    let tui = tui_status.filter(|_| rows > STATUS_H + 1);
-    let status_h = if tui.is_some() { STATUS_H } else { 0 };
+    // short to spare a row. The live status is shared so the metrics poller and the
+    // SIGWINCH redraw both see the latest values.
+    let status: Option<std::sync::Arc<tokio::sync::Mutex<ConnStatus>>> = tui_status
+        .filter(|_| rows > STATUS_H + 1)
+        .map(|s| std::sync::Arc::new(tokio::sync::Mutex::new(s)));
+    let status_h = if status.is_some() { STATUS_H } else { 0 };
     let pty_rows = rows.saturating_sub(status_h).max(1);
 
     let (rx_key, tx_key) = role_keys(s2c_key, c2s_key, false);
@@ -1239,15 +1249,57 @@ where
     // guard resets the region on a panic / early return (the normal exit path
     // resets it explicitly before `process::exit`).
     let mut _region: Option<ScrollRegionGuard> = None;
-    if let Some(st) = &tui {
+    if let Some(st) = &status {
+        let bar = st.lock().await.render(rows);
         let mut o = stdout.lock().await;
         // \x1b[2J clear screen, \x1b[3J clear scrollback, \x1b[H home, then the
         // scroll region and the status bar.
-        let init = format!("\x1b[2J\x1b[3J\x1b[H\x1b[1;{pty_rows}r{}", st.render(rows));
+        let init = format!("\x1b[2J\x1b[3J\x1b[H\x1b[1;{pty_rows}r{bar}");
         let _ = o.write_all(init.as_bytes()).await;
         let _ = o.flush().await;
         _region = Some(ScrollRegionGuard);
     }
+
+    // Status metrics poller (v2): every second, read the live path (relay/direct +
+    // RTT) and, when it changed, update the shared status and redraw. Only spawned
+    // when both the bar and a metrics source are present.
+    let poll_task = if let (Some(st), Some(m)) = (&status, &metrics) {
+        let st = st.clone();
+        let m = m.clone();
+        let poll_stdout = stdout.clone();
+        Some(tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                let snap = m.snapshot();
+                let (_c, rows) = term_size(stdin_fd);
+                let fits = rows > STATUS_H + 1;
+                let bar = {
+                    let mut s = st.lock().await;
+                    let mut changed = false;
+                    if let Some(sn) = snap {
+                        let kind = if sn.relay { ConnKind::Relay } else { ConnKind::Direct };
+                        if s.conn != kind {
+                            s.conn = kind;
+                            changed = true;
+                        }
+                        if s.latency_ms != sn.rtt_ms {
+                            s.latency_ms = sn.rtt_ms;
+                            changed = true;
+                        }
+                    }
+                    (changed && fits).then(|| s.render(rows))
+                };
+                if let Some(bar) = bar {
+                    let mut o = poll_stdout.lock().await;
+                    let _ = o.write_all(bar.as_bytes()).await;
+                    let _ = o.flush().await;
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     // stdin → DATA frames.
     let stdin_tx = frame_tx.clone();
@@ -1269,7 +1321,7 @@ where
     // SIGWINCH → WINSZ frames; with a status bar, recompute the reserved row,
     // reinstall the scroll region, and redraw at the new size.
     let winch_tx = frame_tx.clone();
-    let winch_tui = tui.clone();
+    let winch_status = status.clone();
     let winch_stdout = stdout.clone();
     let winch_task = tokio::spawn(async move {
         if let Ok(mut sig) =
@@ -1281,15 +1333,16 @@ where
                 // shrank below that, drop the reservation for this size (full-screen
                 // scroll region, PTY gets every row) and re-enable it when it grows
                 // back — never install a degenerate `\x1b[1;1r` region.
-                let fits = winch_tui.is_some() && rows > STATUS_H + 1;
+                let fits = winch_status.is_some() && rows > STATUS_H + 1;
                 let status_h = if fits { STATUS_H } else { 0 };
                 let pty_rows = rows.saturating_sub(status_h).max(1);
                 if winch_tx.send(Frame::Winsz { cols, rows: pty_rows }).await.is_err() {
                     break;
                 }
-                if let Some(st) = &winch_tui {
+                if let Some(st) = &winch_status {
+                    // Redraw with the latest live status at the new geometry.
                     let s = if fits {
-                        format!("\x1b[1;{pty_rows}r{}", st.render(rows))
+                        format!("\x1b[1;{pty_rows}r{}", st.lock().await.render(rows))
                     } else {
                         "\x1b[r".to_string() // too small: release the scroll region
                     };
@@ -1334,7 +1387,7 @@ where
     // restore the terminal, and exit directly.
     {
         let mut o = stdout.lock().await;
-        if tui.is_some() {
+        if status.is_some() {
             // Release the scroll region and clear the status row.
             let reset = format!("\x1b[r\x1b[{rows};1H\x1b[2K");
             let _ = o.write_all(reset.as_bytes()).await;
@@ -1344,6 +1397,9 @@ where
     stdin_task.abort();
     winch_task.abort();
     writer_task.abort();
+    if let Some(t) = poll_task {
+        t.abort();
+    }
     drop(frame_tx);
     // Restore the terminal explicitly (its `Drop` would not run after the
     // `process::exit` below).
@@ -1363,6 +1419,7 @@ where
 pub async fn run_pty_client<R, W>(
     _reader: R, _writer: W, _aead_name: &str, _s2c_key: &[u8], _c2s_key: &[u8], _cmd: &str,
     _tui_status: Option<ConnStatus>,
+    _metrics: Option<std::sync::Arc<dyn crate::p2p::ConnMetrics>>,
 ) -> Result<()> {
     Err(CryptoError::Parameter("the P2P shell client is only supported on unix".into()))
 }
