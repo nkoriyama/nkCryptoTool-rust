@@ -21,6 +21,18 @@
 
 Rust版は、C++版の設計思想を継承しつつ、Rustのメモリ安全性とTokioによる高性能な非同期パイプラインを組み合わせて再構築されました。
 
+## **デモ: 踏み台レス PQC P2P シェル**
+
+![踏み台レス PQC P2P シェルのデモ](./docs/p2p_shell_demo.gif)
+
+NAT 配下のホストへ**踏み台なし・ポート開放なし**でシェル接続する様子（bazzite x86_64 →
+nkwire arm64、実機ホールパンチ）。ステータスバーが接続経路・レイテンシ・暗号スイートを
+ライブ表示する: `●Direct P2P ｜ Latency:4ms ｜ P-256+ML-KEM-768 / AES-256-GCM`。
+
+- 使い方: [`P2P_SSH_USAGE_GUIDE.md`](./P2P_SSH_USAGE_GUIDE.md)
+- 他手段との比較: [`P2P_SHELL_COMPARISON.md`](./P2P_SHELL_COMPARISON.md)
+- 実証エビデンス: [`P2P_INTEROP_EVIDENCE.md`](./P2P_INTEROP_EVIDENCE.md)
+
 ## **主な機能**
 
 * **データの暗号化・復号**: 秘密の情報を安全にやり取りできます。
@@ -41,6 +53,11 @@ Rust版は、C++版の設計思想を継承しつつ、Rustのメモリ安全性
     * **PQC ハンドシェイク (V3.1)**: ML-KEM + ML-DSA による量子耐性。
     * **MITM 対策**: Ticket 形式に PQC 鍵指紋を統合し、中間者攻撃を検知。
     * **プロトコル分離**: ALPN によるチャットとファイル転送の安全な共存。
+* **踏み台レス PQC P2P シェル / ポートフォワード**: NAT 配下のホストへ踏み台・ポート開放
+  なしで対話シェル (`--shell`)・ローカル/リモートフォワード (`-L`/`-R`) を張る。ハイブリッド
+  P-256‖ML-KEM-768 KEM + ML-DSA-65 認証 (指紋ピンニング)、`--tui` でライブ接続バー、
+  MLS グループ連動の認可 (Phase 6)、監査ログ・レート制限を備える。
+  詳細は [`P2P_SSH_USAGE_GUIDE.md`](./P2P_SSH_USAGE_GUIDE.md)。
 * **グラフィカルユーザーインターフェース (GUI) のサポート**: Slint を用いた直感的な GUI を搭載。`--gui` オプションで起動可能で、QR コードのスキャンやチャット機能、ファイル転送をグラフィカルに実行できます。
 * **MLS (RFC 9420) グループチャット (オプション機能)**: `--features mls` で有効化。
   Ed25519 ‖ ML-DSA-65 + X25519 ‖ ML-KEM-768 (X-Wing) のハイブリッド PQC ciphersuite
