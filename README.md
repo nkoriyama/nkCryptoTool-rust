@@ -45,6 +45,14 @@ nkwire arm64、実機ホールパンチ）。ステータスバーが接続経�
 - scp 設計: [`P2P_SCP_DESIGN.md`](./P2P_SCP_DESIGN.md)
 - 他ファイル転送との比較: [`P2P_SCP_COMPARISON.md`](./P2P_SCP_COMPARISON.md)
 
+## **チケットを端末に QR 表示（外部ツール不要）**
+
+![端末に QR を表示するデモ](./docs/qr_demo.gif)
+
+`nkct --qr '<ticket>'`（または `… | nkct --qr -` で stdin）で、接続チケットを**その場で
+端末に QR 描画**する。同梱の `qrcode` クレートを使うので `qrencode` などの外部ツールは不要・
+オフラインで動く。サーバ起動時にも同じ QR が自動表示される。
+
 ## **主な機能**
 
 * **データの暗号化・復号**: 秘密の情報を安全にやり取りできます。
