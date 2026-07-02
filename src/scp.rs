@@ -501,13 +501,16 @@ where
             let mut f = tokio::fs::File::open(local)
                 .await
                 .map_err(|e| CryptoError::Parameter(format!("open {}: {e}", local.display())))?;
-            let mut buf = vec![0u8; CHUNK];
+            // Read straight into the frame plaintext buffer ([T_DATA] ‖ payload)
+            // and seal it in place — no per-chunk Data(to_vec()) + encode() copy.
+            let mut pt = vec![0u8; 1 + CHUNK];
+            pt[0] = T_DATA;
             loop {
-                let n = f.read(&mut buf).await.map_err(io_err)?;
+                let n = f.read(&mut pt[1..]).await.map_err(io_err)?;
                 if n == 0 {
                     break;
                 }
-                send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Data(buf[..n].to_vec())).await?;
+                send_packet(&mut writer, aead_name, tx_key, &mut tx, &pt[..1 + n]).await?;
             }
             send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Eof).await?;
 
@@ -779,15 +782,17 @@ where
 
             send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Meta { mode, size }).await?;
             let mut f = tokio::fs::File::from_std(file);
-            let mut buf = vec![0u8; CHUNK];
+            // Read straight into the frame plaintext buffer and seal in place.
+            let mut pt = vec![0u8; 1 + CHUNK];
+            pt[0] = T_DATA;
             let mut sent = 0u64;
             loop {
-                let n = f.read(&mut buf).await.map_err(io_err)?;
+                let n = f.read(&mut pt[1..]).await.map_err(io_err)?;
                 if n == 0 {
                     break;
                 }
                 sent += n as u64;
-                send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Data(buf[..n].to_vec())).await?;
+                send_packet(&mut writer, aead_name, tx_key, &mut tx, &pt[..1 + n]).await?;
             }
             send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Eof).await?;
             send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ok).await?;
