@@ -79,9 +79,15 @@ get ではクライアントの `Get{path, recursive}` の後サーバが送信�
 - **MkDir も open 後再検証**: 作成後に `canonicalize` して write ルート配下か再確認し、外れたら
   作成物を `rmdir` して拒否（`confine`→`create_dir` 間の中間 symlink すり替え TOCTOU 封じ。
   ファイルの `/proc/self/fd` 再検証と対をなす）。
-- **部分失敗**: エントリ毎に `Ack`/`Fail`。confine 拒否・stage/commit 失敗は `Fail`（バッチ継続、
-  ワイヤは一律 "denied"）。プロトコル違反（宣言 size 超過・想定外フレーム・ファイル途中で切断）は
-  致命でストリームを閉じる。per-file 拒否でもファイル本文は宣言 size を上限に消費してストリーム同期を保つ。
+- **部分失敗（＝パイプライン下の在庫の運命を明示）**: エントリ毎に `Ack`/`Fail`。confine 拒否・
+  stage/commit 失敗は `Fail`（ワイヤは一律 "denied"）で、**サーバはバッチを止めず次のエントリを
+  処理し続ける**＝ scp `-r` 互換の「エラーでも続行し最後に集計」。put はパイプライン送信なので
+  `Fail` 受信時点で後続は既に in-flight だが、続行方針なのでそのまま処理される（100 中 3 番目
+  拒否でも残り 97 は転送）。クライアントは各 `Fail` を `skipped` 表示し `done/total` を報告。監査
+  ログには拒否が 1 行ずつ残る（`scp fail: put …` 等）。**致命的エラー**（宣言 size 超過・ファイル
+  本文中の想定外フレーム・途中でのストリーム切断）だけはプロトコル違反として `Err`＋ストリーム
+  切断でバッチ全体を中断する。per-file 拒否でもファイル本文は宣言 size を上限に消費してストリーム
+  同期を保つ。詳細な実測は `P2P_SCP_PIPELINE_REPORT.md`。
 - **get 側のローカル配置**: サーバが送るのはツリー相対パス。クライアントは `safe_join`（絶対・`..`・
   root/prefix コンポーネントを拒否）でローカル base 配下に限定。
 - **非 Linux の限界**: 中間 symlink の open 後再検証（`/proc/self/fd`）は Linux 限定なのは単一
