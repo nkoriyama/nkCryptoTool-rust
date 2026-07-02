@@ -137,6 +137,29 @@ struct Args {
     #[arg(long)]
     forward_policy: Option<String>,
 
+    /// Run a P2P scp (file-transfer) server on ALPN `nkct/scp/1`. Prints a ticket;
+    /// pair with a client's `--scp-put`/`--scp-get --connect <ticket>`. Requires
+    /// `--scp-policy` (default deny) and refuses to run as root.
+    #[arg(long)]
+    serve_scp: bool,
+
+    /// scp client: upload LOCAL to remote absolute path REMOTE. Use with
+    /// `--connect <ticket>`. The remote must allow REMOTE's directory via `write=`
+    /// in its `--scp-policy`.
+    #[arg(long = "scp-put", num_args = 2, value_names = ["LOCAL", "REMOTE"])]
+    scp_put: Option<Vec<String>>,
+
+    /// scp client: download remote absolute path REMOTE to LOCAL. Use with
+    /// `--connect <ticket>`. The remote must allow REMOTE via `read=` in its
+    /// `--scp-policy`.
+    #[arg(long = "scp-get", num_args = 2, value_names = ["REMOTE", "LOCAL"])]
+    scp_get: Option<Vec<String>>,
+
+    /// scp server authorization policy file: lines of
+    /// `<sha3-256-hex>  read="r1, r2"  write="w1"  [user=NAME]`. Default deny.
+    #[arg(long)]
+    scp_policy: Option<String>,
+
     #[arg(
         long,
         help = "Allow unauthenticated connections (SECURITY WARNING: Default is false since v49)"
@@ -483,6 +506,8 @@ async fn main() -> anyhow::Result<()> {
         Operation::Listen
     } else if args.serve_forward {
         Operation::Listen
+    } else if args.serve_scp {
+        Operation::Listen
     } else if args.listen.is_some() {
         Operation::Listen
     } else if args.connect.is_some() {
@@ -560,6 +585,16 @@ async fn main() -> anyhow::Result<()> {
     config.forward_specs = args.forward;
     config.remote_forward_specs = args.remote_forward;
     config.forward_policy_path = args.forward_policy;
+    // scp (file transfer). `--scp-put LOCAL REMOTE` / `--scp-get REMOTE LOCAL`
+    // each arrive as an exactly-2 Vec from clap (`num_args = 2`).
+    config.scp_put = args.scp_put.as_ref().map(|v| (std::path::PathBuf::from(&v[0]), v[1].clone()));
+    config.scp_get = args.scp_get.as_ref().map(|v| (v[0].clone(), std::path::PathBuf::from(&v[1])));
+    config.serve_scp = args.serve_scp;
+    config.scp_policy_path = args.scp_policy;
+    config.scp_mode = args.serve_scp || config.scp_put.is_some() || config.scp_get.is_some();
+    if config.scp_put.is_some() && config.scp_get.is_some() {
+        anyhow::bail!("--scp-put and --scp-get are mutually exclusive");
+    }
     // Validate forward client specs early (fail fast on a bad spec) before any
     // network setup.
     for s in &config.forward_specs {
@@ -572,10 +607,13 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("bad --remote-forward {s:?}: {e}");
         }
     }
-    // The shell and forward modes drive different post-handshake paths; refuse to
-    // combine them in one invocation.
+    // The shell, forward and scp modes drive different post-handshake paths;
+    // refuse to combine them in one invocation.
     if config.shell_mode && config.forward_mode {
         anyhow::bail!("--shell/--serve-shell and --forward/--serve-forward are mutually exclusive");
+    }
+    if config.scp_mode && (config.shell_mode || config.forward_mode) {
+        anyhow::bail!("--serve-scp/--scp-put/--scp-get cannot be combined with shell or forward modes");
     }
     // Port forwarding is as authorization-sensitive as a shell (it reaches the
     // server's network): reject `--allow-unauth`, require an allowlist/pinned key
@@ -634,6 +672,40 @@ async fn main() -> anyhow::Result<()> {
             "refusing to run --serve-shell as root without --shell-policy: there is no \
              per-user privilege drop without a policy. Provide --shell-policy mapping \
              fingerprints to non-root users, or run as an unprivileged user."
+        );
+    }
+    // File transfer reaches the server's filesystem, so it is as
+    // authorization-sensitive as a shell: reject `--allow-unauth`, require an
+    // allowlist/pinned key, and require a default-deny policy to serve at all.
+    if config.scp_mode && args.allow_unauth {
+        anyhow::bail!(
+            "--allow-unauth is not permitted with --serve-scp/--scp-put/--scp-get; \
+             authenticate the peer (--peer-allowlist and/or --signing-pubkey)"
+        );
+    }
+    if args.serve_scp {
+        if args.peer_allowlist.is_none() && config.signing_pubkey.is_none() {
+            anyhow::bail!(
+                "--serve-scp requires --peer-allowlist <file> and/or --signing-pubkey <key> \
+                 to restrict who may transfer files"
+            );
+        }
+        if config.scp_policy_path.is_none() {
+            anyhow::bail!(
+                "--serve-scp requires --scp-policy <file> (default deny); without it no \
+                 path is readable or writable"
+            );
+        }
+    }
+    // The scp server has no per-request privilege drop yet, so every file
+    // operation runs as the server's user. Running it as root would let a peer
+    // read/write anywhere the policy roots point (which root can always reach),
+    // so refuse root outright — run as the intended unprivileged user instead.
+    #[cfg(unix)]
+    if args.serve_scp && unsafe { libc::geteuid() == 0 || libc::getuid() == 0 } {
+        anyhow::bail!(
+            "refusing to run --serve-scp as root: file transfer has no per-user privilege \
+             drop yet, so run it as the unprivileged user that should own the transferred files."
         );
     }
     config.allow_unauth = args.allow_unauth;

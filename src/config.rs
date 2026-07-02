@@ -186,6 +186,20 @@ pub struct CryptoConfig {
     /// Forward server authorization policy file (`--forward-policy`): maps peer
     /// fingerprints to allowed `host:port` targets. Default deny.
     pub forward_policy_path: Option<String>,
+    /// P2P scp mode (ALPN_SCP). Mutually exclusive with chat/file/shell/forward.
+    /// True for both the scp client (`--scp-put`/`--scp-get`) and server.
+    pub scp_mode: bool,
+    /// This node will *serve* file transfer (`--serve-scp`). Only when true does
+    /// an inbound scp-ALPN connection read/write files (per policy). Requires
+    /// `--scp-policy` and refuses to run as root.
+    pub serve_scp: bool,
+    /// scp client upload spec: `(local, remote)` from `--scp-put LOCAL REMOTE`.
+    pub scp_put: Option<(std::path::PathBuf, String)>,
+    /// scp client download spec: `(remote, local)` from `--scp-get REMOTE LOCAL`.
+    pub scp_get: Option<(String, std::path::PathBuf)>,
+    /// scp server authorization policy file (`--scp-policy`): maps peer
+    /// fingerprints to allowed read/write roots. Default deny.
+    pub scp_policy_path: Option<String>,
     pub allow_unauth: bool,
     pub force: bool,
     pub handshake_timeout: u64,
@@ -260,6 +274,11 @@ impl Default for CryptoConfig {
             forward_specs: Vec::new(),
             remote_forward_specs: Vec::new(),
             forward_policy_path: None,
+            scp_mode: false,
+            serve_scp: false,
+            scp_put: None,
+            scp_get: None,
+            scp_policy_path: None,
             allow_unauth: false,
             force: false,
             handshake_timeout: 15,

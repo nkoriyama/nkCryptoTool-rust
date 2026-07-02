@@ -189,9 +189,11 @@ impl NetworkProcessor {
                 // Set the mode exclusively from the ALPN.
                 let shell_allowed = config.serve_shell;
                 let forward_allowed = config.serve_forward;
+                let scp_allowed = config.serve_scp;
                 config.shell_mode = false;
                 config.chat_mode = false;
                 config.forward_mode = false;
+                config.scp_mode = false;
                 if incoming.protocol.0 == ALPN_CHAT {
                     config.chat_mode = true;
                 } else if incoming.protocol.0 == ALPN_FILE {
@@ -208,6 +210,12 @@ impl NetworkProcessor {
                         return;
                     }
                     config.forward_mode = true;
+                } else if incoming.protocol.0 == crate::network::ALPN_SCP {
+                    if !scp_allowed {
+                        eprintln!("Rejecting nkct/scp/1: this node is not an scp server");
+                        return;
+                    }
+                    config.scp_mode = true;
                 } else {
                     eprintln!("Unknown ALPN: {:?}", String::from_utf8_lossy(incoming.protocol.0));
                     return;
@@ -300,9 +308,11 @@ impl NetworkProcessor {
         let mut config = self.config.clone();
         let shell_allowed = config.serve_shell;
         let forward_allowed = config.serve_forward;
+        let scp_allowed = config.serve_scp;
         config.shell_mode = false;
         config.chat_mode = false;
         config.forward_mode = false;
+        config.scp_mode = false;
         if incoming.protocol.0 == ALPN_CHAT {
             config.chat_mode = true;
         } else if incoming.protocol.0 == ALPN_FILE {
@@ -321,6 +331,13 @@ impl NetworkProcessor {
                 ));
             }
             config.forward_mode = true;
+        } else if incoming.protocol.0 == crate::network::ALPN_SCP {
+            if !scp_allowed {
+                return Err(CryptoError::Parameter(
+                    "scp (nkct/scp/1) is not enabled on this node".to_string(),
+                ));
+            }
+            config.scp_mode = true;
         } else {
             return Err(CryptoError::Parameter(format!(
                 "Unknown ALPN: {:?}", String::from_utf8_lossy(incoming.protocol.0)
@@ -584,6 +601,23 @@ impl NetworkProcessor {
                 config.audit_log_path.as_deref(),
             )
             .await?;
+        } else if config.scp_mode {
+            // P2P scp server: policy-gated, path-confined file transfer. The
+            // authenticated fingerprint keys the scp policy / audit.
+            let fp = shell_peer_fp.ok_or_else(|| {
+                CryptoError::Parameter("scp requires an authenticated peer".to_string())
+            })?;
+            crate::scp::run_scp_server(
+                reader,
+                writer,
+                &config.aead_algo,
+                &s2c_key,
+                &c2s_key,
+                fp,
+                config.scp_policy_path.as_deref(),
+                config.audit_log_path.as_deref(),
+            )
+            .await?;
         } else if config.chat_mode {
             let stdin = io_provider.stdin();
             let stdout = Arc::new(tokio::sync::Mutex::new(io_provider.stdout()));
@@ -656,6 +690,8 @@ impl NetworkProcessor {
             crate::network::ALPN_SHELL
         } else if config.forward_mode {
             crate::network::ALPN_FWD
+        } else if config.scp_mode {
+            crate::network::ALPN_SCP
         } else if config.chat_mode {
             ALPN_CHAT
         } else {
@@ -954,6 +990,26 @@ impl NetworkProcessor {
                         &s2c_key,
                         &c2s_key,
                         &specs,
+                    )
+                    .await
+                } else if config.scp_mode {
+                    // P2P scp client: one put or get, then return.
+                    let op = if let Some((local, remote)) = &config.scp_put {
+                        crate::scp::ScpOp::Put { local: local.clone(), remote: remote.clone() }
+                    } else if let Some((remote, local)) = &config.scp_get {
+                        crate::scp::ScpOp::Get { remote: remote.clone(), local: local.clone() }
+                    } else {
+                        return Err(CryptoError::Parameter(
+                            "scp client requires --scp-put or --scp-get".to_string(),
+                        ));
+                    };
+                    crate::scp::run_scp_client(
+                        reader,
+                        writer,
+                        &config.aead_algo,
+                        &s2c_key,
+                        &c2s_key,
+                        &op,
                     )
                     .await
                 } else if config.chat_mode {

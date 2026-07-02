@@ -486,7 +486,7 @@ pub(crate) fn parse_fp_hex(s: &str) -> Option<[u8; 32]> {
 }
 
 /// Extract the whitespace-terminated value of `key` (e.g. `user=`) from `rest`.
-fn extract_kv<'a>(rest: &'a str, key: &str) -> Option<&'a str> {
+pub(crate) fn extract_kv<'a>(rest: &'a str, key: &str) -> Option<&'a str> {
     let i = rest.find(key)? + key.len();
     let v = &rest[i..];
     Some(v.split(char::is_whitespace).next().unwrap_or(v))

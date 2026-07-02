@@ -35,6 +35,10 @@ pub const ALPN_SHELL: &[u8] = b"nkct/shell/1";
 /// One connection multiplexes many TCP streams as channels; see
 /// [`crate::forward`].
 pub const ALPN_FWD: &[u8] = b"nkct/fwd/1";
+/// P2P scp (bastion-less file transfer; see `P2P_SCP_DESIGN.md`). Carries a
+/// single get/put request per connection, policy-gated and path-confined; see
+/// [`crate::scp`].
+pub const ALPN_SCP: &[u8] = b"nkct/scp/1";
 /// MLS group chat ALPN (P4). Each accepted stream under this protocol
 /// carries exactly one length-prefixed `mls_rs::MlsMessage` per the
 /// [`crate::group::transport`] framing helpers — Welcome / Commit /
