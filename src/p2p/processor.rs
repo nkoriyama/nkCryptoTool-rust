@@ -88,11 +88,7 @@ impl NetworkProcessor {
     pub async fn start(&self) -> Result<()> {
         self.start_with_ticket_callback(|ticket| {
             eprintln!("[nkct] Ticket: {}", ticket);
-            if let Ok(code) = qrcode::QrCode::new(ticket.to_string().as_bytes()) {
-                let image = code.render::<qrcode::render::unicode::Dense1x2>()
-                    .dark_color(qrcode::render::unicode::Dense1x2::Light)
-                    .light_color(qrcode::render::unicode::Dense1x2::Dark)
-                    .build();
+            if let Some(image) = crate::utils::render_qr_unicode(&ticket.to_string()) {
                 eprintln!("\n[nkct] Scan QR to connect:\n{}", image);
             }
         }).await

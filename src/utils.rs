@@ -14,6 +14,21 @@ use std::ops::{Deref, DerefMut};
 
 use std::path::Path;
 
+/// Render `text` as a terminal-friendly QR code (unicode half-blocks), or
+/// `None` if `text` is too large to fit in a QR symbol. Colors are inverted
+/// (modules light / background dark) so the code scans on a dark terminal.
+/// Shared by the server ticket display and the `--qr` command; no external
+/// tool (`qrencode` etc.) required.
+pub fn render_qr_unicode(text: &str) -> Option<String> {
+    let code = qrcode::QrCode::new(text.as_bytes()).ok()?;
+    Some(
+        code.render::<qrcode::render::unicode::Dense1x2>()
+            .dark_color(qrcode::render::unicode::Dense1x2::Light)
+            .light_color(qrcode::render::unicode::Dense1x2::Dark)
+            .build(),
+    )
+}
+
 /// True if the PEM file at `path` holds a passphrase-encrypted private
 /// key (a PKCS#8 `EncryptedPrivateKeyInfo`). Note the encrypted form may
 /// still carry the plain `-----BEGIN PRIVATE KEY-----` label, so the

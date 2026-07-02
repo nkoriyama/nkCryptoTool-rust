@@ -165,6 +165,12 @@ struct Args {
     #[arg(short = 'r', long = "recursive")]
     recursive: bool,
 
+    /// Render TEXT (e.g. a `nkct1...` ticket) as a terminal QR code to stdout and
+    /// exit. Self-contained — no external `qrencode`. Use `--qr -` to read the
+    /// text from stdin instead of the command line (keeps it out of `ps`).
+    #[arg(long, value_name = "TEXT")]
+    qr: Option<String>,
+
     #[arg(
         long,
         help = "Allow unauthenticated connections (SECURITY WARNING: Default is false since v49)"
@@ -428,6 +434,32 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "gui")]
     if args.gui {
         return nk_crypto_tool::gui::run_gui().await.map_err(|e| anyhow::anyhow!(e.to_string()));
+    }
+
+    // Standalone QR encoder: render any string (typically a ticket) as a
+    // terminal QR and exit. Self-contained (uses the bundled `qrcode` crate),
+    // so `nkct --serve-… | grep Ticket` can be re-shown as a QR without any
+    // external tool, and it works offline.
+    if let Some(text) = args.qr.as_deref() {
+        // `--qr -` reads the text from stdin so a ticket need not appear in the
+        // process argument list (`ps`). Note a ticket is a shareable connection
+        // address, not a credential — auth is by pinned key (a file path, never
+        // on argv) — so this is a courtesy, not a hard requirement.
+        let text: String = if text == "-" {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
+                .map_err(|e| anyhow::anyhow!("read --qr text from stdin: {e}"))?;
+            s.trim().to_string()
+        } else {
+            text.to_string()
+        };
+        match nk_crypto_tool::utils::render_qr_unicode(&text) {
+            Some(img) => {
+                println!("{img}");
+                return Ok(());
+            }
+            None => anyhow::bail!("string is too long to encode as a QR code"),
+        }
     }
 
     // ----------------------------------------------------------------
