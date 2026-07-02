@@ -171,12 +171,13 @@ struct Args {
     transport: nk_crypto_tool::config::TransportKind,
 
     /// Dynamic peer discovery (iroh). `none` (default) reaches a node only via
-    /// the addresses/relay in its ticket. `local` enables mDNS local-network
-    /// discovery so a NodeId resolves to its current LAN addresses even when a
-    /// ticket's addresses go stale (e.g. after an IP change) — useful for the
-    /// async inbox/prekey flow under --no-relay. Presence is advertised on the
-    /// local segment only, never to a public service. NOTE: `local` is
-    /// temporarily unsupported on iroh 1.0 and currently errors at startup.
+    /// the addresses/relay in its ticket — most private, but works across NAT
+    /// only on a shared LAN or with out-of-band ticket exchange. `n0` publishes
+    /// to / resolves from Number 0's public DNS (pkarr): required for reliable
+    /// reachability across real NATs / cloud VPS (relay + hole-punch need the
+    /// node discoverable), at the cost of a third-party (n0 DNS) observation
+    /// point. `local` (mDNS) is temporarily unsupported on iroh 1.0 and errors
+    /// at startup.
     #[arg(long, value_enum, default_value = "none")]
     discovery: nk_crypto_tool::config::DiscoveryMode,
 

@@ -244,7 +244,36 @@ impl IrohEndpoint {
     /// so the integration test suite does not depend on the public
     /// relay network.
     pub async fn new(config: &CryptoConfig, is_test: bool) -> Result<Self> {
-        let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal).alpns(vec![
+        // Discovery selects the endpoint preset:
+        //   `None`  → `Minimal` (crypto provider only): ticket-only reachability,
+        //             no presence published — the private default.
+        //   `N0`    → `N0` (adds a pkarr publisher + n0 DNS lookup): publishes to
+        //             and resolves via n0's public DNS. Required for reachability
+        //             across real NATs / cloud firewalls — relay and hole-punch
+        //             coordination need the node discoverable, which ticket-only
+        //             `None` does not provide beyond a shared LAN (verified: an
+        //             OCI VPS is unreachable under `None`, connects with a direct
+        //             hole-punch under `N0`). Costs a third-party (n0 DNS)
+        //             observation point.
+        //   `Local` → mDNS, not yet available on iroh 1.0 (see DiscoveryMode).
+        // The relay mode a preset may set is overridden unconditionally below.
+        let preset_builder = match config.discovery {
+            crate::config::DiscoveryMode::None => {
+                Endpoint::builder(iroh::endpoint::presets::Minimal)
+            }
+            crate::config::DiscoveryMode::N0 => {
+                Endpoint::builder(iroh::endpoint::presets::N0)
+            }
+            crate::config::DiscoveryMode::Local => {
+                return Err(CryptoError::Parameter(
+                    "--discovery local (mDNS) is not yet supported on the iroh 1.0 \
+                     transport. Use --discovery none (ticket-only, LAN / out-of-band) \
+                     or --discovery n0 (n0 DNS/pkarr, cross-NAT) for now."
+                        .to_string(),
+                ));
+            }
+        };
+        let mut builder = preset_builder.alpns(vec![
             ALPN_CHAT.to_vec(),
             ALPN_FILE.to_vec(),
             ALPN_MLS.to_vec(),
@@ -270,32 +299,12 @@ impl IrohEndpoint {
                 iroh_relay::RelayMap::from(relay_url),
             ));
         } else {
-            // The `Minimal` preset sets no relay mode, so restore the
-            // historical default (n0 public relays) when none is configured.
+            // Set the relay mode explicitly regardless of preset (`Minimal` sets
+            // none; `N0` already sets this): the historical default is n0 public
+            // relays when neither `--no-relay` nor `--relay-url` is given.
             builder = builder.relay_mode(iroh::endpoint::default_relay_mode());
         }
 
-        // Dynamic peer discovery. Default `None` keeps the historical
-        // ticket-only reachability (no presence advertised).
-        //
-        // `Local` (mDNS) is temporarily unsupported on iroh 1.0: 1.0 removed
-        // local-network discovery from core (only dns/memory/pkarr address
-        // lookups remain) and no iroh-1.0 mDNS adapter crate exists yet.
-        // Re-implementation over `swarm-discovery` is tracked separately. We
-        // fail loudly rather than silently downgrading to `None`, so a user
-        // who asked for LAN self-healing is never misled into thinking it is
-        // active.
-        match config.discovery {
-            crate::config::DiscoveryMode::None => {}
-            crate::config::DiscoveryMode::Local => {
-                return Err(CryptoError::Parameter(
-                    "--discovery local (mDNS) is not yet supported on the iroh 1.0 \
-                     transport. Use --discovery none for now; LAN mDNS discovery \
-                     re-implementation is tracked as a follow-up."
-                        .to_string(),
-                ));
-            }
-        }
 
         let endpoint = builder
             .bind()

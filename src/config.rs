@@ -73,6 +73,20 @@ pub enum DiscoveryMode {
     /// yet). Selecting it currently fails loudly at endpoint construction;
     /// re-implementation over `swarm-discovery` is tracked as a follow-up.
     Local,
+    /// n0 public discovery (DNS/pkarr): publish this node's address to, and
+    /// resolve peers from, Number 0's public DNS server (`iroh.link`). This is
+    /// what makes reachability work across real NATs / cloud firewalls: relay
+    /// and hole-punch coordination need the node to be discoverable, which the
+    /// ticket-only `None` mode does not provide beyond a shared LAN (verified on
+    /// an OCI VPS — `None` could not be reached, `n0` connects with a direct
+    /// hole-punch).
+    ///
+    /// TRADE-OFF: presence is published to a third-party (n0) DNS service, so
+    /// this is NOT the "zero third-party observation point" posture of `None`.
+    /// Choose `n0` for reachability across networks, `none` for maximum privacy
+    /// on a shared LAN / with out-of-band ticket exchange.
+    #[value(name = "n0")]
+    N0,
 }
 
 impl Default for DiscoveryMode {
