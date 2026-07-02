@@ -43,6 +43,7 @@ nkwire arm64、実機ホールパンチ）。ステータスバーが接続経�
 単位の read/write ポリシーとパス confinement 付き。put→ローカル削除→get で往復を実証している。
 
 - scp 設計: [`P2P_SCP_DESIGN.md`](./P2P_SCP_DESIGN.md)
+- 他ファイル転送との比較: [`P2P_SCP_COMPARISON.md`](./P2P_SCP_COMPARISON.md)
 
 ## **主な機能**
 

@@ -1,7 +1,8 @@
 # P2P シェル／到達手段の比較
 
 NAT/CGNAT 配下のホストへ「踏み台なし・ポート開放なし」で到達し、対話シェルを
-張る各手段の比較。
+張る各手段の比較。**ファイル転送**（scp/rsync/croc/wormhole/sendme との比較）は
+[`P2P_SCP_COMPARISON.md`](./P2P_SCP_COMPARISON.md)。
 
 > 本表は**設計説明**。実証面（自動テスト・クロスバックエンド相互運用・実機相互接続・
 > 今後の NAT 越え成功率/遅延計測）は [`P2P_INTEROP_EVIDENCE.md`](./P2P_INTEROP_EVIDENCE.md) を参照。
