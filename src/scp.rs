@@ -765,36 +765,52 @@ where
             }
 
             let total = entries.iter().filter(|e| e.local.is_some()).count();
-            let mut done = 0usize;
-            let mut file_id = 0u32;
-            for e in &entries {
-                file_id += 1;
-                match &e.local {
-                    None => {
-                        send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::MkDir { file_id, path: e.remote.clone(), mode: e.mode }).await?;
-                    }
-                    Some(path) => {
-                        send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Put { file_id, path: e.remote.clone(), mode: e.mode, size: e.size }).await?;
-                        let mut f = tokio::fs::File::open(path)
-                            .await
-                            .map_err(|er| CryptoError::Parameter(format!("open {}: {er}", path.display())))?;
-                        stream_bytes(&mut writer, aead_name, tx_key, &mut tx, file_id, &mut f).await?;
-                    }
-                }
-                match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
-                    Some(ScpFrame::Ack { .. }) => {
-                        if e.local.is_some() {
-                            done += 1;
+            // Pipeline: stream every entry (+ Done) and collect the per-entry acks
+            // concurrently over the two independent stream halves, instead of
+            // blocking for each file's ack before sending the next. On a
+            // high-latency link this removes one round-trip per file (the whole
+            // point of many-small-files transfer); on loopback it is a no-op.
+            // Acks arrive in send order over the single ordered stream, so the
+            // i-th ack pairs with the i-th entry (the file_id confirms it).
+            let sender = async {
+                let mut file_id = 0u32;
+                for e in &entries {
+                    file_id += 1;
+                    match &e.local {
+                        None => {
+                            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::MkDir { file_id, path: e.remote.clone(), mode: e.mode }).await?;
+                        }
+                        Some(path) => {
+                            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Put { file_id, path: e.remote.clone(), mode: e.mode, size: e.size }).await?;
+                            let mut f = tokio::fs::File::open(path)
+                                .await
+                                .map_err(|er| CryptoError::Parameter(format!("open {}: {er}", path.display())))?;
+                            stream_bytes(&mut writer, aead_name, tx_key, &mut tx, file_id, &mut f).await?;
                         }
                     }
-                    Some(ScpFrame::Fail { msg, .. }) => {
-                        eprintln!("[nkct] skipped {}: {msg}", e.remote);
-                    }
-                    Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp put refused: {m}"))),
-                    other => return Err(CryptoError::Parameter(format!("scp put: unexpected reply {other:?}"))),
                 }
-            }
-            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Done).await?;
+                send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Done).await?;
+                Ok::<(), CryptoError>(())
+            };
+            let collector = async {
+                let mut done = 0usize;
+                for e in &entries {
+                    match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
+                        Some(ScpFrame::Ack { .. }) => {
+                            if e.local.is_some() {
+                                done += 1;
+                            }
+                        }
+                        Some(ScpFrame::Fail { msg, .. }) => {
+                            eprintln!("[nkct] skipped {}: {msg}", e.remote);
+                        }
+                        Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp put refused: {m}"))),
+                        other => return Err(CryptoError::Parameter(format!("scp put: unexpected reply {other:?}"))),
+                    }
+                }
+                Ok::<usize, CryptoError>(done)
+            };
+            let ((), done) = tokio::try_join!(sender, collector)?;
             let _ = writer.shutdown().await;
             if *recursive {
                 eprintln!("[nkct] uploaded {done}/{total} files → {remote}");
