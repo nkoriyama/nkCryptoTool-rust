@@ -1,4 +1,5 @@
 /target
+/target-musl
 /target_rustcrypto
 /target_vendored
 
