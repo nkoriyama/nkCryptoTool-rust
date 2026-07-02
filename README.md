@@ -33,6 +33,17 @@ nkwire arm64、実機ホールパンチ）。ステータスバーが接続経�
 - 他手段との比較: [`P2P_SHELL_COMPARISON.md`](./P2P_SHELL_COMPARISON.md)
 - 実証エビデンス: [`P2P_INTEROP_EVIDENCE.md`](./P2P_INTEROP_EVIDENCE.md)
 
+## **デモ: 踏み台レス PQC P2P シェル + ファイル転送 (scp)**
+
+![PQC P2P の ssh + scp デモ](./docs/p2p_ssh_scp_demo.gif)
+
+同じ PQC 認証 P2P トランスポート上で、**対話リモートシェル**（`p2p ssh` で `remote:~$`
+プロンプトに入り ls / cat / id / uname を実行）と**ファイル転送**（`p2p scp`）を行う様子。
+各接続が `Server authenticated successfully (auth: ML-DSA-65)` を示し、scp は fingerprint
+単位の read/write ポリシーとパス confinement 付き。put→ローカル削除→get で往復を実証している。
+
+- scp 設計: [`P2P_SCP_DESIGN.md`](./P2P_SCP_DESIGN.md)
+
 ## **主な機能**
 
 * **データの暗号化・復号**: 秘密の情報を安全にやり取りできます。
