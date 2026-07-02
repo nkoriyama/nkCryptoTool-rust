@@ -26,7 +26,7 @@
 
 use crate::error::{CryptoError, Result};
 use crate::shell::{
-    audit, audit_best_effort, extract_kv, extract_quoted_span, io_err, parse_fp_hex, rate_limited,
+    audit, audit_best_effort, extract_kv, extract_quoted_span, io_err, parse_fp_hex,
     recv_packet, role_keys, send_packet,
 };
 use std::collections::HashMap;
@@ -613,12 +613,10 @@ where
     let (rx_key, tx_key) = role_keys(s2c_key, c2s_key, true);
     let (mut rx, mut tx) = (0u64, 0u64);
 
-    if rate_limited(&peer_fp) {
-        audit_best_effort(audit_path, &peer_fp, "scp deny: rate limited").await;
-        let _ = send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Err("rate limited; try again shortly".into())).await;
-        drain_until_close(&mut reader).await;
-        return Err(CryptoError::Parameter("scp: rate limited".into()));
-    }
+    // No per-operation throttle: an authenticated, policy-allowed client copying
+    // several files in a row is normal use. Brute-force is limited on the
+    // handshake failure path (see `crate::shell::auth_failure_blocked`);
+    // concurrency is bounded by the accept semaphore.
 
     // A policy is mandatory for the server (enforced at startup); default deny.
     let policy = match policy_path {

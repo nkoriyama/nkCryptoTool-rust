@@ -509,29 +509,86 @@ pub(crate) fn fp_hex(fp: &[u8; 32]) -> String {
     fp.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Per-fingerprint connection rate limit: reject a new shell within
-/// `SHELL_RATE_WINDOW` of the previous attempt by the same fingerprint.
-const SHELL_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+/// Auth-failure throttle — a flood / retry-storm dampener on the *handshake
+/// failure* path, keyed by the peer's transport **NodeId** (the one identifier
+/// we have before application authentication runs). That NodeId is authenticated
+/// by the QUIC/TLS transport (it is the peer's ed25519 key, proven during
+/// connection setup), so a peer cannot present another's — a failure only ever
+/// counts against the actual connecting node, never a spoofed victim.
+///
+/// Deliberately **separate from any limit on authenticated operations**: a peer
+/// that has proven its identity (pinned key / allowlist) may then open sessions
+/// or transfer files as fast as the concurrency semaphore allows — only *failed*
+/// handshakes are counted. Conflating the two (the old per-fingerprint 2 s
+/// window applied *post*-auth) throttled legitimate use, e.g. a client copying
+/// several files in a row over scp.
+///
+/// Scope, honestly: unlike password SSH there is **no secret to brute-force** —
+/// authentication is a public-key match, so a wrong key is rejected
+/// deterministically and cheaply. This throttle therefore targets *resource
+/// floods*, not credential guessing, and it only bites a peer that **reuses its
+/// NodeId** (a long-lived process reconnecting, the prekey/inbox flow). A
+/// process-per-transfer CLI attacker mints a fresh NodeId each time and slips
+/// past — but each attempt is still rejected cheaply by the pinned key /
+/// allowlist, and total concurrency is bounded by the accept semaphore.
+const AUTH_FAIL_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+/// Failed handshakes allowed from one NodeId within the window before it is
+/// temporarily blocked.
+const AUTH_FAIL_MAX: u32 = 8;
+/// Hard cap on tracked NodeIds. A flood of *distinct* NodeIds must not grow the
+/// map without bound or make cleanup expensive, so we only scan when over this
+/// cap and, if a live flood keeps it over cap, drop tracking entirely (fail-open
+/// — this is a dampener; the accept semaphore is the real concurrency bound).
+const AUTH_FAIL_MAX_TRACKED: usize = 4096;
 
-pub(crate) fn rate_limited(fp: &[u8; 32]) -> bool {
-    use std::sync::Mutex;
-    use std::time::Instant;
-    static LAST: Mutex<Option<std::collections::HashMap<[u8; 32], Instant>>> = Mutex::new(None);
-    // Recover from a poisoned lock instead of propagating the panic, so one
-    // panicking caller can't wedge rate limiting (and thus all shell auth) for
-    // the life of the process.
-    let mut guard = LAST.lock().unwrap_or_else(|e| e.into_inner());
-    let map = guard.get_or_insert_with(std::collections::HashMap::new);
-    let now = Instant::now();
-    // Evict entries past the window so the map stays bounded by the number of
-    // fingerprints active *within* the window (a flood of distinct fingerprints
-    // can't grow it without bound).
-    map.retain(|_, t| now.duration_since(*t) < SHELL_RATE_WINDOW);
-    if map.contains_key(fp) {
-        return true;
+/// `NodeId -> (failure_count, window_start)`, shared by [`note_auth_failure`] and
+/// [`auth_failure_blocked`]. `None` until first use.
+static AUTH_FAILURES: std::sync::Mutex<
+    Option<std::collections::HashMap<[u8; 32], (u32, std::time::Instant)>>,
+> = std::sync::Mutex::new(None);
+
+/// Amortized cleanup: an O(N) scan only when the map has grown past the cap, so
+/// the common path stays O(1). Called from the write path only.
+fn prune_auth_failures(
+    map: &mut std::collections::HashMap<[u8; 32], (u32, std::time::Instant)>,
+    now: std::time::Instant,
+) {
+    if map.len() <= AUTH_FAIL_MAX_TRACKED {
+        return;
     }
-    map.insert(*fp, now);
-    false
+    map.retain(|_, (_, start)| now.duration_since(*start) < AUTH_FAIL_WINDOW);
+    if map.len() > AUTH_FAIL_MAX_TRACKED {
+        // Still over cap under a live distinct-NodeId flood: bound memory by
+        // dropping tracking. Rotating-NodeId attempts are rejected cheaply by the
+        // pinned key / allowlist anyway.
+        map.clear();
+    }
+}
+
+/// Record one failed handshake/authentication from `node` (its transport NodeId).
+pub(crate) fn note_auth_failure(node: &[u8; 32]) {
+    let now = std::time::Instant::now();
+    // Recover from a poisoned lock rather than propagating the panic, so one
+    // panicking caller can't wedge auth throttling for the life of the process.
+    let mut guard = AUTH_FAILURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    prune_auth_failures(map, now);
+    let e = map.entry(*node).or_insert((0, now));
+    if now.duration_since(e.1) >= AUTH_FAIL_WINDOW {
+        *e = (0, now); // window rolled: reset the counter
+    }
+    e.0 = e.0.saturating_add(1);
+}
+
+/// True if `node` has reached [`AUTH_FAIL_MAX`] failed handshakes *within the
+/// current window*. The window is checked inline (no map scan), so this stays
+/// O(1) and a stale over-threshold entry never falsely blocks a peer.
+pub(crate) fn auth_failure_blocked(node: &[u8; 32]) -> bool {
+    let now = std::time::Instant::now();
+    let mut guard = AUTH_FAILURES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(std::collections::HashMap::new);
+    map.get(node)
+        .is_some_and(|(count, start)| *count >= AUTH_FAIL_MAX && now.duration_since(*start) < AUTH_FAIL_WINDOW)
 }
 
 /// Append one line to the audit log, off the async runtime thread. Returns the
@@ -757,13 +814,9 @@ where
     let (rx_key, tx_key) = role_keys(s2c_key, c2s_key, true);
     let (mut rx_ctr, mut tx_ctr) = (0u64, 0u64);
 
-    // Per-fingerprint rate limit before doing any work.
-    if rate_limited(&peer_fp) {
-        audit_best_effort(audit_path, &peer_fp, "deny: rate limited").await;
-        let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
-            &Frame::Error("rate limited; try again shortly".into())).await;
-        return Err(CryptoError::Parameter("shell: rate limited".into()));
-    }
+    // No per-operation throttle here: this peer is already authenticated, and
+    // concurrency is bounded by the accept semaphore. Brute-force protection
+    // lives on the handshake failure path (see `auth_failure_blocked`).
 
     // First frame must be OPEN.
     let (cols, rows, term, cmd) =
@@ -1495,6 +1548,31 @@ pub async fn run_pty_client<R, W>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_failure_blocks_only_after_threshold() {
+        // Unique NodeId so the process-global map doesn't collide with other tests.
+        let node = {
+            let mut n = [0u8; 32];
+            n[0] = 0xA1;
+            n[1..9].copy_from_slice(&(std::process::id() as u64).to_be_bytes());
+            n
+        };
+        // A fresh NodeId is not blocked.
+        assert!(!auth_failure_blocked(&node));
+        // Below the threshold: still allowed.
+        for _ in 0..(AUTH_FAIL_MAX - 1) {
+            note_auth_failure(&node);
+        }
+        assert!(!auth_failure_blocked(&node), "must allow up to the threshold");
+        // Reaching the threshold blocks.
+        note_auth_failure(&node);
+        assert!(auth_failure_blocked(&node), "must block at the threshold");
+        // A different NodeId is unaffected (per-peer, not global).
+        let mut other = node;
+        other[0] = 0xB2;
+        assert!(!auth_failure_blocked(&other));
+    }
 
     #[test]
     fn status_render_positions_and_colours() {

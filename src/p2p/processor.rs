@@ -380,8 +380,19 @@ impl NetworkProcessor {
         let (mut reader, mut writer) = tokio::io::split(stream);
         let mut peer_id_opt: Option<PeerId> = None;
         let handshake_timeout = Duration::from_secs(config.handshake_timeout);
-        
-        let handshake_result = tokio::time::timeout(handshake_timeout, async {
+
+        // Auth-failure throttle (keyed by the transport NodeId, which we have
+        // before app-auth runs): if this peer has failed too many handshakes
+        // recently, refuse before doing any handshake work. Distinct from any
+        // limit on *authenticated* operations — see `crate::shell`.
+        let remote_node = *remote_peer_id.as_bytes();
+        if crate::shell::auth_failure_blocked(&remote_node) {
+            return Err(CryptoError::Parameter(
+                "too many failed authentication attempts from this peer; try again shortly".to_string(),
+            ));
+        }
+
+        let handshake_outcome = tokio::time::timeout(handshake_timeout, async {
             let mut tb = TranscriptBuilder::new();
             tb.append_raw(remote_peer_id.as_bytes()); // #1 client id
             tb.append_raw(local_peer_id.as_bytes()); // #2 server id
@@ -524,7 +535,21 @@ impl NetworkProcessor {
             }
 
             Ok::<_, CryptoError>(keys)
-        }).await.map_err(|_| CryptoError::Parameter("Handshake timed out".to_string()))??;
+        }).await;
+
+        // Record any handshake/auth failure (or timeout) against this NodeId so a
+        // brute-force / retry storm is throttled at the next connection.
+        let handshake_result = match handshake_outcome {
+            Ok(Ok(keys)) => keys,
+            Ok(Err(e)) => {
+                crate::shell::note_auth_failure(&remote_node);
+                return Err(e);
+            }
+            Err(_) => {
+                crate::shell::note_auth_failure(&remote_node);
+                return Err(CryptoError::Parameter("Handshake timed out".to_string()));
+            }
+        };
 
         let (s2c_key, _s2c_iv, c2s_key, c2s_iv, peer_id) = handshake_result;
 

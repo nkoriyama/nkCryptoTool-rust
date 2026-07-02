@@ -49,7 +49,7 @@
 
 use crate::error::{CryptoError, Result};
 use crate::shell::{
-    audit, audit_best_effort, fp_hex, parse_fp_hex, rate_limited, recv_packet, role_keys,
+    audit, audit_best_effort, fp_hex, parse_fp_hex, recv_packet, role_keys,
     send_packet,
 };
 use std::collections::{HashMap, HashSet};
@@ -841,10 +841,9 @@ where
 {
     let (rx_key, tx_key) = role_keys(s2c_key, c2s_key, true);
 
-    if rate_limited(&peer_fp) {
-        audit_best_effort(audit_path, &peer_fp, "fwd deny: rate limited").await;
-        return Err(CryptoError::Parameter("forward: rate limited".into()));
-    }
+    // No per-operation throttle: the peer is authenticated and channel count is
+    // bounded by MAX_CHANNELS. Brute-force is limited on the handshake failure
+    // path (see `crate::shell::auth_failure_blocked`).
 
     let policy = match policy_path {
         Some(pp) => {
