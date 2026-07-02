@@ -1020,9 +1020,9 @@ impl NetworkProcessor {
                 } else if config.scp_mode {
                     // P2P scp client: one put or get, then return.
                     let op = if let Some((local, remote)) = &config.scp_put {
-                        crate::scp::ScpOp::Put { local: local.clone(), remote: remote.clone() }
+                        crate::scp::ScpOp::Put { local: local.clone(), remote: remote.clone(), recursive: config.scp_recursive }
                     } else if let Some((remote, local)) = &config.scp_get {
-                        crate::scp::ScpOp::Get { remote: remote.clone(), local: local.clone() }
+                        crate::scp::ScpOp::Get { remote: remote.clone(), local: local.clone(), recursive: config.scp_recursive }
                     } else {
                         return Err(CryptoError::Parameter(
                             "scp client requires --scp-put or --scp-get".to_string(),

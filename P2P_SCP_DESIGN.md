@@ -8,13 +8,13 @@
 
 ## 位置づけと非目標
 
-- **やること**: 単一ファイルの put（アップロード）/ get（ダウンロード）、`--scp-policy`
-  による read/write ルート認可、パス traversal / symlink escape の封じ込め、
-  認証付きアトミックコミット、監査ログ。
-- **やらないこと（次段）**: ディレクトリ再帰（`-r`）と `List`/`MkDir` フレーム、
-  `user=` による per-request 権限降格。フレーム集合は将来これらを足せる形に予約する
-  が、本増分では**未実装**。`--serve-scp` は root 実行を拒否し、ファイル I/O は常に
-  サーバ起動ユーザ権限で行う（＝権限境界は「起動ユーザ ∧ policy ルート」）。
+- **やること**: 単一ファイル＋**ディレクトリツリー（`-r`）**の put / get、`--scp-policy`
+  による read/write ルート認可、パス traversal / symlink escape の封じ込め（エントリ毎）、
+  認証付きアトミックコミット（ファイル毎独立）、監査ログ。
+- **やらないこと（次段）**: 並列ストリーム転送（`file_id` 多重化）、`user=` による
+  per-request 権限降格、`Resume{offset}` 中断再開。フレーム集合はこれらを足せる形に
+  予約済み。`--serve-scp` は root 実行を拒否し、ファイル I/O は常にサーバ起動ユーザ権限で
+  行う（＝権限境界は「起動ユーザ ∧ policy ルート」）。
 
 ## トランスポート再利用
 
@@ -65,6 +65,27 @@
 `Put{file_id, path, mode, size}` / `Data{file_id, ...}`）の席だけ予約しておく。将来
 `file_id` 多重化で並列化しても直列クライアントと互換を保てる。素朴さ（scp -r 互換）を
 今取り、性能（並列）は予約に留める。
+
+#### 実装済み（直列）
+
+プロトコルは *sender → receiver* 対称: 送信側が `MkDir` / `Put`+`Data`*+`Eof` をエントリ毎に
+流し `Done` で締め、受信側が `Ack` / `Fail` をエントリ毎に返す。put ではクライアントが送信側、
+get ではクライアントの `Get{path, recursive}` の後サーバが送信側になる。全 file-scoped フレームに
+`file_id:u32` を付与（直列は連番、並列多重化の予約席）。
+
+- **`-r` は「独立に confine された多数のエントリ」**: 各 `Put`/`MkDir` のパスを write ルート配下に
+  個別 confine（`confine_write`/`confine_mkdir`）。ディレクトリ walk は**反復（明示スタック）**で
+  深いツリーでもスタックオーバーフローしない。symlink は walk で辿らず（`file_type` 非追従）スキップ。
+- **MkDir も open 後再検証**: 作成後に `canonicalize` して write ルート配下か再確認し、外れたら
+  作成物を `rmdir` して拒否（`confine`→`create_dir` 間の中間 symlink すり替え TOCTOU 封じ。
+  ファイルの `/proc/self/fd` 再検証と対をなす）。
+- **部分失敗**: エントリ毎に `Ack`/`Fail`。confine 拒否・stage/commit 失敗は `Fail`（バッチ継続、
+  ワイヤは一律 "denied"）。プロトコル違反（宣言 size 超過・想定外フレーム・ファイル途中で切断）は
+  致命でストリームを閉じる。per-file 拒否でもファイル本文は宣言 size を上限に消費してストリーム同期を保つ。
+- **get 側のローカル配置**: サーバが送るのはツリー相対パス。クライアントは `safe_join`（絶対・`..`・
+  root/prefix コンポーネントを拒否）でローカル base 配下に限定。
+- **非 Linux の限界**: 中間 symlink の open 後再検証（`/proc/self/fd`）は Linux 限定なのは単一
+  ファイル時と同じ。運用は policy ルートをサーバ起動ユーザ所有・中間に非信頼書き込み無しを前提。
 
 ### `Err` のワイヤ表現 — 存在オラクル封じ
 

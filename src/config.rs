@@ -200,6 +200,9 @@ pub struct CryptoConfig {
     /// scp server authorization policy file (`--scp-policy`): maps peer
     /// fingerprints to allowed read/write roots. Default deny.
     pub scp_policy_path: Option<String>,
+    /// scp client recursive mode (`-r`/`--recursive`): `--scp-put`/`--scp-get`
+    /// operate on a directory tree instead of a single file.
+    pub scp_recursive: bool,
     pub allow_unauth: bool,
     pub force: bool,
     pub handshake_timeout: u64,
@@ -279,6 +282,7 @@ impl Default for CryptoConfig {
             scp_put: None,
             scp_get: None,
             scp_policy_path: None,
+            scp_recursive: false,
             allow_unauth: false,
             force: false,
             handshake_timeout: 15,

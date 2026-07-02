@@ -39,30 +39,50 @@ use zeroize::Zeroizing;
 const CHUNK: usize = 64 * 1024;
 
 const T_PUT: u8 = 0x01;
-const T_GET: u8 = 0x02;
-const T_META: u8 = 0x03;
-const T_DATA: u8 = 0x04;
-const T_EOF: u8 = 0x05;
-const T_OK: u8 = 0x06;
-const T_ERR: u8 = 0x07;
+const T_MKDIR: u8 = 0x02;
+const T_DATA: u8 = 0x03;
+const T_EOF: u8 = 0x04;
+const T_ACK: u8 = 0x05;
+const T_FAIL: u8 = 0x06;
+const T_GET: u8 = 0x07;
+const T_DONE: u8 = 0x08;
+const T_ERR: u8 = 0x09;
 
-/// One control/data frame exchanged over `ALPN_SCP`.
+/// One control/data frame over `ALPN_SCP`. The protocol is a *sender → receiver*
+/// stream of files: the sender emits `MkDir` / `Put`+`Data`*+`Eof` per entry and
+/// a terminal `Done`; the receiver replies `Ack` / `Fail` per entry. For a `put`
+/// the client is the sender; for a `get` the server becomes the sender after the
+/// client's `Get`. `file_id` scopes the per-file frames — for the serial
+/// transport it is a simple monotonic counter, but it is carried on the wire so a
+/// future parallel variant can multiplex several files over one connection
+/// without breaking serial peers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScpFrame {
-    /// Client → server: write `size` bytes (mode `mode`) to `path`.
-    Put { path: String, mode: u32, size: u64 },
-    /// Client → server: read `path`.
-    Get { path: String },
-    /// Server → client: `Get` response header.
-    Meta { mode: u32, size: u64 },
-    /// Either direction: bulk file bytes (≤ [`CHUNK`] per frame).
-    Data(Vec<u8>),
-    /// Sender → receiver: end of the byte stream.
-    Eof,
-    /// Responder: the operation succeeded (terminal).
-    Ok,
-    /// Either direction: a textual error (authz denied, I/O failure, …).
+    /// Sender → receiver: begin a regular file of `size` bytes (perm `mode`).
+    Put { file_id: u32, path: String, mode: u32, size: u64 },
+    /// Sender → receiver: create a directory (`-r`).
+    MkDir { file_id: u32, path: String, mode: u32 },
+    /// Sender → receiver: bulk file bytes (≤ [`CHUNK`] per frame).
+    Data { file_id: u32, bytes: Vec<u8> },
+    /// Sender → receiver: end of this file's bytes.
+    Eof { file_id: u32 },
+    /// Receiver → sender: this entry was committed successfully.
+    Ack { file_id: u32 },
+    /// Receiver → sender: this entry failed (per-file; the batch continues).
+    Fail { file_id: u32, msg: String },
+    /// Client → server: request a download; `recursive` walks a directory tree.
+    Get { path: String, recursive: bool },
+    /// Sender → receiver: no more entries — the batch is complete.
+    Done,
+    /// Either direction: a fatal / connection-level error (authz denied, protocol).
     Err(String),
+}
+
+fn put_u32(v: &mut Vec<u8>, n: u32) {
+    v.extend_from_slice(&n.to_be_bytes());
+}
+fn get_u32(b: &[u8], off: usize) -> Option<u32> {
+    b.get(off..off + 4).map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]))
 }
 
 impl ScpFrame {
@@ -70,29 +90,46 @@ impl ScpFrame {
     pub fn encode(&self) -> Vec<u8> {
         let mut v = Vec::new();
         match self {
-            ScpFrame::Put { path, mode, size } => {
+            ScpFrame::Put { file_id, path, mode, size } => {
                 v.push(T_PUT);
-                v.extend_from_slice(&mode.to_be_bytes());
+                put_u32(&mut v, *file_id);
+                put_u32(&mut v, *mode);
                 v.extend_from_slice(&size.to_be_bytes());
-                v.extend_from_slice(&(path.len() as u32).to_be_bytes());
+                put_u32(&mut v, path.len() as u32);
                 v.extend_from_slice(path.as_bytes());
             }
-            ScpFrame::Get { path } => {
-                v.push(T_GET);
-                v.extend_from_slice(&(path.len() as u32).to_be_bytes());
+            ScpFrame::MkDir { file_id, path, mode } => {
+                v.push(T_MKDIR);
+                put_u32(&mut v, *file_id);
+                put_u32(&mut v, *mode);
+                put_u32(&mut v, path.len() as u32);
                 v.extend_from_slice(path.as_bytes());
             }
-            ScpFrame::Meta { mode, size } => {
-                v.push(T_META);
-                v.extend_from_slice(&mode.to_be_bytes());
-                v.extend_from_slice(&size.to_be_bytes());
-            }
-            ScpFrame::Data(d) => {
+            ScpFrame::Data { file_id, bytes } => {
                 v.push(T_DATA);
-                v.extend_from_slice(d);
+                put_u32(&mut v, *file_id);
+                v.extend_from_slice(bytes);
             }
-            ScpFrame::Eof => v.push(T_EOF),
-            ScpFrame::Ok => v.push(T_OK),
+            ScpFrame::Eof { file_id } => {
+                v.push(T_EOF);
+                put_u32(&mut v, *file_id);
+            }
+            ScpFrame::Ack { file_id } => {
+                v.push(T_ACK);
+                put_u32(&mut v, *file_id);
+            }
+            ScpFrame::Fail { file_id, msg } => {
+                v.push(T_FAIL);
+                put_u32(&mut v, *file_id);
+                v.extend_from_slice(msg.as_bytes());
+            }
+            ScpFrame::Get { path, recursive } => {
+                v.push(T_GET);
+                v.push(if *recursive { 1 } else { 0 });
+                put_u32(&mut v, path.len() as u32);
+                v.extend_from_slice(path.as_bytes());
+            }
+            ScpFrame::Done => v.push(T_DONE),
             ScpFrame::Err(m) => {
                 v.push(T_ERR);
                 v.extend_from_slice(m.as_bytes());
@@ -106,44 +143,60 @@ impl ScpFrame {
     pub fn decode(buf: &[u8]) -> Result<ScpFrame> {
         let bad = || CryptoError::Parameter("malformed scp frame".to_string());
         let (&ty, rest) = buf.split_first().ok_or_else(bad)?;
+        // Parse a `file_id(4) ‖ mode(4) ‖ [size(8)] ‖ plen(4) ‖ path` tail.
+        let path_entry = |rest: &[u8], with_size: bool| -> Result<(u32, u32, u64, String)> {
+            let fixed = if with_size { 20 } else { 12 };
+            if rest.len() < fixed {
+                return Err(bad());
+            }
+            let file_id = get_u32(rest, 0).ok_or_else(bad)?;
+            let mode = get_u32(rest, 4).ok_or_else(bad)?;
+            let (size, poff) = if with_size {
+                (u64::from_be_bytes(rest[8..16].try_into().map_err(|_| bad())?), 16)
+            } else {
+                (0, 8)
+            };
+            let plen = get_u32(rest, poff).ok_or_else(bad)? as usize;
+            let body = &rest[poff + 4..];
+            if body.len() < plen {
+                return Err(bad());
+            }
+            let path = std::str::from_utf8(&body[..plen]).map_err(|_| bad())?.to_string();
+            Ok((file_id, mode, size, path))
+        };
         match ty {
             T_PUT => {
-                if rest.len() < 16 {
-                    return Err(bad());
-                }
-                let mode = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
-                let size = u64::from_be_bytes(rest[4..12].try_into().map_err(|_| bad())?);
-                let plen = u32::from_be_bytes([rest[12], rest[13], rest[14], rest[15]]) as usize;
-                let rest = &rest[16..];
-                if rest.len() < plen {
-                    return Err(bad());
-                }
-                let path = std::str::from_utf8(&rest[..plen]).map_err(|_| bad())?.to_string();
-                Ok(ScpFrame::Put { path, mode, size })
+                let (file_id, mode, size, path) = path_entry(rest, true)?;
+                Ok(ScpFrame::Put { file_id, path, mode, size })
+            }
+            T_MKDIR => {
+                let (file_id, mode, _sz, path) = path_entry(rest, false)?;
+                Ok(ScpFrame::MkDir { file_id, path, mode })
+            }
+            T_DATA => {
+                let file_id = get_u32(rest, 0).ok_or_else(bad)?;
+                Ok(ScpFrame::Data { file_id, bytes: rest[4..].to_vec() })
+            }
+            T_EOF => Ok(ScpFrame::Eof { file_id: get_u32(rest, 0).ok_or_else(bad)? }),
+            T_ACK => Ok(ScpFrame::Ack { file_id: get_u32(rest, 0).ok_or_else(bad)? }),
+            T_FAIL => {
+                let file_id = get_u32(rest, 0).ok_or_else(bad)?;
+                Ok(ScpFrame::Fail { file_id, msg: String::from_utf8_lossy(&rest[4..]).into_owned() })
             }
             T_GET => {
-                if rest.len() < 4 {
+                if rest.len() < 5 {
                     return Err(bad());
                 }
-                let plen = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-                let rest = &rest[4..];
-                if rest.len() < plen {
+                let recursive = rest[0] != 0;
+                let plen = get_u32(rest, 1).ok_or_else(bad)? as usize;
+                let body = &rest[5..];
+                if body.len() < plen {
                     return Err(bad());
                 }
-                let path = std::str::from_utf8(&rest[..plen]).map_err(|_| bad())?.to_string();
-                Ok(ScpFrame::Get { path })
+                let path = std::str::from_utf8(&body[..plen]).map_err(|_| bad())?.to_string();
+                Ok(ScpFrame::Get { path, recursive })
             }
-            T_META => {
-                if rest.len() < 12 {
-                    return Err(bad());
-                }
-                let mode = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
-                let size = u64::from_be_bytes(rest[4..12].try_into().map_err(|_| bad())?);
-                Ok(ScpFrame::Meta { mode, size })
-            }
-            T_DATA => Ok(ScpFrame::Data(rest.to_vec())),
-            T_EOF => Ok(ScpFrame::Eof),
-            T_OK => Ok(ScpFrame::Ok),
+            T_DONE => Ok(ScpFrame::Done),
             T_ERR => Ok(ScpFrame::Err(String::from_utf8_lossy(rest).into_owned())),
             _ => Err(CryptoError::Parameter(format!("unknown scp frame type {ty}"))),
         }
@@ -347,6 +400,74 @@ fn confine_write(req: &str, roots: &[PathBuf]) -> std::result::Result<PathBuf, S
     Ok(canon_parent.join(name))
 }
 
+/// Confine a `MkDir` request (`-r`): same rules as [`confine_write`] — the parent
+/// must resolve to a directory under a write root and the new component must be a
+/// single plain name. The directory itself need not exist yet. If it already
+/// exists (re-`put` of a tree), that is fine and handled by the caller.
+fn confine_mkdir(req: &str, roots: &[PathBuf]) -> std::result::Result<PathBuf, String> {
+    // Identical validation to a file destination: absolute, plain final
+    // component, parent canonicalized under a root.
+    confine_write(req, roots)
+}
+
+/// Open a confined source file for a `get`: `O_NOFOLLOW` on the final component
+/// plus the Linux `/proc/self/fd` real-path re-check against `roots` (closing the
+/// intermediate-directory symlink race). Returns `(file, mode, size)`; `mode`
+/// comes from the open fd, not a second path lookup. Errors carry a reason for
+/// the audit log — the wire reply is uniformized to "denied" by the caller.
+fn open_confined_read(src: &Path, roots: &[PathBuf]) -> std::result::Result<(std::fs::File, u32, u64), String> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts.open(src).map_err(|e| format!("open {}: {e}", src.display()))?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        if !fd_real_path(file.as_raw_fd()).map(|p| under_any(&p, roots)).unwrap_or(false) {
+            return Err("path escaped read root after open (symlink race)".into());
+        }
+    }
+    let meta = file.metadata().map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err(format!("{} is not a regular file", src.display()));
+    }
+    let mode = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            meta.mode()
+        }
+        #[cfg(not(unix))]
+        {
+            0o644
+        }
+    };
+    Ok((file, mode, meta.len()))
+}
+
+/// Validate a **relative** path received from a peer for a `get -r` (the server
+/// sends tree-relative paths; the client places them under its local base). Reject
+/// absolute paths and any `..` / root / prefix component so a malicious server
+/// cannot write outside the client's chosen destination directory. Returns the
+/// path joined under `base`.
+fn safe_join(base: &Path, rel: &str) -> std::result::Result<PathBuf, String> {
+    let relp = Path::new(rel);
+    if relp.is_absolute() {
+        return Err(format!("relative path expected, got absolute {rel:?}"));
+    }
+    for comp in relp.components() {
+        match comp {
+            Component::Normal(_) => {}
+            _ => return Err(format!("unsafe path component in {rel:?}")),
+        }
+    }
+    Ok(base.join(relp))
+}
+
 // ===========================================================================
 // Staging: write to a hardened temp, commit with an atomic same-dir rename so an
 // interrupted / unauthenticated transfer never leaves bytes at the final path.
@@ -437,6 +558,27 @@ impl Drop for Staged {
     }
 }
 
+/// Set a directory's permission bits via its **fd** (`fchmod`), opening it with
+/// `O_NOFOLLOW | O_DIRECTORY` — never a path-based `set_permissions`, which a
+/// symlink swapped in at `dir` between create and chmod could redirect onto an
+/// arbitrary file (TOCTOU). Best-effort: a failure to chmod is ignored (the
+/// directory still exists with default perms).
+fn set_dir_mode_nofollow(dir: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let mut o = std::fs::OpenOptions::new();
+        o.read(true).custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+        if let Ok(dfd) = o.open(dir) {
+            let _ = dfd.set_permissions(std::fs::Permissions::from_mode(mode & 0o0777));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (dir, mode);
+    }
+}
+
 /// Read a local file's permission bits (unix), or a sane default elsewhere.
 fn local_mode(path: &Path) -> u32 {
     #[cfg(unix)]
@@ -451,16 +593,125 @@ fn local_mode(path: &Path) -> u32 {
     }
 }
 
+/// Depth-first walk of `base`, returning `(relative_path, is_dir)` with every
+/// directory listed before its contents (so a receiver can `MkDir` parents
+/// first). Symlinks and special files are skipped — never followed — so the walk
+/// cannot loop or escape `base`.
+fn walk_tree(base: &Path) -> std::io::Result<Vec<(PathBuf, bool)>> {
+    // Iterative DFS with an explicit stack — a recursive walk could overflow the
+    // call stack on a pathologically deep tree. A directory is emitted (in its
+    // parent's listing) before it is expanded, so parents always precede their
+    // contents (the receiver can MkDir before writing into it).
+    // Bound the entry count so a pathological tree can't exhaust memory (the list
+    // is held before transfer); fail loudly rather than OOM.
+    const MAX_TREE_ENTRIES: usize = 1_000_000;
+    let mut out = Vec::new();
+    let mut stack: Vec<PathBuf> = vec![base.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)?.collect::<std::io::Result<Vec<_>>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        let mut subdirs = Vec::new();
+        for e in entries {
+            let path = e.path();
+            let ft = e.file_type()?; // does NOT follow symlinks
+            let rel = match path.strip_prefix(base) {
+                Ok(r) => r.to_path_buf(),
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                out.push((rel, true));
+                subdirs.push(path);
+            } else if ft.is_file() {
+                out.push((rel, false));
+            }
+            // symlinks / sockets / fifos: skipped (never followed)
+            if out.len() > MAX_TREE_ENTRIES {
+                return Err(std::io::Error::other(format!(
+                    "directory tree exceeds {MAX_TREE_ENTRIES} entries"
+                )));
+            }
+        }
+        // Push in reverse so siblings pop back in sorted order.
+        for d in subdirs.into_iter().rev() {
+            stack.push(d);
+        }
+    }
+    Ok(out)
+}
+
+/// Send one file's bytes as `Data{file_id}`* followed by `Eof{file_id}`, reading
+/// straight into the frame plaintext buffer (`[T_DATA]‖file_id‖payload`) and
+/// sealing it in place — no per-chunk copy. Returns the number of bytes sent.
+async fn stream_bytes<W: AsyncWriteExt + Unpin>(
+    w: &mut W,
+    aead: &str,
+    key: &[u8],
+    ctr: &mut u64,
+    file_id: u32,
+    f: &mut tokio::fs::File,
+) -> Result<u64> {
+    let mut pt = vec![0u8; 5 + CHUNK];
+    pt[0] = T_DATA;
+    pt[1..5].copy_from_slice(&file_id.to_be_bytes());
+    let mut sent = 0u64;
+    loop {
+        let n = f.read(&mut pt[5..]).await.map_err(io_err)?;
+        if n == 0 {
+            break;
+        }
+        sent += n as u64;
+        send_packet(w, aead, key, ctr, &pt[..5 + n]).await?;
+    }
+    send(w, aead, key, ctr, &ScpFrame::Eof { file_id }).await?;
+    Ok(sent)
+}
+
+/// Receive `Data{file_id}`* / `Eof{file_id}` into `staged`, bounded by `size`.
+/// A frame for another `file_id`, an overshoot, or a short stream is an error.
+async fn recv_into_staged<R: AsyncReadExt + Unpin>(
+    r: &mut R,
+    aead: &str,
+    key: &[u8],
+    ctr: &mut u64,
+    file_id: u32,
+    size: u64,
+    staged: &mut Staged,
+) -> Result<()> {
+    let param = |m: String| CryptoError::Parameter(m);
+    let mut received = 0u64;
+    loop {
+        match recv(r, aead, key, ctr).await? {
+            Some(ScpFrame::Data { file_id: fid, bytes }) if fid == file_id => {
+                received += bytes.len() as u64;
+                if received > size {
+                    return Err(param(format!("stream exceeds declared size {size}")));
+                }
+                staged.write_all(&bytes).await.map_err(io_err)?;
+            }
+            Some(ScpFrame::Eof { file_id: fid }) if fid == file_id => break,
+            Some(ScpFrame::Err(m)) => return Err(param(format!("peer error mid-file: {m}"))),
+            Some(other) => return Err(param(format!("unexpected frame in file body: {other:?}"))),
+            None => return Err(param("stream closed before Eof".into())),
+        }
+    }
+    if received != size {
+        return Err(param(format!("size mismatch (declared {size}, got {received})")));
+    }
+    Ok(())
+}
+
 // ===========================================================================
 // Client
 // ===========================================================================
 
 /// What the scp client was asked to do.
 pub enum ScpOp {
-    /// Upload `local` to remote `remote`.
-    Put { local: PathBuf, remote: String },
-    /// Download remote `remote` to `local`.
-    Get { remote: String, local: PathBuf },
+    /// Upload `local` to remote `remote`. With `recursive`, `local` is a
+    /// directory tree copied under the remote path.
+    Put { local: PathBuf, remote: String, recursive: bool },
+    /// Download remote `remote` to `local`. With `recursive`, `remote` is a
+    /// directory tree copied under the local path.
+    Get { remote: String, local: PathBuf, recursive: bool },
 }
 
 /// Run the scp client: perform a single `Put` or `Get` against the peer's
@@ -483,102 +734,134 @@ where
     let (mut rx, mut tx) = (0u64, 0u64);
 
     match op {
-        ScpOp::Put { local, remote } => {
-            let meta = std::fs::metadata(local)
+        ScpOp::Put { local, remote, recursive } => {
+            // One entry to send: either a directory to create, or a file to stream.
+            struct Entry { remote: String, local: Option<PathBuf>, mode: u32, size: u64 }
+            let base_meta = std::fs::metadata(local)
                 .map_err(|e| CryptoError::Parameter(format!("open {}: {e}", local.display())))?;
-            if !meta.is_file() {
-                return Err(CryptoError::Parameter(format!("{} is not a regular file", local.display())));
-            }
-            let mode = local_mode(local);
-            let size = meta.len();
-            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Put {
-                path: remote.clone(),
-                mode,
-                size,
-            })
-            .await?;
-
-            let mut f = tokio::fs::File::open(local)
-                .await
-                .map_err(|e| CryptoError::Parameter(format!("open {}: {e}", local.display())))?;
-            // Read straight into the frame plaintext buffer ([T_DATA] ‖ payload)
-            // and seal it in place — no per-chunk Data(to_vec()) + encode() copy.
-            let mut pt = vec![0u8; 1 + CHUNK];
-            pt[0] = T_DATA;
-            loop {
-                let n = f.read(&mut pt[1..]).await.map_err(io_err)?;
-                if n == 0 {
-                    break;
+            let mut entries: Vec<Entry> = Vec::new();
+            if *recursive {
+                if !base_meta.is_dir() {
+                    return Err(CryptoError::Parameter(format!("{} is not a directory (use without -r)", local.display())));
                 }
-                send_packet(&mut writer, aead_name, tx_key, &mut tx, &pt[..1 + n]).await?;
-            }
-            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Eof).await?;
-
-            match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
-                Some(ScpFrame::Ok) => {
-                    let _ = writer.shutdown().await;
-                    eprintln!("[nkct] uploaded {} ({} bytes) → {}", local.display(), size, remote);
-                    Ok(())
-                }
-                Some(ScpFrame::Err(m)) => Err(CryptoError::Parameter(format!("scp put refused: {m}"))),
-                other => Err(CryptoError::Parameter(format!("scp put: unexpected reply {other:?}"))),
-            }
-        }
-        ScpOp::Get { remote, local } => {
-            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Get { path: remote.clone() }).await?;
-
-            let (mode, size) = match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
-                Some(ScpFrame::Meta { mode, size }) => (mode, size),
-                Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp get refused: {m}"))),
-                other => return Err(CryptoError::Parameter(format!("scp get: unexpected reply {other:?}"))),
-            };
-
-            let mut staged = Staged::create(local.clone())
-                .map_err(|e| CryptoError::Parameter(format!("stage {}: {e}", local.display())))?;
-            let mut received = 0u64;
-            loop {
-                match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
-                    Some(ScpFrame::Data(d)) => {
-                        received += d.len() as u64;
-                        // Bound the local write by the size the server declared in
-                        // Meta, so a misbehaving/compromised server cannot overrun
-                        // our disk past what we agreed to receive.
-                        if received > size {
-                            return Err(CryptoError::Parameter(format!(
-                                "scp get: server sent more than the declared {size} bytes"
-                            )));
-                        }
-                        staged.write_all(&d).await.map_err(io_err)?;
+                // Create the remote base directory first, then its tree (parents
+                // before children, per walk_tree's ordering).
+                entries.push(Entry { remote: remote.clone(), local: None, mode: local_mode(local), size: 0 });
+                for (rel, is_dir) in walk_tree(local).map_err(io_err)? {
+                    let rp = format!("{}/{}", remote.trim_end_matches('/'), rel.to_string_lossy());
+                    let full = local.join(&rel);
+                    if is_dir {
+                        entries.push(Entry { remote: rp, local: None, mode: local_mode(&full), size: 0 });
+                    } else {
+                        let m = std::fs::metadata(&full).map_err(io_err)?;
+                        entries.push(Entry { remote: rp, local: Some(full.clone()), mode: local_mode(&full), size: m.len() });
                     }
-                    Some(ScpFrame::Eof) => break,
-                    Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp get failed: {m}"))),
-                    other => return Err(CryptoError::Parameter(format!("scp get: unexpected frame {other:?}"))),
+                }
+            } else {
+                if !base_meta.is_file() {
+                    return Err(CryptoError::Parameter(format!("{} is not a regular file (use -r for a directory)", local.display())));
+                }
+                entries.push(Entry { remote: remote.clone(), local: Some(local.clone()), mode: local_mode(local), size: base_meta.len() });
+            }
+
+            let total = entries.iter().filter(|e| e.local.is_some()).count();
+            let mut done = 0usize;
+            let mut file_id = 0u32;
+            for e in &entries {
+                file_id += 1;
+                match &e.local {
+                    None => {
+                        send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::MkDir { file_id, path: e.remote.clone(), mode: e.mode }).await?;
+                    }
+                    Some(path) => {
+                        send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Put { file_id, path: e.remote.clone(), mode: e.mode, size: e.size }).await?;
+                        let mut f = tokio::fs::File::open(path)
+                            .await
+                            .map_err(|er| CryptoError::Parameter(format!("open {}: {er}", path.display())))?;
+                        stream_bytes(&mut writer, aead_name, tx_key, &mut tx, file_id, &mut f).await?;
+                    }
+                }
+                match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
+                    Some(ScpFrame::Ack { .. }) => {
+                        if e.local.is_some() {
+                            done += 1;
+                        }
+                    }
+                    Some(ScpFrame::Fail { msg, .. }) => {
+                        eprintln!("[nkct] skipped {}: {msg}", e.remote);
+                    }
+                    Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp put refused: {m}"))),
+                    other => return Err(CryptoError::Parameter(format!("scp put: unexpected reply {other:?}"))),
                 }
             }
-            // Require the terminal Ok before committing: the server sends it only
-            // after the whole file was streamed, so a truncated transfer (Eof
-            // without Ok, or a dropped stream) is never published.
-            match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
-                Some(ScpFrame::Ok) => {}
-                Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp get failed: {m}"))),
-                other => return Err(CryptoError::Parameter(format!("scp get: expected Ok, got {other:?}"))),
-            }
-            if received != size {
-                return Err(CryptoError::Parameter(format!(
-                    "scp get: size mismatch (expected {size}, got {received})"
-                )));
-            }
-            staged
-                .commit(mode)
-                .await
-                .map_err(|e| CryptoError::Parameter(format!("commit {}: {e}", local.display())))?;
-            // Ack receipt, then close our send side gracefully. The server waits
-            // for this before returning, which keeps the stream alive until we've
-            // drained and committed the whole file (see `drain_until_close`).
-            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ok).await?;
+            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Done).await?;
             let _ = writer.shutdown().await;
-            eprintln!("[nkct] downloaded {} ({} bytes) → {}", remote, size, local.display());
+            if *recursive {
+                eprintln!("[nkct] uploaded {done}/{total} files → {remote}");
+            } else {
+                eprintln!("[nkct] uploaded {} ({} bytes) → {}", local.display(), entries[0].size, remote);
+            }
             Ok(())
+        }
+        ScpOp::Get { remote, local, recursive } => {
+            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Get { path: remote.clone(), recursive: *recursive }).await?;
+
+            if !*recursive {
+                // Single file: expect one Put header, then its body, then Done. The
+                // server's path is advisory — we write to the client-chosen `local`.
+                let (file_id, mode, size) = match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
+                    Some(ScpFrame::Put { file_id, mode, size, .. }) => (file_id, mode, size),
+                    Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp get refused: {m}"))),
+                    other => return Err(CryptoError::Parameter(format!("scp get: unexpected reply {other:?}"))),
+                };
+                let mut staged = Staged::create(local.clone())
+                    .map_err(|e| CryptoError::Parameter(format!("stage {}: {e}", local.display())))?;
+                recv_into_staged(&mut reader, aead_name, rx_key, &mut rx, file_id, size, &mut staged).await?;
+                staged.commit(mode).await.map_err(|e| CryptoError::Parameter(format!("commit {}: {e}", local.display())))?;
+                send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ack { file_id }).await?;
+                match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
+                    Some(ScpFrame::Done) | None => {}
+                    Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp get failed: {m}"))),
+                    other => return Err(CryptoError::Parameter(format!("scp get: expected Done, got {other:?}"))),
+                }
+                let _ = writer.shutdown().await;
+                eprintln!("[nkct] downloaded {remote} ({size} bytes) → {}", local.display());
+                Ok(())
+            } else {
+                // Directory tree: create the local base, then place each entry the
+                // server sends under it (relative paths validated by safe_join).
+                std::fs::create_dir_all(local)
+                    .map_err(|e| CryptoError::Parameter(format!("create {}: {e}", local.display())))?;
+                let (mut files, mut dirs) = (0usize, 0usize);
+                loop {
+                    match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
+                        Some(ScpFrame::MkDir { file_id, path, mode }) => {
+                            let d = safe_join(local, &path).map_err(CryptoError::Parameter)?;
+                            std::fs::create_dir_all(&d).map_err(|e| CryptoError::Parameter(format!("mkdir {}: {e}", d.display())))?;
+                            // fchmod via the dir fd (O_NOFOLLOW), not a path-based
+                            // set_permissions a local symlink swap could redirect.
+                            set_dir_mode_nofollow(&d, mode);
+                            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ack { file_id }).await?;
+                            dirs += 1;
+                        }
+                        Some(ScpFrame::Put { file_id, path, mode, size }) => {
+                            let dest = safe_join(local, &path).map_err(CryptoError::Parameter)?;
+                            let mut staged = Staged::create(dest.clone())
+                                .map_err(|e| CryptoError::Parameter(format!("stage {}: {e}", dest.display())))?;
+                            recv_into_staged(&mut reader, aead_name, rx_key, &mut rx, file_id, size, &mut staged).await?;
+                            staged.commit(mode).await.map_err(|e| CryptoError::Parameter(format!("commit {}: {e}", dest.display())))?;
+                            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ack { file_id }).await?;
+                            files += 1;
+                        }
+                        Some(ScpFrame::Done) | None => break,
+                        Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp get failed: {m}"))),
+                        other => return Err(CryptoError::Parameter(format!("scp get: unexpected frame {other:?}"))),
+                    }
+                }
+                let _ = writer.shutdown().await;
+                eprintln!("[nkct] downloaded {files} files, {dirs} dirs → {}", local.display());
+                Ok(())
+            }
         }
     }
 }
@@ -651,160 +934,255 @@ where
         }};
     }
 
-    match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
-        Some(ScpFrame::Put { path, mode, size }) => {
-            let dest = match confine_write(&path, policy.roots(&peer_fp, true)) {
-                Ok(d) => d,
-                Err(e) => deny!(format!("put {path}: {e}")),
-            };
-            if let Err(e) = audit(audit_path, &peer_fp, &format!("scp allow put path={} bytes={size}", dest.display())).await {
-                let _ = send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Err("audit unavailable; refusing".into())).await;
-                return Err(CryptoError::Parameter(format!("scp refused: audit write failed: {e}")));
-            }
+    // A `put` batch is a stream of MkDir / (Put + body) entries ended by Done; a
+    // `get` is a single request that flips us into the sender role. The first
+    // frame selects which. Per-entry problems reply Fail (the batch continues);
+    // protocol violations (wrong frame, overshoot, mid-file close) are fatal and
+    // close the stream. Confine on every entry — the write/read roots are the
+    // boundary, applied per path, so `-r` is just many independently-confined
+    // entries.
+    let (mut n_ok, mut n_fail) = (0usize, 0usize);
+    let mut next_id: u32 = 0;
 
-            let mut staged = match Staged::create(dest.clone()) {
-                Ok(s) => s,
-                Err(e) => deny!(format!("stage {}: {e}", dest.display())),
-            };
-            // Post-create confinement re-check (Linux): verify the staging file's
-            // real directory is still under a write root, closing the window where
-            // an intermediate directory was swapped for a symlink between
-            // confine_write's canonicalize and this open.
-            #[cfg(target_os = "linux")]
-            if !staged
-                .temp_real_parent()
-                .map(|p| under_any(&p, policy.roots(&peer_fp, true)))
-                .unwrap_or(false)
-            {
-                deny!(format!("put {path}: destination escaped write root after open (symlink race)"));
-            }
-            let mut received = 0u64;
-            loop {
-                match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
-                    Some(ScpFrame::Data(d)) => {
-                        received += d.len() as u64;
-                        // Enforce the declared size as an upper bound *as bytes
-                        // arrive*, not just at Eof: otherwise a peer could stream
-                        // unboundedly past its declared size and fill the disk
-                        // before we ever reach the final check.
-                        if received > size {
-                            deny!(format!("stream exceeds declared size {size}"));
+    loop {
+        match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
+            // ---- put: create a directory ----
+            Some(ScpFrame::MkDir { file_id, path, mode }) => {
+                let made = match confine_mkdir(&path, policy.roots(&peer_fp, true)) {
+                    Ok(dir) => {
+                        let created = match tokio::fs::create_dir(&dir).await {
+                            Ok(()) => true,
+                            // A re-put of an existing tree is fine.
+                            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                            Err(_) => {
+                                // couldn't create; fall through to reject
+                                send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Fail { file_id, msg: "denied".into() }).await?;
+                                n_fail += 1;
+                                continue;
+                            }
+                        };
+                        // Verify + set mode on the *directory fd* (fchmod), never a
+                        // path-based set_permissions that a symlink swap could
+                        // redirect. Open with O_NOFOLLOW|O_DIRECTORY and re-check the
+                        // fd's real path is under a write root (closes the
+                        // confine→create intermediate-symlink race, Linux).
+                        let mut o = std::fs::OpenOptions::new();
+                        o.read(true);
+                        #[cfg(unix)]
+                        {
+                            use std::os::unix::fs::OpenOptionsExt;
+                            o.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
                         }
-                        if staged.write_all(&d).await.is_err() {
-                            let _ = send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Err("transfer failed".into())).await;
-                            return Err(CryptoError::FileWrite("scp put: staging write failed".into()));
+                        let ok = match o.open(&dir) {
+                            Ok(dfd) => {
+                                let under = {
+                                    #[cfg(target_os = "linux")]
+                                    {
+                                        use std::os::fd::AsRawFd;
+                                        fd_real_path(dfd.as_raw_fd()).map(|p| under_any(&p, policy.roots(&peer_fp, true))).unwrap_or(false)
+                                    }
+                                    #[cfg(not(target_os = "linux"))]
+                                    {
+                                        true
+                                    }
+                                };
+                                if under {
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        let _ = dfd.set_permissions(std::fs::Permissions::from_mode(mode & 0o0777));
+                                    }
+                                    true
+                                } else {
+                                    false
+                                }
+                            }
+                            Err(_) => false,
+                        };
+                        if ok {
+                            Some(dir)
+                        } else {
+                            if created {
+                                let _ = std::fs::remove_dir(&dir);
+                            }
+                            None
                         }
                     }
-                    Some(ScpFrame::Eof) => break,
-                    Some(ScpFrame::Err(m)) => {
-                        audit_best_effort(audit_path, &peer_fp, &format!("scp put aborted by client: {m}")).await;
-                        return Ok(()); // staged temp dropped/discarded
+                    Err(_) => None,
+                };
+                match made {
+                    Some(dir) => {
+                        // Mode was already applied via the directory fd above
+                        // (fchmod); no path-based set_permissions here — it would
+                        // reintroduce the symlink-swap TOCTOU we just closed.
+                        audit_best_effort(audit_path, &peer_fp, &format!("scp mkdir ok path={}", dir.display())).await;
+                        send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ack { file_id }).await?;
+                        n_ok += 1;
                     }
                     None => {
-                        audit_best_effort(audit_path, &peer_fp, "scp put: stream closed before Eof").await;
-                        return Ok(());
+                        audit_best_effort(audit_path, &peer_fp, &format!("scp deny: mkdir {path}")).await;
+                        send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Fail { file_id, msg: "denied".into() }).await?;
+                        n_fail += 1;
                     }
-                    other => deny!(format!("unexpected frame during put: {other:?}")),
                 }
             }
-            // Eof reached: the byte count must match the declared size exactly
-            // (the loop already rejected any overshoot, so this catches a short
-            // stream — fewer bytes than promised).
-            if received != size {
-                deny!(format!("size mismatch (declared {size}, got {received})"));
+            // ---- put: receive a file ----
+            Some(ScpFrame::Put { file_id, path, mode, size }) => {
+                let dest = confine_write(&path, policy.roots(&peer_fp, true));
+                let mut staged: Option<Staged> = match &dest {
+                    Ok(d) => Staged::create(d.clone()).ok(),
+                    Err(_) => None,
+                };
+                // Post-create confinement re-check (Linux): if the staging file's
+                // real directory is not under a write root (intermediate-symlink
+                // swap between confine and open), discard — we still consume the
+                // body below to keep the stream in sync, then Fail.
+                #[cfg(target_os = "linux")]
+                if let Some(s) = &staged {
+                    if !s.temp_real_parent().map(|p| under_any(&p, policy.roots(&peer_fp, true))).unwrap_or(false) {
+                        staged = None;
+                    }
+                }
+                // Consume this file's body (bounded by the declared size) whether or
+                // not we are keeping it, so a per-file reject never desyncs the batch.
+                let mut received = 0u64;
+                loop {
+                    match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
+                        Some(ScpFrame::Data { file_id: fid, bytes }) if fid == file_id => {
+                            received += bytes.len() as u64;
+                            if received > size {
+                                let _ = send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Err("transfer failed".into())).await;
+                                drain_until_close(&mut reader).await;
+                                return Err(CryptoError::Parameter("scp put: stream exceeds declared size".into()));
+                            }
+                            if let Some(s) = staged.as_mut() {
+                                if s.write_all(&bytes).await.is_err() {
+                                    staged = None; // I/O failed: stop keeping, keep consuming
+                                }
+                            }
+                        }
+                        Some(ScpFrame::Eof { file_id: fid }) if fid == file_id => break,
+                        None => {
+                            drain_until_close(&mut reader).await;
+                            return Err(CryptoError::Parameter("scp put: stream closed mid-file".into()));
+                        }
+                        other => {
+                            let _ = send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Err("protocol error".into())).await;
+                            drain_until_close(&mut reader).await;
+                            return Err(CryptoError::Parameter(format!("scp put: unexpected frame in body: {other:?}")));
+                        }
+                    }
+                }
+                let committed = match (&dest, staged.take(), received == size) {
+                    (Ok(d), Some(s), true) => match s.commit(mode).await {
+                        Ok(()) => {
+                            audit_best_effort(audit_path, &peer_fp, &format!("scp put ok path={} bytes={received}", d.display())).await;
+                            true
+                        }
+                        Err(_) => false,
+                    },
+                    _ => false,
+                };
+                if committed {
+                    send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ack { file_id }).await?;
+                    n_ok += 1;
+                } else {
+                    let reason = match &dest {
+                        Err(e) => format!("put {path}: {e}"),
+                        Ok(_) if received != size => format!("put {path}: size mismatch"),
+                        Ok(_) => format!("put {path}: stage/commit failed"),
+                    };
+                    audit_best_effort(audit_path, &peer_fp, &format!("scp fail: {reason}")).await;
+                    send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Fail { file_id, msg: "denied".into() }).await?;
+                    n_fail += 1;
+                }
             }
-            if let Err(e) = staged.commit(mode).await {
-                let _ = send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Err(format!("commit: {e}"))).await;
-                return Err(CryptoError::FileWrite(e.to_string()));
+            // ---- get: we become the sender (single file or recursive tree) ----
+            Some(ScpFrame::Get { path, recursive }) => {
+                let read_roots = policy.roots(&peer_fp, false);
+                if !recursive {
+                    let src = match confine_read(&path, read_roots) {
+                        Ok(s) => s,
+                        Err(e) => deny!(format!("get {path}: {e}")),
+                    };
+                    let (file, mode, size) = match open_confined_read(&src, read_roots) {
+                        Ok(t) => t,
+                        Err(e) => deny!(format!("get {path}: {e}")),
+                    };
+                    if let Err(e) = audit(audit_path, &peer_fp, &format!("scp allow get path={} bytes={size}", src.display())).await {
+                        let _ = send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Err("audit unavailable; refusing".into())).await;
+                        return Err(CryptoError::Parameter(format!("scp refused: audit write failed: {e}")));
+                    }
+                    next_id += 1;
+                    let name = src.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                    send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Put { file_id: next_id, path: name, mode, size }).await?;
+                    let mut f = tokio::fs::File::from_std(file);
+                    let sent = stream_bytes(&mut writer, aead_name, tx_key, &mut tx, next_id, &mut f).await?;
+                    // The client acks after committing; then Done + drain.
+                    let _ = recv(&mut reader, aead_name, rx_key, &mut rx).await?;
+                    send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Done).await?;
+                    audit_best_effort(audit_path, &peer_fp, &format!("scp get ok path={} bytes={sent}", src.display())).await;
+                    drain_until_close(&mut reader).await;
+                    return Ok(());
+                }
+                // Recursive: the request must resolve to a directory under a read root.
+                let root = match confine_read(&path, read_roots) {
+                    Ok(d) => d,
+                    Err(e) => deny!(format!("get {path}: {e}")),
+                };
+                if !root.is_dir() {
+                    deny!(format!("get {path}: not a directory (recursive)"));
+                }
+                let entries = match walk_tree(&root) {
+                    Ok(e) => e,
+                    Err(e) => deny!(format!("get {path}: walk: {e}")),
+                };
+                audit_best_effort(audit_path, &peer_fp, &format!("scp allow get -r path={} entries={}", root.display(), entries.len())).await;
+                for (rel, is_dir) in entries {
+                    next_id += 1;
+                    let rels = rel.to_string_lossy().into_owned();
+                    if is_dir {
+                        let dmode = local_mode(&root.join(&rel));
+                        send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::MkDir { file_id: next_id, path: rels, mode: dmode }).await?;
+                    } else {
+                        let full = root.join(&rel);
+                        match open_confined_read(&full, read_roots) {
+                            Ok((file, mode, size)) => {
+                                send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Put { file_id: next_id, path: rels, mode, size }).await?;
+                                let mut f = tokio::fs::File::from_std(file);
+                                stream_bytes(&mut writer, aead_name, tx_key, &mut tx, next_id, &mut f).await?;
+                            }
+                            Err(e) => {
+                                // A file walk_tree listed can no longer be opened
+                                // safely (removed / perms changed / symlink race
+                                // mid-transfer). Fail the whole get *loudly* rather
+                                // than silently delivering an incomplete tree.
+                                audit_best_effort(audit_path, &peer_fp, &format!("scp get -r abort: {}: {e}", full.display())).await;
+                                let _ = send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Err("transfer failed".into())).await;
+                                drain_until_close(&mut reader).await;
+                                return Err(CryptoError::Parameter(format!("scp get -r: {} unreadable mid-transfer", full.display())));
+                            }
+                        }
+                    }
+                    // Consume the client's per-entry ack (Ack/Fail); ignore its kind.
+                    let _ = recv(&mut reader, aead_name, rx_key, &mut rx).await?;
+                }
+                send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Done).await?;
+                drain_until_close(&mut reader).await;
+                return Ok(());
             }
-            audit_best_effort(audit_path, &peer_fp, &format!("scp put ok path={} bytes={received}", dest.display())).await;
-            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ok).await?;
-            // Hold the connection open until the client has read our Ok and closed,
-            // so the final frame is not lost to a stream reset on return.
-            drain_until_close(&mut reader).await;
-            Ok(())
+            // ---- end of a put batch ----
+            Some(ScpFrame::Done) | None => {
+                audit_best_effort(audit_path, &peer_fp, &format!("scp batch end ok={n_ok} fail={n_fail}")).await;
+                drain_until_close(&mut reader).await;
+                return Ok(());
+            }
+            other => {
+                let _ = send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Err("protocol error".into())).await;
+                drain_until_close(&mut reader).await;
+                return Err(CryptoError::Parameter(format!("scp: unexpected frame {other:?}")));
+            }
         }
-        Some(ScpFrame::Get { path }) => {
-            let src = match confine_read(&path, policy.roots(&peer_fp, false)) {
-                Ok(s) => s,
-                Err(e) => deny!(format!("get {path}: {e}")),
-            };
-            // Open with O_NOFOLLOW so the final component can't be a symlink out of
-            // the confined root (canonicalize already resolved intermediate links).
-            let mut opts = std::fs::OpenOptions::new();
-            opts.read(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.custom_flags(libc::O_NOFOLLOW);
-            }
-            let file = match opts.open(&src) {
-                Ok(f) => f,
-                Err(e) => deny!(format!("open {}: {e}", src.display())),
-            };
-            // Post-open confinement re-check (Linux): the opened inode's real path
-            // must still be under a read root, closing the intermediate-directory
-            // symlink race that O_NOFOLLOW (final component only) leaves open.
-            #[cfg(target_os = "linux")]
-            {
-                use std::os::fd::AsRawFd;
-                if !fd_real_path(file.as_raw_fd())
-                    .map(|p| under_any(&p, policy.roots(&peer_fp, false)))
-                    .unwrap_or(false)
-                {
-                    deny!(format!("get {path}: path escaped read root after open (symlink race)"));
-                }
-            }
-            let meta = file.metadata().map_err(io_err)?;
-            if !meta.is_file() {
-                deny!(format!("{} is not a regular file", src.display()));
-            }
-            // Mode from the open fd's metadata (not a second path lookup, which
-            // could resolve to a different inode after the check).
-            let mode = {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::MetadataExt;
-                    meta.mode()
-                }
-                #[cfg(not(unix))]
-                {
-                    0o644
-                }
-            };
-            let size = meta.len();
-            if let Err(e) = audit(audit_path, &peer_fp, &format!("scp allow get path={} bytes={size}", src.display())).await {
-                let _ = send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Err("audit unavailable; refusing".into())).await;
-                return Err(CryptoError::Parameter(format!("scp refused: audit write failed: {e}")));
-            }
-
-            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Meta { mode, size }).await?;
-            let mut f = tokio::fs::File::from_std(file);
-            // Read straight into the frame plaintext buffer and seal in place.
-            let mut pt = vec![0u8; 1 + CHUNK];
-            pt[0] = T_DATA;
-            let mut sent = 0u64;
-            loop {
-                let n = f.read(&mut pt[1..]).await.map_err(io_err)?;
-                if n == 0 {
-                    break;
-                }
-                sent += n as u64;
-                send_packet(&mut writer, aead_name, tx_key, &mut tx, &pt[..1 + n]).await?;
-            }
-            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Eof).await?;
-            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ok).await?;
-            // Critical for a non-empty Get: the whole file may still be in flight
-            // when we return. Wait for the client to drain, commit and ack-close
-            // (its ScpFrame::Ok then EOF) before dropping the stream — otherwise the
-            // reset discards buffered bulk data and the client sees "connection
-            // lost" mid-read.
-            drain_until_close(&mut reader).await;
-            audit_best_effort(audit_path, &peer_fp, &format!("scp get ok path={} bytes={sent}", src.display())).await;
-            Ok(())
-        }
-        Some(other) => Err(CryptoError::Parameter(format!("scp: expected Put/Get, got {other:?}"))),
-        None => Ok(()), // clean close before any request
     }
 }
 
@@ -815,12 +1193,15 @@ mod tests {
     #[test]
     fn frame_roundtrip() {
         let frames = [
-            ScpFrame::Put { path: "/a/b/c.bin".into(), mode: 0o644, size: 1 << 40 },
-            ScpFrame::Get { path: "/srv/pub/x".into() },
-            ScpFrame::Meta { mode: 0o600, size: 12345 },
-            ScpFrame::Data(vec![0, 1, 2, 3, 255, 128]),
-            ScpFrame::Eof,
-            ScpFrame::Ok,
+            ScpFrame::Put { file_id: 7, path: "/a/b/c.bin".into(), mode: 0o644, size: 1 << 40 },
+            ScpFrame::MkDir { file_id: 3, path: "sub/dir".into(), mode: 0o755 },
+            ScpFrame::Data { file_id: 7, bytes: vec![0, 1, 2, 3, 255, 128] },
+            ScpFrame::Eof { file_id: 7 },
+            ScpFrame::Ack { file_id: 7 },
+            ScpFrame::Fail { file_id: 7, msg: "nope".into() },
+            ScpFrame::Get { path: "/srv/pub/x".into(), recursive: false },
+            ScpFrame::Get { path: "/srv/pub".into(), recursive: true },
+            ScpFrame::Done,
             ScpFrame::Err("nope".into()),
         ];
         for f in frames {
@@ -834,8 +1215,18 @@ mod tests {
     fn decode_rejects_truncated() {
         assert!(ScpFrame::decode(&[]).is_err());
         assert!(ScpFrame::decode(&[T_PUT, 0, 0]).is_err()); // header too short
-        assert!(ScpFrame::decode(&[T_GET, 0, 0, 0, 9]).is_err()); // claims 9-byte path, none present
+        assert!(ScpFrame::decode(&[T_GET, 0, 0, 0, 0, 9]).is_err()); // claims 9-byte path, none present
+        assert!(ScpFrame::decode(&[T_DATA, 0, 0]).is_err()); // missing file_id
         assert!(ScpFrame::decode(&[0xff]).is_err()); // unknown type
+    }
+
+    #[test]
+    fn safe_join_rejects_escapes() {
+        let base = Path::new("/tmp/base");
+        assert!(safe_join(base, "a/b/c.txt").is_ok());
+        assert!(safe_join(base, "../etc/passwd").is_err());
+        assert!(safe_join(base, "/etc/passwd").is_err());
+        assert!(safe_join(base, "a/../../x").is_err());
     }
 
     #[test]

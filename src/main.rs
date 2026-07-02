@@ -160,6 +160,11 @@ struct Args {
     #[arg(long)]
     scp_policy: Option<String>,
 
+    /// Recurse into directories for `--scp-put` / `--scp-get` (like `scp -r`):
+    /// the LOCAL/REMOTE argument is a directory tree copied under the destination.
+    #[arg(short = 'r', long = "recursive")]
+    recursive: bool,
+
     #[arg(
         long,
         help = "Allow unauthenticated connections (SECURITY WARNING: Default is false since v49)"
@@ -591,6 +596,7 @@ async fn main() -> anyhow::Result<()> {
     config.scp_get = args.scp_get.as_ref().map(|v| (v[0].clone(), std::path::PathBuf::from(&v[1])));
     config.serve_scp = args.serve_scp;
     config.scp_policy_path = args.scp_policy;
+    config.scp_recursive = args.recursive;
     config.scp_mode = args.serve_scp || config.scp_put.is_some() || config.scp_get.is_some();
     if config.scp_put.is_some() && config.scp_get.is_some() {
         anyhow::bail!("--scp-put and --scp-get are mutually exclusive");
