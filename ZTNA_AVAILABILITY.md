@@ -29,6 +29,11 @@ nkct のネイティブ P2P は**まさにそれが止めたいこと**をやる
 | **厳格（egress allowlist / broker-only・UDP 遮断）** | ❌ 遮断 | **実測: 全遮断**（§3.2） |
 | **アプリ allowlist**（承認アプリのみ通信可） | ❌ エージェント段で遮断 | 推定 |
 
+> **「推定」の確度差**（後の実測が何を検証するかを分けるため）: split-tunnel は egress 的に
+> 素の internet と等価なので direct 成立は**高確度**（原理から導ける）。アプリ allowlist は
+> エージェント実装依存で**中確度**。§5 の商用 ZTNA / TLS 傍受は製品・設定・シグネチャ依存で
+> **低確度**。いずれの推定も**実測で覆りうる**。
+
 ## 3. 実測エビデンス
 
 ### 3.1 寛容 full-tunnel（WireGuard exit-node, 2026-07-02）
@@ -87,9 +92,15 @@ ZTNA が「経路の認可」、nkct が「端点の暗号認証」を担い、*
 - **AUP/ポリシー**: 会社支給端末・業務 ZTNA 上で nkct を使ってブローカー外へ出るのは、多くの
   組織で **ZTNA/利用規定違反**になり得る。ZTNA はまさに un-sanctioned な egress を止めるための
   仕組み。自分が管理する環境・許可された枠で。
-- **商用 ZTNA は未実測**（Zscaler ZPA / Cloudflare Gateway / Netskope 等）。特に TLS 傍受プロキシ・
-  CONNECT-only プロキシ下では、iroh relay（QUIC/HTTPS）が素通りしない懸念があり、厳しい見込み
-  （推定）。判定は `--conn-metrics` が direct/relay/失敗を一発で出す。
+- **商用 ZTNA は未実測**（Zscaler ZPA / Cloudflare Gateway / Netskope 等）。予測を確度で分ける:
+  - **高確度（アーキテクチャから導ける）**: iroh relay は 443/TLS 上で確立するので、UDP を全遮断
+    しても **443 が開いていれば relay 経路は生存しうる**。
+  - **低〜不確実（製品・設定・シグネチャ依存）**: TLS 傍受プロキシ・CONNECT-only プロキシ下で
+    iroh relay（QUIC/HTTPS）が素通りするかは、プロキシ実装次第で**大きく振れる**（厳しい見込み
+    だが確度は低い）。
+  - **これらの推定は実測で覆りうる**。「未実測（まだ測っていない）」と「外れうる（測ったら違う
+    かも）」は別の留保で、特に TLS 傍受下の relay 挙動はプロキシ実装依存で**予測が外れうる**。
+    判定は対象環境で `--conn-metrics` を実測するのが最速（direct/relay/失敗を一発で出す）。
 
 ## 6. 運用指針（nkct を ZTNA 下で使いたい管理者へ）
 
