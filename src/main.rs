@@ -696,20 +696,18 @@ async fn main() -> anyhow::Result<()> {
              to restrict who may obtain a shell"
         );
     }
-    // A root shell server is only safe with a privilege-drop policy (Phase 2b):
-    // every allowed session then drops to the policy's mapped non-root user.
-    // Without a policy, refuse to serve as root (it would hand a peer a root
-    // shell). With a policy, the per-session `resolve_drop` enforces the drop and
-    // refuses any mapping that would still be root.
+    // Tier 1 (same-user): the shell runs as the server's own user — there is no
+    // in-process privilege drop (the setuid path was removed when the PTY layer
+    // unified on portable-pty). So a root shell server is never safe: every
+    // allowed session would be a root shell. Refuse to serve as root outright,
+    // regardless of policy. For multiple distinct users, run one unprivileged
+    // per-user server instance each (see TRUST_BOOTSTRAP_DESIGN.md).
     #[cfg(unix)]
-    if args.serve_shell
-        && config.shell_policy_path.is_none()
-        && unsafe { libc::geteuid() == 0 || libc::getuid() == 0 }
-    {
+    if args.serve_shell && unsafe { libc::geteuid() == 0 || libc::getuid() == 0 } {
         anyhow::bail!(
-            "refusing to run --serve-shell as root without --shell-policy: there is no \
-             per-user privilege drop without a policy. Provide --shell-policy mapping \
-             fingerprints to non-root users, or run as an unprivileged user."
+            "refusing to run --serve-shell as root: there is no per-user privilege drop \
+             (Tier 1 runs the shell as the server's own user). Run as an unprivileged \
+             user, or a separate per-user instance for each user."
         );
     }
     // File transfer reaches the server's filesystem, so it is as

@@ -71,6 +71,14 @@ pub fn secure_write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C, force:
     let dir = path_ref.parent().ok_or_else(|| {
         CryptoError::FileWrite("Failed to determine parent directory".to_string())
     })?;
+    // A bare filename (no directory component) has an *empty* parent, not `None`.
+    // `NamedTempFile::new_in("")` / `metadata("")` then fail ("path not found") on
+    // Windows — and `access("")` fails on unix too — so normalize "" to ".".
+    let dir: &Path = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
 
     // F-48-10: Check directory writability for better error messages (F-49-2 improved)
     #[cfg(unix)]
@@ -102,11 +110,16 @@ pub fn secure_write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C, force:
     let mut tmp = NamedTempFile::new_in(dir)
         .map_err(|e| CryptoError::FileWrite(format!("Failed to create temporary file: {}", e)))?;
 
-    // F-48-2 Fix: Set 0600 permissions on the temp file using the file descriptor (fchmod equivalent)
-    use std::os::unix::fs::PermissionsExt;
-    tmp.as_file()
-        .set_permissions(std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| CryptoError::FileWrite(format!("Failed to set temp file permissions: {}", e)))?;
+    // F-48-2: owner-only (0600) permissions on the temp file via its fd (fchmod
+    // equivalent). Windows has no unix mode bits; there the temp directory's ACLs
+    // provide owner-only access (documented weaker guarantee).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|e| CryptoError::FileWrite(format!("Failed to set temp file permissions: {}", e)))?;
+    }
 
     use std::io::Write;
     tmp.as_file_mut()
@@ -186,26 +199,54 @@ impl Drop for SecureBuffer {
         //    allocate/drop cycles. munlock on a partially-locked range
         //    is a no-op for the unlocked portion, so using capacity
         //    covers ranges locked via new()/with_capacity()/extend.
-        let cap = self.0.capacity();
-        if cap > 0 {
-            unsafe {
-                let _ = libc::munlock(self.0.as_ptr() as *const libc::c_void, cap);
-            }
-        }
+        unlock_mem(self.0.as_ptr(), self.0.capacity());
     }
+}
+
+/// Lock a memory range so secrets are not swapped to disk (best-effort; a
+/// failure is ignored — the buffer is still zeroized on drop). unix: `mlock`;
+/// windows: `VirtualLock`; other targets: no-op.
+#[inline]
+fn lock_mem(ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::mlock(ptr as *const libc::c_void, len);
+    }
+    #[cfg(windows)]
+    unsafe {
+        let _ = windows_sys::Win32::System::Memory::VirtualLock(ptr as *const core::ffi::c_void, len);
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (ptr, len);
+}
+
+/// Paired unlock for [`lock_mem`].
+#[inline]
+fn unlock_mem(ptr: *const u8, len: usize) {
+    if len == 0 {
+        return;
+    }
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::munlock(ptr as *const libc::c_void, len);
+    }
+    #[cfg(windows)]
+    unsafe {
+        let _ = windows_sys::Win32::System::Memory::VirtualUnlock(ptr as *const core::ffi::c_void, len);
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = (ptr, len);
 }
 
 impl SecureBuffer {
     pub fn new(size: usize) -> Result<Self> {
         let buf = vec![0u8; size];
 
-        // Lock memory to prevent swapping. munlock is paired in Drop.
-        unsafe {
-            if libc::mlock(buf.as_ptr() as *const libc::c_void, buf.len()) != 0 {
-                // Ignore mlock failure as in the C++ version;
-                // the Drop impl still zeroizes on release.
-            }
-        }
+        // Lock memory to prevent swapping (best-effort). Unlocked in Drop.
+        lock_mem(buf.as_ptr(), buf.len());
 
         Ok(SecureBuffer(buf))
     }
@@ -218,11 +259,7 @@ impl SecureBuffer {
 
     pub fn with_capacity(capacity: usize) -> Result<Self> {
         let buf = Vec::with_capacity(capacity);
-        if buf.capacity() > 0 {
-            unsafe {
-                let _ = libc::mlock(buf.as_ptr() as *const libc::c_void, buf.capacity());
-            }
-        }
+        lock_mem(buf.as_ptr(), buf.capacity());
         Ok(SecureBuffer(buf))
     }
 
@@ -234,9 +271,7 @@ impl SecureBuffer {
         let new_cap = self.0.capacity();
 
         if new_ptr != old_ptr || new_cap != old_cap {
-            unsafe {
-                let _ = libc::mlock(new_ptr as *const libc::c_void, new_cap);
-            }
+            lock_mem(new_ptr, new_cap);
         }
     }
 
@@ -305,6 +340,11 @@ pub fn get_and_verify_passphrase(prompt: &str) -> Result<Option<Zeroizing<String
 }
 
 pub fn disable_core_dumps() {
+    // unix: drop RLIMIT_CORE to 0 (+ PR_SET_DUMPABLE on Linux) so a crash cannot
+    // dump key material to disk. Windows has no RLIMIT_CORE; crash-dump
+    // suppression there is an OS/WER-level concern outside this process
+    // (documented limitation).
+    #[cfg(unix)]
     unsafe {
         let limit = libc::rlimit {
             rlim_cur: 0,

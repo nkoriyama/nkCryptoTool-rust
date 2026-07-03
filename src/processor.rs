@@ -14,7 +14,6 @@ use crate::strategy::streaming_aead::{self as v3, StreamingMode};
 use crate::strategy::CryptoStrategy;
 use rand_core::RngCore;
 use std::collections::HashMap;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::File;
@@ -25,6 +24,22 @@ pub type ProgressCallback = Arc<dyn Fn(f64) + Send + Sync>;
 
 const BUF_SIZE: usize = 1024 * 1024;
 const AEAD_OVERHEAD: usize = 32;
+
+/// Open an output file for exclusive creation with owner-only permissions and
+/// symlink protection. unix: 0600 + `O_NOFOLLOW`; on Windows those flags do not
+/// exist, so it falls back to a plain exclusive create — the output directory's
+/// ACLs provide owner access, but the symlink-swap TOCTOU guard is weaker there
+/// (documented limitation).
+fn open_secure_create<P: AsRef<Path>>(path: P) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    o.open(path)
+}
 
 pub struct CryptoProcessor {
     strategy: Option<Box<dyn CryptoStrategy>>,
@@ -506,7 +521,6 @@ impl CryptoProcessor {
     ) -> Result<Box<dyn CryptoStrategy>> {
         let cb_clone = progress_callback.clone();
         tokio::task::spawn_blocking(move || {
-            use std::fs::OpenOptions;
             use std::io::{BufReader, BufWriter, Read, Write};
 
             let in_file =
@@ -517,12 +531,7 @@ impl CryptoProcessor {
                 let _ = std::fs::remove_file(&output_path);
             }
 
-            let out_file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&output_path)
+            let out_file = open_secure_create(&output_path)
                 .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
             let mut writer = BufWriter::with_capacity(BUF_SIZE * 4, out_file);
 
@@ -592,7 +601,6 @@ impl CryptoProcessor {
 
         let cb_clone = progress_callback.clone();
         let res = tokio::task::spawn_blocking(move || {
-            use std::fs::OpenOptions;
             use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
             // Pass 1: Verification (no disk writing)
@@ -641,12 +649,7 @@ impl CryptoProcessor {
                 .map_err(|e| CryptoError::FileRead(e.to_string()))?;
             let mut reader = BufReader::with_capacity(BUF_SIZE * 4, &in_file);
 
-            let out_file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&temp_output_path_clone)
+            let out_file = open_secure_create(&temp_output_path_clone)
                 .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
             let mut writer = BufWriter::with_capacity(BUF_SIZE * 4, out_file);
 
@@ -729,7 +732,6 @@ impl CryptoProcessor {
     ) -> Result<Box<dyn CryptoStrategy>> {
         let cb_clone = progress_callback.clone();
         tokio::task::spawn_blocking(move || {
-            use std::fs::OpenOptions;
             use std::io::{BufReader, BufWriter, Write};
 
             if chunk_size == 0 {
@@ -744,12 +746,7 @@ impl CryptoProcessor {
             if force {
                 let _ = std::fs::remove_file(&output_path);
             }
-            let out_file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&output_path)
+            let out_file = open_secure_create(&output_path)
                 .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
             let mut writer = BufWriter::with_capacity(BUF_SIZE * 4, out_file);
 
@@ -838,7 +835,6 @@ impl CryptoProcessor {
 
         let cb_clone = progress_callback.clone();
         let res = tokio::task::spawn_blocking(move || {
-            use std::fs::OpenOptions;
             use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 
             if chunk_size == 0 {
@@ -878,12 +874,7 @@ impl CryptoProcessor {
                 let mut writer: Option<BufWriter<std::fs::File>> = if verify_only {
                     None
                 } else {
-                    let out_file = OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .mode(0o600)
-                        .custom_flags(libc::O_NOFOLLOW)
-                        .open(&temp_output_path_clone)
+                    let out_file = open_secure_create(&temp_output_path_clone)
                         .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
                     Some(BufWriter::with_capacity(BUF_SIZE * 4, out_file))
                 };
