@@ -1,7 +1,8 @@
 # P2P ファイル転送の比較
 
 NAT/CGNAT 配下のホストへ「踏み台なし・ポート開放なし」でファイルを送受する各手段の比較。
-対話シェル/到達手段そのものの比較は [`P2P_SHELL_COMPARISON.md`](./P2P_SHELL_COMPARISON.md)。
+対話シェル/到達手段そのものの比較は [`P2P_SHELL_COMPARISON.md`](./P2P_SHELL_COMPARISON.md)、
+ZTNA / egress 制御下の可用性は [`ZTNA_AVAILABILITY.md`](./ZTNA_AVAILABILITY.md)。
 
 > 本表は**設計説明**。nkCryptoTool 側の数値・挙動は本セッションで実測・検証済み
 > （[`P2P_SCP_PIPELINE_REPORT.md`](./P2P_SCP_PIPELINE_REPORT.md) /

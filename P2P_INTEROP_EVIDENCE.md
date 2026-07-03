@@ -268,3 +268,4 @@ x86_64）の `--serve-shell` へ接続した。両端 `--discovery n0`、`--mode
 - `P2P_SHELL_COMPARISON.md` — 設計・到達手段の比較表（本ドキュメントが実証面を補う）
 - `P2P_SHELL_DESIGN.md` — P2P シェルの設計メモ（§12 テスト計画）
 - `P2P_SSH_USAGE_GUIDE.md` — 利用ガイド
+- `ZTNA_AVAILABILITY.md` — ZTNA / egress 制御下の可用性（実測 + 運用指針）

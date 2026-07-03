@@ -1,0 +1,126 @@
+# ZTNA 環境下における nkCryptoTool の可用性
+
+ZTNA(Zero Trust Network Access）や egress を制御するネットワーク下で nkct（P2P
+shell / scp / chat / file）がどこまで到達できるか、実測と運用指針。
+
+> 本書は**実測エビデンス + 運用指針**。nkct 側の数値・挙動は本ラボで実測。**商用 ZTNA
+> 製品（Zscaler ZPA / Cloudflare Gateway 等）は未実測**の項目を推定として明記する
+> （Part 2 の規律に準拠）。関連の性能・到達性実証は
+> [`P2P_INTEROP_EVIDENCE.md`](./P2P_INTEROP_EVIDENCE.md)。
+
+## 1. 前提: nkct トランスポートが要求するもの
+
+iroh トランスポートは 3 つに依存する:
+
+1. **outbound UDP** — 直接ホールパンチ（P2P の主経路）。
+2. **n0 の DNS/pkarr（`iroh.link`）** — `--discovery n0` のピア発見。
+3. **relay（443/TLS）へのフォールバック** — UDP が塞がれたとき。
+
+ZTNA はこの 3 つをよく制限する。よって**可用性は ZTNA の egress posture に完全に依存**する。
+根本的な緊張として、**厳格 ZTNA は「un-brokered な egress を止める」ための仕組み**であり、
+nkct のネイティブ P2P は**まさにそれが止めたいこと**をやる。
+
+## 2. posture 別 可用性マトリクス
+
+| ZTNA posture | nkct ネイティブ(iroh) | 実測/推定 |
+|---|---|---|
+| **split-tunnel**（社内アプリのみブローカー、他は素の internet） | ✅ 通る（direct hole-punch） | 推定（素のネットと同等） |
+| **full-tunnel・egress 寛容**（UDP 通る・一般 internet 可） | ✅ 通る（relay fallback もあり得る） | **実測: direct・RTT +1ms**（§3.1） |
+| **厳格（egress allowlist / broker-only・UDP 遮断）** | ❌ 遮断 | **実測: 全遮断**（§3.2） |
+| **アプリ allowlist**（承認アプリのみ通信可） | ❌ エージェント段で遮断 | 推定 |
+
+## 3. 実測エビデンス
+
+### 3.1 寛容 full-tunnel（WireGuard exit-node, 2026-07-02）
+
+bazzite を Tailscale exit-node（full-tunnel VPN）配下に置き、tailnet 外の OCI VPS へ接続:
+**20/20 direct hole-punch 成立・relay 0%・RTT 中央値 5ms（exit-node 1 ホップ分 +1ms）**。
+＝ egress が寛容な full-tunnel なら nkct は素通りする。詳細は `P2P_INTEROP_EVIDENCE.md` 第2パス。
+
+### 3.2 厳格 ZTNA（OpenZiti default-deny egress ラボ, 2026-07-03）
+
+nkpve（Proxmox）上に OpenZiti を構築（CT121=controller/router、CT122=enroll 済エンドポイント）。
+エンドポイントに **nftables default-deny egress**（許可は Ziti ブローカー 192.168.0.75 のみ）を課し、
+「un-brokered egress を禁じる」ZTNA posture を再現:
+
+| 経路 | 結果 |
+|---|---|
+| ベースライン（制限なし）nkct `--conn-metrics` | **relay=false rtt_ms=1**（LAN 直結で疎通） |
+| default-deny 下: Ziti ブローカー(3022) | **到達可（唯一の sanctioned 経路）** |
+| default-deny 下: nkct ネイティブ iroh P2P | **BLOCKED**（UDP ホールパンチ遮断→connect timeout 連続、metrics 出ず） |
+| default-deny 下: 一般 internet（curl 1.1.1.1） | **BLOCKED** |
+
+＝ 厳格 ZTNA は nkct ネイティブ P2P を**完全に止める**。
+
+## 4. 構成的可用性 — sanction すれば厳格 ZTNA 下でも通る
+
+厳格 ZTNA でも、nkct を**ブローカー許可サービスとして sanction すれば通る**。鍵は nkct の
+**TCP トランスポート**（`--transport tcp --listen/--connect host:port` = 素の TCP + PQC ハンドシェイク）。
+iroh の多宛先 UDP と違い、TCP なら単一 host:port として ZTNA サービスにトンネルできる。
+
+**実測（同ラボ, default-deny egress 下, 2026-07-03）**:
+- CT121 に nkct TCP サーバ（127.0.0.1:7788）+ `ziti tunnel host`（サービス `nkct-svc`: host.v1→7788、
+  bind=host識別子 / dial=endpoint識別子 の service-policy）。
+- CT122 で `ziti tunnel proxy nkct-svc:7788`（**TUN 不要 = 非特権 LXC で動く**）→ local:7788 を張る。
+- CT122 の nkct client `--transport tcp --connect 127.0.0.1:7788` → Ziti fabric 経由で CT121 到達。
+- **結果: default-deny egress 下でも PQC 相互認証が成立**（client `Server authenticated / Handshake
+  completed`、server `Client authenticated (pinned key)`）。ネイティブ iroh は同条件で遮断される。
+
+### 二層の共存（本ラボが実証したこと）
+
+- **ネットワーク層（ZTNA/Ziti）**: 誰が・どの経路で外に出られるかを default-deny + ブローカーで制御。
+- **アプリ層（nkct）**: その sanctioned 経路の上で、ML-KEM + ML-DSA 相互認証 + 指紋ピン + AEAD を重ねる。
+
+ZTNA が「経路の認可」、nkct が「端点の暗号認証」を担い、**排他でなく積層**する
+（設計思想は [`TRUST_BOOTSTRAP_DESIGN.md`](./TRUST_BOOTSTRAP_DESIGN.md) の
+「ネットワーク ZTNA が許可した経路の上に nkct のアプリ層相互認証を重ねる」の実データ裏付け）。
+
+## 5. 制約と注意
+
+- **TCP トランスポートは chat / file のみ**。shell / scp / forward は iroh 専用なので、**sanction
+  経路（TCP）では現状 shell/scp は使えない**。ZTNA 下で shell/scp を通したい場合は relay 経路
+  （下記 6.b の自己ホスト relay）を使う。
+- **iroh（多宛先 UDP P2P）は単純な Ziti サービス化が困難**（ホールパンチ + n0 DNS + relay の
+  複数宛先）。sanction には TCP トランスポートを使うのが要点。
+- **透過インターセプタ（`ziti tunnel tproxy/run`）は非特権 LXC で init 失敗**（NET_ADMIN /
+  iptables mangle 要）。`ziti tunnel proxy`（アプリ層ポートフォワード）は TUN 不要で動く。
+- **AUP/ポリシー**: 会社支給端末・業務 ZTNA 上で nkct を使ってブローカー外へ出るのは、多くの
+  組織で **ZTNA/利用規定違反**になり得る。ZTNA はまさに un-sanctioned な egress を止めるための
+  仕組み。自分が管理する環境・許可された枠で。
+- **商用 ZTNA は未実測**（Zscaler ZPA / Cloudflare Gateway / Netskope 等）。特に TLS 傍受プロキシ・
+  CONNECT-only プロキシ下では、iroh relay（QUIC/HTTPS）が素通りしない懸念があり、厳しい見込み
+  （推定）。判定は `--conn-metrics` が direct/relay/失敗を一発で出す。
+
+## 6. 運用指針（nkct を ZTNA 下で使いたい管理者へ）
+
+- **寛容な ZTNA**（split / permissive full-tunnel）: そのまま通る。何もしなくてよい（§3.1）。
+- **厳格な ZTNA**: 2 通り。
+  - **(a) TCP トランスポートを ZTNA サービスとして sanction**（§4）。chat/file が通る。shell/scp は不可。
+  - **(b) 自己ホスト relay を ZTNA 許可ドメイン・443 に立て、`--relay-url` で指す**。iroh 経路のまま
+    relay-only で通せる可能性（TLS 傍受があると厳しい・要検証）。shell/scp も iroh 経路なので候補。
+- 判定は**対象環境で `--conn-metrics` を実測**するのが最速。direct/relay/失敗が 1 行で出る。
+
+## 7. 再現（ラボ構成）
+
+- ホスト: Proxmox（nkpve）。CT121 `ziti`（debian-12・非特権・2c/2GB/8GB、OpenZiti v2.0.0
+  `ziti edge quickstart`、controller `:1280` + router `:3022`）。CT122 `zt-endpoint`（TUN passthrough、
+  enroll 済、nkct musl バイナリ）。
+- **v2.0.0 の罠**: advertise アドレスに素の IP は SAN 検証で fatal → **ホスト名 `ziti.lan`**
+  を advertise（クライアントの `/etc/hosts` に `192.168.0.75 ziti.lan`）。
+- egress 制御: `nft` で `chain output { policy drop; oif lo accept; ct state established,related accept;
+  ip daddr <broker> accept }`。
+
+## 8. 結論
+
+- **可用性は ZTNA の egress posture に完全依存**: 寛容なら素通り（実測 +1ms）、厳格なら
+  ネイティブ P2P は全遮断（実測）。
+- **厳格 ZTNA 下でも sanction すれば通る**: TCP トランスポートを ZTNA サービス化すれば、
+  ブローカー経路の上で nkct の PQC 相互認証が成立（実測）。ネットワーク ZTNA と nkct アプリ層
+  認証は積層する。
+- 制約: sanction 経路（TCP）では shell/scp 不可・iroh 直の sanction は困難・商用 ZTNA は未実測。
+
+## 関連
+
+- `P2P_INTEROP_EVIDENCE.md` — 到達性・性能の実測（本書の前提）。
+- `TRUST_BOOTSTRAP_DESIGN.md` — 二層共存の設計思想。
+- `P2P_SCP_COMPARISON.md` — 他ファイル転送との比較。
