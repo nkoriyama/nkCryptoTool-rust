@@ -33,6 +33,19 @@ nkwire arm64、実機ホールパンチ）。ステータスバーが接続経�
 - 他手段との比較: [`P2P_SHELL_COMPARISON.md`](./P2P_SHELL_COMPARISON.md)
 - 実証エビデンス: [`P2P_INTEROP_EVIDENCE.md`](./P2P_INTEROP_EVIDENCE.md)
 
+## **デモ: 踏み台レス PQC P2P シェル — Linux → Windows (ConPTY)**
+
+![Linux から Windows への PQC P2P シェルのデモ](./docs/p2p_shell_win_linux_demo.gif)
+
+Linux クライアントから実 Windows ホストへ、**踏み台なし・ポート開放なし・相互 ML-DSA-65
+認証**でシェル接続する様子（bazzite x86_64 → DESKTOP-UCP2T48、Wi-Fi ↔ 有線の実機
+ホールパンチ・直結経路）。`whoami` / `ver` / `hostname` が Windows 側 (ConPTY) で実行され、
+ステータスバーが `●Direct P2P ｜ Latency:3ms ｜ P-256+ML-KEM-768 / AES-256-GCM` を表示する。
+同一コードが openpty (Unix) と ConPTY (Windows) を `portable-pty` で吸収し、プロセス起動
+ユーザの権限で動作する（Tier-1 同一ユーザ）。
+
+同一ホスト内 Linux ↔ Linux 版（ループバック iroh）: [`docs/p2p_shell_linux_demo.gif`](./docs/p2p_shell_linux_demo.gif)。
+
 ## **デモ: 踏み台レス PQC P2P シェル + ファイル転送 (scp)**
 
 ![PQC P2P の ssh + scp デモ](./docs/p2p_ssh_scp_demo.gif)

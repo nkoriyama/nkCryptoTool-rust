@@ -31,3 +31,4 @@ ticket.log
 
 # Generated UniFFI bindings (regenerate with the uniffi-bindgen bin)
 /bindings/
+demos/.state/
