@@ -113,6 +113,33 @@ ZTNA が「経路の認可」、nkct が「端点の暗号認証」を担い、*
 
 ## 7. 再現（ラボ構成）
 
+Proxmox（nkpve）上に LXC 3 台で「厳格 ZTNA posture + sanctioned 経路」を再現した構成:
+
+```mermaid
+flowchart LR
+  subgraph CT122["CT122 zt-endpoint (非特権/TUN) — 192.168.0.173"]
+    C["nkct client<br/>--transport tcp<br/>--connect 127.0.0.1:7788"]
+    P["ziti tunnel proxy<br/>local :7788"]
+    NFT{{"nftables OUTPUT<br/>policy drop<br/>allow: lo / established / broker のみ"}}
+    C --> P
+  end
+  subgraph CT121["CT121 ziti = ブローカー — 192.168.0.75 / ziti.lan"]
+    CTRL["OpenZiti<br/>controller :1280<br/>edge router :3022"]
+    S["nkct TCP server<br/>127.0.0.1:7788"]
+    H["ziti tunnel host<br/>→ service nkct-svc"]
+    H --> S
+  end
+  P -->|"② sanctioned: Ziti fabric<br/>PQC 相互認証 (§4 実測)"| H
+  NFT -.->|"iroh P2P (UDP)"| X1["✗ BLOCKED (§3.2)"]
+  NFT -.->|"一般 internet"| X2["✗ BLOCKED (§3.2)"]
+```
+
+- **① default-deny egress**: CT122 の nftables が broker(192.168.0.75)以外への egress を全遮断
+  → nkct ネイティブ iroh P2P も一般 internet も止まる（§3.2 実測）。
+- **② sanctioned 経路**: nkct の TCP トランスポートを Ziti サービス(`nkct-svc`)化
+  → default-deny 下でも Ziti fabric 経由で PQC 相互認証が成立（§4 実測）。
+- **CT123 `zt-agent`**（特権/TUN・停止・参照残置）: 透過 tproxy 検証機 → §8。
+
 - ホスト: Proxmox（nkpve）。CT121 `ziti`（debian-12・非特権・2c/2GB/8GB、OpenZiti v2.0.0
   `ziti edge quickstart`、controller `:1280` + router `:3022`）。CT122 `zt-endpoint`（TUN passthrough、
   enroll 済、nkct musl バイナリ、proxy-mode 本番構成）。CT123 `zt-agent`（**特権 LXC**・
