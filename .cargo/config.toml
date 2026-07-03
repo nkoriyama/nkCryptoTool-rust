@@ -1,8 +1,25 @@
+# `native` is only a fallback for targets without their own section below. Do NOT
+# let a cross-compiled artifact inherit it: `native` bakes in the *build host's*
+# CPU (e.g. Zen5 AVX-512/VAES), which SIGILLs on a different CPU and is
+# irreproducible in CI (the runner's CPU is undefined). Give every distributed
+# target an explicit, portable floor.
 [build]
 rustflags = ["-C", "target-cpu=native"]
 
+# Local Linux dev: full host tuning (this is the machine that runs it).
 [target.x86_64-unknown-linux-gnu]
 rustflags = [
   "-C", "target-cpu=native",
   "-C", "target-feature=+aes,+ssse3,+avx2,+vaes,+pclmulqdq"
+]
+
+# Windows is always cross-compiled here for *other* machines, so pin a portable
+# floor instead of inheriting `native`. x86-64-v3 = Haswell+ / Zen1+ (AVX2/BMI2,
+# no AVX-512); AES-NI + PCLMULQDQ are effectively universal on x86-64. This makes
+# the .exe reproducible and safe to distribute without relying on a RUSTFLAGS env
+# override. (crypto provider is `ring`, which ships pregenerated asm — no nasm.)
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  "-C", "target-cpu=x86-64-v3",
+  "-C", "target-feature=+aes,+pclmulqdq",
 ]
