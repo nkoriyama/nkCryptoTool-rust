@@ -906,7 +906,7 @@ where
         .openpty(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| CryptoError::Parameter(format!("openpty: {e}")))?;
     let command = build_shell_command(&run_cmd, &safe_term);
-    let mut child = pty
+    let child = pty
         .slave
         .spawn_command(command)
         .map_err(|e| CryptoError::Parameter(format!("spawn shell: {e}")))?;
@@ -969,11 +969,30 @@ where
         }
     });
 
+    // Detect the shell process exiting independently of the PTY reaching EOF. On
+    // unix, dropping the slave makes the master read hit EOF when the shell exits
+    // (handled by the `None` arm below). On Windows the ConPTY keeps its output
+    // pipe open as long as any handle (reader/writer/master) lives, so the read
+    // never ends and the client would hang until it disconnects. Wait on the
+    // child in a thread and surface its exit code so the bridge can drain any
+    // remaining output and finish cleanly on both platforms.
+    let mut killer = child.clone_killer();
+    let (exit_tx, mut exit_rx) = tokio::sync::oneshot::channel::<i32>();
+    std::thread::spawn(move || {
+        let mut child = child;
+        let code = child.wait().map(|s| s.exit_code() as i32).unwrap_or(-1);
+        let _ = exit_tx.send(code);
+    });
+    let mut child_code: Option<i32> = None;
+
     loop {
         tokio::select! {
             chunk = out_rx.recv() => match chunk {
-                Some(bytes) => send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
-                    &Frame::Data(bytes)).await?,
+                // On a write error the client is gone; break to the unconditional
+                // teardown below (kill the shell, abort the reader, audit) rather
+                // than `?`-returning past it and leaking the process/task.
+                Some(bytes) => if send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
+                    &Frame::Data(bytes)).await.is_err() { break; },
                 None => break, // PTY closed (shell exited)
             },
             frame = in_frame_rx.recv() => match frame {
@@ -986,20 +1005,41 @@ where
                 Some(Frame::Exit(_)) | Some(Frame::Error(_)) | None => break,
                 Some(Frame::Open { .. }) => {} // ignore a duplicate OPEN
             },
+            code = &mut exit_rx => {
+                // The shell process exited. On unix the reader also hits EOF and
+                // the `None` arm drains the tail; on Windows the ConPTY pipe never
+                // EOFs, so drain any buffered output with a short idle timeout and
+                // then finish so we don't lose the program's final bytes.
+                let c = code.unwrap_or(-1);
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(100), out_rx.recv()).await
+                    {
+                        // A write error here also falls through to the teardown
+                        // below (don't `?` past the reap/audit).
+                        Ok(Some(bytes)) => if send_frame(&mut writer, aead_name, tx_key,
+                            &mut tx_ctr, &Frame::Data(bytes)).await.is_err() { break; },
+                        _ => break,
+                    }
+                }
+                child_code = Some(c);
+                break;
+            }
         }
     }
 
     // Always reap the shell. If we are here because the client went away while
     // the shell is still running, kill it so neither the process nor the PTY
-    // bridge threads leak (kill on an already-exited child is a harmless no-op).
+    // bridge threads leak (kill on an already-exited child is a harmless no-op);
+    // otherwise the shell already exited and the waiter thread has the code.
     reader_task.abort();
-    let _ = child.kill();
-    let code = tokio::task::spawn_blocking(move || child.wait())
-        .await
-        .ok()
-        .and_then(|r| r.ok())
-        .map(|s| s.exit_code() as i32)
-        .unwrap_or(-1);
+    let code = match child_code {
+        Some(c) => c,
+        None => {
+            let _ = killer.kill();
+            exit_rx.await.unwrap_or(-1)
+        }
+    };
     audit_best_effort(audit_path, &peer_fp, &format!("session end exit={code}")).await;
     let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr, &Frame::Exit(code)).await;
     Ok(())

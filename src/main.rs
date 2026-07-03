@@ -424,6 +424,19 @@ fn private_key_file_is_encrypted(path: &Option<String>) -> bool {
 async fn main() -> anyhow::Result<()> {
     nk_crypto_tool::utils::disable_core_dumps();
 
+    // Diagnostics: when RUST_LOG is set, install a tracing subscriber so iroh's
+    // internal logs (magicsock hole-punch, relay fallback, QUIC handshake) and
+    // our own tracing reach stderr. Silent by default — normal runs are
+    // unaffected. Example: `RUST_LOG=iroh=debug,nk_crypto_tool=debug nkct …`.
+    if std::env::var_os("RUST_LOG").is_some() {
+        use tracing_subscriber::{fmt, EnvFilter};
+        let _ = fmt()
+            .with_env_filter(EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init();
+    }
+
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if std::is_x86_feature_detected!("aes") {
         eprintln!("AES-NI is available!");
