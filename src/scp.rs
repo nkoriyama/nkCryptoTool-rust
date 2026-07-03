@@ -245,7 +245,10 @@ async fn drain_until_close(reader: &mut (impl AsyncReadExt + Unpin)) {
 pub struct ScpPolicy {
     read: HashMap<[u8; 32], Vec<PathBuf>>,
     write: HashMap<[u8; 32], Vec<PathBuf>>,
-    #[allow(dead_code)] // parsed + audited now; enforced (privilege drop) in a follow-up.
+    // allow(dead_code): the per-fingerprint `user=` map is parsed and audited at
+    // policy-load time but not yet consumed by a code path.
+    // Future: wire it into the shell per-user privilege-drop path.
+    #[allow(dead_code)]
     user: HashMap<[u8; 32], String>,
 }
 
