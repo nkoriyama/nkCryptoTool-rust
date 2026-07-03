@@ -104,20 +104,64 @@ ZTNA が「経路の認可」、nkct が「端点の暗号認証」を担い、*
 
 - ホスト: Proxmox（nkpve）。CT121 `ziti`（debian-12・非特権・2c/2GB/8GB、OpenZiti v2.0.0
   `ziti edge quickstart`、controller `:1280` + router `:3022`）。CT122 `zt-endpoint`（TUN passthrough、
-  enroll 済、nkct musl バイナリ）。
+  enroll 済、nkct musl バイナリ、proxy-mode 本番構成）。CT123 `zt-agent`（**特権 LXC**・
+  透過 tproxy 検証用、§8。停止・参照残置）。
 - **v2.0.0 の罠**: advertise アドレスに素の IP は SAN 検証で fatal → **ホスト名 `ziti.lan`**
   を advertise（クライアントの `/etc/hosts` に `192.168.0.75 ziti.lan`）。
 - egress 制御: `nft` で `chain output { policy drop; oif lo accept; ct state established,related accept;
   ip daddr <broker> accept }`。
 
-## 8. 結論
+## 8. 透過インターセプト（tproxy）の知見
+
+`ziti tunnel proxy`（§4）はローカルポート + `nkct --connect 127.0.0.1:port` の明示接続だが、
+より ZTNA エージェントらしい**透過インターセプト**（アプリは実サービス名に繋ぐだけ）も検証した。
+
+- **非特権 LXC では init 失敗**（`failed to initialize an interceptor`）。NET_ADMIN / iptables
+  mangle / TPROXY が要る。→ **特権 LXC + ホストで tproxy 系モジュール**（`nf_tproxy_ipv4`,
+  `xt_TPROXY`, `nft_tproxy`）を load すると**インターセプタは初期化成功**:
+  DNS server（127.0.0.1:53）+ サービス名の仮想 IP 割当（`nkct.ziti → 100.64.0.2`）+
+  `iptables -t mangle NF-INTERCEPT ... -j TPROXY` ルールまで自動生成される。
+- ただし **`ziti tunnel tproxy` の TPROXY ルールは PREROUTING**＝**ゲートウェイ透過**
+  （このホストを経由する*下流ホスト*の transit を捕捉）向け。**同一ホスト上のローカルアプリ**は
+  ローカル生成トラフィックが OUTPUT を通り PREROUTING に来ないため捕捉されない（fwmark ルート /
+  ルーティングテーブルも未設定）。→ 実測でローカル nkct は intercept されず reset。
+- **結論**: 端点自身のアプリを透過 intercept したいなら **C 版 `ziti-edge-tunnel`（TUN ベース）**
+  を使う（本番エンドポイントエージェントはこちらが定石。ただし debian-12 の openziti apt repo には
+  当該パッケージが無く、別途入れる必要）。それ以外（同一ホストのローカルアプリ）は **proxy-mode
+  が確実**（§4・§9 の本番構成で採用）。特権 CT の tproxy は**ゲートウェイ ZTNA**（下流を守る）に有効。
+
+## 9. 本番運用構成（ラボ・systemd + 永続 nftables）
+
+§4 の sanctioned 経路を「毎回手起動」でなく**再起動耐性のある systemd + 永続ファイア
+ウォール**に固めた実構成（nkpve 上, 全サービス enabled・CT onboot=1）:
+
+| ノード | サービス（systemd） | 役割 |
+|---|---|---|
+| **CT121 `ziti`** | `ziti-quickstart` | controller `:1280` + edge router `:3022` |
+| | `nkct-tcp` | nkct TCP サーバ `127.0.0.1:7788`（PQC・指紋ピン） |
+| | `ziti-host` | `ziti tunnel host` で service `nkct-svc` を 7788 へ終端 |
+| **CT122 `zt-endpoint`** | `ziti-proxy` | `ziti tunnel proxy nkct-svc:7788` で local:7788 を提供 |
+| | `nftables`（`/etc/nftables.conf`） | **default-deny egress**（許可は lo / established / ブローカー） |
+
+- **実測（本番構成・再起動耐性込み）**: CT122 で nftables default-deny + ziti-proxy が systemd
+  常駐した状態で、**internet=遮断**・**nkct `--transport tcp --connect 127.0.0.1:7788` = PQC 相互認証
+  成立**（`Handshake completed / File sent`、サーバ側 `Client authenticated (pinned key)`）。
+- **永続性**: 全 systemd サービス `enabled`、CT `onboot=1`。`/etc/nftables.conf` は `nftables.service`
+  が boot 時にロード → **再起動後も ZTNA posture（default-deny）と sanctioned 経路が自動復帰**。
+- **本番強化の余地**: (1) controller/router は quickstart ではなく **openziti-controller /
+  openziti-router パッケージ**（systemd・PKI ローテ・HA）へ移行推奨。(2) 透過が要る端点は
+  **C 版 ziti-edge-tunnel**（§8）。(3) admin パスワード/PKI/証明書更新の運用。(4) ブローカーの
+  外部到達（LAN 外エンドポイント）は edge router の公開 or 追加ルータ。
+
+## 10. 結論
 
 - **可用性は ZTNA の egress posture に完全依存**: 寛容なら素通り（実測 +1ms）、厳格なら
   ネイティブ P2P は全遮断（実測）。
 - **厳格 ZTNA 下でも sanction すれば通る**: TCP トランスポートを ZTNA サービス化すれば、
   ブローカー経路の上で nkct の PQC 相互認証が成立（実測）。ネットワーク ZTNA と nkct アプリ層
-  認証は積層する。
-- 制約: sanction 経路（TCP）では shell/scp 不可・iroh 直の sanction は困難・商用 ZTNA は未実測。
+  認証は積層する。**systemd + 永続 nftables で再起動耐性のある本番構成に固められる**（§9）。
+- 制約: sanction 経路（TCP）では shell/scp 不可・iroh 直の sanction は困難・同一ホストの透過は
+  C 版 tunneler 要（§8）・商用 ZTNA は未実測。
 
 ## 関連
 
