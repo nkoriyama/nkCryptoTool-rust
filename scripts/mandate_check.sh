@@ -114,8 +114,12 @@ else
 fi
 
 # 7. main history linear since v2.0.4 (no merge / rebase / squash)
-# v2.0.4 = b9ec19a; check no merge commits since then
-MERGE_COUNT="$(git log --merges b9ec19a..HEAD 2>/dev/null | wc -l || echo 0)"
+# v2.0.4 = b9ec19a; check no merge commits since then.
+# Use `rev-list --count` (one integer = number of merge COMMITS). The old
+# `git log --merges | wc -l` counted LINES: a single merge commit's default
+# `git log` output is ~6 lines, so under a PR's synthetic merge ref it reported
+# a false "6 merge commits". `--count` is immune to that.
+MERGE_COUNT="$(git rev-list --merges --count b9ec19a..HEAD 2>/dev/null || echo 0)"
 if [ "$MERGE_COUNT" -eq 0 ]; then
     pass "main history linear since v2.0.4"
 else
