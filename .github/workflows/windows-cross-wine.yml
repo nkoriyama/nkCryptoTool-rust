@@ -1,0 +1,63 @@
+# Cross-compile the Windows .exe on ubuntu (cargo-xwin — no real Windows needed)
+# and smoke-test it under Wine as a bastion-less PQC P2P client against a
+# Linux-native server (iroh transport + mutual ML-DSA-65 auth + a remote shell
+# command round-trip). Complements the native windows-latest build in ci.yml.
+#
+# No nasm / cmake: the crypto provider is `ring` 0.17, which ships pregenerated
+# asm for x86_64-pc-windows-msvc (verified: ring builds with nasm removed from
+# PATH). The .exe's portable CPU floor (x86-64-v3 + AES-NI) comes from
+# .cargo/config.toml's [target.x86_64-pc-windows-msvc] section, so the artifact
+# is reproducible regardless of the runner's CPU — no RUSTFLAGS override needed.
+name: Windows cross + Wine P2P smoke
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-cross-wine:
+    name: Windows cross-build + Wine P2P smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (stable, +windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-cross-wine
+
+      - name: Install cargo-xwin toolchain (clang/lld/llvm) + wine64
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm lld wine64
+          cargo install --locked cargo-xwin
+
+      - name: Cache the xwin Windows SDK/CRT
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/cargo-xwin
+          key: xwin-sdk-${{ runner.os }}
+
+      - name: Build the Linux-native binary (the P2P server for the smoke)
+        run: cargo build --release --bin nk-crypto-tool --no-default-features --features backend-rustcrypto
+
+      - name: Cross-build the Windows .exe (portable v3 floor via .cargo/config.toml, no nasm)
+        run: cargo xwin build --release --target x86_64-pc-windows-msvc --bin nk-crypto-tool --no-default-features --features backend-rustcrypto
+
+      - name: Wine smoke — the .exe does bastion-less PQC P2P to a Linux server
+        env:
+          WINEDEBUG: -all
+          NK_PASSPHRASE: ci-wine-smoke
+        run: bash ci/wine_p2p_smoke.sh
