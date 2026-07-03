@@ -116,19 +116,54 @@ jobs:
             --features "testing backend-openssl-vendored gui-camera gui-notifications gui-screen-protection gui-file-transfer" \
             --lib -- --ignored
 
-  # Windows / macOS build-only matrix is DEFERRED to v2.2.
+  # Windows: build (release-blocking) + clippy/test (advisory during rollout).
   #
-  # Initial F4 attempt revealed:
-  #   - macos-latest (Apple Silicon): ring crate 0.17.x compile error on
-  #     aarch64-darwin (CAPS_STATIC assertion) — requires ring pin / patch
-  #     or macos-13 Intel runner switch
-  #   - windows-latest: openssl-sys cannot locate OpenSSL — requires
-  #     `vcpkg install openssl` setup or `backend-openssl-vendored` feature
-  #     wiring at workflow level
+  # The earlier windows blocker was openssl-sys. It disappears with the default
+  # pure-Rust `backend-rustcrypto` (no OpenSSL): we build --no-default-features
+  # --features backend-rustcrypto (core crypto + p2p + shell, no GUI). ring's
+  # x86_64 asm needs nasm, which windows-latest lacks, so install it.
   #
-  # Both fixes are workflow / OS-setup work, not source code changes.
-  # Deferred to v2.2 (PHASE5_ROADMAP §3.1: OS matrix の test full 化) with
-  # explicit OS-specific environment preparation.
+  # build is release-blocking (the whole crate — incl. the crypto path and the
+  # portable-pty/ConPTY shell — is verified to compile for windows). clippy and
+  # test are advisory (continue-on-error) while windows is new: some tests still
+  # assume unix (paths / permissions), and the windows security-hardening
+  # degradations (O_NOFOLLOW / core-dump) are documented, not yet windows-native.
+  #
+  # macOS remains deferred (ring 0.17 aarch64-darwin build issue is separate).
+  test-windows:
+    name: Build (Windows, rustcrypto)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install nasm (ring x86_64 asm)
+        shell: pwsh
+        run: |
+          choco install nasm -y
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-stable
+
+      - name: cargo build (pure-Rust backend, no OpenSSL/GUI) — release-blocking
+        run: cargo build --no-default-features --features backend-rustcrypto
+
+      - name: cargo clippy (advisory during windows rollout)
+        continue-on-error: true  # F4-X13 explicit allowance
+        run: cargo clippy --no-default-features --features "testing backend-rustcrypto"
+
+      - name: cargo test (advisory — some tests still assume unix)
+        continue-on-error: true  # F4-X13 explicit allowance
+        run: cargo test --no-default-features --features "testing backend-rustcrypto"
 
   # Optional: cargo audit for security advisories (F4-O2 推奨).
   # Non-blocking — security advisories are reviewed but do not fail the

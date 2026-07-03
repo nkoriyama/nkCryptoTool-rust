@@ -644,22 +644,43 @@ pub(crate) async fn audit_best_effort(path: Option<&str>, fp: &[u8; 32], event: 
 // `setuid`).
 // ===========================================================================
 
-/// Resolved drop target: the uid/gid/supplementary-groups to become, plus the
-/// user's own login shell (from `/etc/passwd`) to run instead of the operator's.
-#[cfg(unix)]
-#[derive(Clone)]
-struct DropTarget {
-    uid: libc::uid_t,
-    gid: libc::gid_t,
-    groups: Vec<libc::gid_t>,
-    shell: Option<String>,
+/// Tier 1 (same-user) authorization for a shell session. There is **no
+/// in-process privilege drop** (the setuid path was removed when the PTY layer
+/// unified on `portable-pty`, whose spawn cannot run a `pre_exec` drop). So:
+/// - **root server is refused** — every session would be a root shell.
+/// - a policy `user=` is accepted only when it names the server's *own* user;
+///   we cannot become anyone else. Map to the server's user, or run a separate
+///   per-user server instance (see `TRUST_BOOTSTRAP_DESIGN.md`).
+#[cfg(all(shell_desktop, unix))]
+fn enforce_same_user(policy_user: Option<&str>) -> std::result::Result<(), String> {
+    let euid = unsafe { libc::geteuid() };
+    // Root by either real or effective uid (matching the main.rs startup gate).
+    if euid == 0 || unsafe { libc::getuid() } == 0 {
+        return Err("server runs as root; refusing (Tier 1 has no privilege drop). \
+                    Run --serve-shell as an unprivileged user, or a per-user instance."
+            .into());
+    }
+    match policy_user {
+        None => Ok(()),
+        Some(u) => match user_uid(u) {
+            Some(uid) if uid == euid => Ok(()),
+            Some(_) => Err(format!(
+                "policy maps this fingerprint to user {u:?}, but Tier 1 cannot switch \
+                 users (server is uid {euid}); map to the server's own user or run a \
+                 per-user server instance"
+            )),
+            None => Err(format!("policy maps this fingerprint to unknown user {u:?}")),
+        },
+    }
 }
 
-/// Look up a user's uid, primary gid, and supplementary groups by name.
-#[cfg(unix)]
-fn lookup_user(name: &str) -> std::result::Result<DropTarget, String> {
+/// Resolve just a user's uid by name (no supplementary groups — the removal of
+/// the privilege drop also removed the `getgrouplist` call, which additionally
+/// avoids that syscall's non-portable signature across unixes). `None` = unknown.
+#[cfg(all(shell_desktop, unix))]
+fn user_uid(name: &str) -> Option<libc::uid_t> {
     use std::ffi::CString;
-    let cname = CString::new(name).map_err(|_| "user name contains NUL".to_string())?;
+    let cname = CString::new(name).ok()?;
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = vec![0 as libc::c_char; 8192];
     let mut result: *mut libc::passwd = std::ptr::null_mut();
@@ -667,131 +688,111 @@ fn lookup_user(name: &str) -> std::result::Result<DropTarget, String> {
         libc::getpwnam_r(cname.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
     };
     if rc != 0 || result.is_null() {
-        return Err(format!("unknown user {name:?}"));
+        return None;
     }
-    let (uid, gid) = (pwd.pw_uid, pwd.pw_gid);
-    // Copy the user's login shell out of the pwd buffer (a non-empty, absolute
-    // path); used so a dropped session runs that user's shell, not the operator's.
-    let shell = if pwd.pw_shell.is_null() {
-        None
-    } else {
-        let s = unsafe { std::ffi::CStr::from_ptr(pwd.pw_shell) }
-            .to_string_lossy()
-            .into_owned();
-        if s.starts_with('/') { Some(s) } else { None }
-    };
-    // getgrouplist: query the count, then fetch.
-    let mut ngroups: libc::c_int = 64;
-    let mut gids = vec![0 as libc::gid_t; ngroups as usize];
-    let r = unsafe {
-        libc::getgrouplist(cname.as_ptr(), gid as _, gids.as_mut_ptr(), &mut ngroups)
-    };
-    if r < 0 {
-        gids = vec![0 as libc::gid_t; ngroups.max(0) as usize];
-        let r2 = unsafe {
-            libc::getgrouplist(cname.as_ptr(), gid as _, gids.as_mut_ptr(), &mut ngroups)
-        };
-        if r2 < 0 {
-            return Err(format!("getgrouplist failed for {name:?}"));
-        }
-    }
-    gids.truncate(ngroups.max(0) as usize);
-    Ok(DropTarget { uid, gid, groups: gids, shell })
+    Some(pwd.pw_uid)
 }
 
-/// Allocate a pty pair sized to `(cols, rows)`, returning `(master_fd,
-/// slave_fd)`. We use `libc::openpty` directly because we need the *slave* fd to
-/// hand the child as its controlling terminal/stdio under a `pre_exec` privilege
-/// drop (which the higher-level pty crate's spawn does not support).
-#[cfg(unix)]
-fn open_pty(cols: u16, rows: u16) -> Result<(std::os::fd::RawFd, std::os::fd::RawFd)> {
-    let mut master: libc::c_int = -1;
-    let mut slave: libc::c_int = -1;
-    let ws = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
-    let r = unsafe {
-        libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null(), &ws)
+/// Best-effort check whether this process holds an elevated (Administrator)
+/// token — the Windows counterpart to the unix root check. Note: this detects
+/// UAC elevation; a service running as a privileged account without an elevated
+/// *token* may not be caught, so operators must not run `--serve-shell` as a
+/// service/SYSTEM account.
+#[cfg(all(shell_desktop, windows))]
+fn is_elevated() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
-    if r != 0 {
-        return Err(CryptoError::Parameter(format!(
-            "openpty: {}", std::io::Error::last_os_error()
-        )));
-    }
-    // Mark both ends close-on-exec so the spawned shell does not inherit the raw
-    // master/slave fds. The child's stdio is set up from separate `dup`s (which
-    // clear CLOEXEC), and the slave's controlling-terminal `ioctl` runs in
-    // `pre_exec` before `exec`, so CLOEXEC there is harmless.
-    for fd in [master, slave] {
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-            let e = std::io::Error::last_os_error();
-            unsafe { libc::close(master); libc::close(slave); }
-            return Err(CryptoError::Parameter(format!("pty FD_CLOEXEC: {e}")));
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        // Fail CLOSED throughout: if we cannot open or query our own token, assume
+        // elevated so the session is refused rather than served with unknown privilege.
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return true;
         }
+        let mut elevation: TOKEN_ELEVATION = std::mem::zeroed();
+        let mut ret_len: u32 = 0;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            &mut elevation as *mut TOKEN_ELEVATION as *mut core::ffi::c_void,
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        );
+        CloseHandle(token);
+        ok == 0 || elevation.TokenIsElevated != 0
     }
-    Ok((master, slave))
 }
 
-/// Decide how (or whether) to drop privileges for `policy_user`:
-/// - **root server**: must drop to a mapped *non-root* user; a missing `user=`
-///   or a mapping to uid 0 is refused (never serve a root shell).
-/// - **non-root server**: cannot become another user; the mapped user (if any)
-///   must be ourselves, otherwise the session is refused (no privilege gain).
-///
-/// Returns `Ok(None)` when no drop is needed (already the right user).
-#[cfg(unix)]
-fn resolve_drop(policy_user: Option<&str>) -> std::result::Result<Option<DropTarget>, String> {
-    let cur = unsafe { libc::geteuid() };
-    // Treat the server as root if EITHER the real or effective uid is 0 (matching
-    // the startup gate in main.rs): a real uid of 0 with a non-zero effective uid
-    // could otherwise skip the drop entirely and leave a shell able to regain root
-    // via setuid(0). The actual drop below sets real/effective/saved ids.
-    let server_is_root = cur == 0 || unsafe { libc::getuid() } == 0;
+/// Windows has no setuid drop, so a policy `user=` cannot be honored; the shell
+/// always runs as the server's own account. Mirror the unix root refusal: never
+/// hand out an elevated shell, and refuse a `user=` mapping rather than silently
+/// run as the wrong (current) user.
+#[cfg(all(shell_desktop, windows))]
+fn enforce_same_user(policy_user: Option<&str>) -> std::result::Result<(), String> {
+    if is_elevated() {
+        return Err("server is running elevated (Administrator); refusing (Tier 1 has no \
+                    privilege drop). Run --serve-shell as a standard user."
+            .into());
+    }
     match policy_user {
-        Some(u) => {
-            let t = lookup_user(u)?;
-            if server_is_root {
-                if t.uid == 0 {
-                    return Err(format!("policy maps {u:?} to root; refusing a root shell"));
-                }
-                // A non-root uid is not enough: a primary or supplementary GID of
-                // 0 (root/wheel) would still grant root-group file access and,
-                // on many systems, sudo/wheel privileges. Refuse any such mapping
-                // so the dropped shell holds no root-equivalent group.
-                if t.gid == 0 || t.groups.contains(&0) {
-                    return Err(format!(
-                        "policy maps {u:?} to a root group (gid 0); refusing a root-group shell"
-                    ));
-                }
-                Ok(Some(t))
-            } else if t.uid == cur {
-                Ok(None) // already this user
-            } else {
-                Err(format!("cannot run as {u:?} without root (server is uid {cur})"))
-            }
-        }
-        None => {
-            if server_is_root {
-                Err("server runs as root but no user= is mapped for this fingerprint; \
-                     refusing a root shell"
-                    .into())
-            } else {
-                Ok(None)
-            }
-        }
+        None => Ok(()),
+        Some(u) => Err(format!(
+            "policy maps this fingerprint to user {u:?}, but the Windows shell runs as \
+             the server's own account (no user switching); remove user= or run a \
+             per-user server instance"
+        )),
     }
+}
+
+/// Build the platform shell command. Unix: the operator's `$SHELL` (or `/bin/sh`)
+/// as a login shell (`-l`) or `-c <cmd>`. Windows: `%COMSPEC%` (or `cmd.exe`),
+/// interactive or `/C <cmd>`. Runs as the server's own user (Tier 1).
+#[cfg(all(shell_desktop, unix))]
+fn build_shell_command(run_cmd: &str, term: &str) -> portable_pty::CommandBuilder {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut cmd = portable_pty::CommandBuilder::new(shell);
+    if run_cmd.is_empty() {
+        cmd.arg("-l");
+    } else {
+        cmd.arg("-c");
+        cmd.arg(run_cmd);
+    }
+    cmd.env("TERM", term);
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
+    cmd
+}
+
+#[cfg(all(shell_desktop, windows))]
+fn build_shell_command(run_cmd: &str, _term: &str) -> portable_pty::CommandBuilder {
+    let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+    let mut cmd = portable_pty::CommandBuilder::new(shell);
+    if !run_cmd.is_empty() {
+        cmd.arg("/C");
+        cmd.arg(run_cmd);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        cmd.cwd(cwd);
+    }
+    cmd
 }
 
 // ===========================================================================
-// Phase 1: single-user PTY bridge (unix). The server allocates a PTY and runs
-// the shell, dropping to the policy's mapped user (Phase 2b) when configured;
-// the client puts its terminal in raw mode and pumps both directions.
+// Single-user PTY bridge (desktop). The server allocates a PTY (via portable-pty
+// = openpty on unix / ConPTY on Windows) and runs the shell as its own user
+// (Tier 1: no privilege drop); the client puts its terminal in raw mode and
+// pumps both directions.
 // ===========================================================================
 
 /// Server side of a real shell session: allocate a PTY, spawn the shell, and
 /// bridge it to the client over the secured frame stream until the shell exits.
 /// Authorization (who may reach this at all) is the transport allowlist / pinned
-/// key enforced before this runs; this still runs the shell as the server user.
-#[cfg(unix)]
+/// key enforced before this runs; the shell runs as the server's own user.
+#[cfg(shell_desktop)]
 #[allow(clippy::too_many_arguments)]
 // allow(too_many_arguments): the secured stream halves + session keys + the
 // authenticated peer fingerprint + policy/audit paths are all genuinely needed
@@ -866,33 +867,22 @@ where
         ),
     };
     let run_cmd = allow_event.0;
-    let drop_user = allow_event.1;
+    let policy_user = allow_event.1;
     if let Err(e) = audit(audit_path, &peer_fp, &allow_event.2).await {
         let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
             &Frame::Error("audit log unavailable; refusing".into())).await;
         return Err(CryptoError::Parameter(format!("shell refused: audit write failed: {e}")));
     }
 
-    // Resolve privilege drop (Phase 2b). A failure here (e.g. server is root but
-    // the fingerprint maps to no user / to root) refuses the session.
-    let drop_target = match resolve_drop(drop_user.as_deref()) {
-        Ok(t) => t,
-        Err(reason) => {
-            audit_best_effort(audit_path, &peer_fp, &format!("deny: {reason}")).await;
-            let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
-                &Frame::Error(reason.clone())).await;
-            return Err(CryptoError::Parameter(format!("shell denied: {reason}")));
-        }
-    };
-
-    // When dropping to another user, run *that* user's login shell (from
-    // /etc/passwd) rather than the operator's `$SHELL`; otherwise fall back to the
-    // operator's `$SHELL`, then `/bin/sh`.
-    let shell = drop_target
-        .as_ref()
-        .and_then(|t| t.shell.clone())
-        .or_else(|| std::env::var("SHELL").ok())
-        .unwrap_or_else(|| "/bin/sh".to_string());
+    // Tier 1: run as the server's own user — no privilege drop. Refuse serving as
+    // root, and refuse a policy `user=` that names anyone but ourselves (we cannot
+    // become another user without the removed setuid path).
+    if let Err(reason) = enforce_same_user(policy_user.as_deref()) {
+        audit_best_effort(audit_path, &peer_fp, &format!("deny: {reason}")).await;
+        let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
+            &Frame::Error(reason.clone())).await;
+        return Err(CryptoError::Parameter(format!("shell denied: {reason}")));
+    }
     // Sanitize the client-supplied TERM: it ends up in the shell's environment
     // and is looked up by terminfo, so restrict it to a safe, bounded name (else
     // fall back to a conservative default).
@@ -905,114 +895,35 @@ where
         "xterm".to_string()
     };
 
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let (master_fd, slave_fd) = open_pty(cols, rows)?;
-    // Own both pty ends immediately so any early return below (a failed `dup` or
-    // `spawn`) closes them instead of leaking an fd — repeated failed connections
-    // must not exhaust the server's fd table.
-    let master = unsafe { std::fs::File::from_raw_fd(master_fd) };
-    let slave = unsafe { OwnedFd::from_raw_fd(slave_fd) };
-    let slave_raw = slave.as_raw_fd();
-    // Child stdio = three dups of the slave (Command takes ownership of each).
-    // Use F_DUPFD_CLOEXEC so each dup is close-on-exec: otherwise, between this
-    // dup and our `spawn`, another thread spawning an unrelated child could leak
-    // this shell's pty slave into that child (i/o interception). Our own child
-    // gets it as stdio via std's `dup2` (which clears CLOEXEC), so it still works.
-    let dup_stdio = || -> Result<std::process::Stdio> {
-        let fd = unsafe { libc::fcntl(slave_raw, libc::F_DUPFD_CLOEXEC, 0) };
-        if fd < 0 {
-            return Err(CryptoError::Parameter(format!(
-                "dup pty slave: {}", std::io::Error::last_os_error()
-            )));
-        }
-        Ok(std::process::Stdio::from(unsafe { OwnedFd::from_raw_fd(fd) }))
-    };
-    let (sin, sout, serr) = (dup_stdio()?, dup_stdio()?, dup_stdio()?);
-
-    let mut command = std::process::Command::new(&shell);
-    command.env("TERM", &safe_term);
-    if run_cmd.is_empty() {
-        command.arg("-l");
-    } else {
-        command.arg("-c").arg(&run_cmd);
-    }
-    command.stdin(sin).stdout(sout).stderr(serr);
-
-    // After fork, before exec — async-signal-safe syscalls only: new session,
-    // make the pty our controlling terminal, then drop privileges in the
-    // required order (supplementary groups → gid → uid) and verify root cannot
-    // be regained. Any failure returns Err so exec never happens (no shell runs
-    // with the wrong privileges).
-    let ctty_fd = slave_raw;
-    // Flatten the drop target into a fixed-size, `Copy`-only value so the
-    // `pre_exec` closure captures NO heap-owning object: nothing is dropped in the
-    // child between fork and exec, so there is no chance of deadlocking on the
-    // allocator lock held by another parent thread. Refuse (fail-closed) a user
-    // with more supplementary groups than the inline array holds.
-    const MAX_DROP_GROUPS: usize = 64;
-    let drop_in_child: Option<([libc::gid_t; MAX_DROP_GROUPS], usize, libc::uid_t, libc::gid_t)> =
-        match &drop_target {
-            Some(t) => {
-                if t.groups.len() > MAX_DROP_GROUPS {
-                    return Err(CryptoError::Parameter(format!(
-                        "user has {} supplementary groups (max {MAX_DROP_GROUPS})",
-                        t.groups.len()
-                    )));
-                }
-                let mut arr = [0 as libc::gid_t; MAX_DROP_GROUPS];
-                arr[..t.groups.len()].copy_from_slice(&t.groups);
-                Some((arr, t.groups.len(), t.uid, t.gid))
-            }
-            None => None,
-        };
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        command.pre_exec(move || {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::ioctl(ctty_fd, libc::TIOCSCTTY as _, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if let Some((groups, ngroups, uid, gid)) = &drop_in_child {
-                if libc::setgroups(*ngroups as _, groups.as_ptr()) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::setgid(*gid) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if libc::setuid(*uid) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // If we can still regain root, the drop did not stick — abort the
-                // exec. Use a raw-errno error (no heap allocation): allocating
-                // here, post-fork, could deadlock on the allocator lock held by
-                // another parent thread.
-                if libc::setuid(0) == 0 {
-                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
-                }
-            }
-            Ok(())
-        });
-    }
-    let mut child = command
-        .spawn()
+    // Allocate the PTY sized to the client's terminal, via portable-pty (openpty
+    // on unix, ConPTY on Windows). The controlling-terminal setup (setsid +
+    // TIOCSCTTY on unix) is handled by portable-pty's spawn; the shell runs as
+    // *this* process's user — there is no privilege drop. portable-pty sets
+    // close-on-exec on the master fd (via the filedescriptor crate), so the
+    // leak-into-an-unrelated-concurrent-child protection the hand-rolled openpty
+    // path enforced with F_DUPFD_CLOEXEC is preserved, now owned by the crate.
+    let pty = portable_pty::native_pty_system()
+        .openpty(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+        .map_err(|e| CryptoError::Parameter(format!("openpty: {e}")))?;
+    let command = build_shell_command(&run_cmd, &safe_term);
+    let mut child = pty
+        .slave
+        .spawn_command(command)
         .map_err(|e| CryptoError::Parameter(format!("spawn shell: {e}")))?;
-    // Drop the Command so the parent's copies of the child's stdio (three dups of
-    // the pty slave, owned by `command`) are closed; otherwise the slave stays
-    // open in this process and the master never reaches EOF when the shell exits.
-    drop(command);
-    // Close our remaining slave end so the child holds the only slave (the master
-    // then sees EOF/EIO once the shell exits and closes its stdio).
-    drop(slave);
-    // `master` is kept for resize (TIOCSWINSZ); dup it for the blocking
-    // reader/writer threads.
-    let mut pty_reader = master
-        .try_clone()
-        .map_err(|e| CryptoError::Parameter(format!("clone pty master (read): {e}")))?;
-    let mut pty_writer = master
-        .try_clone()
-        .map_err(|e| CryptoError::Parameter(format!("clone pty master (write): {e}")))?;
+    // Close the parent's slave handle so the master reaches EOF when the shell
+    // exits (otherwise the read side never ends).
+    drop(pty.slave);
+    // Split the master: an owned reader for the output thread and an owned writer
+    // for the input thread; `master` itself is kept to resize the PTY.
+    let mut pty_reader = pty
+        .master
+        .try_clone_reader()
+        .map_err(|e| CryptoError::Parameter(format!("clone pty reader: {e}")))?;
+    let mut pty_writer = pty
+        .master
+        .take_writer()
+        .map_err(|e| CryptoError::Parameter(format!("take pty writer: {e}")))?;
+    let master = pty.master;
 
     // Blocking PTY master → async, via a reader thread feeding a channel.
     let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
@@ -1068,10 +979,9 @@ where
             frame = in_frame_rx.recv() => match frame {
                 Some(Frame::Data(d)) => { let _ = in_tx.send(d).await; }
                 Some(Frame::Winsz { cols, rows }) => {
-                    let ws = libc::winsize {
-                        ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0,
-                    };
-                    unsafe { libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &ws); }
+                    let _ = master.resize(portable_pty::PtySize {
+                        rows, cols, pixel_width: 0, pixel_height: 0,
+                    });
                 }
                 Some(Frame::Exit(_)) | Some(Frame::Error(_)) | None => break,
                 Some(Frame::Open { .. }) => {} // ignore a duplicate OPEN
@@ -1088,34 +998,38 @@ where
         .await
         .ok()
         .and_then(|r| r.ok())
-        .and_then(|s| s.code())
+        .map(|s| s.exit_code() as i32)
         .unwrap_or(-1);
     audit_best_effort(audit_path, &peer_fp, &format!("session end exit={code}")).await;
     let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr, &Frame::Exit(code)).await;
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(shell_desktop))]
 #[allow(clippy::too_many_arguments)]
 pub async fn run_pty_server<R, W>(
     _reader: R, _writer: W, _aead_name: &str, _s2c_key: &[u8], _c2s_key: &[u8],
     _peer_fp: [u8; 32], _policy_path: Option<&str>, _audit_path: Option<&str>,
 ) -> Result<()> {
-    Err(CryptoError::Parameter("the P2P shell server is only supported on unix".into()))
+    Err(CryptoError::Parameter(
+        "the P2P shell server is only supported on desktop platforms (unix excluding \
+         mobile, or windows)".into(),
+    ))
 }
 
 /// Restores terminal attributes on drop, so a panic or early return never leaves
-/// the user's terminal stuck in raw mode.
-#[cfg(unix)]
+/// the user's terminal stuck in raw mode. `enable()` operates on stdin/stdout.
+#[cfg(all(shell_desktop, unix))]
 struct RawModeGuard {
     fd: std::os::fd::RawFd,
     orig: libc::termios,
 }
 
-#[cfg(unix)]
+#[cfg(all(shell_desktop, unix))]
 impl RawModeGuard {
-    /// Put `fd` (a tty) into raw mode; returns `None` if `fd` is not a terminal.
-    fn enable(fd: std::os::fd::RawFd) -> Option<Self> {
+    /// Put stdin into raw mode; returns `None` if it is not a terminal.
+    fn enable() -> Option<Self> {
+        let fd = libc::STDIN_FILENO;
         if unsafe { libc::isatty(fd) } != 1 {
             return None;
         }
@@ -1132,22 +1046,93 @@ impl RawModeGuard {
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(shell_desktop, unix))]
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.orig) };
     }
 }
 
-/// Read the controlling terminal's window size, or `(80, 24)` if `fd` is not a
+/// Windows console raw mode: disable line/echo/processed input and enable VT
+/// input on stdin, and enable VT processing on stdout (so the remote PTY's ANSI
+/// renders and the status-bar escapes work). Original modes are restored on drop.
+/// Handles are stored as `isize` so the guard stays `Send`.
+#[cfg(all(shell_desktop, windows))]
+struct RawModeGuard {
+    in_h: isize,
+    out_h: isize,
+    in_orig: u32,
+    out_orig: u32,
+}
+
+#[cfg(all(shell_desktop, windows))]
+impl RawModeGuard {
+    fn enable() -> Option<Self> {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+            ENABLE_PROCESSED_INPUT, ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+        };
+        unsafe {
+            let in_h = GetStdHandle(STD_INPUT_HANDLE);
+            let out_h = GetStdHandle(STD_OUTPUT_HANDLE);
+            let mut in_orig: u32 = 0;
+            let mut out_orig: u32 = 0;
+            if GetConsoleMode(in_h, &mut in_orig) == 0 || GetConsoleMode(out_h, &mut out_orig) == 0 {
+                return None;
+            }
+            let in_raw = (in_orig
+                & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                | ENABLE_VIRTUAL_TERMINAL_INPUT;
+            let out_new = out_orig | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING;
+            if SetConsoleMode(in_h, in_raw) == 0 || SetConsoleMode(out_h, out_new) == 0 {
+                return None;
+            }
+            Some(Self { in_h: in_h as isize, out_h: out_h as isize, in_orig, out_orig })
+        }
+    }
+}
+
+#[cfg(all(shell_desktop, windows))]
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Console::SetConsoleMode;
+        unsafe {
+            SetConsoleMode(self.in_h as _, self.in_orig);
+            SetConsoleMode(self.out_h as _, self.out_orig);
+        }
+    }
+}
+
+/// Read the controlling terminal's window size, or `(80, 24)` if stdin is not a
 /// tty (e.g. piped input for a scripted session).
-#[cfg(unix)]
-fn term_size(fd: std::os::fd::RawFd) -> (u16, u16) {
+#[cfg(all(shell_desktop, unix))]
+fn term_size() -> (u16, u16) {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
+    if unsafe { libc::ioctl(libc::STDIN_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
         (ws.ws_col, ws.ws_row)
     } else {
         (80, 24)
+    }
+}
+
+/// Windows: the console window size from `GetConsoleScreenBufferInfo`, or
+/// `(80, 24)` if stdout is not a console.
+#[cfg(all(shell_desktop, windows))]
+fn term_size() -> (u16, u16) {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleScreenBufferInfo, GetStdHandle, CONSOLE_SCREEN_BUFFER_INFO, STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut info: CONSOLE_SCREEN_BUFFER_INFO = std::mem::zeroed();
+        if GetConsoleScreenBufferInfo(h, &mut info) != 0 {
+            let cols = (info.srWindow.Right - info.srWindow.Left + 1).max(1) as u16;
+            let rows = (info.srWindow.Bottom - info.srWindow.Top + 1).max(1) as u16;
+            (cols, rows)
+        } else {
+            (80, 24)
+        }
     }
 }
 
@@ -1267,10 +1252,11 @@ impl ConnStatus {
 
 /// Releases the terminal scroll region on drop, so an early return or a panic
 /// never leaves the bottom rows reserved. (The normal exit path resets it
-/// explicitly too, since `process::exit` skips `Drop`.)
-#[cfg(unix)]
+/// explicitly too, since `process::exit` skips `Drop`.) Pure ANSI — works on any
+/// desktop terminal (Windows needs VT output, enabled by `RawModeGuard`).
+#[cfg(shell_desktop)]
 struct ScrollRegionGuard;
-#[cfg(unix)]
+#[cfg(shell_desktop)]
 impl Drop for ScrollRegionGuard {
     fn drop(&mut self) {
         use std::io::Write as _;
@@ -1280,10 +1266,49 @@ impl Drop for ScrollRegionGuard {
     }
 }
 
+/// Handle one terminal resize: recompute the reserved status rows for the new
+/// size, tell the remote PTY the new geometry (WINSZ), and — with a status bar —
+/// reinstall the scroll region and redraw. Returns `false` to stop the resize
+/// task (the outbound channel closed). Shared by the unix SIGWINCH driver and the
+/// Windows polling driver.
+#[cfg(shell_desktop)]
+async fn apply_resize(
+    winch_tx: &tokio::sync::mpsc::Sender<Frame>,
+    winch_status: &Option<std::sync::Arc<tokio::sync::Mutex<ConnStatus>>>,
+    winch_stdout: &std::sync::Arc<tokio::sync::Mutex<tokio::io::Stdout>>,
+) -> bool {
+    let (cols, rows) = term_size();
+    // The bar only fits when there's a spare row above it; if the window shrank
+    // below that, drop the reservation for this size (full-screen scroll region,
+    // PTY gets every row) and re-enable it when it grows back — never install a
+    // degenerate `\x1b[1;1r` region.
+    let h = match winch_status {
+        Some(st) => st.lock().await.height(cols),
+        None => 0,
+    };
+    let fits = winch_status.is_some() && h > 0 && rows > h + 1;
+    let status_h = if fits { h } else { 0 };
+    let pty_rows = rows.saturating_sub(status_h).max(1);
+    if winch_tx.send(Frame::Winsz { cols, rows: pty_rows }).await.is_err() {
+        return false;
+    }
+    if let Some(st) = winch_status {
+        let s = if fits {
+            format!("\x1b[1;{pty_rows}r{}", st.lock().await.render(cols, rows))
+        } else {
+            "\x1b[r".to_string() // too small: release the scroll region
+        };
+        let mut o = winch_stdout.lock().await;
+        let _ = o.write_all(s.as_bytes()).await;
+        let _ = o.flush().await;
+    }
+    true
+}
+
 /// Client side of a real shell session: announce our terminal, go raw, and pump
 /// stdin↔stdout against the remote PTY until the remote shell exits. When
 /// `tui_status` is `Some`, reserve the bottom row for a status line.
-#[cfg(unix)]
+#[cfg(shell_desktop)]
 #[allow(clippy::too_many_arguments)]
 // allow(too_many_arguments): the secured stream halves + AEAD name + session keys
 // + the optional one-shot command + the optional status-bar seed and live metrics
@@ -1304,9 +1329,7 @@ where
     R: AsyncReadExt + Unpin + Send,
     W: AsyncWriteExt + Unpin + Send + 'static,
 {
-    use std::os::fd::AsRawFd;
-    let stdin_fd = std::io::stdin().as_raw_fd();
-    let (cols, rows) = term_size(stdin_fd);
+    let (cols, rows) = term_size();
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_string());
 
     // With a status bar, give the remote PTY fewer rows and reserve the bottom
@@ -1350,7 +1373,7 @@ where
     });
 
     // Raw mode for the duration of the session (restored on drop).
-    let _raw = RawModeGuard::enable(stdin_fd);
+    let _raw = RawModeGuard::enable();
 
     // Shared stdout: the PTY passthrough and the status redraw both write here, so
     // a lock keeps a status draw (save→move→print→restore) atomic w.r.t. PTY bytes.
@@ -1385,7 +1408,7 @@ where
             loop {
                 tick.tick().await;
                 let snap = m.snapshot();
-                let (cols, rows) = term_size(stdin_fd);
+                let (cols, rows) = term_size();
                 let bar = {
                     let mut s = st.lock().await;
                     let mut changed = false;
@@ -1431,42 +1454,37 @@ where
         }
     });
 
-    // SIGWINCH → WINSZ frames; with a status bar, recompute the reserved row,
-    // reinstall the scroll region, and redraw at the new size.
+    // Terminal resize → WINSZ frames; with a status bar, recompute the reserved
+    // row, reinstall the scroll region, and redraw. unix: SIGWINCH (event-driven);
+    // windows has no SIGWINCH, so poll the console size. Both call `apply_resize`.
     let winch_tx = frame_tx.clone();
     let winch_status = status.clone();
     let winch_stdout = stdout.clone();
     let winch_task = tokio::spawn(async move {
-        if let Ok(mut sig) =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+        #[cfg(unix)]
         {
-            while sig.recv().await.is_some() {
-                let (cols, rows) = term_size(stdin_fd);
-                // Recompute the bar height for the new width (1 or 2 rows). The bar
-                // only fits when there's a spare row above it; if the window shrank
-                // below that, drop the reservation for this size (full-screen scroll
-                // region, PTY gets every row) and re-enable it when it grows back —
-                // never install a degenerate `\x1b[1;1r` region.
-                let h = match &winch_status {
-                    Some(st) => st.lock().await.height(cols),
-                    None => 0,
-                };
-                let fits = winch_status.is_some() && h > 0 && rows > h + 1;
-                let status_h = if fits { h } else { 0 };
-                let pty_rows = rows.saturating_sub(status_h).max(1);
-                if winch_tx.send(Frame::Winsz { cols, rows: pty_rows }).await.is_err() {
-                    break;
+            if let Ok(mut sig) = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::window_change(),
+            ) {
+                while sig.recv().await.is_some() {
+                    if !apply_resize(&winch_tx, &winch_status, &winch_stdout).await {
+                        break;
+                    }
                 }
-                if let Some(st) = &winch_status {
-                    // Redraw with the latest live status at the new geometry.
-                    let s = if fits {
-                        format!("\x1b[1;{pty_rows}r{}", st.lock().await.render(cols, rows))
-                    } else {
-                        "\x1b[r".to_string() // too small: release the scroll region
-                    };
-                    let mut o = winch_stdout.lock().await;
-                    let _ = o.write_all(s.as_bytes()).await;
-                    let _ = o.flush().await;
+            }
+        }
+        #[cfg(windows)]
+        {
+            let mut last = term_size();
+            let mut tick = tokio::time::interval(std::time::Duration::from_millis(400));
+            loop {
+                tick.tick().await;
+                let cur = term_size();
+                if cur != last {
+                    last = cur;
+                    if !apply_resize(&winch_tx, &winch_status, &winch_stdout).await {
+                        break;
+                    }
                 }
             }
         }
@@ -1536,13 +1554,16 @@ where
     std::process::exit(exit_code & 0xff);
 }
 
-#[cfg(not(unix))]
+#[cfg(not(shell_desktop))]
 pub async fn run_pty_client<R, W>(
     _reader: R, _writer: W, _aead_name: &str, _s2c_key: &[u8], _c2s_key: &[u8], _cmd: &str,
     _tui_status: Option<ConnStatus>,
     _metrics: Option<std::sync::Arc<dyn crate::p2p::ConnMetrics>>,
 ) -> Result<()> {
-    Err(CryptoError::Parameter("the P2P shell client is only supported on unix".into()))
+    Err(CryptoError::Parameter(
+        "the P2P shell client is only supported on desktop platforms (unix excluding \
+         mobile, or windows)".into(),
+    ))
 }
 
 #[cfg(test)]
