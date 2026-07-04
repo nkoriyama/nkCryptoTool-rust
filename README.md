@@ -58,6 +58,25 @@ Linux クライアントから実 Windows ホストへ、**踏み台なし・ポ
 - scp 設計: [`P2P_SCP_DESIGN.md`](./P2P_SCP_DESIGN.md)
 - 他ファイル転送との比較: [`P2P_SCP_COMPARISON.md`](./P2P_SCP_COMPARISON.md)
 
+## **デモ: PQC P2P scp — 1 GiB 転送のライブ進捗バー**
+
+![PQC P2P scp の 1 GiB 転送とライブ進捗バー](./docs/p2p_scp_demo.gif)
+
+`--serve-scp` サーバへ 1 GiB のファイルを put / get する様子。転送中に
+`[scp] send/recv NN%  X/Y MiB  Z MiB/s` の進捗行がライブ更新される（stderr が TTY の
+ときだけ描画するので、バックグラウンドのサーバでは出ない）。default-deny の fingerprint
+read/write ポリシーと mutual ML-DSA-65 認証の上で、1 GiB が往復してバイト一致する。
+
+## **デモ: 入れ子 / チェーン PQC P2P（シェルの中で scp サーバを起動）**
+
+![入れ子 PQC P2P: シェルに入り、その中で scp サーバを起動して外から取得](./docs/p2p_nested_demo.gif)
+
+p2p シェルで「ホスト A」に入り、**その A のシェルの中で `nkct --serve-scp` を起動**すると、
+A が新たな scp エンドポイントになる。外側の scp クライアントはその ticket で A のファイルを
+取得できる。**2 本の独立した PQC P2P ホップ**（それぞれ mutual ML-DSA-65 認証）が連なり、
+どこにもポート開放は要らない。shell と scp は 1 プロセスでは排他だが、シェルの中で起動する
+scp は別プロセスなので両立する。
+
 ## **チケットを端末に QR 表示（外部ツール不要）**
 
 ![端末に QR を表示するデモ](./docs/qr_demo.gif)
