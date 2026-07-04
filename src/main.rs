@@ -437,11 +437,6 @@ async fn main() -> anyhow::Result<()> {
             .try_init();
     }
 
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-    if std::is_x86_feature_detected!("aes") {
-        eprintln!("AES-NI is available!");
-    }
-
     let args = Args::parse();
 
     #[cfg(feature = "gui")]
