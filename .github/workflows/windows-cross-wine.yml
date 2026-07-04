@@ -51,6 +51,12 @@ jobs:
           key: xwin-sdk-${{ runner.os }}
 
       - name: Build the Linux-native binary (the P2P server for the smoke)
+        # .cargo/config.toml pins the linux-gnu target to `target-cpu=native
+        # -Ctarget-feature=+vaes` for local dev. On a GitHub runner without VAES
+        # that SIGILLs (a proc-macro built with +vaes then run by rustc), so
+        # override to a portable floor here — RUSTFLAGS wins over the config.
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v2"
         run: cargo build --release --bin nk-crypto-tool --no-default-features --features backend-rustcrypto
 
       - name: Cross-build the Windows .exe (portable v3 floor via .cargo/config.toml, no nasm)
