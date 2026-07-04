@@ -30,7 +30,9 @@ use crate::shell::{
     recv_packet, role_keys, send_packet,
 };
 use std::collections::HashMap;
+use std::io::{IsTerminal, Write as _};
 use std::path::{Component, Path, PathBuf};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroizing;
 
@@ -644,6 +646,63 @@ fn walk_tree(base: &Path) -> std::io::Result<Vec<(PathBuf, bool)>> {
 
 /// Send one file's bytes as `Data{file_id}`* followed by `Eof{file_id}`, reading
 /// straight into the frame plaintext buffer (`[T_DATA]‖file_id‖payload`) and
+/// Below this size a transfer is effectively instant, so a `\r` progress line
+/// would only flicker; draw one only for larger files.
+const PROGRESS_MIN: u64 = 512 * 1024;
+
+/// A `\r`-updating transfer-progress line on stderr, throttled to ~10 Hz. Active
+/// only when stderr is a TTY — so a backgrounded server never draws it, only an
+/// interactive client does — and only for transfers past [`PROGRESS_MIN`]. No
+/// extra deps: same raw-ANSI approach as the shell's status bar.
+struct Progress {
+    total: u64,
+    start: Instant,
+    last: Instant,
+    label: &'static str,
+    active: bool,
+}
+
+impl Progress {
+    fn new(total: u64, label: &'static str) -> Self {
+        let active = total >= PROGRESS_MIN && std::io::stderr().is_terminal();
+        let now = Instant::now();
+        Progress { total, start: now, last: now, label, active }
+    }
+
+    fn tick(&mut self, done: u64) {
+        if !self.active {
+            return;
+        }
+        let now = Instant::now();
+        // Redraw at most ~10 Hz, but always draw the final (done == total) frame.
+        if done < self.total && now.duration_since(self.last).as_millis() < 100 {
+            return;
+        }
+        self.last = now;
+        let pct = if self.total > 0 { done.saturating_mul(100) / self.total } else { 100 };
+        let mib = 1024.0 * 1024.0;
+        let secs = self.start.elapsed().as_secs_f64().max(0.001);
+        let mut err = std::io::stderr();
+        // Trailing spaces clear any remainder of a previous, longer line.
+        let _ = write!(
+            err,
+            "\r[scp] {} {:3}%  {:.1}/{:.1} MiB  {:.1} MiB/s   ",
+            self.label,
+            pct,
+            done as f64 / mib,
+            self.total as f64 / mib,
+            (done as f64 / secs) / mib,
+        );
+        let _ = err.flush();
+    }
+
+    fn finish(&mut self) {
+        if self.active {
+            let _ = writeln!(std::io::stderr());
+        }
+    }
+}
+
 /// sealing it in place — no per-chunk copy. Returns the number of bytes sent.
 async fn stream_bytes<W: AsyncWriteExt + Unpin>(
     w: &mut W,
@@ -653,6 +712,8 @@ async fn stream_bytes<W: AsyncWriteExt + Unpin>(
     file_id: u32,
     f: &mut tokio::fs::File,
 ) -> Result<u64> {
+    let total = f.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let mut prog = Progress::new(total, "send");
     let mut pt = vec![0u8; 5 + CHUNK];
     pt[0] = T_DATA;
     pt[1..5].copy_from_slice(&file_id.to_be_bytes());
@@ -664,7 +725,9 @@ async fn stream_bytes<W: AsyncWriteExt + Unpin>(
         }
         sent += n as u64;
         send_packet(w, aead, key, ctr, &pt[..5 + n]).await?;
+        prog.tick(sent);
     }
+    prog.finish();
     send(w, aead, key, ctr, &ScpFrame::Eof { file_id }).await?;
     Ok(sent)
 }
@@ -682,6 +745,7 @@ async fn recv_into_staged<R: AsyncReadExt + Unpin>(
 ) -> Result<()> {
     let param = |m: String| CryptoError::Parameter(m);
     let mut received = 0u64;
+    let mut prog = Progress::new(size, "recv");
     loop {
         match recv(r, aead, key, ctr).await? {
             Some(ScpFrame::Data { file_id: fid, bytes }) if fid == file_id => {
@@ -690,6 +754,7 @@ async fn recv_into_staged<R: AsyncReadExt + Unpin>(
                     return Err(param(format!("stream exceeds declared size {size}")));
                 }
                 staged.write_all(&bytes).await.map_err(io_err)?;
+                prog.tick(received);
             }
             Some(ScpFrame::Eof { file_id: fid }) if fid == file_id => break,
             Some(ScpFrame::Err(m)) => return Err(param(format!("peer error mid-file: {m}"))),
@@ -697,6 +762,7 @@ async fn recv_into_staged<R: AsyncReadExt + Unpin>(
             None => return Err(param("stream closed before Eof".into())),
         }
     }
+    prog.finish();
     if received != size {
         return Err(param(format!("size mismatch (declared {size}, got {received})")));
     }
