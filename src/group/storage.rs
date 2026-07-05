@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::group::redb_storage::{
@@ -197,11 +197,27 @@ impl GroupStorage {
 /// [`GroupStorage::open_at`] entry point. The security-bearing key path is the
 /// PQC at-rest hierarchy (random DEK in `at-rest.key`/`<db>.kek`); this is only
 /// for callers that drive the DB directly by passphrase.
+///
+/// Uses PBKDF2-HMAC-SHA256 (audit L4): a single-round SHA-256 made a
+/// passphrase-driven DB trivially brute-forceable, a real footgun on this `pub`
+/// path if a frontend ever fed it a low-entropy passphrase. The high iteration
+/// count removes that cheap offline guess.
+///
+/// The salt is a fixed domain-separated label. There is no per-DB salt on this
+/// passphrase-only convenience path: a *stored* random salt is the production
+/// PQC at-rest hierarchy's job, and mixing the DB *path* into the salt was
+/// rejected because it would make a moved/renamed database permanently
+/// undecryptable (a far worse, data-losing footgun than the residual it would
+/// close). The residual: a common passphrase yields the same DEK across DBs, so
+/// an attacker with several DB files could amortize a dictionary attack — but
+/// only against low-entropy passphrases on this non-production path, and the
+/// iteration count keeps each guess expensive. Production never takes this path.
 fn passphrase_to_dek(passphrase: &str) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(b"nkct-redb-passphrase-v1");
-    hasher.update(passphrase.as_bytes());
-    hasher.finalize().into()
+    const KDF_SALT: &[u8] = b"nkct-redb-passphrase-v1";
+    const KDF_ITERATIONS: u32 = 256_000; // matches the at-rest PBKDF2 default
+    let mut dek = [0u8; 32];
+    pbkdf2::pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), KDF_SALT, KDF_ITERATIONS, &mut dek);
+    dek
 }
 
 impl std::fmt::Debug for GroupStorage {
