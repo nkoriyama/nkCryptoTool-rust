@@ -745,9 +745,15 @@ impl GroupChatProcessor {
     ///   (e.g. the KeyPackage we previously published was already
     ///   consumed elsewhere).
     pub async fn accept_welcome(&self) -> Result<GroupId, GroupError> {
-        let inc = self
+        let pending = self
             .endpoint
             .accept()
+            .await
+            .map_err(GroupError::Transport)?;
+        // Run per-connection setup off the (now cheap) accept, bounded so a peer
+        // that stalls the handshake cannot hang this call forever.
+        let inc = pending
+            .establish(crate::p2p::P2P_SETUP_TIMEOUT)
             .await
             .map_err(GroupError::Transport)?;
         if inc.protocol != crate::group::transport::ALPN_MLS_PROTOCOL {
@@ -916,9 +922,15 @@ impl GroupChatProcessor {
     ///
     /// [`accept_welcome`]: Self::accept_welcome
     pub async fn accept_next(&self) -> Result<IncomingGroupEvent, GroupError> {
-        let mut inc = self
+        let pending = self
             .endpoint
             .accept()
+            .await
+            .map_err(GroupError::Transport)?;
+        // Run per-connection setup off the (now cheap) accept, bounded so a peer
+        // that stalls the handshake cannot hang this call forever.
+        let mut inc = pending
+            .establish(crate::p2p::P2P_SETUP_TIMEOUT)
             .await
             .map_err(GroupError::Transport)?;
         if inc.protocol != crate::group::transport::ALPN_MLS_PROTOCOL {

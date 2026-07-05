@@ -180,6 +180,59 @@ impl tokio::io::AsyncWrite for IrohBiStream {
 /// QUIC layer can negotiate them. `accept` rejects any peer whose
 /// negotiated ALPN is not in this set so the caller never sees an
 /// unknown protocol.
+/// A half-open incoming iroh connection: the `Accepting` future plus the
+/// endpoint's registered protocols, so `establish` can negotiate the ALPN and
+/// open the stream off the accept loop under a timeout.
+struct IrohPending {
+    accepting: iroh::endpoint::Accepting,
+    protocols: Vec<crate::p2p::P2pProtocol>,
+}
+
+#[async_trait::async_trait]
+impl crate::p2p::P2pPending for IrohPending {
+    async fn establish(
+        self: Box<Self>,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<crate::p2p::P2pIncoming, crate::p2p::P2pError> {
+        let IrohPending {
+            mut accepting,
+            protocols,
+        } = *self;
+        tokio::time::timeout(timeout, async move {
+            let alpn_bytes = accepting
+                .alpn()
+                .await
+                .map_err(|e| crate::p2p::P2pError::Accept(format!("ALPN detection: {}", e)))?;
+            let protocol = protocols
+                .iter()
+                .find(|p| p.0 == alpn_bytes.as_slice())
+                .copied()
+                .ok_or_else(|| {
+                    crate::p2p::P2pError::Accept(format!(
+                        "Unknown ALPN: {:?}",
+                        String::from_utf8_lossy(alpn_bytes.as_slice())
+                    ))
+                })?;
+            let connection = accepting
+                .await
+                .map_err(|e| crate::p2p::P2pError::Accept(e.to_string()))?;
+            let remote_node_id = connection.remote_id();
+            let peer_id = crate::p2p::PeerId::new(*remote_node_id.as_bytes());
+            let (send, recv) = connection
+                .accept_bi()
+                .await
+                .map_err(|e| crate::p2p::P2pError::Accept(format!("accept_bi: {}", e)))?;
+            Ok::<_, crate::p2p::P2pError>(crate::p2p::P2pIncoming {
+                peer_id,
+                protocol,
+                stream: Box::new(IrohBiStream { send, recv }),
+            })
+        })
+        .await
+        .map_err(|_| crate::p2p::P2pError::Accept("connection setup timed out".to_string()))?
+    }
+}
+
 pub struct IrohEndpoint {
     endpoint: iroh::Endpoint,
     local_id: crate::p2p::PeerId,
@@ -422,45 +475,23 @@ impl crate::p2p::P2pEndpoint for IrohEndpoint {
 
     async fn accept(
         &self,
-    ) -> std::result::Result<crate::p2p::P2pIncoming, crate::p2p::P2pError> {
+    ) -> std::result::Result<Box<dyn crate::p2p::P2pPending>, crate::p2p::P2pError> {
+        // Only the cheap, peer-independent steps run here: wait for a QUIC
+        // incoming and turn it into an `Accepting`. Protocol negotiation and
+        // `accept_bi` — the steps a malicious peer can stall — are deferred to
+        // `IrohPending::establish`, run off the accept loop under a timeout.
         let incoming = self
             .endpoint
             .accept()
             .await
             .ok_or(crate::p2p::P2pError::Closed)?;
-        let mut connecting = incoming
+        let accepting = incoming
             .accept()
             .map_err(|e| crate::p2p::P2pError::Accept(e.to_string()))?;
-        let alpn_bytes = connecting
-            .alpn()
-            .await
-            .map_err(|e| crate::p2p::P2pError::Accept(format!("ALPN detection: {}", e)))?;
-        let protocol = self
-            .protocols
-            .iter()
-            .find(|p| p.0 == alpn_bytes.as_slice())
-            .copied()
-            .ok_or_else(|| {
-                crate::p2p::P2pError::Accept(format!(
-                    "Unknown ALPN: {:?}",
-                    String::from_utf8_lossy(alpn_bytes.as_slice())
-                ))
-            })?;
-        let connection = connecting
-            .await
-            .map_err(|e| crate::p2p::P2pError::Accept(e.to_string()))?;
-        let remote_node_id = connection.remote_id();
-        let peer_id = crate::p2p::PeerId::new(*remote_node_id.as_bytes());
-
-        let (send, recv) = connection
-            .accept_bi()
-            .await
-            .map_err(|e| crate::p2p::P2pError::Accept(format!("accept_bi: {}", e)))?;
-        Ok(crate::p2p::P2pIncoming {
-            peer_id,
-            protocol,
-            stream: Box::new(IrohBiStream { send, recv }),
-        })
+        Ok(Box::new(IrohPending {
+            accepting,
+            protocols: self.protocols.clone(),
+        }))
     }
 
     async fn close(&self) -> std::result::Result<(), crate::p2p::P2pError> {

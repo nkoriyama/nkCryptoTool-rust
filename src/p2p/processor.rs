@@ -124,15 +124,33 @@ impl NetworkProcessor {
         res
     }
 
+    /// Neutralize terminal-spoofing characters in a message that may embed
+    /// remote-supplied bytes (an unknown ALPN, a peer-influenced error string):
+    /// strips control chars and bidi/zero-width marks that would otherwise inject
+    /// escape sequences or reorder an operator's terminal / log display.
+    fn sanitize_for_terminal(msg: &str) -> String {
+        let unsafe_char = |c: char| {
+            c.is_control()
+                || ('\u{200B}'..='\u{200F}').contains(&c) // zero-width + bidi marks
+                || ('\u{202A}'..='\u{202E}').contains(&c) // bidi embed/override
+                || ('\u{2066}'..='\u{2069}').contains(&c) // bidi isolates
+        };
+        msg.chars()
+            .map(|c| if unsafe_char(c) { ' ' } else { c })
+            .collect()
+    }
+
     async fn run_listen_loop(&self) -> Result<()> {
-        // Note (serial accept): the backend `accept()` completes the per-connection
-        // handshake (ALPN + `accept_bi`) inline, so a peer that stalls mid-handshake
-        // can hold up new accepts — a pre-existing head-of-line limitation (see
-        // `network/mod.rs` "serialized accept loop"), not introduced here. Fully
-        // fixing it means splitting the idle-wait from the per-connection handshake
-        // in the P2p trait (a wait that must not itself be timed out); tracked as
-        // future work. Because the loop is serial, we must NOT add any fixed delay
-        // here (a backoff sleep would itself become a DoS an attacker could trigger
+        // Accept is now cheap: the backend `accept()` returns a `P2pPending`
+        // WITHOUT running the per-connection setup (ALPN negotiation + `accept_bi`),
+        // so a peer that stalls mid-handshake can no longer hold up new accepts.
+        // Each accepted connection reserves a concurrency permit, then runs
+        // `establish` — bounded by `P2P_SETUP_TIMEOUT` — in its own spawned task,
+        // off this loop. This fixes the head-of-line stall this note previously
+        // described as future work. The permit is acquired BEFORE spawning so a
+        // flood of half-open peers cannot spawn unbounded setup tasks. Because each
+        // iteration does only one cheap accept, we must NOT add any fixed delay on
+        // error (a backoff sleep would itself become a DoS an attacker could trigger
         // by forcing errors) — on error we only `yield_now` to stay cooperative.
         loop {
             // One inbound connection per iteration. A per-connection failure
@@ -141,25 +159,11 @@ impl NetworkProcessor {
             // keep accepting. Only a closed endpoint (shutdown / ctrl-c) ends the
             // loop. (Previously `while let Ok(..)` exited on the first such error,
             // so the server died after a single connection.)
-            let incoming = match self.endpoint.accept().await {
+            let pending = match self.endpoint.accept().await {
                 Ok(inc) => inc,
                 Err(crate::p2p::P2pError::Closed) => break,
                 Err(e) => {
-                    // Neutralize terminal-spoofing characters: the message can embed
-                    // remote-supplied bytes (e.g. an unknown ALPN) that would
-                    // otherwise inject escape sequences, or bidi/zero-width controls
-                    // that reorder an operator's terminal / log display.
-                    let unsafe_char = |c: char| {
-                        c.is_control()
-                            || ('\u{200B}'..='\u{200F}').contains(&c) // zero-width + bidi marks
-                            || ('\u{202A}'..='\u{202E}').contains(&c) // bidi embed/override
-                            || ('\u{2066}'..='\u{2069}').contains(&c) // bidi isolates
-                    };
-                    let msg: String = e
-                        .to_string()
-                        .chars()
-                        .map(|c| if unsafe_char(c) { ' ' } else { c })
-                        .collect();
+                    let msg = Self::sanitize_for_terminal(&e.to_string());
                     eprintln!("[nkct] accept error (continuing to serve): {msg}");
                     // Cooperative yield only — no fixed delay (see the serial-accept
                     // note above). Should `accept()` ever return errors without
@@ -170,13 +174,36 @@ impl NetworkProcessor {
                     continue;
                 }
             };
+            // Reserve a concurrency slot BEFORE spawning the per-connection setup:
+            // a flood of half-open peers then cannot spawn unbounded setup tasks.
+            // A stalling peer's `establish` times out within P2P_SETUP_TIMEOUT,
+            // freeing its slot, so the accept loop is never permanently starved.
+            let permit = match self.semaphore.clone().acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => break, // semaphore closed → endpoint shutting down
+            };
             let config_clone = self.config.clone();
-            let semaphore = self.semaphore.clone();
             let cached_allowlist = self.cached_allowlist.clone();
             let local_peer_id = self.endpoint.local_id();
             let io_provider = self.io_provider.clone();
 
             tokio::spawn(async move {
+                let _permit = permit; // held for the connection's lifetime
+
+                // Protocol negotiation + stream open run HERE, off the accept loop,
+                // bounded by the timeout — a peer that stalls this cannot block
+                // other connections from being accepted and served.
+                let incoming = match pending.establish(crate::p2p::P2P_SETUP_TIMEOUT).await {
+                    Ok(inc) => inc,
+                    Err(e) => {
+                        eprintln!(
+                            "[nkct] connection setup failed (continuing to serve): {}",
+                            Self::sanitize_for_terminal(&e.to_string())
+                        );
+                        return;
+                    }
+                };
+
                 let mut config = config_clone;
                 // Only a node started with `--serve-shell` (which validated
                 // authz and refused root at startup) may serve a shell; a peer
@@ -216,11 +243,6 @@ impl NetworkProcessor {
                     eprintln!("Unknown ALPN: {:?}", String::from_utf8_lossy(incoming.protocol.0));
                     return;
                 }
-
-                let _permit = match semaphore.acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
 
                 let remote_peer_id = incoming.peer_id;
                 if let Err(e) = Self::handle_server_connection(
@@ -298,8 +320,13 @@ impl NetworkProcessor {
     where
         F: FnOnce() + Send + 'static,
     {
-        let incoming = self.endpoint.accept().await
+        let pending = self.endpoint.accept().await
             .map_err(|e| CryptoError::Parameter(format!("Accept failed: {}", e)))?;
+        // Single-shot: run the per-connection setup inline, but still bound it so
+        // a peer that completes the QUIC handshake then never opens a stream
+        // cannot hang the listener forever.
+        let incoming = pending.establish(crate::p2p::P2P_SETUP_TIMEOUT).await
+            .map_err(|e| CryptoError::Parameter(format!("Connection setup failed: {}", e)))?;
 
         let mut config = self.config.clone();
         let shell_allowed = config.serve_shell;

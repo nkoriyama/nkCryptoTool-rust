@@ -23,6 +23,29 @@ pub struct P2pIncoming {
     pub stream: Box<dyn P2pStream>,
 }
 
+/// Bound on the per-connection setup that [`P2pPending::establish`] runs
+/// (protocol negotiation + stream open). Generous enough for a real cross-NAT /
+/// relay handshake, short enough to cut a peer that completes the QUIC handshake
+/// then never opens a stream (a Slowloris-style accept-loop stall).
+pub const P2P_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A half-open incoming connection whose per-peer setup — protocol negotiation
+/// and opening the bidirectional stream — has **not** run yet. Accepting one is
+/// cheap and cannot be stalled by the peer, so the listener can accept the next
+/// connection immediately and run [`establish`](Self::establish) off the accept
+/// loop (bounded by a concurrency permit + `timeout`), removing the head-of-line
+/// stall where one slow/malicious peer blocks all new connections.
+#[async_trait::async_trait]
+pub trait P2pPending: Send {
+    /// Negotiate the protocol and open the bidirectional stream, bounded by
+    /// `timeout`. A peer that stalls this (e.g. never opens the stream) yields a
+    /// timeout error rather than blocking forever.
+    async fn establish(
+        self: Box<Self>,
+        timeout: std::time::Duration,
+    ) -> Result<P2pIncoming, P2pError>;
+}
+
 /// A local P2P node — the origin of outgoing connections and the
 /// recipient of incoming ones.
 ///
@@ -50,10 +73,11 @@ pub trait P2pEndpoint: Send + Sync {
         protocol: P2pProtocol,
     ) -> Result<Box<dyn P2pStream>, P2pError>;
 
-    /// Wait for the next incoming connection on any registered
-    /// protocol. The returned [`P2pIncoming`] reports which protocol
-    /// was negotiated so the caller can dispatch accordingly.
-    async fn accept(&self) -> Result<P2pIncoming, P2pError>;
+    /// Wait for the next incoming connection. Returns a [`P2pPending`] whose
+    /// per-peer setup has not run yet, so this call cannot be stalled by the
+    /// peer; the caller runs [`P2pPending::establish`] off the accept loop to
+    /// learn the negotiated protocol and obtain the stream.
+    async fn accept(&self) -> Result<Box<dyn P2pPending>, P2pError>;
 
     /// Shut the endpoint down. Subsequent `connect` / `accept` calls
     /// return [`P2pError::Closed`].
