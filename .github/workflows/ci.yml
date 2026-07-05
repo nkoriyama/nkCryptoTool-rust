@@ -47,7 +47,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0  # mandate_check.sh needs git log against v2.0.4
           # Check out the PR branch head, not GitHub's synthetic merge ref.
@@ -144,7 +144,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install nasm (ring x86_64 asm)
         shell: pwsh
@@ -183,7 +183,7 @@ jobs:
     continue-on-error: true  # F4-X13 explicit allowance for advisory step
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Install Rust toolchain (stable)
         uses: dtolnay/rust-toolchain@stable
