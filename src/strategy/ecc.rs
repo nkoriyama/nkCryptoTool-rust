@@ -8,11 +8,9 @@ use crate::backend::{self, HashBackend};
 use crate::error::{CryptoError, Result};
 use crate::key::SharedKeyProvider;
 use crate::strategy::streaming_aead::{
-    self as v3, StreamingAeadProcessor, StreamingMode, V3_DEFAULT_CHUNK_SIZE,
-    V3_NONCE_PREFIX_LEN, V3_SESSION_ID_LEN,
+    self as v3, V3_DEFAULT_CHUNK_SIZE, V3_NONCE_PREFIX_LEN, V3_SESSION_ID_LEN,
 };
 use crate::strategy::{CryptoStrategy, StrategyType};
-use hkdf::Hkdf;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
@@ -29,9 +27,6 @@ pub struct EccStrategy {
     #[zeroize(skip)]
     aead_algo: String,
 
-    // Common streaming AEAD processor (v2 / v3)
-    #[zeroize(skip)]
-    aead: Option<StreamingAeadProcessor>,
     #[zeroize(skip)]
     hash_ctx: Option<backend::Hash>,
 
@@ -48,8 +43,6 @@ pub struct EccStrategy {
 
     // ---- v3 chunked-AEAD state ----
     #[zeroize(skip)]
-    streaming_mode: StreamingMode,
-    #[zeroize(skip)]
     chunk_size: u32,
     nonce_prefix: Zeroizing<Vec<u8>>,
     #[zeroize(skip)]
@@ -65,7 +58,6 @@ impl EccStrategy {
             curve_name: "prime256v1".to_string(),
             digest_algo: "SHA3-512".to_string(),
             aead_algo: "AES-256-GCM".to_string(),
-            aead: None,
             hash_ctx: None,
             encryption_key: Zeroizing::new(Vec::new()),
             iv: Vec::new(),
@@ -74,7 +66,6 @@ impl EccStrategy {
             ephemeral_pubkey: Vec::new(),
             sign_key_der: None,
             verify_key_der: None,
-            streaming_mode: StreamingMode::LegacySingleMessage,
             chunk_size: V3_DEFAULT_CHUNK_SIZE,
             nonce_prefix: Zeroizing::new(Vec::new()),
             file_session_id: None,
@@ -82,21 +73,6 @@ impl EccStrategy {
         }
     }
 
-    fn hkdf_derive(
-        &self,
-        secret: &[u8],
-        out_len: usize,
-        salt: &[u8],
-        info: &str,
-    ) -> Result<Zeroizing<Vec<u8>>> {
-        let mut okm = Zeroizing::new(vec![0u8; out_len]);
-        use sha3::Sha3_256;
-        let hk = Hkdf::<Sha3_256>::new(Some(salt), secret);
-        hk.expand(info.as_bytes(), &mut okm)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        drop(hk); // #15 Fix: Explicitly drop Hkdf object to minimize PRK lifetime
-        Ok(okm)
-    }
     pub fn take_shared_secret(&mut self) -> Zeroizing<Vec<u8>> {
         std::mem::take(&mut self.shared_secret)
     }
@@ -311,29 +287,15 @@ impl CryptoStrategy for EccStrategy {
 
     fn prepare_encryption(&mut self, key_paths: &HashMap<String, String>) -> Result<()> {
         self.prepare_shared_secret_encryption(key_paths)?;
-        match self.streaming_mode {
-            StreamingMode::LegacySingleMessage => {
-                self.encryption_key =
-                    self.hkdf_derive(&self.shared_secret, 32, &self.salt, "ecc-encryption")?;
-                self.aead = Some(StreamingAeadProcessor::new_encrypt(
-                    &self.aead_algo,
-                    &self.encryption_key,
-                    &self.iv,
-                )?);
-            }
-            StreamingMode::ChunkedAead => {
-                self.encryption_key =
-                    v3::hkdf_expand(&self.shared_secret, &self.salt, v3::V3_INFO_ENC_KEY, 32)?;
-                self.nonce_prefix = v3::hkdf_expand(
-                    &self.shared_secret,
-                    &self.salt,
-                    v3::V3_INFO_NONCE_PREFIX,
-                    V3_NONCE_PREFIX_LEN,
-                )?;
-                self.aead = None;
-                self.chunk_counter = 0;
-            }
-        }
+        self.encryption_key =
+            v3::hkdf_expand(&self.shared_secret, &self.salt, v3::V3_INFO_ENC_KEY, 32)?;
+        self.nonce_prefix = v3::hkdf_expand(
+            &self.shared_secret,
+            &self.salt,
+            v3::V3_INFO_NONCE_PREFIX,
+            V3_NONCE_PREFIX_LEN,
+        )?;
+        self.chunk_counter = 0;
         Ok(())
     }
 
@@ -343,85 +305,16 @@ impl CryptoStrategy for EccStrategy {
         passphrase: &mut Option<Zeroizing<String>>,
     ) -> Result<()> {
         self.prepare_shared_secret_decryption(key_paths, passphrase)?;
-        match self.streaming_mode {
-            StreamingMode::LegacySingleMessage => {
-                self.encryption_key =
-                    self.hkdf_derive(&self.shared_secret, 32, &self.salt, "ecc-encryption")?;
-                self.aead = Some(StreamingAeadProcessor::new_decrypt(
-                    &self.aead_algo,
-                    &self.encryption_key,
-                    &self.iv,
-                )?);
-            }
-            StreamingMode::ChunkedAead => {
-                self.encryption_key =
-                    v3::hkdf_expand(&self.shared_secret, &self.salt, v3::V3_INFO_ENC_KEY, 32)?;
-                self.nonce_prefix = v3::hkdf_expand(
-                    &self.shared_secret,
-                    &self.salt,
-                    v3::V3_INFO_NONCE_PREFIX,
-                    V3_NONCE_PREFIX_LEN,
-                )?;
-                self.aead = None;
-                self.chunk_counter = 0;
-            }
-        }
+        self.encryption_key =
+            v3::hkdf_expand(&self.shared_secret, &self.salt, v3::V3_INFO_ENC_KEY, 32)?;
+        self.nonce_prefix = v3::hkdf_expand(
+            &self.shared_secret,
+            &self.salt,
+            v3::V3_INFO_NONCE_PREFIX,
+            V3_NONCE_PREFIX_LEN,
+        )?;
+        self.chunk_counter = 0;
         Ok(())
-    }
-
-    fn encrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        let mut out = Zeroizing::new(vec![0u8; data.len()]);
-        let n = aead.encrypt_into(data, &mut out)?;
-        out.truncate(n);
-        Ok(out)
-    }
-
-    fn decrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        let mut out = Zeroizing::new(vec![0u8; data.len()]);
-        let n = aead.decrypt_into(data, &mut out)?;
-        out.truncate(n);
-        Ok(out)
-    }
-
-    fn encrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        aead.encrypt_into(input, output)
-    }
-
-    fn decrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        aead.decrypt_into(input, output)
-    }
-
-    fn finalize_encryption(&mut self) -> Result<Vec<u8>> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        aead.finalize_encryption()
-    }
-
-    fn finalize_decryption(&mut self, tag: &[u8]) -> Result<()> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        aead.finalize_decryption(tag)
-    }
-
-    fn restart_decryption(&mut self) -> Result<()> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        aead.restart_decryption()
     }
 
     fn prepare_signing(
@@ -594,7 +487,7 @@ impl CryptoStrategy for EccStrategy {
     }
 
     fn get_header_size(&self) -> usize {
-        let mut size = 4 + 2
+        let size = 4 + 2
             + 1
             + 4
             + self.curve_name.len()
@@ -607,20 +500,15 @@ impl CryptoStrategy for EccStrategy {
             + 4
             + self.iv.len()
             + 4
-            + self.aead_algo.len();
-        if self.streaming_mode == StreamingMode::ChunkedAead {
-            size += 4; // chunk_size u32
-        }
+            + self.aead_algo.len()
+            + 4; // chunk_size u32
         size
     }
 
     fn serialize_header(&self) -> Vec<u8> {
         let mut header = Vec::new();
         header.extend_from_slice(b"NKCT");
-        let version: u16 = match self.streaming_mode {
-            StreamingMode::LegacySingleMessage => 2,
-            StreamingMode::ChunkedAead => 3,
-        };
+        let version: u16 = 3;
         header.extend_from_slice(&version.to_le_bytes());
         header.push(self.get_strategy_type() as u8);
 
@@ -642,9 +530,7 @@ impl CryptoStrategy for EccStrategy {
         header.extend_from_slice(&(self.aead_algo.len() as u32).to_le_bytes());
         header.extend_from_slice(self.aead_algo.as_bytes());
 
-        if self.streaming_mode == StreamingMode::ChunkedAead {
-            header.extend_from_slice(&self.chunk_size.to_le_bytes());
-        }
+        header.extend_from_slice(&self.chunk_size.to_le_bytes());
 
         header
     }
@@ -664,6 +550,11 @@ impl CryptoStrategy for EccStrategy {
                 .map_err(|_| CryptoError::FileRead("Invalid version".to_string()))?,
         );
         pos += 2;
+        if version != 3 {
+            return Err(CryptoError::FileRead(
+                "legacy v1/v2 file format is no longer supported; decrypt it with an older nkCryptoTool release and re-encrypt".into(),
+            ));
+        }
 
         let strategy_type = data[pos];
         pos += 1;
@@ -714,45 +605,26 @@ impl CryptoStrategy for EccStrategy {
         self.ephemeral_pubkey = read_vec(&mut pos)?;
         self.salt = read_vec(&mut pos)?;
         self.iv = read_vec(&mut pos)?;
-        // AES-256-GCM / ChaCha20-Poly1305 use a 96-bit IV; reject a malformed
-        // header here with a clear error rather than panicking downstream.
-        if self.iv.len() != 12 {
-            return Err(CryptoError::FileRead(format!(
-                "invalid IV length {} in header (expected 12)",
-                self.iv.len()
-            )));
-        }
 
-        if version >= 2 {
-            self.aead_algo = read_string(&mut pos)?;
-        } else {
-            self.aead_algo = "AES-256-GCM".to_string();
-        }
+        // v3 always carries the AEAD algorithm string.
+        self.aead_algo = read_string(&mut pos)?;
 
-        match version {
-            2 => {
-                self.streaming_mode = StreamingMode::LegacySingleMessage;
-            }
-            3 => {
-                if data.len() < pos + 4 {
-                    return Err(CryptoError::FileRead(
-                        "v3 header missing chunk_size".to_string(),
-                    ));
-                }
-                self.chunk_size = u32::from_le_bytes(
-                    data[pos..pos + 4]
-                        .try_into()
-                        .map_err(|_| CryptoError::FileRead("Invalid chunk_size".to_string()))?,
-                );
-                pos += 4;
-                if self.chunk_size == 0 {
-                    return Err(CryptoError::FileRead(
-                        "v3 chunk_size must be > 0".to_string(),
-                    ));
-                }
-                self.streaming_mode = StreamingMode::ChunkedAead;
-            }
-            _ => return Err(CryptoError::InvalidVersion),
+        // v3 trailer: chunk_size (u32).
+        if data.len() < pos + 4 {
+            return Err(CryptoError::FileRead(
+                "v3 header missing chunk_size".to_string(),
+            ));
+        }
+        self.chunk_size = u32::from_le_bytes(
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| CryptoError::FileRead("Invalid chunk_size".to_string()))?,
+        );
+        pos += 4;
+        if self.chunk_size == 0 {
+            return Err(CryptoError::FileRead(
+                "v3 chunk_size must be > 0".to_string(),
+            ));
         }
 
         Ok(pos)
@@ -772,14 +644,6 @@ impl CryptoStrategy for EccStrategy {
 
     fn get_iv(&self) -> Vec<u8> {
         self.iv.clone()
-    }
-
-    fn streaming_mode(&self) -> StreamingMode {
-        self.streaming_mode
-    }
-
-    fn set_streaming_mode(&mut self, mode: StreamingMode) {
-        self.streaming_mode = mode;
     }
 
     fn chunk_size(&self) -> u32 {

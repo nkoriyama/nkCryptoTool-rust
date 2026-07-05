@@ -2,7 +2,6 @@
  * Copyright (c) 2024-2026 Naohiro KORIYAMA <nkoriyama@gmail.com>
  *
  * Integration tests for the v3 ChunkedAead format:
- *   - v2 → v3 backward compatibility
  *   - chunk boundary roundtrips (empty / 1B / chunk_size / non-multiple / multi)
  *   - truncation, reordering, mix-and-match attacks
  *   - chunk size tamper via SHA-256 File Session ID
@@ -141,7 +140,6 @@ fn write_v3_file(path: &std::path::Path, header: &[u8], chunks: &[Vec<u8>]) {
 #[serial]
 async fn v3_roundtrip_empty_file() {
     std::env::set_var("NKCT_V3_CHUNK_SIZE", V3_CHUNK_SIZE.to_string());
-    std::env::remove_var("NKCT_FORCE_V2");
     let dir = TempDir::new().unwrap();
     let keys = make_ecc_keys(&dir);
     let pt_path = dir.path().join("in.bin");
@@ -158,7 +156,6 @@ async fn v3_roundtrip_empty_file() {
 #[serial]
 async fn v3_roundtrip_one_byte() {
     std::env::set_var("NKCT_V3_CHUNK_SIZE", V3_CHUNK_SIZE.to_string());
-    std::env::remove_var("NKCT_FORCE_V2");
     let dir = TempDir::new().unwrap();
     let keys = make_ecc_keys(&dir);
     let pt_path = dir.path().join("in.bin");
@@ -174,7 +171,6 @@ async fn v3_roundtrip_one_byte() {
 #[serial]
 async fn v3_roundtrip_exact_chunk_size() {
     std::env::set_var("NKCT_V3_CHUNK_SIZE", V3_CHUNK_SIZE.to_string());
-    std::env::remove_var("NKCT_FORCE_V2");
     let dir = TempDir::new().unwrap();
     let keys = make_ecc_keys(&dir);
     let pt_path = dir.path().join("in.bin");
@@ -191,7 +187,6 @@ async fn v3_roundtrip_exact_chunk_size() {
 #[serial]
 async fn v3_roundtrip_multiple_chunks_aligned() {
     std::env::set_var("NKCT_V3_CHUNK_SIZE", V3_CHUNK_SIZE.to_string());
-    std::env::remove_var("NKCT_FORCE_V2");
     let dir = TempDir::new().unwrap();
     let keys = make_ecc_keys(&dir);
     let pt_path = dir.path().join("in.bin");
@@ -208,7 +203,6 @@ async fn v3_roundtrip_multiple_chunks_aligned() {
 #[serial]
 async fn v3_roundtrip_non_aligned_partial_final() {
     std::env::set_var("NKCT_V3_CHUNK_SIZE", V3_CHUNK_SIZE.to_string());
-    std::env::remove_var("NKCT_FORCE_V2");
     let dir = TempDir::new().unwrap();
     let keys = make_ecc_keys(&dir);
     let pt_path = dir.path().join("in.bin");
@@ -223,173 +217,12 @@ async fn v3_roundtrip_non_aligned_partial_final() {
     assert_eq!(fs::read(&dec_path).unwrap(), content);
 }
 
-// ------------- v2 → v3 backward compatibility -------------------
-
-#[tokio::test]
-#[serial]
-async fn v3_decoder_reads_v2_encryption() {
-    std::env::set_var("NKCT_FORCE_V2", "1");
-    std::env::remove_var("NKCT_V3_CHUNK_SIZE");
-    let dir = TempDir::new().unwrap();
-    let keys = make_ecc_keys(&dir);
-    let pt_path = dir.path().join("in.bin");
-    let ct_path = dir.path().join("out.enc");
-    let dec_path = dir.path().join("out.dec");
-    let content: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
-    fs::write(&pt_path, &content).unwrap();
-
-    ecc_encrypt(&pt_path, &ct_path, &keys).await;
-    // Confirm we really wrote a v2 file (version field at bytes 4..6 = 2).
-    let ct_bytes = fs::read(&ct_path).unwrap();
-    assert_eq!(&ct_bytes[0..4], b"NKCT");
-    assert_eq!(u16::from_le_bytes([ct_bytes[4], ct_bytes[5]]), 2);
-
-    std::env::remove_var("NKCT_FORCE_V2");
-    ecc_decrypt(&ct_path, &dec_path, &keys).await;
-    assert_eq!(fs::read(&dec_path).unwrap(), content);
-}
-
-#[tokio::test]
-#[serial]
-async fn v3_decoder_reads_v2_pqc() {
-    std::env::set_var("NKCT_FORCE_V2", "1");
-    std::env::remove_var("NKCT_V3_CHUNK_SIZE");
-    let dir = TempDir::new().unwrap();
-    let (pub_key, priv_key) = make_pqc_keys(&dir);
-    let pt_path = dir.path().join("in.bin");
-    let ct_path = dir.path().join("out.enc");
-    let dec_path = dir.path().join("out.dec");
-    let content: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
-    fs::write(&pt_path, &content).unwrap();
-
-    let mut p = CryptoProcessor::new(CryptoMode::PQC);
-    let cfg = CryptoConfig {
-        operation: Operation::Encrypt,
-        input_files: vec![pt_path.to_str().unwrap().to_string()],
-        output_file: Some(ct_path.to_str().unwrap().to_string()),
-        recipient_pubkey: Some(pub_key.to_str().unwrap().to_string()),
-        force: true,
-        mode: CryptoMode::PQC,
-        pqc_kem_algo: "ML-KEM-768".to_string(),
-        ..CryptoConfig::default()
-    };
-    p.process(&cfg, None).await.expect("encrypt pqc v2");
-
-    // PQC writes the same NKCT magic + uint16_t version layout as ECC, so
-    // the v2 marker lives at bytes 4..6.
-    let ct_bytes = fs::read(&ct_path).unwrap();
-    assert_eq!(&ct_bytes[0..4], b"NKCT");
-    assert_eq!(u16::from_le_bytes([ct_bytes[4], ct_bytes[5]]), 2);
-
-    std::env::remove_var("NKCT_FORCE_V2");
-    let mut p2 = CryptoProcessor::new(CryptoMode::PQC);
-    let cfg = CryptoConfig {
-        operation: Operation::Decrypt,
-        input_files: vec![ct_path.to_str().unwrap().to_string()],
-        output_file: Some(dec_path.to_str().unwrap().to_string()),
-        user_privkey: Some(priv_key.to_str().unwrap().to_string()),
-        force: true,
-        mode: CryptoMode::PQC,
-        pqc_kem_algo: "ML-KEM-768".to_string(),
-        ..CryptoConfig::default()
-    };
-    p2.process(&cfg, None).await.expect("decrypt pqc v2");
-    assert_eq!(fs::read(&dec_path).unwrap(), content);
-}
-
-#[tokio::test]
-#[serial]
-async fn v3_decoder_reads_v2_hybrid() {
-    std::env::set_var("NKCT_FORCE_V2", "1");
-    std::env::remove_var("NKCT_V3_CHUNK_SIZE");
-    let dir = TempDir::new().unwrap();
-    let key_dir = dir.path().join("keys");
-    fs::create_dir_all(&key_dir).unwrap();
-
-    let mut paths = HashMap::new();
-    paths.insert(
-        "public-ecdh-key".to_string(),
-        key_dir.join("pub_ecdh.key").to_str().unwrap().to_string(),
-    );
-    paths.insert(
-        "private-ecdh-key".to_string(),
-        key_dir.join("priv_ecdh.key").to_str().unwrap().to_string(),
-    );
-    paths.insert(
-        "public-mlkem-key".to_string(),
-        key_dir.join("pub_mlkem.key").to_str().unwrap().to_string(),
-    );
-    paths.insert(
-        "private-mlkem-key".to_string(),
-        key_dir
-            .join("priv_mlkem.key")
-            .to_str()
-            .unwrap()
-            .to_string(),
-    );
-    paths.insert("kem-algo".to_string(), "ML-KEM-768".to_string());
-    let strat = HybridStrategy::new();
-    strat
-        .generate_encryption_key_pair(&paths, None, true)
-        .expect("hybrid keygen");
-
-    let pt_path = dir.path().join("in.bin");
-    let ct_path = dir.path().join("out.enc");
-    let dec_path = dir.path().join("out.dec");
-    let content: Vec<u8> = (0..1024).map(|i| (i & 0xFF) as u8).collect();
-    fs::write(&pt_path, &content).unwrap();
-
-    let mut p = CryptoProcessor::new(CryptoMode::Hybrid);
-    let cfg = CryptoConfig {
-        operation: Operation::Encrypt,
-        input_files: vec![pt_path.to_str().unwrap().to_string()],
-        output_file: Some(ct_path.to_str().unwrap().to_string()),
-        recipient_ecdh_pubkey: Some(key_dir.join("pub_ecdh.key").to_str().unwrap().to_string()),
-        recipient_mlkem_pubkey: Some(
-            key_dir.join("pub_mlkem.key").to_str().unwrap().to_string(),
-        ),
-        force: true,
-        mode: CryptoMode::Hybrid,
-        pqc_kem_algo: "ML-KEM-768".to_string(),
-        ..CryptoConfig::default()
-    };
-    p.process(&cfg, None).await.expect("encrypt hybrid v2");
-
-    // Hybrid's *outer* wrapper version is 1 in legacy mode, not 2 — the
-    // inner ECC/PQC headers carry their own v2 marker but the outer field
-    // at bytes 4..6 (read by hybrid.rs deserialize_header at L407-411) is
-    // 1. v3 dispatch maps outer_version=1 to LegacySingleMessage
-    // (hybrid.rs L454-457).
-    let ct_bytes = fs::read(&ct_path).unwrap();
-    assert_eq!(&ct_bytes[0..4], b"NKCT");
-    assert_eq!(u16::from_le_bytes([ct_bytes[4], ct_bytes[5]]), 1);
-
-    std::env::remove_var("NKCT_FORCE_V2");
-    let mut p2 = CryptoProcessor::new(CryptoMode::Hybrid);
-    let cfg = CryptoConfig {
-        operation: Operation::Decrypt,
-        input_files: vec![ct_path.to_str().unwrap().to_string()],
-        output_file: Some(dec_path.to_str().unwrap().to_string()),
-        user_ecdh_privkey: Some(key_dir.join("priv_ecdh.key").to_str().unwrap().to_string()),
-        user_mlkem_privkey: Some(
-            key_dir.join("priv_mlkem.key").to_str().unwrap().to_string(),
-        ),
-        force: true,
-        mode: CryptoMode::Hybrid,
-        pqc_kem_algo: "ML-KEM-768".to_string(),
-        ..CryptoConfig::default()
-    };
-    p2.process(&cfg, None).await.expect("decrypt hybrid v2");
-    assert_eq!(fs::read(&dec_path).unwrap(), content);
-}
-
 // ------------- Attack: truncation ------------------------------
 
 #[tokio::test]
 #[serial]
 async fn v3_truncation_attack_detected() {
     std::env::set_var("NKCT_V3_CHUNK_SIZE", V3_CHUNK_SIZE.to_string());
-    std::env::remove_var("NKCT_FORCE_V2");
     let dir = TempDir::new().unwrap();
     let keys = make_ecc_keys(&dir);
     let pt_path = dir.path().join("in.bin");
@@ -430,7 +263,6 @@ async fn v3_truncation_attack_detected() {
 #[serial]
 async fn v3_reorder_attack_detected() {
     std::env::set_var("NKCT_V3_CHUNK_SIZE", V3_CHUNK_SIZE.to_string());
-    std::env::remove_var("NKCT_FORCE_V2");
     let dir = TempDir::new().unwrap();
     let keys = make_ecc_keys(&dir);
     let pt_path = dir.path().join("in.bin");
@@ -460,7 +292,6 @@ async fn v3_reorder_attack_detected() {
 #[serial]
 async fn v3_mix_and_match_attack_detected() {
     std::env::set_var("NKCT_V3_CHUNK_SIZE", V3_CHUNK_SIZE.to_string());
-    std::env::remove_var("NKCT_FORCE_V2");
     let dir = TempDir::new().unwrap();
     let keys = make_ecc_keys(&dir);
     let pt_a = dir.path().join("a.bin");
@@ -499,7 +330,6 @@ async fn v3_mix_and_match_attack_detected() {
 #[serial]
 async fn v3_chunk_size_tamper_detected_via_session_id() {
     std::env::set_var("NKCT_V3_CHUNK_SIZE", V3_CHUNK_SIZE.to_string());
-    std::env::remove_var("NKCT_FORCE_V2");
     let dir = TempDir::new().unwrap();
     let keys = make_ecc_keys(&dir);
     let pt_path = dir.path().join("in.bin");
@@ -556,7 +386,6 @@ fn make_pqc_keys(dir: &TempDir) -> (PathBuf, PathBuf) {
 #[serial]
 async fn v3_roundtrip_pqc_mlkem768() {
     std::env::set_var("NKCT_V3_CHUNK_SIZE", V3_CHUNK_SIZE.to_string());
-    std::env::remove_var("NKCT_FORCE_V2");
     let dir = TempDir::new().unwrap();
     let (pub_key, priv_key) = make_pqc_keys(&dir);
     let pt_path = dir.path().join("in.bin");
@@ -601,7 +430,6 @@ async fn v3_roundtrip_pqc_mlkem768() {
 #[serial]
 async fn v3_roundtrip_hybrid_ecdh_mlkem() {
     std::env::set_var("NKCT_V3_CHUNK_SIZE", V3_CHUNK_SIZE.to_string());
-    std::env::remove_var("NKCT_FORCE_V2");
     let dir = TempDir::new().unwrap();
     let key_dir = dir.path().join("keys");
     fs::create_dir_all(&key_dir).unwrap();

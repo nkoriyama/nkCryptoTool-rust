@@ -7,8 +7,7 @@
 use crate::error::{CryptoError, Result};
 use crate::key::SharedKeyProvider;
 use crate::strategy::streaming_aead::{
-    self as v3, StreamingAeadProcessor, StreamingMode, V3_DEFAULT_CHUNK_SIZE,
-    V3_NONCE_PREFIX_LEN, V3_SESSION_ID_LEN,
+    self as v3, V3_DEFAULT_CHUNK_SIZE, V3_NONCE_PREFIX_LEN, V3_SESSION_ID_LEN,
 };
 use crate::strategy::{ecc::EccStrategy, pqc::PqcStrategy, CryptoStrategy, StrategyType};
 use std::collections::HashMap;
@@ -22,12 +21,8 @@ pub struct HybridStrategy {
     encryption_key: Zeroizing<Vec<u8>>,
     iv: Vec<u8>,
     salt: Vec<u8>,
-    #[zeroize(skip)]
-    aead: Option<StreamingAeadProcessor>,
 
     // ---- v3 chunked-AEAD state ----
-    #[zeroize(skip)]
-    streaming_mode: StreamingMode,
     #[zeroize(skip)]
     chunk_size: u32,
     nonce_prefix: Zeroizing<Vec<u8>>,
@@ -47,8 +42,6 @@ impl HybridStrategy {
             encryption_key: Zeroizing::new(Vec::new()),
             iv: Vec::new(),
             salt: Vec::new(),
-            aead: None,
-            streaming_mode: StreamingMode::LegacySingleMessage,
             chunk_size: V3_DEFAULT_CHUNK_SIZE,
             nonce_prefix: Zeroizing::new(Vec::new()),
             file_session_id: None,
@@ -172,35 +165,14 @@ impl CryptoStrategy for HybridStrategy {
         self.salt = self.ecc.get_salt();
         self.iv = self.ecc.get_iv();
 
-        match self.streaming_mode {
-            StreamingMode::LegacySingleMessage => {
-                use hkdf::Hkdf;
-                use sha3::Sha3_256;
-                let mut okm = Zeroizing::new(vec![0u8; 32]);
-                let hk = Hkdf::<Sha3_256>::new(Some(&self.salt), &combined_ss);
-                hk.expand(b"hybrid-encryption", &mut okm)
-                    .map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
-                drop(hk);
-                self.encryption_key = okm;
-                self.aead = Some(StreamingAeadProcessor::new_encrypt(
-                    "AES-256-GCM",
-                    &self.encryption_key,
-                    &self.iv,
-                )?);
-            }
-            StreamingMode::ChunkedAead => {
-                self.encryption_key =
-                    v3::hkdf_expand(&combined_ss, &self.salt, v3::V3_INFO_ENC_KEY, 32)?;
-                self.nonce_prefix = v3::hkdf_expand(
-                    &combined_ss,
-                    &self.salt,
-                    v3::V3_INFO_NONCE_PREFIX,
-                    V3_NONCE_PREFIX_LEN,
-                )?;
-                self.aead = None;
-                self.chunk_counter = 0;
-            }
-        }
+        self.encryption_key = v3::hkdf_expand(&combined_ss, &self.salt, v3::V3_INFO_ENC_KEY, 32)?;
+        self.nonce_prefix = v3::hkdf_expand(
+            &combined_ss,
+            &self.salt,
+            v3::V3_INFO_NONCE_PREFIX,
+            V3_NONCE_PREFIX_LEN,
+        )?;
+        self.chunk_counter = 0;
         Ok(())
     }
 
@@ -229,91 +201,15 @@ impl CryptoStrategy for HybridStrategy {
         combined_ss[..ss_ecc.len()].copy_from_slice(&ss_ecc);
         combined_ss[ss_ecc.len()..].copy_from_slice(&ss_pqc);
 
-        match self.streaming_mode {
-            StreamingMode::LegacySingleMessage => {
-                use hkdf::Hkdf;
-                use sha3::Sha3_256;
-                let mut okm = Zeroizing::new(vec![0u8; 32]);
-                let hk = Hkdf::<Sha3_256>::new(Some(&self.salt), &combined_ss);
-                hk.expand(b"hybrid-encryption", &mut okm)
-                    .map_err(|e| crate::error::CryptoError::OpenSSL(e.to_string()))?;
-                drop(hk);
-                self.encryption_key = okm;
-                self.aead = Some(StreamingAeadProcessor::new_decrypt(
-                    "AES-256-GCM",
-                    &self.encryption_key,
-                    &self.iv,
-                )?);
-            }
-            StreamingMode::ChunkedAead => {
-                self.encryption_key =
-                    v3::hkdf_expand(&combined_ss, &self.salt, v3::V3_INFO_ENC_KEY, 32)?;
-                self.nonce_prefix = v3::hkdf_expand(
-                    &combined_ss,
-                    &self.salt,
-                    v3::V3_INFO_NONCE_PREFIX,
-                    V3_NONCE_PREFIX_LEN,
-                )?;
-                self.aead = None;
-                self.chunk_counter = 0;
-            }
-        }
+        self.encryption_key = v3::hkdf_expand(&combined_ss, &self.salt, v3::V3_INFO_ENC_KEY, 32)?;
+        self.nonce_prefix = v3::hkdf_expand(
+            &combined_ss,
+            &self.salt,
+            v3::V3_INFO_NONCE_PREFIX,
+            V3_NONCE_PREFIX_LEN,
+        )?;
+        self.chunk_counter = 0;
         Ok(())
-    }
-
-    fn encrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        let mut out = Zeroizing::new(vec![0u8; data.len()]);
-        let n = aead.encrypt_into(data, &mut out)?;
-        out.truncate(n);
-        Ok(out)
-    }
-
-    fn decrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        let mut out = Zeroizing::new(vec![0u8; data.len()]);
-        let n = aead.decrypt_into(data, &mut out)?;
-        out.truncate(n);
-        Ok(out)
-    }
-
-    fn encrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        aead.encrypt_into(input, output)
-    }
-
-    fn decrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        aead.decrypt_into(input, output)
-    }
-
-    fn finalize_encryption(&mut self) -> Result<Vec<u8>> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        aead.finalize_encryption()
-    }
-
-    fn finalize_decryption(&mut self, tag: &[u8]) -> Result<()> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        aead.finalize_decryption(tag)
-    }
-
-    fn restart_decryption(&mut self) -> Result<()> {
-        let aead = self.aead.as_mut().ok_or(CryptoError::Parameter(
-            "AEAD context not initialized".to_string(),
-        ))?;
-        aead.restart_decryption()
     }
 
     fn prepare_signing(
@@ -363,21 +259,21 @@ impl CryptoStrategy for HybridStrategy {
     }
 
     fn get_header_size(&self) -> usize {
-        let mut size =
-            4 + 2 + 1 + 4 + self.ecc.get_header_size() + 4 + self.pqc.get_header_size();
-        if self.streaming_mode == StreamingMode::ChunkedAead {
-            size += 4;
-        }
+        let size = 4
+            + 2
+            + 1
+            + 4
+            + self.ecc.get_header_size()
+            + 4
+            + self.pqc.get_header_size()
+            + 4; // chunk_size u32
         size
     }
 
     fn serialize_header(&self) -> Vec<u8> {
         let mut header = Vec::new();
         header.extend_from_slice(b"NKCT");
-        let outer_version: u16 = match self.streaming_mode {
-            StreamingMode::LegacySingleMessage => 1,
-            StreamingMode::ChunkedAead => 3,
-        };
+        let outer_version: u16 = 3;
         header.extend_from_slice(&outer_version.to_le_bytes());
         header.push(self.get_strategy_type() as u8);
 
@@ -389,9 +285,7 @@ impl CryptoStrategy for HybridStrategy {
         header.extend_from_slice(&(pqc_h.len() as u32).to_le_bytes());
         header.extend_from_slice(&pqc_h);
 
-        if self.streaming_mode == StreamingMode::ChunkedAead {
-            header.extend_from_slice(&self.chunk_size.to_le_bytes());
-        }
+        header.extend_from_slice(&self.chunk_size.to_le_bytes());
 
         header
     }
@@ -409,6 +303,11 @@ impl CryptoStrategy for HybridStrategy {
                 .try_into()
                 .map_err(|_| CryptoError::FileRead("Invalid version".to_string()))?,
         );
+        if outer_version != 3 {
+            return Err(CryptoError::FileRead(
+                "legacy v1/v2 file format is no longer supported; decrypt it with an older nkCryptoTool release and re-encrypt".into(),
+            ));
+        }
 
         let mut pos = 7;
         if data.len() < pos + 4 {
@@ -451,30 +350,22 @@ impl CryptoStrategy for HybridStrategy {
         self.pqc.deserialize_header(&data[pos..pos + pqc_len])?;
         pos += pqc_len;
 
-        match outer_version {
-            1 => {
-                self.streaming_mode = StreamingMode::LegacySingleMessage;
-            }
-            3 => {
-                if data.len() < pos + 4 {
-                    return Err(CryptoError::FileRead(
-                        "v3 hybrid header missing chunk_size".to_string(),
-                    ));
-                }
-                self.chunk_size = u32::from_le_bytes(
-                    data[pos..pos + 4]
-                        .try_into()
-                        .map_err(|_| CryptoError::FileRead("Invalid chunk_size".to_string()))?,
-                );
-                pos += 4;
-                if self.chunk_size == 0 {
-                    return Err(CryptoError::FileRead(
-                        "v3 chunk_size must be > 0".to_string(),
-                    ));
-                }
-                self.streaming_mode = StreamingMode::ChunkedAead;
-            }
-            _ => return Err(CryptoError::InvalidVersion),
+        // v3 trailer: chunk_size (u32).
+        if data.len() < pos + 4 {
+            return Err(CryptoError::FileRead(
+                "v3 hybrid header missing chunk_size".to_string(),
+            ));
+        }
+        self.chunk_size = u32::from_le_bytes(
+            data[pos..pos + 4]
+                .try_into()
+                .map_err(|_| CryptoError::FileRead("Invalid chunk_size".to_string()))?,
+        );
+        pos += 4;
+        if self.chunk_size == 0 {
+            return Err(CryptoError::FileRead(
+                "v3 chunk_size must be > 0".to_string(),
+            ));
         }
 
         self.salt = self.ecc.get_salt();
@@ -493,14 +384,6 @@ impl CryptoStrategy for HybridStrategy {
     }
     fn get_iv(&self) -> Vec<u8> {
         self.iv.clone()
-    }
-
-    fn streaming_mode(&self) -> StreamingMode {
-        self.streaming_mode
-    }
-
-    fn set_streaming_mode(&mut self, mode: StreamingMode) {
-        self.streaming_mode = mode;
     }
 
     fn chunk_size(&self) -> u32 {
@@ -648,17 +531,31 @@ mod tests {
     #[test]
     fn test_hybrid_deserialize_header_short() {
         let mut strategy = HybridStrategy::new();
-        // 8 bytes header (too short, should be at least 11)
-        let data = b"NKCT\x01\x00\x02";
+        // 7 bytes v3 header (magic + version 3 + strategy): too short for the
+        // ECC length field that follows.
+        let data = b"NKCT\x03\x00\x02";
         let res = strategy.deserialize_header(data);
         assert!(res.is_err());
         if let Err(e) = res {
             assert!(e.to_string().contains("Header too short"));
         }
 
-        // 11 bytes header (enough for magic and version, but not enough for ECC/PQC lengths)
-        let data = b"NKCT\x01\x00\x02\x00\x00\x00\x00";
+        // 11 bytes v3 header (enough for magic/version, but not enough for
+        // the ECC/PQC bodies the lengths point at).
+        let data = b"NKCT\x03\x00\x02\x00\x00\x00\x00";
         let res = strategy.deserialize_header(data);
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn test_hybrid_deserialize_header_rejects_legacy_version() {
+        let mut strategy = HybridStrategy::new();
+        // Legacy outer version 1 is no longer accepted.
+        let data = b"NKCT\x01\x00\x03\x00\x00\x00\x00";
+        let res = strategy.deserialize_header(data);
+        assert!(res.is_err());
+        if let Err(e) = res {
+            assert!(e.to_string().contains("no longer supported"));
+        }
     }
 }

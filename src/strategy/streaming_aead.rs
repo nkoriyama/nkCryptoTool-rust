@@ -3,18 +3,14 @@
  *
  * This file is part of nkCryptoTool.
  *
- * Common streaming AEAD processor shared by ECC / PQC / Hybrid strategies.
+ * Common chunked-AEAD (v3) helpers shared by ECC / PQC / Hybrid strategies.
  *
- * Two modes are supported:
- *   - LegacySingleMessage (v2): one AES-GCM context spanning the whole file,
- *     single trailing tag. Wire-format identical to nkCryptoTool v2.
- *   - ChunkedAead (v3): independent AEAD invocation per chunk with
- *     prefix+counter nonce and AAD = session_id || counter || flags.
+ * v3 (ChunkedAead): one independent AEAD invocation per chunk with a
+ * prefix+counter nonce and AAD = session_id || counter || flags.
  */
 
-use crate::backend::{self, Aead, AeadBackend};
 use crate::error::{CryptoError, Result};
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::Zeroizing;
 
 #[cfg(feature = "backend-rustcrypto")]
 use aes_gcm::{
@@ -47,125 +43,6 @@ pub const V3_DEFAULT_CHUNK_SIZE: u32 = 1024 * 1024;
 /// HKDF info labels for v3 derivation.
 pub const V3_INFO_ENC_KEY: &[u8] = b"nkct-v3-enc-key";
 pub const V3_INFO_NONCE_PREFIX: &[u8] = b"nkct-v3-nonce-prefix";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StreamingMode {
-    LegacySingleMessage,
-    ChunkedAead,
-}
-
-impl Default for StreamingMode {
-    fn default() -> Self {
-        StreamingMode::LegacySingleMessage
-    }
-}
-
-/// Wraps the legacy single-message AEAD context used by v2.
-pub struct StreamingAeadProcessor {
-    aead_algo: String,
-    encryption_key: Zeroizing<Vec<u8>>,
-    iv: Vec<u8>,
-    aead_ctx: Option<Aead>,
-}
-
-impl Zeroize for StreamingAeadProcessor {
-    fn zeroize(&mut self) {
-        self.encryption_key.zeroize();
-        self.iv.zeroize();
-        // aead_ctx is zeroized via its own Drop.
-    }
-}
-
-impl ZeroizeOnDrop for StreamingAeadProcessor {}
-
-impl Drop for StreamingAeadProcessor {
-    fn drop(&mut self) {
-        self.zeroize();
-    }
-}
-
-impl StreamingAeadProcessor {
-    pub fn new_encrypt(aead_algo: &str, key: &[u8], iv: &[u8]) -> Result<Self> {
-        let ctx = backend::new_encrypt(aead_algo, key, iv)?;
-        Ok(Self {
-            aead_algo: aead_algo.to_string(),
-            encryption_key: Zeroizing::new(key.to_vec()),
-            iv: iv.to_vec(),
-            aead_ctx: Some(ctx),
-        })
-    }
-
-    pub fn new_decrypt(aead_algo: &str, key: &[u8], iv: &[u8]) -> Result<Self> {
-        let ctx = backend::new_decrypt(aead_algo, key, iv)?;
-        Ok(Self {
-            aead_algo: aead_algo.to_string(),
-            encryption_key: Zeroizing::new(key.to_vec()),
-            iv: iv.to_vec(),
-            aead_ctx: Some(ctx),
-        })
-    }
-
-    pub fn aead_algo(&self) -> &str {
-        &self.aead_algo
-    }
-
-    pub fn encryption_key(&self) -> &[u8] {
-        &self.encryption_key
-    }
-
-    pub fn encrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
-        let ctx = self
-            .aead_ctx
-            .as_mut()
-            .ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        ctx.update(input, output)
-    }
-
-    pub fn decrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
-        let ctx = self
-            .aead_ctx
-            .as_mut()
-            .ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        ctx.update(input, output)
-    }
-
-    pub fn finalize_encryption(&mut self) -> Result<Vec<u8>> {
-        let ctx = self
-            .aead_ctx
-            .as_mut()
-            .ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        let mut out = vec![0u8; 16];
-        let n = ctx.finalize(&mut out)?;
-        out.truncate(n);
-        let mut tag = vec![0u8; 16];
-        ctx.get_tag(&mut tag)?;
-        out.extend_from_slice(&tag);
-        Ok(out)
-    }
-
-    pub fn finalize_decryption(&mut self, tag: &[u8]) -> Result<()> {
-        let ctx = self
-            .aead_ctx
-            .as_mut()
-            .ok_or(CryptoError::Parameter("AEAD context not initialized".to_string()))?;
-        ctx.set_tag(tag)?;
-        let mut out = vec![0u8; 16];
-        ctx.finalize(&mut out)
-            .map_err(|_| CryptoError::SignatureVerification)?;
-        Ok(())
-    }
-
-    pub fn restart_decryption(&mut self) -> Result<()> {
-        if self.encryption_key.is_empty() {
-            return Err(CryptoError::Parameter("Key not set".to_string()));
-        }
-        let ctx = backend::new_decrypt(&self.aead_algo, &self.encryption_key, &self.iv)?;
-        self.aead_ctx = Some(ctx);
-        Ok(())
-    }
-}
-
-
 
 /// One-shot AEAD encryption with AAD for v3 chunks. Returns ciphertext || tag.
 pub fn aead_encrypt_chunk(

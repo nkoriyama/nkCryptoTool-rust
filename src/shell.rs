@@ -23,9 +23,8 @@
 //! safely each connection. The plaintext inside one packet is a single
 //! [`Frame`].
 
-use crate::backend;
-use crate::backend::AeadBackend;
 use crate::error::{CryptoError, Result};
+use crate::strategy::streaming_aead::{aead_decrypt_chunk, aead_encrypt_chunk};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::Zeroizing;
 
@@ -162,16 +161,10 @@ pub(crate) async fn send_packet<W: AsyncWriteExt + Unpin>(
     pt: &[u8],
 ) -> Result<()> {
     let nonce = nonce_from_ctr(*ctr);
-    let mut aead = backend::new_encrypt(aead_name, key, &nonce)?;
-    let mut ct = Zeroizing::new(vec![0u8; pt.len() + 32]);
-    let n = aead.update(pt, &mut ct)?;
-    let fin = aead.finalize(&mut ct[n..])?;
-    let mut tag = [0u8; TAG_LEN];
-    aead.get_tag(&mut tag)?;
-
-    let mut packet = Vec::with_capacity(n + fin + TAG_LEN);
-    packet.extend_from_slice(&ct[..n + fin]);
-    packet.extend_from_slice(&tag);
+    // One-shot AEAD: `ct_tag` = ciphertext || 16-byte tag, byte-for-byte the same
+    // packet the streaming path produced (single-message GCM), so the wire is
+    // unchanged. No AAD (the counter-nonce alone binds ordering).
+    let packet = aead_encrypt_chunk(aead_name, key, &nonce, &[], pt)?;
 
     w.write_all(&(packet.len() as u32).to_le_bytes()).await.map_err(io_err)?;
     w.write_all(&packet).await.map_err(io_err)?;
@@ -207,17 +200,14 @@ pub(crate) async fn recv_packet<R: AsyncReadExt + Unpin>(
     let mut packet = Zeroizing::new(vec![0u8; len]);
     r.read_exact(&mut packet).await.map_err(io_err)?;
 
-    let (ciphertext, tag) = packet.split_at(packet.len() - TAG_LEN);
     let nonce = nonce_from_ctr(*ctr);
-    let mut aead = backend::new_decrypt(aead_name, key, &nonce)?;
-    aead.set_tag(tag)?;
-    let mut out = Zeroizing::new(vec![0u8; ciphertext.len() + 32]);
-    let n = aead.update(ciphertext, &mut out)?;
-    let fin = aead.finalize(&mut out[n..])?;
+    // One-shot AEAD over the whole `ciphertext || tag` packet, no AAD — matches
+    // the streaming path's single-message GCM byte-for-byte. A replayed/reordered
+    // packet decrypts under the wrong counter-nonce and fails authentication.
+    let out = aead_decrypt_chunk(aead_name, key, &nonce, &[], &packet)?;
     *ctr = ctr.checked_add(1).ok_or_else(|| {
         CryptoError::Parameter("recv counter overflow".to_string())
     })?;
-    out.truncate(n + fin);
     Ok(Some(out))
 }
 

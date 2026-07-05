@@ -10,20 +10,19 @@ use crate::key::SharedKeyProvider;
 use crate::strategy::ecc::EccStrategy;
 use crate::strategy::hybrid::HybridStrategy;
 use crate::strategy::pqc::PqcStrategy;
-use crate::strategy::streaming_aead::{self as v3, StreamingMode};
+use crate::strategy::streaming_aead as v3;
 use crate::strategy::CryptoStrategy;
 use rand_core::RngCore;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
 pub type ProgressCallback = Arc<dyn Fn(f64) + Send + Sync>;
 
 const BUF_SIZE: usize = 1024 * 1024;
-const AEAD_OVERHEAD: usize = 32;
 
 /// Open an output file for exclusive creation with owner-only permissions and
 /// symlink protection. unix: 0600 + `O_NOFOLLOW`; on Windows those flags do not
@@ -331,24 +330,15 @@ impl CryptoProcessor {
             "Strategy already in use".to_string(),
         ))?;
 
-        // New encryptions default to v3 (chunked AEAD). Tests can request
-        // the legacy v2 layout via NKCT_FORCE_V2=1.
-        let use_v3 = std::env::var("NKCT_FORCE_V2")
-            .map(|v| v.is_empty() || v == "0")
-            .unwrap_or(true);
-        if use_v3 {
-            strategy.set_streaming_mode(StreamingMode::ChunkedAead);
-            // NKCT_V3_CHUNK_SIZE lets tests pick a small chunk size so the
-            // boundary cases (file size = chunk_size etc.) stay cheap.
-            let chunk_size = std::env::var("NKCT_V3_CHUNK_SIZE")
-                .ok()
-                .and_then(|s| s.parse::<u32>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(v3::V3_DEFAULT_CHUNK_SIZE);
-            strategy.set_chunk_size(chunk_size);
-        } else {
-            strategy.set_streaming_mode(StreamingMode::LegacySingleMessage);
-        }
+        // All encryptions use the v3 chunked-AEAD format.
+        // NKCT_V3_CHUNK_SIZE lets tests pick a small chunk size so the
+        // boundary cases (file size = chunk_size etc.) stay cheap.
+        let chunk_size = std::env::var("NKCT_V3_CHUNK_SIZE")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(v3::V3_DEFAULT_CHUNK_SIZE);
+        strategy.set_chunk_size(chunk_size);
 
         strategy.prepare_encryption(&key_paths)?;
 
@@ -358,36 +348,21 @@ impl CryptoProcessor {
         let input_path_str = input_path.to_string();
         let output_path_str = output_path.to_string();
 
-        let result = match strategy.streaming_mode() {
-            StreamingMode::LegacySingleMessage => {
-                self.run_streaming_encrypt(
-                    strategy,
-                    input_path_str,
-                    output_path_str,
-                    header,
-                    total_input_size,
-                    config.force,
-                    progress_callback,
-                )
-                .await
-            }
-            StreamingMode::ChunkedAead => {
-                let sid = v3::compute_session_id(&header);
-                strategy.set_file_session_id(sid);
-                let chunk_size = strategy.chunk_size();
-                self.run_chunked_encrypt(
-                    strategy,
-                    input_path_str,
-                    output_path_str,
-                    header,
-                    total_input_size,
-                    chunk_size,
-                    config.force,
-                    progress_callback,
-                )
-                .await
-            }
-        };
+        let sid = v3::compute_session_id(&header);
+        strategy.set_file_session_id(sid);
+        let chunk_size = strategy.chunk_size();
+        let result = self
+            .run_chunked_encrypt(
+                strategy,
+                input_path_str,
+                output_path_str,
+                header,
+                total_input_size,
+                chunk_size,
+                config.force,
+                progress_callback,
+            )
+            .await;
 
         match result {
             Ok(s) => {
@@ -447,53 +422,22 @@ impl CryptoProcessor {
         let input_path_str = input_path.to_string();
         let output_path_str = output_path.to_string();
 
-        let result = match strategy.streaming_mode() {
-            StreamingMode::LegacySingleMessage => {
-                let tag_size = strategy.get_tag_size() as u64;
-                if total_size < tag_size {
-                    return Err(CryptoError::FileRead("File too small".to_string()));
-                }
-                let mut tag = vec![0u8; tag_size as usize];
-                input_file
-                    .seek(std::io::SeekFrom::End(-(tag_size as i64)))
-                    .await?;
-                input_file.read_exact(&mut tag).await?;
-                let ciphertext_size = total_size
-                    .checked_sub(header_size)
-                    .and_then(|s| s.checked_sub(tag_size))
-                    .ok_or_else(|| {
-                        CryptoError::FileRead("File too small for header and tag".to_string())
-                    })?;
-                self.run_streaming_decrypt(
-                    strategy,
-                    input_path_str,
-                    output_path_str,
-                    header_size,
-                    ciphertext_size,
-                    tag,
-                    config.force,
-                    progress_callback,
-                )
-                .await
-            }
-            StreamingMode::ChunkedAead => {
-                let chunk_size = strategy.chunk_size();
-                let body_size = total_size.checked_sub(header_size).ok_or_else(|| {
-                    CryptoError::FileRead("File too small for header".to_string())
-                })?;
-                self.run_chunked_decrypt(
-                    strategy,
-                    input_path_str,
-                    output_path_str,
-                    header_size,
-                    body_size,
-                    chunk_size,
-                    config.force,
-                    progress_callback,
-                )
-                .await
-            }
-        };
+        let chunk_size = strategy.chunk_size();
+        let body_size = total_size
+            .checked_sub(header_size)
+            .ok_or_else(|| CryptoError::FileRead("File too small for header".to_string()))?;
+        let result = self
+            .run_chunked_decrypt(
+                strategy,
+                input_path_str,
+                output_path_str,
+                header_size,
+                body_size,
+                chunk_size,
+                config.force,
+                progress_callback,
+            )
+            .await;
 
         match result {
             Ok(s) => {
@@ -501,216 +445,6 @@ impl CryptoProcessor {
                 Ok(())
             }
             Err(e) => Err(e),
-        }
-    }
-
-    // allow(clippy::too_many_arguments): each parameter is a distinct, required
-    // crypto input (strategy/paths/sizes/tag/flags); bundling into a struct adds
-    // field-swap risk in security-critical code for no functional benefit.
-    // Future: revisit only if a cohesive context type emerges naturally.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_streaming_encrypt(
-        &self,
-        mut strategy: Box<dyn CryptoStrategy>,
-        input_path: String,
-        output_path: String,
-        header: Vec<u8>,
-        total_input_size: u64,
-        force: bool,
-        progress_callback: Option<ProgressCallback>,
-    ) -> Result<Box<dyn CryptoStrategy>> {
-        let cb_clone = progress_callback.clone();
-        tokio::task::spawn_blocking(move || {
-            use std::io::{BufReader, BufWriter, Read, Write};
-
-            let in_file =
-                std::fs::File::open(&input_path).map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let mut reader = BufReader::with_capacity(BUF_SIZE * 4, in_file);
-
-            if force {
-                let _ = std::fs::remove_file(&output_path);
-            }
-
-            let out_file = open_secure_create(&output_path)
-                .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-            let mut writer = BufWriter::with_capacity(BUF_SIZE * 4, out_file);
-
-            writer
-                .write_all(&header)
-                .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-
-            let mut in_buf = Zeroizing::new(vec![0u8; BUF_SIZE]);
-            let mut out_buf = vec![0u8; BUF_SIZE + AEAD_OVERHEAD];
-            let mut total_processed = 0u64;
-
-            loop {
-                let n = reader
-                    .read(&mut in_buf)
-                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                if n == 0 {
-                    break;
-                }
-
-                let m = strategy.encrypt_into(&in_buf[..n], &mut out_buf)?;
-                writer
-                    .write_all(&out_buf[..m])
-                    .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-
-                total_processed += n as u64;
-                if let Some(ref cb) = cb_clone {
-                    if total_input_size > 0 {
-                        cb(total_processed as f64 / total_input_size as f64);
-                    }
-                }
-            }
-
-            let final_block = strategy.finalize_encryption()?;
-            if !final_block.is_empty() {
-                writer
-                    .write_all(&final_block)
-                    .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-            }
-            writer
-                .flush()
-                .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-
-            Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
-        })
-        .await
-        .map_err(|e| CryptoError::OpenSSL(format!("Blocking task failed: {}", e)))?
-    }
-
-    // allow(clippy::too_many_arguments): each parameter is a distinct, required
-    // crypto input (strategy/paths/sizes/tag/flags); bundling into a struct adds
-    // field-swap risk in security-critical code for no functional benefit.
-    // Future: revisit only if a cohesive context type emerges naturally.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_streaming_decrypt(
-        &self,
-        mut strategy: Box<dyn CryptoStrategy>,
-        input_path: String,
-        output_path: String,
-        header_size: u64,
-        ciphertext_size: u64,
-        tag: Vec<u8>,
-        force: bool,
-        progress_callback: Option<ProgressCallback>,
-    ) -> Result<Box<dyn CryptoStrategy>> {
-        let temp_output_path = format!("{}.tmp.{}", output_path, rand_core::OsRng.next_u64());
-        let temp_output_path_clone = temp_output_path.clone();
-
-        let cb_clone = progress_callback.clone();
-        let res = tokio::task::spawn_blocking(move || {
-            use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-
-            // Pass 1: Verification (no disk writing)
-            let mut in_file = std::fs::File::open(&input_path)
-                .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            {
-                in_file
-                    .seek(SeekFrom::Start(header_size))
-                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                let mut reader = BufReader::with_capacity(BUF_SIZE * 4, &in_file);
-
-                let mut in_buf = vec![0u8; BUF_SIZE];
-                // Defense-in-depth: Zeroize Pass 1 dummy buffer to prevent plaintext residue in memory
-                let mut out_buf = Zeroizing::new(vec![0u8; BUF_SIZE + AEAD_OVERHEAD]);
-                let mut total_read = 0u64;
-
-                while total_read < ciphertext_size {
-                    let to_read =
-                        std::cmp::min(BUF_SIZE as u64, ciphertext_size - total_read) as usize;
-                    reader
-                        .read_exact(&mut in_buf[..to_read])
-                        .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-
-                    // Decrypt but discard results
-                    let _ = strategy.decrypt_into(&in_buf[..to_read], &mut out_buf)?;
-                    out_buf.fill(0); // Immediate clear
-
-                    total_read += to_read as u64;
-                    if let Some(ref cb) = cb_clone {
-                        if ciphertext_size > 0 {
-                            // Pass 1 takes 0% -> 50% of progress
-                            cb((total_read as f64 / ciphertext_size as f64) * 0.5);
-                        }
-                    }
-                }
-
-                // Verify the final tag
-                strategy.finalize_decryption(&tag)?;
-            }
-
-            // Pass 1 succeeded. Now Pass 2: Actually writing to temporary file.
-            strategy.restart_decryption()?;
-
-            in_file
-                .seek(SeekFrom::Start(header_size))
-                .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            let mut reader = BufReader::with_capacity(BUF_SIZE * 4, &in_file);
-
-            let out_file = open_secure_create(&temp_output_path_clone)
-                .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-            let mut writer = BufWriter::with_capacity(BUF_SIZE * 4, out_file);
-
-            let mut in_buf = vec![0u8; BUF_SIZE];
-            // Pass 2 writes real plaintext; keep it in a Zeroizing buffer like
-            // Pass 1 so decrypted bytes do not linger on the heap after drop.
-            let mut out_buf = Zeroizing::new(vec![0u8; BUF_SIZE + AEAD_OVERHEAD]);
-            let mut total_read_pass2 = 0u64;
-
-            while total_read_pass2 < ciphertext_size {
-                let to_read = std::cmp::min(BUF_SIZE as u64, ciphertext_size - total_read_pass2) as usize;
-                reader
-                    .read_exact(&mut in_buf[..to_read])
-                    .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-
-                let m = strategy.decrypt_into(&in_buf[..to_read], &mut out_buf)?;
-                writer
-                    .write_all(&out_buf[..m])
-                    .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-
-                total_read_pass2 += to_read as u64;
-                if let Some(ref cb) = cb_clone {
-                    if ciphertext_size > 0 {
-                        // Pass 2 takes 50% -> 100% of progress
-                        cb(0.5 + (total_read_pass2 as f64 / ciphertext_size as f64) * 0.5);
-                    }
-                }
-            }
-
-            // Optional: Re-verify in Pass 2
-            strategy.finalize_decryption(&tag)?;
-
-            writer
-                .flush()
-                .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-
-            Ok::<Box<dyn CryptoStrategy>, CryptoError>(strategy)
-        })
-        .await
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&temp_output_path);
-            CryptoError::OpenSSL(format!("Blocking task failed: {}", e))
-        })?;
-
-        match res {
-            Ok(s) => {
-                if !force && Path::new(&output_path).exists() {
-                    let _ = std::fs::remove_file(&temp_output_path);
-                    return Err(CryptoError::FileWrite("File exists".to_string()));
-                }
-                std::fs::rename(&temp_output_path, &output_path)
-                    .map_err(|e| {
-                        let _ = std::fs::remove_file(&temp_output_path);
-                        CryptoError::FileWrite(e.to_string())
-                    })?;
-                Ok(s)
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&temp_output_path);
-                Err(e)
-            }
         }
     }
 

@@ -4,16 +4,12 @@
  * This file is part of nkCryptoTool.
  */
 
-use crate::backend::{AeadBackend, HashBackend};
+use crate::backend::HashBackend;
 use crate::error::{CryptoError, Result};
-use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use zeroize::Zeroizing;
 
 #[cfg(feature = "backend-openssl")]
 use foreign_types::ForeignType;
-#[cfg(feature = "backend-openssl")]
-use openssl::cipher::Cipher;
-#[cfg(feature = "backend-openssl")]
-use openssl::cipher_ctx::CipherCtx;
 #[cfg(feature = "backend-openssl")]
 use openssl::derive::Deriver;
 #[cfg(feature = "backend-openssl")]
@@ -30,21 +26,6 @@ use openssl::pkey::PKey;
 use openssl_sys as ffi;
 #[cfg(feature = "backend-openssl")]
 use std::ptr;
-
-pub struct OpenSslAead {
-    #[cfg(feature = "backend-openssl")]
-    ctx: CipherCtx,
-    _is_encrypt: bool,
-}
-
-impl Zeroize for OpenSslAead {
-    fn zeroize(&mut self) {
-        // OpenSSL CipherCtx is automatically cleared on drop (EVP_CIPHER_CTX_free).
-        // No explicit zeroize method is provided by the openssl crate for CipherCtx.
-    }
-}
-
-impl ZeroizeOnDrop for OpenSslAead {}
 
 #[cfg(feature = "backend-openssl")]
 fn load_private_key_robust(
@@ -193,160 +174,6 @@ fn load_public_key_robust(der: &[u8]) -> Result<PKey<openssl::pkey::Public>> {
     Err(CryptoError::PublicKeyLoad(
         "Failed to load public key".to_string(),
     ))
-}
-
-impl AeadBackend for OpenSslAead {
-    fn new_encrypt(cipher_name: &str, key: &[u8], iv: &[u8]) -> Result<Self> {
-        #[cfg(feature = "backend-openssl")]
-        {
-            let mut ctx = CipherCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            let normalized_name = cipher_name.to_lowercase();
-            let cipher = match normalized_name.as_str() {
-                "aes-256-gcm" => Cipher::aes_256_gcm(),
-                "chacha20-poly1305" => Cipher::chacha20_poly1305(),
-                _ => {
-                    return Err(CryptoError::Parameter(format!(
-                        "Unsupported cipher: {}",
-                        cipher_name
-                    )))
-                }
-            };
-            ctx.encrypt_init(Some(cipher), None, None)
-                .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            ctx.set_iv_length(iv.len())
-                .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            ctx.encrypt_init(None, Some(key), Some(iv))
-                .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            Ok(Self {
-                ctx,
-                _is_encrypt: true,
-            })
-        }
-        #[cfg(not(feature = "backend-openssl"))]
-        {
-            let _ = (cipher_name, key, iv);
-            Err(CryptoError::Parameter(
-                "OpenSSL backend not enabled".to_string(),
-            ))
-        }
-    }
-
-    fn new_decrypt(cipher_name: &str, key: &[u8], iv: &[u8]) -> Result<Self> {
-        #[cfg(feature = "backend-openssl")]
-        {
-            let mut ctx = CipherCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            let normalized_name = cipher_name.to_lowercase();
-            let cipher = match normalized_name.as_str() {
-                "aes-256-gcm" => Cipher::aes_256_gcm(),
-                "chacha20-poly1305" => Cipher::chacha20_poly1305(),
-                _ => {
-                    return Err(CryptoError::Parameter(format!(
-                        "Unsupported cipher: {}",
-                        cipher_name
-                    )))
-                }
-            };
-            ctx.decrypt_init(Some(cipher), None, None)
-                .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            ctx.set_iv_length(iv.len())
-                .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            ctx.decrypt_init(None, Some(key), Some(iv))
-                .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-            Ok(Self {
-                ctx,
-                _is_encrypt: false,
-            })
-        }
-        #[cfg(not(feature = "backend-openssl"))]
-        {
-            let _ = (cipher_name, key, iv);
-            Err(CryptoError::Parameter(
-                "OpenSSL backend not enabled".to_string(),
-            ))
-        }
-    }
-
-    fn re_init(&mut self, key: &[u8], iv: &[u8]) -> Result<()> {
-        #[cfg(feature = "backend-openssl")]
-        {
-            if self._is_encrypt {
-                self.ctx
-                    .encrypt_init(None, Some(key), Some(iv))
-                    .map_err(|e| CryptoError::OpenSSL(e.to_string()))
-            } else {
-                self.ctx
-                    .decrypt_init(None, Some(key), Some(iv))
-                    .map_err(|e| CryptoError::OpenSSL(e.to_string()))
-            }
-        }
-        #[cfg(not(feature = "backend-openssl"))]
-        {
-            let _ = (key, iv);
-            Err(CryptoError::Parameter(
-                "OpenSSL backend not enabled".to_string(),
-            ))
-        }
-    }
-
-    fn update(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize> {
-        #[cfg(feature = "backend-openssl")]
-        return self
-            .ctx
-            .cipher_update(input, Some(output))
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()));
-        #[cfg(not(feature = "backend-openssl"))]
-        {
-            let _ = (input, output);
-            Err(CryptoError::Parameter(
-                "OpenSSL backend not enabled".to_string(),
-            ))
-        }
-    }
-
-    fn finalize(&mut self, output: &mut [u8]) -> Result<usize> {
-        #[cfg(feature = "backend-openssl")]
-        return self
-            .ctx
-            .cipher_final(output)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()));
-        #[cfg(not(feature = "backend-openssl"))]
-        {
-            let _ = output;
-            Err(CryptoError::Parameter(
-                "OpenSSL backend not enabled".to_string(),
-            ))
-        }
-    }
-
-    fn get_tag(&self, tag: &mut [u8]) -> Result<()> {
-        #[cfg(feature = "backend-openssl")]
-        return self
-            .ctx
-            .tag(tag)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()));
-        #[cfg(not(feature = "backend-openssl"))]
-        {
-            let _ = tag;
-            Err(CryptoError::Parameter(
-                "OpenSSL backend not enabled".to_string(),
-            ))
-        }
-    }
-
-    fn set_tag(&mut self, tag: &[u8]) -> Result<()> {
-        #[cfg(feature = "backend-openssl")]
-        return self
-            .ctx
-            .set_tag(tag)
-            .map_err(|e| CryptoError::OpenSSL(e.to_string()));
-        #[cfg(not(feature = "backend-openssl"))]
-        {
-            let _ = tag;
-            Err(CryptoError::Parameter(
-                "OpenSSL backend not enabled".to_string(),
-            ))
-        }
-    }
 }
 
 pub struct OpenSslHash {
