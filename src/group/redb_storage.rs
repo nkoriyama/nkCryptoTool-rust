@@ -1239,9 +1239,20 @@ pub struct RedbInboxStore {
     b: RedbBackend,
     /// Per-recipient prekey pool cap (newest win). Mirrors `MAX_PREKEYS_STORED`.
     max_prekeys: usize,
+    /// Per-recipient envelope count cap (newest win). With the global byte
+    /// budget below this bounds the unauthenticated DEPOSIT disk-exhaustion vector.
+    max_envelopes: usize,
 }
 
 const META_NEXT_ID: &[u8] = b"next_id";
+/// Cached running total of sealed envelope bytes (lazily initialised).
+const META_ENV_BYTES: &[u8] = b"env_bytes";
+/// Global cap on total sealed envelope bytes across all recipients. DEPOSIT is
+/// unauthenticated and accepts large payloads to arbitrary recipient ids, so a
+/// per-recipient count cap alone cannot stop a spray across many ids — this
+/// bounds the store's total on-disk size. `deposit` is the only writer of
+/// `TBL_ENV` (POLL is read-only), so a counter maintained there stays accurate.
+const MAX_TOTAL_ENVELOPE_BYTES: u64 = 1 << 30; // 1 GiB
 
 impl RedbInboxStore {
     /// Open (or create) the encrypted inbox database at `path`.
@@ -1249,10 +1260,12 @@ impl RedbInboxStore {
         path: impl AsRef<Path>,
         dek: &[u8; 32],
         max_prekeys: usize,
+        max_envelopes: usize,
     ) -> Result<Self, RedbStorageError> {
         Ok(Self {
             b: RedbBackend::open_inbox(path, dek)?,
             max_prekeys,
+            max_envelopes,
         })
     }
 
@@ -1303,7 +1316,105 @@ impl RedbInboxStore {
             let mut t = wtx
                 .open_table(TBL_ENV)
                 .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+
+            // Running total of sealed envelope bytes, read from TBL_META and
+            // lazily initialised by one full scan the first time (older DBs
+            // predate the counter). `deposit` is the only writer, so it stays
+            // accurate thereafter.
+            let cached: Option<u64> = {
+                let meta = wtx
+                    .open_table(TBL_META)
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                let x = meta
+                    .get(META_ENV_BYTES)
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+                    .map(|v| {
+                        let raw = v.value();
+                        let mut b = [0u8; 8];
+                        // Copy only what's present (dst and src must match length,
+                        // so a short/corrupt value can never panic here).
+                        let n = raw.len().min(8);
+                        b[..n].copy_from_slice(&raw[..n]);
+                        u64::from_be_bytes(b)
+                    });
+                x
+            };
+            let mut total_bytes = match cached {
+                Some(n) => n,
+                None => {
+                    let mut sum = 0u64;
+                    for entry in t
+                        .iter()
+                        .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+                    {
+                        let (_k, v) =
+                            entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                        sum = sum.saturating_add(v.value().len() as u64);
+                    }
+                    sum
+                }
+            };
+
             t.insert(key.as_slice(), sealed.as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            total_bytes = total_bytes.saturating_add(sealed.len() as u64);
+
+            // (1) Per-recipient count cap: evict this recipient's oldest (lowest
+            // id) beyond the cap so one recipient id cannot accumulate forever.
+            let lo = composite_key(&bi, 0);
+            let hi = composite_key(&bi, u64::MAX);
+            let mut rkeys: Vec<(Vec<u8>, u64)> = Vec::new();
+            {
+                let range = t
+                    .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                for entry in range {
+                    let (k, v) =
+                        entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                    rkeys.push((k.value().to_vec(), v.value().len() as u64));
+                }
+            }
+            if rkeys.len() > self.max_envelopes {
+                for (k, sz) in rkeys.iter().take(rkeys.len() - self.max_envelopes) {
+                    t.remove(k.as_slice())
+                        .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                    total_bytes = total_bytes.saturating_sub(*sz);
+                }
+            }
+
+            // (2) Global byte budget: evict the lowest-keyed envelopes until the
+            // total is under the cap, so a spray across many recipient ids cannot
+            // exhaust the disk either.
+            if total_bytes > MAX_TOTAL_ENVELOPE_BYTES {
+                let mut over = total_bytes - MAX_TOTAL_ENVELOPE_BYTES;
+                let mut gkeys: Vec<Vec<u8>> = Vec::new();
+                {
+                    let iter = t
+                        .iter()
+                        .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                    for entry in iter {
+                        if over == 0 {
+                            break;
+                        }
+                        let (k, v) =
+                            entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                        let sz = v.value().len() as u64;
+                        gkeys.push(k.value().to_vec());
+                        over = over.saturating_sub(sz);
+                        total_bytes = total_bytes.saturating_sub(sz);
+                    }
+                }
+                for k in gkeys {
+                    t.remove(k.as_slice())
+                        .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                }
+            }
+            drop(t);
+
+            let mut meta = wtx
+                .open_table(TBL_META)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            meta.insert(META_ENV_BYTES, total_bytes.to_be_bytes().as_slice())
                 .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         }
         wtx.commit()
@@ -2365,9 +2476,29 @@ mod tests {
 
     fn inbox(max_prekeys: usize) -> (tempfile::TempDir, RedbInboxStore) {
         let dir = tempdir().expect("tempdir");
-        let s = RedbInboxStore::open(dir.path().join("inbox.redb"), &[0x55u8; 32], max_prekeys)
+        let s = RedbInboxStore::open(dir.path().join("inbox.redb"), &[0x55u8; 32], max_prekeys, 256)
             .expect("open inbox");
         (dir, s)
+    }
+
+    #[test]
+    fn inbox_envelope_cap_evicts_oldest() {
+        // Per-recipient envelope cap = 3: after 5 deposits the two oldest
+        // (ids 1,2) must be evicted, leaving only the three newest (3,4,5).
+        let dir = tempdir().expect("tempdir");
+        let s = RedbInboxStore::open(dir.path().join("inbox.redb"), &[0x55u8; 32], 256, 3)
+            .expect("open inbox");
+        let rcpt = [0x11u8; 32];
+        for i in 1..=5u8 {
+            s.deposit(&rcpt, &rcpt, &[i; 8], i as i64).expect("deposit");
+        }
+        let ids: Vec<u64> = s
+            .poll(&rcpt, 0, 100)
+            .expect("poll")
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(ids, vec![3, 4, 5], "per-recipient cap should evict the oldest");
     }
 
     #[test]
@@ -2446,10 +2577,10 @@ mod tests {
         let dek = [0x77u8; 32];
         let rcpt = [0xe5u8; 32];
         {
-            let s = RedbInboxStore::open(&path, &dek, 50).expect("open");
+            let s = RedbInboxStore::open(&path, &dek, 50, 256).expect("open");
             s.deposit(&rcpt, &rcpt, b"persisted", 1).expect("dep");
         }
-        let s2 = RedbInboxStore::open(&path, &dek, 50).expect("reopen");
+        let s2 = RedbInboxStore::open(&path, &dek, 50, 256).expect("reopen");
         let got = s2.poll(&rcpt, 0, 10).expect("poll");
         assert_eq!(got, vec![(1, b"persisted".to_vec())]);
         // Cursor counter also persisted: next id is 2, not a reset to 1.
