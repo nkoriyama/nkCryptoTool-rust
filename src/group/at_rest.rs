@@ -380,6 +380,11 @@ impl AtRestKey {
     /// AEAD check fails (this is how an at-rest rollback is detected). A
     /// wrong at-rest key, tampered KEK, wrong binding, or wrong counter all
     /// surface as `GroupError::Backend`.
+    ///
+    /// Anti-rollback floor (audit M1): when `counter` is `Some`, a KEK that is
+    /// *not* counter-bound (`0x01`/`0x02`) is **rejected** rather than opened.
+    /// The version byte must not be able to opt a KEK out of counter checking —
+    /// otherwise a restored pre-anti-rollback snapshot would bypass the counter.
     pub fn decapsulate_dek(
         &self,
         kek_bytes: &[u8],
@@ -392,20 +397,39 @@ impl AtRestKey {
         if kek_bytes[0..8] != KEK_MAGIC {
             return Err(GroupError::Storage("KEK file: bad magic".into()));
         }
-        let info = match kek_bytes[8] {
-            KEK_VERSION_LEGACY => HPKE_INFO.to_vec(),
-            KEK_VERSION_BOUND => bound_info(binding),
-            KEK_VERSION_COUNTER_BOUND => {
-                let c = counter.ok_or_else(|| {
-                    GroupError::Storage(
-                        "KEK is anti-rollback (v0x03) but no rollback counter is available; \
-                         set NK_ROLLBACK_POLICY to the policy this DB was created under"
-                            .into(),
-                    )
-                })?;
-                counter_bound_info(binding, c)
+        // The (version, counter) pairing is the anti-rollback floor (audit M1).
+        // Crucially, when a counter is in play the KEK's *version byte* must NOT
+        // be allowed to decide whether the counter is checked: a v0x01/v0x02 KEK
+        // carries no counter binding, so honouring it under an active counter
+        // would let a restored pre-anti-rollback snapshot (a genuine older
+        // `groups.db` + `groups.db.kek` pair) open without tripping the counter —
+        // exactly the rollback the counter is meant to detect. So with a counter
+        // present we require the counter-bound version and reject anything below
+        // it; without a counter we keep opening the legacy/bound versions.
+        let info = match (kek_bytes[8], counter) {
+            (KEK_VERSION_COUNTER_BOUND, Some(c)) => counter_bound_info(binding, c),
+            (KEK_VERSION_COUNTER_BOUND, None) => {
+                return Err(GroupError::Storage(
+                    "KEK is anti-rollback (v0x03) but no rollback counter is available; \
+                     set NK_ROLLBACK_POLICY to the policy this DB was created under"
+                        .into(),
+                ));
             }
-            other => {
+            (KEK_VERSION_LEGACY | KEK_VERSION_BOUND, Some(_)) => {
+                return Err(GroupError::Storage(
+                    "at-rest KEK is below the anti-rollback floor: a rollback counter \
+                     (NK_ROLLBACK_POLICY) is active but the on-disk KEK is not counter-bound \
+                     (version 0x01/0x02). This is either a storage rollback to a \
+                     pre-anti-rollback snapshot or a database created before the policy was \
+                     enabled; re-establish the baseline with an explicit rekey under the \
+                     policy, or open under NK_ROLLBACK_POLICY=off if the current on-disk \
+                     state is trusted."
+                        .into(),
+                ));
+            }
+            (KEK_VERSION_LEGACY, None) => HPKE_INFO.to_vec(),
+            (KEK_VERSION_BOUND, None) => bound_info(binding),
+            (other, _) => {
                 return Err(GroupError::Storage(format!(
                     "KEK file: unsupported version {other:#x}"
                 )))
@@ -657,6 +681,26 @@ fn resolve_kek_to_dek(
 
     let c = counter.current()?;
     let pending = kek_pending_path(&paths.kek);
+
+    // Anti-rollback floor (audit M1): with a counter active, the live KEK must be
+    // counter-bound (v0x03). A v0x01/v0x02 live KEK is caught authoritatively in
+    // `decapsulate_dek`, but surface it here with an actionable message instead of
+    // letting it fall through the candidate probe into the generic "rollback
+    // detected" error — the two cases (legit un-migrated DB vs. restored snapshot)
+    // are indistinguishable from the KEK alone, so we fail closed either way.
+    if live.len() >= KEK_HEADER_LEN
+        && (live[8] == KEK_VERSION_LEGACY || live[8] == KEK_VERSION_BOUND)
+    {
+        return Err(GroupError::Storage(
+            "at-rest KEK is below the anti-rollback floor: a rollback counter \
+             (NK_ROLLBACK_POLICY) is active but the on-disk KEK is not counter-bound \
+             (version 0x01/0x02). This is either a storage rollback to a pre-anti-rollback \
+             snapshot or a database created before the policy was enabled; re-establish the \
+             baseline with an explicit rekey under the policy, or open under \
+             NK_ROLLBACK_POLICY=off if the current on-disk state is trusted."
+                .into(),
+        ));
+    }
 
     // 1) Live KEK at the current counter.
     if let Ok(dek) = at_rest_key.decapsulate_dek(&live, binding, Some(c)) {
@@ -1542,6 +1586,45 @@ mod tests {
             Err(GroupError::Storage(m)) => assert!(m.contains("anti-rollback") || m.contains("counter")),
             other => panic!("expected counter-required error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn v2_bound_kek_rejected_once_a_counter_is_active() {
+        // M1: a per-DB-bound (v0x02, no counter) KEK — the shape written under
+        // NK_ROLLBACK_POLICY=off — must NOT open once a rollback counter is in
+        // play. Otherwise a restored pre-anti-rollback snapshot bypasses the
+        // counter, because the version byte would opt the KEK out of the check.
+        let dir = tempdir().expect("tempdir");
+        let (paths, pass) = anti_rollback_paths(dir.path());
+
+        // Seal a v0x02 KEK (policy off) and materialise the DB.
+        let dek = resolve_dek_with(&paths, &pass, None).expect("init off");
+        drop(GroupStorage::open_at_with_raw_key(&paths.db, &dek).expect("open"));
+        assert_eq!(
+            fs::read(&paths.kek).expect("kek")[8],
+            KEK_VERSION_BOUND,
+            "off policy writes a v0x02 KEK",
+        );
+
+        // Now open the same on-disk state under an active counter: it must fail
+        // closed with an anti-rollback-floor error, not silently open.
+        let counter = MemoryCounter::new(3);
+        match resolve_dek_with(&paths, &pass, Some(&counter)) {
+            Err(GroupError::Storage(m)) => assert!(
+                m.contains("anti-rollback floor") || m.contains("counter-bound"),
+                "expected a floor rejection, got: {m}",
+            ),
+            other => panic!("v0x02 KEK under an active counter must be rejected, got {other:?}"),
+        }
+
+        // The authoritative guard in `decapsulate_dek` rejects it too, directly.
+        let key = AtRestKey::load_encrypted(&paths.key, pass.as_str()).expect("load");
+        let binding = db_binding(&paths.db);
+        let live = fs::read(&paths.kek).expect("kek");
+        assert!(
+            key.decapsulate_dek(&live, &binding, Some(3)).is_err(),
+            "decapsulate_dek must reject a non-counter-bound KEK when a counter is given",
+        );
     }
 
     #[test]
