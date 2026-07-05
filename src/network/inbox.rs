@@ -100,7 +100,9 @@
 //! the honest-server case topped up.
 
 use crate::network::ALPN_INBOX;
-use crate::p2p::{P2pEndpoint, P2pError, P2pIncoming, P2pProtocol, PeerAddr, PeerId};
+use crate::p2p::{
+    P2pEndpoint, P2pError, P2pIncoming, P2pProtocol, PeerAddr, PeerId, P2P_SETUP_TIMEOUT,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -146,6 +148,14 @@ pub const FETCH_RL_REFILL_PER_SEC: f64 = 1.0 / 30.0;
 /// table reaches this, fully-refilled (idle) buckets are pruned, bounding
 /// memory without losing any throttle state for active senders.
 const FETCH_RL_MAX_TRACKED: usize = 4096;
+
+/// Upper bound on connections whose per-connection setup + handling run
+/// concurrently. A permit is reserved BEFORE the per-connection task is spawned,
+/// so a flood of half-open peers cannot spawn unbounded setup tasks each holding
+/// a connection (and its [`P2P_SETUP_TIMEOUT`] window) open. Generous enough not
+/// to serialize honest clients (DEPOSIT / POLL are brief); bounded enough to cap
+/// concurrent resource use under an accept flood.
+const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 
 /// Default per-frame idle timeout. Generous enough to absorb iroh
 /// hole-punching latency; short enough to bound retry cost.
@@ -594,6 +604,9 @@ mod server {
         /// A std mutex, not async: the critical section is a few map ops
         /// with no `.await`, so it never blocks the runtime meaningfully.
         fetch_rl: StdMutex<HashMap<PeerId, TokenBucket>>,
+        /// Bounds concurrent per-connection setup + handling (see
+        /// [`MAX_CONCURRENT_CONNECTIONS`]).
+        conn_sem: Arc<tokio::sync::Semaphore>,
     }
 
     impl InboxServer {
@@ -627,6 +640,7 @@ mod server {
             Ok(Self {
                 store,
                 fetch_rl: StdMutex::new(HashMap::new()),
+                conn_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             })
         }
 
@@ -660,17 +674,37 @@ mod server {
             endpoint: Arc<dyn P2pEndpoint>,
         ) -> Result<(), InboxError> {
             loop {
-                let incoming = endpoint
-                    .accept()
-                    .await
-                    .map_err(InboxError::Transport)?;
-                if incoming.protocol != P2pProtocol(ALPN_INBOX) {
-                    // Not addressed to us — drop. (Endpoint may serve
-                    // multiple ALPNs; only ours is interesting here.)
-                    continue;
-                }
+                // `accept()` is cheap: it does NOT run the per-connection setup
+                // (ALPN negotiation + stream open), so a peer that stalls the
+                // handshake can no longer block new accepts. Setup runs in the
+                // spawned task below, bounded by `P2P_SETUP_TIMEOUT` (the H2
+                // head-of-line fix).
+                let pending = endpoint.accept().await.map_err(InboxError::Transport)?;
+                // Reserve a slot BEFORE spawning so an accept flood cannot spawn
+                // unbounded setup tasks; a stalling peer's `establish` times out
+                // and frees the slot.
+                let permit = match Arc::clone(&self.conn_sem).acquire_owned().await {
+                    Ok(p) => p,
+                    Err(_) => return Ok(()), // semaphore closed → shutting down
+                };
                 let me = Arc::clone(&self);
                 tokio::spawn(async move {
+                    let _permit = permit; // held for the connection's lifetime
+                    let incoming = match pending.establish(P2P_SETUP_TIMEOUT).await {
+                        Ok(inc) => inc,
+                        Err(_) => {
+                            // Timed out or dropped mid-setup. No detail is logged:
+                            // the message can embed remote-supplied bytes (an
+                            // unknown ALPN) that would inject terminal escapes.
+                            eprintln!("[inbox] connection setup failed or timed out");
+                            return;
+                        }
+                    };
+                    if incoming.protocol != P2pProtocol(ALPN_INBOX) {
+                        // Not addressed to us — drop. (Endpoint may serve
+                        // multiple ALPNs; only ours is interesting here.)
+                        return;
+                    }
                     if let Err(e) = me.handle(incoming).await {
                         eprintln!("[inbox] handle error: {e}");
                     }

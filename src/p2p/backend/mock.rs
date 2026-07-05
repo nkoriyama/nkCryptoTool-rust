@@ -26,7 +26,9 @@
 //! // alice.connect(bob's addr, PROTO) <─pipe─> bob.accept()
 //! ```
 
-use crate::p2p::{P2pEndpoint, P2pError, P2pIncoming, P2pProtocol, P2pStream, PeerAddr, PeerId};
+use crate::p2p::{
+    P2pEndpoint, P2pError, P2pIncoming, P2pPending, P2pProtocol, P2pStream, PeerAddr, PeerId,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -84,6 +86,22 @@ pub struct MockEndpoint {
     inbox: Mutex<mpsc::UnboundedReceiver<P2pIncoming>>,
 }
 
+/// The mock has no real handshake — `accept` already produced a fully-built
+/// `P2pIncoming` — so `establish` just hands it back (the timeout is irrelevant).
+struct MockPending {
+    incoming: P2pIncoming,
+}
+
+#[async_trait]
+impl P2pPending for MockPending {
+    async fn establish(
+        self: Box<Self>,
+        _timeout: std::time::Duration,
+    ) -> Result<P2pIncoming, P2pError> {
+        Ok(self.incoming)
+    }
+}
+
 #[async_trait]
 impl P2pEndpoint for MockEndpoint {
     fn local_id(&self) -> PeerId {
@@ -129,13 +147,15 @@ impl P2pEndpoint for MockEndpoint {
         Ok(Box::new(client_side))
     }
 
-    async fn accept(&self) -> Result<P2pIncoming, P2pError> {
-        self.inbox
+    async fn accept(&self) -> Result<Box<dyn P2pPending>, P2pError> {
+        let incoming = self
+            .inbox
             .lock()
             .await
             .recv()
             .await
-            .ok_or(P2pError::Closed)
+            .ok_or(P2pError::Closed)?;
+        Ok(Box::new(MockPending { incoming }))
     }
 
     async fn close(&self) -> Result<(), P2pError> {
@@ -169,7 +189,13 @@ mod tests {
         let bob = net.register(PeerId::new([2; 32]), vec![PROTO_CHAT]);
 
         let server = tokio::spawn(async move {
-            let inc = bob.accept().await.unwrap();
+            let inc = bob
+                .accept()
+                .await
+                .unwrap()
+                .establish(std::time::Duration::from_secs(1))
+                .await
+                .unwrap();
             assert_eq!(inc.peer_id, PeerId::new([1; 32]));
             assert_eq!(inc.protocol, PROTO_CHAT);
             let mut s = inc.stream;
@@ -226,8 +252,20 @@ mod tests {
         let _s1 = alice.connect(&pid(2), PROTO_CHAT).await.unwrap();
         let _s2 = alice.connect(&pid(2), PROTO_FILE).await.unwrap();
 
-        let inc1 = bob.accept().await.unwrap();
-        let inc2 = bob.accept().await.unwrap();
+        let inc1 = bob
+            .accept()
+            .await
+            .unwrap()
+            .establish(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        let inc2 = bob
+            .accept()
+            .await
+            .unwrap()
+            .establish(std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
         let mut seen = vec![inc1.protocol, inc2.protocol];
         seen.sort_by_key(|p| p.0);
         assert_eq!(seen, vec![PROTO_CHAT, PROTO_FILE]);
