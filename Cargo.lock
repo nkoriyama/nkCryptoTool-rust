@@ -5271,7 +5271,7 @@ dependencies = [
  "serial_test",
  "sha2 0.10.9",
  "sha3",
- "signature 2.2.0",
+ "signature 3.0.0",
  "slint",
  "slint-build",
  "spki 0.7.3",
