@@ -132,7 +132,6 @@ dependencies = [
  "cfg-if 1.0.4",
  "cipher",
  "cpufeatures 0.2.17",
- "zeroize",
 ]
 
 [[package]]
@@ -2840,7 +2839,6 @@ checksum = "f0d8a4362ccb29cb0b265253fb0a2728f592895ee6854fd9bc13f2ffda266ff1"
 dependencies = [
  "opaque-debug",
  "polyval",
- "zeroize",
 ]
 
 [[package]]
@@ -5218,17 +5216,14 @@ dependencies = [
 name = "nk-crypto-tool"
 version = "2.1.0"
 dependencies = [
- "aes",
  "aes-gcm",
  "anyhow",
  "arboard",
  "async-trait",
  "base64 0.21.7",
- "chacha20 0.9.1",
  "chacha20poly1305",
  "clap",
  "crc",
- "ctr",
  "data-encoding",
  "der 0.7.10",
  "ecdsa",
@@ -5236,8 +5231,6 @@ dependencies = [
  "fips203",
  "fips204",
  "foreign-types 0.3.2",
- "generic-array",
- "ghash",
  "hex",
  "hkdf",
  "hmac",
@@ -5265,7 +5258,6 @@ dependencies = [
  "parking_lot",
  "pbkdf2",
  "pkcs8 0.10.2",
- "poly1305",
  "portable-pty",
  "qrcode",
  "rand_core 0.6.4",
@@ -5283,7 +5275,6 @@ dependencies = [
  "slint",
  "slint-build",
  "spki 0.7.3",
- "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -6480,7 +6471,6 @@ dependencies = [
  "cpufeatures 0.2.17",
  "opaque-debug",
  "universal-hash",
- "zeroize",
 ]
 
 [[package]]
