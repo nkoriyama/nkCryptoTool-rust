@@ -22,5 +22,5 @@ mod traits;
 mod types;
 
 pub use processor::NetworkProcessor;
-pub use traits::{P2pEndpoint, P2pIncoming, P2pStream};
+pub use traits::{P2pEndpoint, P2pIncoming, P2pPending, P2pStream, P2P_SETUP_TIMEOUT};
 pub use types::{ConnMetrics, ConnSnapshot, P2pError, P2pProtocol, PeerAddr, PeerId};

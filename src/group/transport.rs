@@ -334,7 +334,13 @@ mod tests {
         let bob_addr = bob.local_addr().await.expect("bob addr");
 
         let server = tokio::spawn(async move {
-            let inc = bob.accept().await.expect("bob accept");
+            let inc = bob
+                .accept()
+                .await
+                .expect("bob accept")
+                .establish(std::time::Duration::from_secs(1))
+                .await
+                .expect("bob establish");
             assert_eq!(inc.protocol, ALPN_MLS_PROTOCOL);
             let (msg, raw) = recv_mls_message(inc.stream).await.expect("recv");
             assert_eq!(msg.wire_format(), mls_rs::WireFormat::KeyPackage);
