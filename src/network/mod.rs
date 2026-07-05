@@ -2,9 +2,11 @@ pub mod tcp;
 #[cfg(feature = "mls")]
 pub mod inbox;
 
-use crate::backend;
-use crate::backend::{Aead, AeadBackend};
 use crate::config::{CryptoConfig, TransportKind};
+use crate::strategy::streaming_aead::{
+    aead_decrypt_chunk, aead_encrypt_chunk, build_aad, build_nonce, V3_FLAG_FINAL,
+    V3_FLAG_INTERMEDIATE, V3_NONCE_PREFIX_LEN, V3_SESSION_ID_LEN, V3_TAG_LEN,
+};
 use crate::error::{CryptoError, Result};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
@@ -27,7 +29,7 @@ pub const CUMULATIVE_TIMEOUT: Duration = Duration::from_secs(7200);
 pub const CHAT_SESSION_TIMEOUT: Duration = Duration::from_secs(7200); // 2 hours
 
 pub const ALPN_CHAT: &[u8] = b"nkct/chat/1";
-pub const ALPN_FILE: &[u8] = b"nkct/file/1";
+pub const ALPN_FILE: &[u8] = b"nkct/file/2";
 /// P2P shell (bastion-less PQC SSH; see `P2P_SHELL_DESIGN.md`). Phase 0 carries
 /// an echo session; later phases carry a PTY bridge.
 pub const ALPN_SHELL: &[u8] = b"nkct/shell/1";
@@ -548,6 +550,21 @@ impl IOProvider for TestIOProvider {
     }
 }
 
+/// Read from `r` until `buf` is completely full or EOF is reached, returning the
+/// number of bytes filled. A return value `< buf.len()` signals EOF, which the
+/// file sender uses to mark the final chunk.
+async fn fill_chunk<R: AsyncReadExt + Unpin>(r: &mut R, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        let n = r.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+    }
+    Ok(filled)
+}
+
 pub struct NetworkProcessor;
 
 impl NetworkProcessor {
@@ -661,8 +678,20 @@ impl NetworkProcessor {
         iv: &[u8],
         on_progress: Option<ProgressCallback>,
     ) -> Result<()> {
-        let mut aead = backend::new_decrypt(aead_algo, key, iv)?;
-        let mut out_buffer = Zeroizing::new(vec![0u8; BUF_SIZE + 32]);
+        // Per-chunk one-shot AEAD (v3 framing). `iv` (shared from the handshake,
+        // unique per transfer) supplies both the nonce prefix and the session id;
+        // the monotonic counter makes every (key, nonce) unique within a transfer.
+        if iv.len() < V3_NONCE_PREFIX_LEN {
+            return Err(CryptoError::Parameter(
+                "file transfer iv shorter than nonce prefix".to_string(),
+            ));
+        }
+        let prefix = &iv[..V3_NONCE_PREFIX_LEN];
+        let mut session_id = [0u8; V3_SESSION_ID_LEN];
+        let m = iv.len().min(V3_SESSION_ID_LEN);
+        session_id[..m].copy_from_slice(&iv[..m]);
+        let mut counter: u32 = 0;
+
         let mut total_received = 0u64;
         let mut next_emit_at = PROGRESS_CHUNK_BYTES;
         loop {
@@ -671,38 +700,59 @@ impl NetworkProcessor {
                 tokio::time::timeout(IDLE_TIMEOUT, reader.read_exact(&mut len_bytes)).await;
             match read_res {
                 Ok(Ok(_)) => {}
-                Ok(Err(_)) | Err(_) => break,
+                // A read failure / EOF before the FINAL chunk is a truncated
+                // transfer, not a clean end: surface it rather than returning Ok.
+                Ok(Err(_)) | Err(_) => {
+                    return Err(CryptoError::Parameter(
+                        "file transfer truncated before final chunk".to_string(),
+                    ));
+                }
             }
 
-            let chunk_len = u32::from_le_bytes(len_bytes) as usize;
-            if chunk_len == 0 {
-                break;
-            }
-            if chunk_len > BUF_SIZE + 256 {
+            let frame_len = u32::from_le_bytes(len_bytes) as usize;
+            // frame = [flags: 1][ciphertext || 16B tag]. Smallest valid frame is an
+            // empty (final) chunk = 1 + tag; largest is a full BUF_SIZE plaintext
+            // chunk (ciphertext len == plaintext len) + tag + flags, plus a small
+            // slack matching the sender's bound.
+            if !(1 + V3_TAG_LEN..=1 + BUF_SIZE + 256).contains(&frame_len) {
                 return Err(CryptoError::Parameter(format!(
                     "Chunk size {} exceeds limit",
-                    chunk_len
+                    frame_len
                 )));
             }
-            total_received += chunk_len as u64;
-            if total_received > MAX_FILE_SIZE {
-                return Err(CryptoError::Parameter(
-                    "File size limit exceeded".to_string(),
-                ));
-            }
 
-            let mut encrypted_chunk = Zeroizing::new(vec![0u8; chunk_len]);
-            tokio::time::timeout(IDLE_TIMEOUT, reader.read_exact(&mut encrypted_chunk))
+            let mut frame = Zeroizing::new(vec![0u8; frame_len]);
+            tokio::time::timeout(IDLE_TIMEOUT, reader.read_exact(&mut frame))
                 .await
                 .map_err(|_| {
                     CryptoError::Parameter("Idle timeout while reading chunk".to_string())
                 })?
                 .map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
-            let n = aead.update(&encrypted_chunk, &mut out_buffer)?;
-            writer
-                .write_all(&out_buffer[..n])
+            let flags = frame[0];
+            if flags != V3_FLAG_INTERMEDIATE && flags != V3_FLAG_FINAL {
+                return Err(CryptoError::Parameter(
+                    "invalid file chunk flags".to_string(),
+                ));
+            }
+            let ct_tag = &frame[1..];
+
+            let nonce = build_nonce(prefix, counter);
+            let aad = build_aad(&session_id, counter, flags);
+            let pt = aead_decrypt_chunk(aead_algo, key, &nonce, &aad, ct_tag)?;
+
+            total_received += pt.len() as u64;
+            if total_received > MAX_FILE_SIZE {
+                return Err(CryptoError::Parameter(
+                    "File size limit exceeded".to_string(),
+                ));
+            }
+
+            tokio::time::timeout(IDLE_TIMEOUT, writer.write_all(&pt))
                 .await
+                .map_err(|_| {
+                    CryptoError::Parameter("Idle timeout while writing chunk".to_string())
+                })?
                 .map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
             if let Some(ref cb) = on_progress {
@@ -711,20 +761,16 @@ impl NetworkProcessor {
                     next_emit_at = total_received + PROGRESS_CHUNK_BYTES;
                 }
             }
+
+            counter = counter.checked_add(1).ok_or_else(|| {
+                CryptoError::Parameter("file chunk counter overflow".to_string())
+            })?;
+
+            if flags == V3_FLAG_FINAL {
+                break;
+            }
         }
 
-        let mut tag = [0u8; 16];
-        tokio::time::timeout(IDLE_TIMEOUT, reader.read_exact(&mut tag))
-            .await
-            .map_err(|_| CryptoError::Parameter("Idle timeout while reading tag".to_string()))?
-            .map_err(|e| CryptoError::FileRead(format!("Failed to read GCM tag: {}", e)))?;
-
-        aead.set_tag(&tag)?;
-        let final_n = aead.finalize(&mut out_buffer)?;
-        writer
-            .write_all(&out_buffer[..final_n])
-            .await
-            .map_err(|e| CryptoError::FileRead(e.to_string()))?;
         writer
             .flush()
             .await
@@ -756,66 +802,76 @@ impl NetworkProcessor {
         iv: &[u8],
         on_progress: Option<ProgressCallback>,
     ) -> Result<()> {
-        let mut aead = backend::new_encrypt(aead_algo, key, iv)?;
+        // Per-chunk one-shot AEAD (v3 framing) — mirror of the receive setup so
+        // both peers derive the identical prefix/session id from the shared `iv`.
+        if iv.len() < V3_NONCE_PREFIX_LEN {
+            return Err(CryptoError::Parameter(
+                "file transfer iv shorter than nonce prefix".to_string(),
+            ));
+        }
+        let prefix = &iv[..V3_NONCE_PREFIX_LEN];
+        let mut session_id = [0u8; V3_SESSION_ID_LEN];
+        let m = iv.len().min(V3_SESSION_ID_LEN);
+        session_id[..m].copy_from_slice(&iv[..m]);
+        let mut counter: u32 = 0;
+
         let mut buffer = Zeroizing::new(vec![0u8; BUF_SIZE]);
-        let mut out_buffer = Zeroizing::new(vec![0u8; BUF_SIZE + 32]);
         let mut sent: u64 = 0;
         let mut next_emit_at: u64 = PROGRESS_CHUNK_BYTES;
 
         loop {
-            let n = reader
-                .read(&mut buffer)
+            let got = fill_chunk(&mut reader, &mut buffer)
                 .await
                 .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            if n == 0 {
-                break;
-            }
-            let enc_n = aead.update(&buffer[..n], &mut out_buffer)?;
+            // A partial fill means EOF: this is the last (possibly empty) chunk.
+            // A file that ends exactly on a BUF_SIZE boundary produces one final
+            // empty chunk on the next iteration.
+            let is_final = got < buffer.len();
+            let flags = if is_final {
+                V3_FLAG_FINAL
+            } else {
+                V3_FLAG_INTERMEDIATE
+            };
+            let nonce = build_nonce(prefix, counter);
+            let aad = build_aad(&session_id, counter, flags);
+            let ct = aead_encrypt_chunk(aead_algo, key, &nonce, &aad, &buffer[..got])?;
 
-            tokio::time::timeout(IDLE_TIMEOUT, writer.write_all(&(enc_n as u32).to_le_bytes()))
+            let frame_len = (1 + ct.len()) as u32;
+            tokio::time::timeout(IDLE_TIMEOUT, writer.write_all(&frame_len.to_le_bytes()))
                 .await
                 .map_err(|_| {
                     CryptoError::Parameter("Idle timeout while sending chunk header".to_string())
                 })?
                 .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            tokio::time::timeout(IDLE_TIMEOUT, writer.write_all(&out_buffer[..enc_n]))
+            tokio::time::timeout(IDLE_TIMEOUT, writer.write_all(&[flags]))
+                .await
+                .map_err(|_| {
+                    CryptoError::Parameter("Idle timeout while sending chunk flags".to_string())
+                })?
+                .map_err(|e| CryptoError::FileRead(e.to_string()))?;
+            tokio::time::timeout(IDLE_TIMEOUT, writer.write_all(&ct))
                 .await
                 .map_err(|_| {
                     CryptoError::Parameter("Idle timeout while sending chunk".to_string())
                 })?
                 .map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
-            sent += n as u64;
+            sent += got as u64;
             if let Some(ref cb) = on_progress {
                 if sent >= next_emit_at {
                     cb(sent, None);
                     next_emit_at = sent + PROGRESS_CHUNK_BYTES;
                 }
             }
+
+            counter = counter.checked_add(1).ok_or_else(|| {
+                CryptoError::Parameter("file chunk counter overflow".to_string())
+            })?;
+
+            if is_final {
+                break;
+            }
         }
-
-        let final_n = aead.finalize(&mut out_buffer)?;
-        let mut tag = vec![0u8; 16];
-        aead.get_tag(&mut tag)?;
-
-        tokio::time::timeout(IDLE_TIMEOUT, writer.write_all(&(final_n as u32).to_le_bytes()))
-            .await
-            .map_err(|_| {
-                CryptoError::Parameter(
-                    "Idle timeout while sending final chunk header".to_string(),
-                )
-            })?
-            .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        tokio::time::timeout(IDLE_TIMEOUT, writer.write_all(&out_buffer[..final_n]))
-            .await
-            .map_err(|_| {
-                CryptoError::Parameter("Idle timeout while sending final chunk".to_string())
-            })?
-            .map_err(|e| CryptoError::FileRead(e.to_string()))?;
-        tokio::time::timeout(IDLE_TIMEOUT, writer.write_all(&tag))
-            .await
-            .map_err(|_| CryptoError::Parameter("Idle timeout while sending tag".to_string()))?
-            .map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
         writer
             .flush()
@@ -824,8 +880,8 @@ impl NetworkProcessor {
 
         // Graceful close: signal end-of-stream to the receiver. Without this,
         // iroh QUIC SendStream reset on drop causes a "connection lost"
-        // error on the receiver mid-read of the GCM tag. AsyncWrite shutdown
-        // maps to QUIC FIN/finish for iroh streams and to a no-op for TCP.
+        // error on the receiver mid-read. AsyncWrite shutdown maps to QUIC
+        // FIN/finish for iroh streams and to a no-op for TCP.
         writer
             .shutdown()
             .await
@@ -877,11 +933,9 @@ impl NetworkProcessor {
 
         let stdout_rx = stdout.clone();
         let rx_task = tokio::spawn(async move {
-            let mut out_buf = Zeroizing::new(vec![0u8; 70000]);
             let mut seen_nonces: std::collections::HashSet<Vec<u8>> =
                 std::collections::HashSet::new();
             let mut nonce_history = std::collections::VecDeque::new();
-            let mut rx_aead_opt: Option<Aead> = None;
             let result = async {
                 loop {
                     let mut len_bytes = [0u8; 4];
@@ -911,8 +965,7 @@ impl NetworkProcessor {
                         })?
                         .map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
-                    let (nonce, rest) = packet.split_at(12);
-                    let (ciphertext, tag) = rest.split_at(rest.len() - 16);
+                    let (nonce, ct_and_tag) = packet.split_at(12);
 
                     if seen_nonces.contains(nonce) {
                         return Err(CryptoError::Parameter(
@@ -928,18 +981,10 @@ impl NetworkProcessor {
                         }
                     }
 
-                    let rx_aead = match rx_aead_opt.as_mut() {
-                        Some(aead) => {
-                            aead.re_init(&rx_key, nonce)?;
-                            aead
-                        }
-                        None => rx_aead_opt.insert(backend::new_decrypt(&aead_name_str, &rx_key, nonce)?),
-                    };
-                    rx_aead.set_tag(tag)?;
-
-                    let n = rx_aead.update(ciphertext, &mut out_buf)?;
-                    let final_n = rx_aead.finalize(&mut out_buf[n..])?;
-                    let used = n + final_n;
+                    // One-shot AEAD over `ciphertext || tag`, no AAD — byte-for-byte
+                    // the same as the old per-message streaming context (each chat
+                    // message already re-initialized with its own random nonce).
+                    let pt = aead_decrypt_chunk(&aead_name_str, &rx_key, nonce, &[], ct_and_tag)?;
 
                     // Lossy decode: preserve valid UTF-8 portions and mark
                     // bad bytes with U+FFFD instead of dropping the entire
@@ -947,7 +992,7 @@ impl NetworkProcessor {
                     // non-UTF-8 bytes, and showing a partial-but-readable
                     // message is more useful than a single placeholder line.
                     let msg_content: Zeroizing<String> = Zeroizing::new(
-                        String::from_utf8_lossy(&out_buf[..used]).into_owned(),
+                        String::from_utf8_lossy(&pt).into_owned(),
                     );
                     let msg = Zeroizing::new(
                         msg_content
@@ -973,8 +1018,6 @@ impl NetworkProcessor {
                         let _ = out.write_all(b"\n> ").await;
                         let _ = out.flush().await;
                     }
-
-                    out_buf.fill(0);
                 }
                 Ok::<(), CryptoError>(())
             }
@@ -993,7 +1036,6 @@ impl NetworkProcessor {
             let _ = out.flush().await;
         }
 
-        let mut tx_aead_opt: Option<Aead> = None;
         loop {
             tokio::select! {
                 rx_result = rx_done_rx.recv() => {
@@ -1043,24 +1085,14 @@ impl NetworkProcessor {
                         OsRng.fill_bytes(&mut nonce);
                     }
 
-                    let tx_aead = match tx_aead_opt.as_mut() {
-                        Some(aead) => {
-                            aead.re_init(&tx_key, &nonce)?;
-                            aead
-                        }
-                        None => tx_aead_opt.insert(backend::new_encrypt(aead_name, &tx_key, &nonce)?),
-                    };
-                    let mut encrypted = Zeroizing::new(vec![0u8; data.len() + 32]);
-                    let n = tx_aead.update(data, &mut encrypted)?;
-                    let final_n = tx_aead.finalize(&mut encrypted[n..])?;
+                    // One-shot AEAD, no AAD: with a fresh random nonce per message
+                    // this yields the identical `nonce || ciphertext || tag` wire
+                    // bytes the old streaming context produced.
+                    let ct_tag = aead_encrypt_chunk(aead_name, &tx_key, &nonce, &[], data)?;
 
-                    let mut tag = Zeroizing::new(vec![0u8; 16]);
-                    tx_aead.get_tag(&mut tag)?;
-
-                    let mut packet = Zeroizing::new(Vec::with_capacity(12 + n + final_n + 16));
+                    let mut packet = Zeroizing::new(Vec::with_capacity(12 + ct_tag.len()));
                     packet.extend_from_slice(&nonce);
-                    packet.extend_from_slice(&encrypted[..n + final_n]);
-                    packet.extend_from_slice(&tag);
+                    packet.extend_from_slice(&ct_tag);
 
                     tokio::time::timeout(IDLE_TIMEOUT, stream_tx.write_all(&(packet.len() as u32).to_le_bytes())).await
                         .map_err(|_| CryptoError::Parameter("Idle timeout while sending chat header".to_string()))?

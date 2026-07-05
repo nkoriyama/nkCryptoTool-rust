@@ -10,8 +10,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use zeroize::Zeroizing;
 
-pub use streaming_aead::StreamingMode;
-
 pub mod ecc;
 pub mod hybrid;
 pub mod pqc;
@@ -63,22 +61,6 @@ pub trait CryptoStrategy: Send + Sync {
         passphrase: &mut Option<Zeroizing<String>>,
     ) -> Result<()>;
 
-    fn encrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>>;
-    fn decrypt_transform(&mut self, data: &[u8]) -> Result<Zeroizing<Vec<u8>>>;
-
-    fn encrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize>;
-    fn decrypt_into(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize>;
-
-    fn finalize_encryption(&mut self) -> Result<Vec<u8>>;
-    fn finalize_decryption(&mut self, tag: &[u8]) -> Result<()>;
-
-    /// Restarts the decryption AEAD context for Two-pass processing.
-    fn restart_decryption(&mut self) -> Result<()> {
-        Err(crate::error::CryptoError::Parameter(
-            "Two-pass decryption not supported by this strategy".to_string(),
-        ))
-    }
-
     // Signing / Verification
     fn prepare_signing(
         &mut self,
@@ -116,21 +98,11 @@ pub trait CryptoStrategy: Send + Sync {
     fn get_salt(&self) -> Vec<u8>;
     fn get_iv(&self) -> Vec<u8>;
 
-    // ---- v3 streaming-AEAD hooks (default to legacy v2 behavior) ----
-
-    /// Reports which streaming format the current header / state implies.
-    /// Default is the legacy single-message v2 layout.
-    fn streaming_mode(&self) -> StreamingMode {
-        StreamingMode::LegacySingleMessage
-    }
-
-    /// Selects the streaming format to use for upcoming encrypt operations.
-    /// No-op for strategies that only support legacy v2.
-    fn set_streaming_mode(&mut self, _mode: StreamingMode) {}
+    // ---- v3 chunked-AEAD hooks ----
 
     /// Chunk size that this strategy will use for v3 encrypt or has decoded
     /// from a v3 header. Returns `streaming_aead::V3_DEFAULT_CHUNK_SIZE` by
-    /// default; only meaningful when `streaming_mode() == ChunkedAead`.
+    /// default.
     fn chunk_size(&self) -> u32 {
         streaming_aead::V3_DEFAULT_CHUNK_SIZE
     }
@@ -139,8 +111,8 @@ pub trait CryptoStrategy: Send + Sync {
     fn set_chunk_size(&mut self, _size: u32) {}
 
     /// Returns the SHA-256(header_bytes)[..16] file session ID. Available
-    /// only after `prepare_encryption` (with `streaming_mode == ChunkedAead`)
-    /// or after `deserialize_header` has consumed a v3 header.
+    /// only after `prepare_encryption` or after `deserialize_header` has
+    /// consumed a v3 header.
     fn file_session_id(&self) -> Option<[u8; streaming_aead::V3_SESSION_ID_LEN]> {
         None
     }

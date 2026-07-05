@@ -243,7 +243,7 @@ impl KeyProvider for TpmKeyProvider {
     }
 
     fn wrap_raw(&self, key_material: &[u8], passphrase: Option<&str>) -> Result<String> {
-        use crate::backend::{self, AeadBackend};
+        use crate::strategy::streaming_aead::aead_encrypt_chunk;
         use rand_core::{OsRng, RngCore};
 
         // 1. Fresh 32-byte KEK, sealed in the TPM. A KEK fits the TPM's sealed-
@@ -254,15 +254,15 @@ impl KeyProvider for TpmKeyProvider {
         let (pub_blob, priv_blob) = self.tpm_seal(&kek, passphrase)?;
 
         // 2. AES-256-GCM the key material under the KEK with a fresh 96-bit nonce.
+        //    The vetted one-shot returns ciphertext || tag(16); split so the blob
+        //    keeps its nonce | tag | ct layout (byte-identical to the previous
+        //    streaming path, so existing wrapped blobs still round-trip).
         let mut nonce = [0u8; 12];
         OsRng.fill_bytes(&mut nonce);
-        let mut aead = backend::new_encrypt("aes-256-gcm", &kek, &nonce)?;
-        let mut ct = vec![0u8; key_material.len() + 16];
-        let n1 = aead.update(key_material, &mut ct)?;
-        let n2 = aead.finalize(&mut ct[n1..])?;
-        ct.truncate(n1 + n2);
-        let mut tag = [0u8; 16];
-        aead.get_tag(&mut tag)?;
+        let ct_tag = aead_encrypt_chunk("AES-256-GCM", &kek, &nonce, &[], key_material)?;
+        let split = ct_tag.len() - 16;
+        let ct = &ct_tag[..split];
+        let tag = &ct_tag[split..];
 
         // 3. blob = u32 pub_len | pub | u32 priv_len | priv | nonce(12) | tag(16) | ct.
         //    None of this is secret (the TPM priv blob is TPM-encrypted, the rest is
@@ -273,8 +273,8 @@ impl KeyProvider for TpmKeyProvider {
         combined.extend_from_slice(&(priv_blob.len() as u32).to_le_bytes());
         combined.extend_from_slice(&priv_blob);
         combined.extend_from_slice(&nonce);
-        combined.extend_from_slice(&tag);
-        combined.extend_from_slice(&ct);
+        combined.extend_from_slice(tag);
+        combined.extend_from_slice(ct);
 
         use base64::{engine::general_purpose, Engine as _};
         let mut out_data = Vec::new();
@@ -289,7 +289,7 @@ impl KeyProvider for TpmKeyProvider {
     }
 
     fn unwrap_raw(&self, pem_str: &str, passphrase: Option<&str>) -> Result<Zeroizing<Vec<u8>>> {
-        use crate::backend::{self, AeadBackend};
+        use crate::strategy::streaming_aead::aead_decrypt_chunk;
         use base64::{engine::general_purpose, Engine as _};
 
         let b64 = pem_str
@@ -327,16 +327,14 @@ impl KeyProvider for TpmKeyProvider {
         // 1. Unseal the KEK from the TPM.
         let kek = self.tpm_unseal(&pub_blob, &priv_blob, passphrase)?;
 
-        // 2. AES-256-GCM decrypt the key material; finalize verifies the GCM tag,
-        //    so a wrong KEK / tampered blob fails here rather than returning garbage.
-        //    GCM is a stream cipher (pt len == ct len), so allocate exactly ct.len()
-        //    — no headroom that could hold un-zeroized scratch past the truncation.
-        let mut aead = backend::new_decrypt("aes-256-gcm", &kek, &nonce)?;
-        let mut pt = Zeroizing::new(vec![0u8; ct.len()]);
-        let n1 = aead.update(&ct, &mut pt)?;
-        aead.set_tag(&tag)?;
-        let n2 = aead.finalize(&mut pt[n1..])?;
-        pt.truncate(n1 + n2);
+        // 2. AES-256-GCM decrypt the key material; the vetted one-shot verifies
+        //    the GCM tag, so a wrong KEK / tampered blob fails here rather than
+        //    returning garbage. Reassemble ciphertext || tag for the call (the
+        //    blob stores them separated as nonce | tag | ct). The plaintext is
+        //    returned in a `Zeroizing` buffer.
+        let mut ct_tag = ct;
+        ct_tag.extend_from_slice(&tag);
+        let pt = aead_decrypt_chunk("AES-256-GCM", &kek, &nonce, &[], &ct_tag)?;
         Ok(pt)
     }
 }

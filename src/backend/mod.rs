@@ -5,7 +5,7 @@
  */
 
 use crate::error::Result;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 pub mod openssl_impl;
 pub mod rustcrypto_impl;
@@ -13,31 +13,12 @@ pub mod rustcrypto_impl;
 #[cfg(all(feature = "backend-openssl", not(feature = "backend-rustcrypto")))]
 pub use openssl_impl as crypto_impl;
 #[cfg(all(feature = "backend-openssl", not(feature = "backend-rustcrypto")))]
-pub use openssl_impl::OpenSslAead as Aead;
-#[cfg(all(feature = "backend-openssl", not(feature = "backend-rustcrypto")))]
 pub use openssl_impl::OpenSslHash as Hash;
 
 #[cfg(feature = "backend-rustcrypto")]
 pub use rustcrypto_impl as crypto_impl;
 #[cfg(feature = "backend-rustcrypto")]
-pub use rustcrypto_impl::RustCryptoAead as Aead;
-#[cfg(feature = "backend-rustcrypto")]
 pub use rustcrypto_impl::RustCryptoHash as Hash;
-
-/// Common traits and types for all cryptographic backends.
-pub trait AeadBackend: Zeroize {
-    fn new_encrypt(cipher: &str, key: &[u8], iv: &[u8]) -> Result<Self>
-    where
-        Self: Sized;
-    fn new_decrypt(cipher: &str, key: &[u8], iv: &[u8]) -> Result<Self>
-    where
-        Self: Sized;
-    fn re_init(&mut self, key: &[u8], iv: &[u8]) -> Result<()>;
-    fn update(&mut self, input: &[u8], output: &mut [u8]) -> Result<usize>;
-    fn finalize(&mut self, output: &mut [u8]) -> Result<usize>;
-    fn get_tag(&self, tag: &mut [u8]) -> Result<()>;
-    fn set_tag(&mut self, tag: &[u8]) -> Result<()>;
-}
 
 pub trait HashBackend {
     fn new(algo: &str) -> Result<Self>
@@ -48,14 +29,6 @@ pub trait HashBackend {
     fn finalize_verify(&mut self, key_der: &[u8], signature: &[u8]) -> Result<bool>;
     fn init_sign(&mut self, key_der: &[u8], passphrase: Option<&str>) -> Result<()>;
     fn init_verify(&mut self, key_der: &[u8]) -> Result<()>;
-}
-
-pub fn new_encrypt(cipher: &str, key: &[u8], iv: &[u8]) -> Result<Aead> {
-    Aead::new_encrypt(cipher, key, iv)
-}
-
-pub fn new_decrypt(cipher: &str, key: &[u8], iv: &[u8]) -> Result<Aead> {
-    Aead::new_decrypt(cipher, key, iv)
 }
 
 pub fn new_hash(algo: &str) -> Result<Hash> {

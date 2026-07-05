@@ -218,10 +218,12 @@ async fn test_e2e_file_transfer_large_10mib() {
 // receive_file} over an in-memory buffer — so a byte can be flipped/forged at
 // a precise offset without standing up an Iroh transport.
 //
-// Wire layout produced by send_file:
-//   repeat { [chunk_len: u32 LE] [AEAD ciphertext: chunk_len bytes] }
-//   [0u32]                      (terminator)
-//   [tag: 16 bytes]             (AEAD authentication tag over the stream)
+// Wire layout produced by send_file (nkct/file/2, per-chunk one-shot AEAD):
+//   repeat { [frame_len: u32 LE] [flags: u8] [ciphertext || 16B tag] }
+//   where frame_len = 1 + (ciphertext||tag).len(); the final chunk (and only
+//   it) carries flags = V3_FLAG_FINAL. Each chunk is authenticated independently
+//   (nonce = iv-prefix||counter, AAD = session_id||counter||flags); a truncated
+//   transfer is detected by EOF arriving before a FINAL chunk.
 // --------------------------------------------------------------------------
 
 const ADV_AEAD: &str = "AES-256-GCM";
