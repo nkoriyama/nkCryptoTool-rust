@@ -780,8 +780,8 @@ mod tests {
         assert_eq!(&*unwrapped_sk, &*sk, "SK mismatch for {}", algo);
         
         let message = b"hello world";
-        let sig = backend::pqc_sign(algo, &unwrapped_sk, message, None).unwrap();
-        let ok = backend::pqc_verify(algo, &pk, message, &sig).unwrap();
+        let sig = backend::pqc_sign(algo, &unwrapped_sk, message, &[]).unwrap();
+        let ok = backend::pqc_verify(algo, &pk, message, &sig, &[]).unwrap();
         
         assert!(ok, "Verification failed for {}", algo);
     }

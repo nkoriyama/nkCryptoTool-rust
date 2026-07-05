@@ -326,7 +326,7 @@ impl CryptoStrategy for PqcStrategy {
     }
 
     fn sign_hash(&mut self) -> Result<Vec<u8>> {
-        backend::pqc_sign(&self.dsa_algo, &self.dsa_privkey, &self.sign_buffer, None)
+        backend::pqc_sign(&self.dsa_algo, &self.dsa_privkey, &self.sign_buffer, &[])
     }
 
     fn verify_hash(&mut self, signature: &[u8]) -> Result<bool> {
@@ -334,7 +334,7 @@ impl CryptoStrategy for PqcStrategy {
             .peer_public_key
             .as_ref()
             .ok_or(CryptoError::Parameter("No pubkey".to_string()))?;
-        backend::pqc_verify(&self.dsa_algo, raw_pub, &self.sign_buffer, signature)
+        backend::pqc_verify(&self.dsa_algo, raw_pub, &self.sign_buffer, signature, &[])
     }
 
     fn serialize_signature_header(&self) -> Vec<u8> {

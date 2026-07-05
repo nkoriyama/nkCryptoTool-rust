@@ -121,7 +121,7 @@ impl SignedPrekey {
         }
         let peer_id = peer_id_from_dsa_pub(dsa_pub);
         let msg = signed_message(&peer_id, self.prekey_id, &self.xwing_pub);
-        Ok(crate::backend::pqc_verify(PREKEY_SIGN_ALGO, dsa_pub, &msg, &self.signature)?)
+        Ok(crate::backend::pqc_verify(PREKEY_SIGN_ALGO, dsa_pub, &msg, &self.signature, &[])?)
     }
 
     /// Serialize to the wire form:
@@ -208,7 +208,7 @@ pub fn generate(count: u32, start_id: u32, dsa_priv: &[u8]) -> Result<Vec<Genera
             return Err(PrekeyError::BadPublicKeyLen(prekey_id, xwing_pub.len()));
         }
         let msg = signed_message(&recipient_peer_id, prekey_id, &xwing_pub);
-        let signature = crate::backend::pqc_sign(PREKEY_SIGN_ALGO, dsa_priv, &msg, None)?;
+        let signature = crate::backend::pqc_sign(PREKEY_SIGN_ALGO, dsa_priv, &msg, &[])?;
         out.push(GeneratedPrekey {
             signed: SignedPrekey { prekey_id, xwing_pub, signature },
             xwing_priv: sk,

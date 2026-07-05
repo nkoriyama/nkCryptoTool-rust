@@ -445,12 +445,7 @@ pub fn pqc_keygen_dsa(
     }
 }
 
-pub fn pqc_sign(
-    algo: &str,
-    raw_priv: &[u8],
-    message: &[u8],
-    _passphrase: Option<&str>,
-) -> Result<Vec<u8>> {
+pub fn pqc_sign(algo: &str, raw_priv: &[u8], message: &[u8], ctx: &[u8]) -> Result<Vec<u8>> {
     #[cfg(feature = "backend-rustcrypto")]
     {
         match algo {
@@ -461,7 +456,7 @@ pub fn pqc_sign(
                 let mut sk = fips204::ml_dsa_44::PrivateKey::try_from_bytes(sk_bytes)
                     .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
                 let res = sk
-                    .try_sign(message, &[])
+                    .try_sign(message, ctx)
                     .map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?
                     .to_vec();
                 zeroize_bytes(&mut sk);
@@ -474,7 +469,7 @@ pub fn pqc_sign(
                 let mut sk = fips204::ml_dsa_65::PrivateKey::try_from_bytes(sk_bytes)
                     .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
                 let res = sk
-                    .try_sign(message, &[])
+                    .try_sign(message, ctx)
                     .map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?
                     .to_vec();
                 zeroize_bytes(&mut sk);
@@ -487,7 +482,7 @@ pub fn pqc_sign(
                 let mut sk = fips204::ml_dsa_87::PrivateKey::try_from_bytes(sk_bytes)
                     .map_err(|_| CryptoError::PrivateKeyLoad("Invalid key".to_string()))?;
                 let res = sk
-                    .try_sign(message, &[])
+                    .try_sign(message, ctx)
                     .map_err(|_| CryptoError::OpenSSL("Sign failed".to_string()))?
                     .to_vec();
                 zeroize_bytes(&mut sk);
@@ -498,14 +493,20 @@ pub fn pqc_sign(
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
     {
-        let _ = (algo, raw_priv, message, _passphrase);
+        let _ = (algo, raw_priv, message, ctx);
         Err(CryptoError::Parameter(
             "RustCrypto backend not enabled".to_string(),
         ))
     }
 }
 
-pub fn pqc_verify(algo: &str, raw_pub: &[u8], message: &[u8], signature: &[u8]) -> Result<bool> {
+pub fn pqc_verify(
+    algo: &str,
+    raw_pub: &[u8],
+    message: &[u8],
+    signature: &[u8],
+    ctx: &[u8],
+) -> Result<bool> {
     #[cfg(feature = "backend-rustcrypto")]
     {
         match algo {
@@ -518,7 +519,7 @@ pub fn pqc_verify(algo: &str, raw_pub: &[u8], message: &[u8], signature: &[u8]) 
                 let sig_arr: [u8; 2420] = signature
                     .try_into()
                     .map_err(|_| CryptoError::Parameter("Invalid sig size".to_string()))?;
-                Ok(pk.verify(message, &sig_arr, &[]))
+                Ok(pk.verify(message, &sig_arr, ctx))
             }
             "ML-DSA-65" => {
                 let pk_bytes: [u8; 1952] = (raw_pub)
@@ -529,7 +530,7 @@ pub fn pqc_verify(algo: &str, raw_pub: &[u8], message: &[u8], signature: &[u8]) 
                 let sig_arr: [u8; 3309] = signature
                     .try_into()
                     .map_err(|_| CryptoError::Parameter("Invalid sig size".to_string()))?;
-                Ok(pk.verify(message, &sig_arr, &[]))
+                Ok(pk.verify(message, &sig_arr, ctx))
             }
             "ML-DSA-87" => {
                 let pk_bytes: [u8; 2592] = (raw_pub)
@@ -540,14 +541,14 @@ pub fn pqc_verify(algo: &str, raw_pub: &[u8], message: &[u8], signature: &[u8]) 
                 let sig_arr: [u8; 4627] = signature
                     .try_into()
                     .map_err(|_| CryptoError::Parameter("Invalid sig size".to_string()))?;
-                Ok(pk.verify(message, &sig_arr, &[]))
+                Ok(pk.verify(message, &sig_arr, ctx))
             }
             _ => Err(CryptoError::Parameter(format!("Unsupported DSA: {}", algo))),
         }
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
     {
-        let _ = (algo, raw_pub, message, signature);
+        let _ = (algo, raw_pub, message, signature, ctx);
         Err(CryptoError::Parameter(
             "RustCrypto backend not enabled".to_string(),
         ))

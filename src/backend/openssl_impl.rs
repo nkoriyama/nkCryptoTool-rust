@@ -96,6 +96,27 @@ mod ffi_ext {
             bsize: libc::size_t,
         ) -> libc::c_int;
 
+        // `_ex` variants take a trailing OSSL_PARAM[] — used to pass the FIPS 204
+        // ML-DSA `context-string` (domain separation). See KEY_EXCHANGE_DESIGN.md §2.
+        pub fn EVP_DigestSignInit_ex(
+            ctx: *mut ffi::EVP_MD_CTX,
+            pctx: *mut *mut ffi::EVP_PKEY_CTX,
+            mdname: *const libc::c_char,
+            libctx: *mut libc::c_void,
+            props: *const libc::c_char,
+            pkey: *mut ffi::EVP_PKEY,
+            params: *const ffi::OSSL_PARAM,
+        ) -> libc::c_int;
+        pub fn EVP_DigestVerifyInit_ex(
+            ctx: *mut ffi::EVP_MD_CTX,
+            pctx: *mut *mut ffi::EVP_PKEY_CTX,
+            mdname: *const libc::c_char,
+            libctx: *mut libc::c_void,
+            props: *const libc::c_char,
+            pkey: *mut ffi::EVP_PKEY,
+            params: *const ffi::OSSL_PARAM,
+        ) -> libc::c_int;
+
         pub fn EVP_PKEY_fromdata_init(ctx: *mut ffi::EVP_PKEY_CTX) -> libc::c_int;
         pub fn EVP_PKEY_fromdata(
             ctx: *mut ffi::EVP_PKEY_CTX,
@@ -164,6 +185,78 @@ fn pkey_from_raw(
         ffi::EVP_PKEY_CTX_free(ctx);
         res
     }
+}
+
+/// Initialise an `EVP_MD_CTX` for ML-DSA sign/verify under the FIPS 204
+/// `context-string` `ctx`. Empty `ctx` keeps the pre-context path (no OSSL_PARAM,
+/// `ctx=""`); a non-empty `ctx` is passed via the `context-string` signature
+/// param so OpenSSL prepends it per FIPS 204 (pure ML-DSA). See
+/// KEY_EXCHANGE_DESIGN.md §2. Caller owns `md_ctx` and `pkey`.
+///
+/// # Safety
+/// `md_ctx` and `pkey` must be valid live pointers for the call.
+#[cfg(feature = "backend-openssl")]
+unsafe fn mldsa_digest_init(
+    md_ctx: *mut ffi::EVP_MD_CTX,
+    pkey: *mut ffi::EVP_PKEY,
+    ctx: &[u8],
+    is_sign: bool,
+) -> Result<()> {
+    use ffi_ext::*;
+    if ctx.is_empty() {
+        let rc = if is_sign {
+            ffi::EVP_DigestSignInit(md_ctx, ptr::null_mut(), ptr::null(), ptr::null_mut(), pkey)
+        } else {
+            ffi::EVP_DigestVerifyInit(md_ctx, ptr::null_mut(), ptr::null(), ptr::null_mut(), pkey)
+        };
+        return if rc == 1 {
+            Ok(())
+        } else {
+            Err(CryptoError::OpenSSL("EVP_DigestSign/VerifyInit failed".to_string()))
+        };
+    }
+    let name = std::ffi::CString::new("context-string")
+        .map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+    let bld = OSSL_PARAM_BLD_new();
+    if bld.is_null() {
+        return Err(CryptoError::OpenSSL("OSSL_PARAM_BLD_new failed".to_string()));
+    }
+    let mut res = Err(CryptoError::OpenSSL(
+        "ML-DSA context-string init failed".to_string(),
+    ));
+    if OSSL_PARAM_BLD_push_octet_string(bld, name.as_ptr(), ctx.as_ptr() as *const _, ctx.len()) == 1
+    {
+        let params = OSSL_PARAM_BLD_to_param(bld);
+        if !params.is_null() {
+            let rc = if is_sign {
+                EVP_DigestSignInit_ex(
+                    md_ctx,
+                    ptr::null_mut(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                    pkey,
+                    params,
+                )
+            } else {
+                EVP_DigestVerifyInit_ex(
+                    md_ctx,
+                    ptr::null_mut(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                    ptr::null(),
+                    pkey,
+                    params,
+                )
+            };
+            if rc == 1 {
+                res = Ok(());
+            }
+            OSSL_PARAM_free(params);
+        }
+    }
+    OSSL_PARAM_BLD_free(bld);
+    res
 }
 
 #[cfg(feature = "backend-openssl")]
@@ -645,36 +738,20 @@ pub fn pqc_keygen_dsa(
     }
 }
 
-pub fn pqc_sign(
-    algo: &str,
-    raw_priv: &[u8],
-    message: &[u8],
-    passphrase: Option<&str>,
-) -> Result<Vec<u8>> {
+pub fn pqc_sign(algo: &str, raw_priv: &[u8], message: &[u8], ctx: &[u8]) -> Result<Vec<u8>> {
     #[cfg(feature = "backend-openssl")]
     {
-        let _ = passphrase;
         let pkey = pkey_from_raw(algo, raw_priv, true)?;
-        let ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
-        // PQC DSA in OpenSSL uses DigestSign with NULL digest
+        let md_ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        // PQC DSA in OpenSSL uses DigestSign with NULL digest; `ctx` = FIPS 204
+        // context string (empty preserves the pre-context ctx="" behaviour).
         unsafe {
-            if ffi::EVP_DigestSignInit(
-                ctx.as_ptr(),
-                ptr::null_mut(),
-                ptr::null(),
-                ptr::null_mut(),
-                pkey.as_ptr(),
-            ) != 1
-            {
-                return Err(CryptoError::OpenSSL(
-                    "EVP_DigestSignInit failed".to_string(),
-                ));
-            }
+            mldsa_digest_init(md_ctx.as_ptr(), pkey.as_ptr(), ctx, true)?;
         }
         let mut sig_len = 0;
         unsafe {
             if ffi::EVP_DigestSign(
-                ctx.as_ptr(),
+                md_ctx.as_ptr(),
                 ptr::null_mut(),
                 &mut sig_len,
                 message.as_ptr(),
@@ -689,7 +766,7 @@ pub fn pqc_sign(
         let mut sig = vec![0u8; sig_len as usize];
         unsafe {
             if ffi::EVP_DigestSign(
-                ctx.as_ptr(),
+                md_ctx.as_ptr(),
                 sig.as_mut_ptr(),
                 &mut sig_len,
                 message.as_ptr(),
@@ -704,7 +781,7 @@ pub fn pqc_sign(
     }
     #[cfg(not(feature = "backend-openssl"))]
     {
-        let _ = (raw_priv, message, passphrase, algo);
+        let _ = (raw_priv, message, ctx, algo);
         Err(CryptoError::Parameter(
             "OpenSSL backend not enabled".to_string(),
         ))
@@ -716,26 +793,16 @@ pub fn pqc_verify(
     raw_pub: &[u8],
     message: &[u8],
     signature: &[u8],
+    ctx: &[u8],
 ) -> Result<bool> {
     #[cfg(feature = "backend-openssl")]
     {
         let pkey = pkey_from_raw(algo, raw_pub, false)?;
-        let ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
+        let md_ctx = MdCtx::new().map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
         unsafe {
-            if ffi::EVP_DigestVerifyInit(
-                ctx.as_ptr(),
-                ptr::null_mut(),
-                ptr::null(),
-                ptr::null_mut(),
-                pkey.as_ptr(),
-            ) != 1
-            {
-                return Err(CryptoError::OpenSSL(
-                    "EVP_DigestVerifyInit failed".to_string(),
-                ));
-            }
+            mldsa_digest_init(md_ctx.as_ptr(), pkey.as_ptr(), ctx, false)?;
             let r = ffi::EVP_DigestVerify(
-                ctx.as_ptr(),
+                md_ctx.as_ptr(),
                 signature.as_ptr(),
                 signature.len(),
                 message.as_ptr(),
@@ -752,7 +819,7 @@ pub fn pqc_verify(
     }
     #[cfg(not(feature = "backend-openssl"))]
     {
-        let _ = (raw_pub, message, signature, algo);
+        let _ = (raw_pub, message, signature, algo, ctx);
         Err(CryptoError::Parameter(
             "OpenSSL backend not enabled".to_string(),
         ))

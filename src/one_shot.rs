@@ -469,7 +469,7 @@ impl RecipientBundle {
         let mut msg = Vec::with_capacity(BUNDLE_SIG_CONTEXT.len() + payload.len());
         msg.extend_from_slice(BUNDLE_SIG_CONTEXT);
         msg.extend_from_slice(&payload);
-        let sig = crate::backend::pqc_sign(prekey::PREKEY_SIGN_ALGO, dsa_priv, &msg, None)
+        let sig = crate::backend::pqc_sign(prekey::PREKEY_SIGN_ALGO, dsa_priv, &msg, &[])
             .map_err(OneShotError::Crypto)?;
         let mut out = payload;
         out.extend_from_slice(&(sig.len() as u32).to_le_bytes());
@@ -536,7 +536,7 @@ impl RecipientBundle {
         let mut msg = Vec::with_capacity(BUNDLE_SIG_CONTEXT.len() + payload.len());
         msg.extend_from_slice(BUNDLE_SIG_CONTEXT);
         msg.extend_from_slice(payload);
-        let ok = crate::backend::pqc_verify(prekey::PREKEY_SIGN_ALGO, &dsa_pub, &msg, sig)
+        let ok = crate::backend::pqc_verify(prekey::PREKEY_SIGN_ALGO, &dsa_pub, &msg, sig, &[])
             .map_err(OneShotError::Crypto)?;
         if !ok {
             return Err(OneShotError::BundleUntrusted);

@@ -71,17 +71,40 @@ pub fn pqc_keygen_dsa(
     crypto_impl::pqc_keygen_dsa(algo)
 }
 
-pub fn pqc_sign(
-    algo: &str,
-    priv_der: &[u8],
-    message: &[u8],
-    passphrase: Option<&str>,
-) -> Result<Vec<u8>> {
-    crypto_impl::pqc_sign(algo, priv_der, message, passphrase)
+/// The FIPS 204 context string is a single length-prefixed byte with a 1-byte
+/// length field, so it is capped at 255 bytes. Reject longer values up front
+/// (rather than letting a backend truncate or error opaquely) — our own labels
+/// are short constants, but this keeps the API honest for any future caller.
+const MLDSA_CTX_MAX: usize = 255;
+
+/// Sign `message` with an ML-DSA key under the FIPS 204 **context string** `ctx`
+/// (domain separation). `ctx` empty preserves the pre-context behaviour
+/// (`ctx=""`); a non-empty `ctx` is prepended per FIPS 204 as
+/// `M' = 0x00 ‖ len(ctx) ‖ ctx ‖ message` (pure ML-DSA). See KEY_EXCHANGE_DESIGN.md §2.
+pub fn pqc_sign(algo: &str, priv_der: &[u8], message: &[u8], ctx: &[u8]) -> Result<Vec<u8>> {
+    if ctx.len() > MLDSA_CTX_MAX {
+        return Err(crate::error::CryptoError::Parameter(format!(
+            "ML-DSA context string too long: {} > {MLDSA_CTX_MAX}",
+            ctx.len()
+        )));
+    }
+    crypto_impl::pqc_sign(algo, priv_der, message, ctx)
 }
 
-pub fn pqc_verify(algo: &str, pub_der: &[u8], message: &[u8], signature: &[u8]) -> Result<bool> {
-    crypto_impl::pqc_verify(algo, pub_der, message, signature)
+pub fn pqc_verify(
+    algo: &str,
+    pub_der: &[u8],
+    message: &[u8],
+    signature: &[u8],
+    ctx: &[u8],
+) -> Result<bool> {
+    if ctx.len() > MLDSA_CTX_MAX {
+        return Err(crate::error::CryptoError::Parameter(format!(
+            "ML-DSA context string too long: {} > {MLDSA_CTX_MAX}",
+            ctx.len()
+        )));
+    }
+    crypto_impl::pqc_verify(algo, pub_der, message, signature, ctx)
 }
 
 pub fn pqc_encap(algo: &str, peer_pub_der: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {

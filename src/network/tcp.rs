@@ -170,7 +170,7 @@ impl NetworkProcessor {
 
                 // Verify signature regardless of whether we have a pinned key
                 let algo = config.pqc_dsa_algo.clone();
-                if !backend::pqc_verify(&algo, &client_dsa_pub, &transcript, &sig)? {
+                if !backend::pqc_verify(&algo, &client_dsa_pub, &transcript, &sig, &[])? {
                     return Err(CryptoError::SignatureVerification);
                 }
 
@@ -327,7 +327,7 @@ impl NetworkProcessor {
                 };
 
                 let sig =
-                    backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, &server_transcript, None)?;
+                    backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, &server_transcript, &[])?;
                 server_hello = sig;
             }
 
@@ -500,7 +500,7 @@ impl NetworkProcessor {
                 // the key-derivation salt (Sha3 of server_transcript) identical on both ends.
                 CommonProcessor::update_transcript(&mut transcript, &client_dsa_pub);
                 let sig =
-                    backend::pqc_sign(&self.config.pqc_dsa_algo, &raw_priv, &transcript, None)?;
+                    backend::pqc_sign(&self.config.pqc_dsa_algo, &raw_priv, &transcript, &[])?;
                 CommonProcessor::write_vec(&mut stream, &sig).await?;
                 CommonProcessor::write_vec(&mut stream, &client_dsa_pub).await?;
             }
@@ -539,7 +539,7 @@ impl NetworkProcessor {
                     )?;
 
                     let algo = self.config.pqc_dsa_algo.clone();
-                    if !backend::pqc_verify(&algo, &raw_pub, &server_transcript, &sig)? {
+                    if !backend::pqc_verify(&algo, &raw_pub, &server_transcript, &sig, &[])? {
                         return Err(CryptoError::SignatureVerification);
                     }
                 } else if !self.config.allow_unauth {

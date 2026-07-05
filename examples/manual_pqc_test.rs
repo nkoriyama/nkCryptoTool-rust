@@ -6,10 +6,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Keygen ok. pk len: {}, sk len: {}", pk.len(), sk.len());
 
     let msg = b"Handshake transcript test message";
-    let sig = backend::pqc_sign(algo, &sk, msg, None)?;
+    let sig = backend::pqc_sign(algo, &sk, msg, &[])?;
     println!("Sign ok. sig len: {}", sig.len());
 
-    let ok = backend::pqc_verify(algo, &pk, msg, &sig)?;
+    let ok = backend::pqc_verify(algo, &pk, msg, &sig, &[])?;
     println!("Verify result: {}", ok);
 
     if ok {
