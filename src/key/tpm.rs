@@ -64,6 +64,20 @@ impl TpmKeyProvider {
     /// Returns the sealed object's `(pub_blob, priv_blob)`. TPM sealed-data
     /// objects are size-limited, which is why callers seal a small KEK and
     /// envelope-encrypt the real (arbitrary-size) key material under it.
+    ///
+    /// ## Plaintext-KEK exposure caveat (audit L2)
+    ///
+    /// In the passphrase case `tpm2_create -i` reads the sealed `data` from a
+    /// file (stdin carries the passphrase for `-p file:-`), so the raw KEK is
+    /// briefly staged to a `NamedTempFile` and then overwritten via
+    /// [`crate::utils::secure_erase_file`] before unlink. That best-effort erase
+    /// does **not** reliably scrub the bytes on copy-on-write filesystems
+    /// (btrfs/ZFS snapshots) or wear-leveling SSDs, where the original blocks can
+    /// survive — as `secure_erase_file`'s own docs note. (Without a passphrase
+    /// the KEK is piped via stdin and never staged.) Operators wrapping sensitive
+    /// keys should point `TMPDIR` at a RAM-backed tmpfs/ramfs (e.g. `/dev/shm`) so
+    /// the staged KEK never touches persistent storage. Plumbing it through a
+    /// FIFO/stdin instead of a temp file is the full fix and remains future work.
     fn tpm_seal(&self, data: &[u8], passphrase: Option<&str>) -> Result<(Vec<u8>, Vec<u8>)> {
         let primary_ctx =
             NamedTempFile::new().map_err(|e| CryptoError::FileWrite(e.to_string()))?;

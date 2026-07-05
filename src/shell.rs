@@ -548,10 +548,36 @@ fn prune_auth_failures(
     }
     map.retain(|_, (_, start)| now.duration_since(*start) < AUTH_FAIL_WINDOW);
     if map.len() > AUTH_FAIL_MAX_TRACKED {
-        // Still over cap under a live distinct-NodeId flood: bound memory by
-        // dropping tracking. Rotating-NodeId attempts are rejected cheaply by the
-        // pinned key / allowlist anyway.
-        map.clear();
+        // Still over cap under a live distinct-NodeId flood. Do NOT drop *all*
+        // tracking (the previous `map.clear()` was fail-open: it wiped the
+        // failure counts of genuinely-throttled peers, letting a rotating-NodeId
+        // flood also reset any real attacker that had reached the block
+        // threshold). Instead keep only the entries that are actually AT the
+        // block threshold within the window, so a real attacker stays blocked;
+        // sub-threshold noise (each rotated NodeId contributes a single failure)
+        // is evicted and is cheap to re-track. Reaching the threshold costs
+        // [`AUTH_FAIL_MAX`] failed handshakes per NodeId, so the retained set is
+        // self-limiting by attacker effort.
+        map.retain(|_, (count, start)| {
+            *count >= AUTH_FAIL_MAX && now.duration_since(*start) < AUTH_FAIL_WINDOW
+        });
+        // Absolute memory backstop: if a determined attacker somehow drove more
+        // than the cap of *distinct* NodeIds to the block threshold within the
+        // window (each costing AUTH_FAIL_MAX rejected handshakes), keep only the
+        // most-recently-active cap entries so the map can never grow without
+        // bound. Evicted entries are the ones closest to window expiry anyway, so
+        // a genuine current attacker (freshest failures) stays blocked.
+        if map.len() > AUTH_FAIL_MAX_TRACKED {
+            // Find the cap-th most-recent window_start in O(n) (partition, not a
+            // full O(n log n) sort — the prune already scans the map in O(n), so
+            // this adds no worse-than-linear work even under a flood), then keep
+            // entries at/after it.
+            let mut starts: Vec<std::time::Instant> = map.values().map(|(_, s)| *s).collect();
+            let idx = starts.len() - AUTH_FAIL_MAX_TRACKED;
+            let (_, cutoff, _) = starts.select_nth_unstable(idx);
+            let cutoff = *cutoff;
+            map.retain(|_, (_, start)| *start >= cutoff);
+        }
     }
 }
 

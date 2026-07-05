@@ -1196,12 +1196,16 @@ impl RedbPreSharedKeyStorage {
 pub struct RedbApplicationStorage(RedbBackend);
 
 impl RedbApplicationStorage {
-    pub fn get(&self, key: &str) -> Result<Option<Vec<u8>>, RedbStorageError> {
+    /// Returns the value in a `Zeroizing<Vec<u8>>` so a long-term secret read
+    /// here — notably the MLS signing identity SK — is wiped from the heap on
+    /// drop instead of lingering in a plain `Vec` (audit L3). `open_record`
+    /// already yields a `Zeroizing<Vec<u8>>`; we simply stop unwrapping it.
+    pub fn get(&self, key: &str) -> Result<Option<Zeroizing<Vec<u8>>>, RedbStorageError> {
         let b = &self.0;
         let k = key.as_bytes();
         match b.get_raw(TBL_APP, k)? {
             None => Ok(None),
-            Some(rec) => Ok(Some(b.open_record(TID_APP, k, &rec)?.to_vec())),
+            Some(rec) => Ok(Some(b.open_record(TID_APP, k, &rec)?)),
         }
     }
 
@@ -2415,7 +2419,7 @@ mod tests {
         assert!(b2.key_package_storage().get(&[1, 2]).expect("kp").is_some());
         assert_eq!(
             b2.application_data_storage().get("mls:identity:sk").expect("app").unwrap(),
-            vec![0xcd; 32]
+            vec![0xcdu8; 32].into()
         );
     }
 
@@ -2432,7 +2436,7 @@ mod tests {
         assert!(RedbBackend::rotate_group_dek(&path, &[0x99; 32], &[0x22; 32]).is_err());
         // Original DEK still opens and data is intact.
         let b = RedbBackend::open(&path, &[0x11; 32]).expect("reopen old");
-        assert_eq!(b.application_data_storage().get("k").expect("app").unwrap(), vec![1, 2, 3]);
+        assert_eq!(b.application_data_storage().get("k").expect("app").unwrap(), vec![1u8, 2, 3].into());
     }
 
     #[test]
@@ -2465,11 +2469,11 @@ mod tests {
         assert!(app.get("mls:identity:sk").expect("get none").is_none());
         app.insert("mls:identity:sk", &[0xaa; 32]).expect("insert");
         app.insert("mls:identity:pk", &[0xbb; 32]).expect("insert");
-        assert_eq!(app.get("mls:identity:sk").expect("get").unwrap(), vec![0xaa; 32]);
-        assert_eq!(app.get("mls:identity:pk").expect("get").unwrap(), vec![0xbb; 32]);
+        assert_eq!(app.get("mls:identity:sk").expect("get").unwrap(), vec![0xaau8; 32].into());
+        assert_eq!(app.get("mls:identity:pk").expect("get").unwrap(), vec![0xbbu8; 32].into());
         // Overwrite.
         app.insert("mls:identity:sk", &[0xcc; 32]).expect("insert");
-        assert_eq!(app.get("mls:identity:sk").expect("get").unwrap(), vec![0xcc; 32]);
+        assert_eq!(app.get("mls:identity:sk").expect("get").unwrap(), vec![0xccu8; 32].into());
     }
 
     // ---------------- inbox store ----------------

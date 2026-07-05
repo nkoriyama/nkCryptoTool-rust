@@ -31,6 +31,25 @@ mod rc_internal {
 
 pub type Hash = RustCryptoHash;
 
+/// Overwrite the in-place bytes of `val` with zeros (not optimizable away).
+///
+/// # Safety invariant (audit L6)
+///
+/// This reinterprets `val` as `size_of::<T>()` raw bytes and wipes them, so it
+/// is only sound for types that are plain-old-data — a fixed-size byte array or
+/// a struct of such — where an all-zero bit pattern is a valid inhabitant. It
+/// MUST NOT be used on:
+///   - a type that owns heap-allocated or otherwise indirected secrets (`Box`,
+///     `Vec`, `String`, or anything holding a pointer): zeroing would (a) wipe
+///     the pointer/length while leaving the real secret on the heap, and (b)
+///     corrupt the pointer so the following drop double-frees or frees a bogus
+///     address; or
+///   - a type for which all-zero is an *invalid* bit pattern (`&T`, `NonNull`,
+///     `NonZero*`, a niche-optimized enum): writing zero there is instant
+///     undefined behaviour.
+/// Every current caller passes a fixed-size POD stack value (the fips203/204
+/// key structs), so the invariant holds; keep it that way. For a heap-owning
+/// secret, wrap it in `Zeroizing` / derive `ZeroizeOnDrop` instead.
 #[cfg(feature = "backend-rustcrypto")]
 fn zeroize_bytes<T>(val: &mut T) {
     let len = std::mem::size_of::<T>();

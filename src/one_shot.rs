@@ -255,6 +255,15 @@ pub fn open(
     let aad = build_aad(p.mode, p.prekey_id);
 
     let session_key = match p.mode {
+        // Replay note (audit L5): static-only has no per-message prekey to
+        // consume, so — unlike MODE_FULL, where a second open finds the prekey
+        // already deleted — this envelope decrypts successfully every time it is
+        // (re)delivered. It provides confidentiality and no forward secrecy, but
+        // no replay protection at this layer. The mitigation is policy:
+        // `FsProfile::StrictPqFs` refuses static-only outright; a
+        // `DefaultFallback` recipient that needs replay protection must dedup on
+        // an upper layer (e.g. a seen-message cache). This is intentional
+        // availability-first behaviour, documented rather than silently relied on.
         MODE_STATIC_ONLY => recipient_key_schedule(
             MODE_STATIC_ONLY,
             static_sk,

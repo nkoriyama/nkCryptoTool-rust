@@ -312,7 +312,16 @@ impl GroupChatProcessor {
         ) {
             (Some(sk), Some(pk)) => {
                 use mls_rs_core::crypto::{SignaturePublicKey, SignatureSecretKey};
-                (SignatureSecretKey::new(sk), SignaturePublicKey::new(pk))
+                // `sk`/`pk` come back as `Zeroizing<Vec<u8>>` (audit L3). The
+                // `sk.to_vec()` copy is moved straight into `SignatureSecretKey`,
+                // which derives `ZeroizeOnDrop` (mls-rs-core), so the secret ends
+                // up in a self-zeroizing container — there is no lingering
+                // un-zeroized copy — and the transient `Zeroizing` `sk` wipes on
+                // drop. (`pk` is public; zeroizing it is harmless.)
+                (
+                    SignatureSecretKey::new(sk.to_vec()),
+                    SignaturePublicKey::new(pk.to_vec()),
+                )
             }
             _ => {
                 let (sk, pk) = suite

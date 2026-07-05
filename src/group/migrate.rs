@@ -275,7 +275,7 @@ mod tests {
         let groups = storage.list_group_ids().expect("list");
         assert_eq!(groups.len(), 1);
         let app = storage.application_data_storage().expect("app");
-        assert_eq!(app.get("mls:identity:sk").expect("get").unwrap(), vec![0xcdu8; 32]);
+        assert_eq!(app.get("mls:identity:sk").expect("get").unwrap(), vec![0xcdu8; 32].into());
     }
 
     #[test]
