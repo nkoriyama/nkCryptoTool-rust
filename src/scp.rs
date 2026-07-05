@@ -23,6 +23,18 @@
 //! drop yet), so `--serve-scp` refuses to run as root and every file operation
 //! runs as the server's own user, confined to the policy's read/write roots.
 //! Directory recursion (`-r`) is a documented follow-up.
+//!
+//! ## Path-confinement hardening by platform
+//!
+//! Every open pairs `O_NOFOLLOW` (final component) with an **after-open fd
+//! real-path re-check** against the policy roots ([`recheck_fd_confined`]),
+//! which closes the intermediate-directory symlink race a check-time
+//! `canonicalize` cannot. That re-check is available on **Linux**
+//! (`/proc/self/fd`) and **macOS** (`fcntl(F_GETPATH)`). On any other Unix the
+//! re-check **fails closed** — the operation is refused rather than served
+//! unconfined (porting FreeBSD `O_RESOLVE_BENEATH` would re-enable it). On
+//! non-Unix (Windows) the fd re-check does not run; that hardening is tracked
+//! separately.
 
 use crate::error::{CryptoError, Result};
 use crate::shell::{
@@ -356,15 +368,68 @@ fn under_any(canon: &Path, roots: &[PathBuf]) -> bool {
     roots.iter().any(|r| canon.starts_with(r))
 }
 
-/// The kernel's fully symlink-resolved path of an open fd, via `/proc/self/fd`
-/// (Linux). Used to re-verify **after open** that the opened inode is still under
-/// a policy root: `confine_*` canonicalizes at check time and `O_NOFOLLOW` guards
-/// only the final component, so an attacker who swaps an *intermediate* directory
-/// for a symlink between check and open could otherwise escape the root. The
-/// post-open path reflects what the kernel actually traversed, closing that race.
+/// The kernel's fully symlink-resolved path of an open fd. Used to re-verify
+/// **after open** that the opened inode is still under a policy root: `confine_*`
+/// canonicalizes at check time and `O_NOFOLLOW` guards only the final component,
+/// so an attacker who swaps an *intermediate* directory for a symlink between
+/// check and open could otherwise escape the root. The post-open path reflects
+/// what the kernel actually traversed, closing that race.
+///
+/// Linux reads `/proc/self/fd/<fd>`; macOS uses `fcntl(F_GETPATH)`, which returns
+/// the vnode's real path (intermediate symlinks resolved). Both are the sound
+/// fd-based analog — a second path-based `canonicalize` would just reintroduce
+/// the same TOCTOU. Platforms without such a primitive are handled by
+/// [`recheck_fd_confined`] (fail closed).
 #[cfg(target_os = "linux")]
 fn fd_real_path(fd: std::os::fd::RawFd) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()
+}
+
+#[cfg(target_os = "macos")]
+fn fd_real_path(fd: std::os::fd::RawFd) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+    // F_GETPATH writes a NUL-terminated path of at most PATH_MAX bytes into buf.
+    let mut buf = vec![0u8; libc::PATH_MAX as usize];
+    // SAFETY: `buf` is PATH_MAX bytes and `fd` is a live descriptor for the call.
+    let rc = unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) };
+    if rc != 0 {
+        return None;
+    }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    buf.truncate(len);
+    Some(PathBuf::from(std::ffi::OsString::from_vec(buf)))
+}
+
+/// Re-verify, after opening `fd` with `O_NOFOLLOW`, that the kernel actually
+/// landed on an inode under one of `roots` — closing the intermediate-directory
+/// symlink race that `O_NOFOLLOW` (final component only) plus a check-time
+/// `canonicalize` cannot.
+///
+/// On Linux and macOS this consults [`fd_real_path`]. On any other Unix
+/// (FreeBSD and friends) there is no equivalent fd→realpath primitive here, so
+/// we **fail closed**: rather than silently skip the re-check and serve an
+/// operation we cannot confine, we refuse it. Serving scp on those platforms
+/// therefore requires porting this re-check (e.g. FreeBSD `O_RESOLVE_BENEATH`).
+#[cfg(unix)]
+fn recheck_fd_confined(
+    fd: std::os::fd::RawFd,
+    roots: &[PathBuf],
+) -> std::result::Result<(), String> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        match fd_real_path(fd) {
+            Some(p) if under_any(&p, roots) => Ok(()),
+            Some(_) => Err("path escaped root after open (intermediate-symlink race)".into()),
+            None => Err("could not verify the opened path against a policy root".into()),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (fd, roots);
+        Err("scp path confinement is only hardened against local symlink races on \
+             Linux and macOS; refusing this operation on the current platform"
+            .into())
+    }
 }
 
 /// Confine a `Get` request: the path must be absolute, resolve (symlinks and all)
@@ -416,8 +481,9 @@ fn confine_mkdir(req: &str, roots: &[PathBuf]) -> std::result::Result<PathBuf, S
 }
 
 /// Open a confined source file for a `get`: `O_NOFOLLOW` on the final component
-/// plus the Linux `/proc/self/fd` real-path re-check against `roots` (closing the
-/// intermediate-directory symlink race). Returns `(file, mode, size)`; `mode`
+/// plus the fd real-path re-check against `roots` (closing the intermediate-
+/// directory symlink race; Linux/macOS, fail-closed on other Unix — see
+/// [`recheck_fd_confined`]). Returns `(file, mode, size)`; `mode`
 /// comes from the open fd, not a second path lookup. Errors carry a reason for
 /// the audit log — the wire reply is uniformized to "denied" by the caller.
 fn open_confined_read(src: &Path, roots: &[PathBuf]) -> std::result::Result<(std::fs::File, u32, u64), String> {
@@ -429,12 +495,10 @@ fn open_confined_read(src: &Path, roots: &[PathBuf]) -> std::result::Result<(std
         opts.custom_flags(libc::O_NOFOLLOW);
     }
     let file = opts.open(src).map_err(|e| format!("open {}: {e}", src.display()))?;
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
-        if !fd_real_path(file.as_raw_fd()).map(|p| under_any(&p, roots)).unwrap_or(false) {
-            return Err("path escaped read root after open (symlink race)".into());
-        }
+        recheck_fd_confined(file.as_raw_fd(), roots)?;
     }
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() {
@@ -517,13 +581,19 @@ impl Staged {
         self.file.as_mut().expect("staged file open").write_all(buf).await
     }
 
-    /// The real directory the staging fd actually lives in (Linux), for a
-    /// post-create confinement re-check against intermediate-symlink swaps.
-    #[cfg(target_os = "linux")]
-    fn temp_real_parent(&self) -> Option<PathBuf> {
+    /// Re-verify the staging fd actually landed under a write root — a post-create
+    /// confinement check against an intermediate-symlink swap between confine and
+    /// open. Real check on Linux/macOS, fail-closed on other Unix (see
+    /// [`recheck_fd_confined`]).
+    #[cfg(unix)]
+    fn recheck_confined(&self, roots: &[PathBuf]) -> std::result::Result<(), String> {
         use std::os::fd::AsRawFd;
-        let fd = self.file.as_ref()?.as_raw_fd();
-        fd_real_path(fd)?.parent().map(Path::to_path_buf)
+        let fd = self
+            .file
+            .as_ref()
+            .ok_or("staging file already closed")?
+            .as_raw_fd();
+        recheck_fd_confined(fd, roots)
     }
 
     /// fsync, apply `mode`, then atomically rename onto the final path. Consumes
@@ -1060,17 +1130,18 @@ where
                         }
                         let ok = match o.open(&dir) {
                             Ok(dfd) => {
+                                // Re-check the opened directory fd is under a write
+                                // root (Linux/macOS; fail-closed on other Unix). On
+                                // non-unix there is no fd re-check — preserve the
+                                // prior behaviour (Windows hardening is tracked
+                                // separately) by treating the open as sufficient.
+                                #[cfg(unix)]
                                 let under = {
-                                    #[cfg(target_os = "linux")]
-                                    {
-                                        use std::os::fd::AsRawFd;
-                                        fd_real_path(dfd.as_raw_fd()).map(|p| under_any(&p, policy.roots(&peer_fp, true))).unwrap_or(false)
-                                    }
-                                    #[cfg(not(target_os = "linux"))]
-                                    {
-                                        true
-                                    }
+                                    use std::os::fd::AsRawFd;
+                                    recheck_fd_confined(dfd.as_raw_fd(), policy.roots(&peer_fp, true)).is_ok()
                                 };
+                                #[cfg(not(unix))]
+                                let under = true;
                                 if under {
                                     #[cfg(unix)]
                                     {
@@ -1118,13 +1189,13 @@ where
                     Ok(d) => Staged::create(d.clone()).ok(),
                     Err(_) => None,
                 };
-                // Post-create confinement re-check (Linux): if the staging file's
-                // real directory is not under a write root (intermediate-symlink
-                // swap between confine and open), discard — we still consume the
-                // body below to keep the stream in sync, then Fail.
-                #[cfg(target_os = "linux")]
+                // Post-create confinement re-check: if the staging fd did not land
+                // under a write root (intermediate-symlink swap between confine and
+                // open), or the platform cannot verify it, discard — we still
+                // consume the body below to keep the stream in sync, then Fail.
+                #[cfg(unix)]
                 if let Some(s) = &staged {
-                    if !s.temp_real_parent().map(|p| under_any(&p, policy.roots(&peer_fp, true))).unwrap_or(false) {
+                    if s.recheck_confined(policy.roots(&peer_fp, true)).is_err() {
                         staged = None;
                     }
                 }
@@ -1391,14 +1462,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn fd_real_path_reveals_intermediate_symlink_escape() {
         // The post-open re-check's mechanism: opening a file through an
         // intermediate directory symlink that escapes the root yields an fd whose
-        // /proc/self/fd real path is *outside* the root, so under_any() rejects it
-        // — this is what closes the check→open swap race that O_NOFOLLOW (final
-        // component only) cannot.
+        // real path (Linux /proc/self/fd, macOS F_GETPATH) is *outside* the root,
+        // so under_any() rejects it — this is what closes the check→open swap race
+        // that O_NOFOLLOW (final component only) cannot. `recheck_fd_confined`
+        // wraps exactly this and must Err on the escaped fd while Ok'ing a
+        // genuinely-confined one.
         use std::os::fd::AsRawFd;
         let dir = std::env::temp_dir().join(format!("nkct-scp-fdrp-{:x}", std::process::id()));
         let root = dir.join("root");
@@ -1406,6 +1479,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&secret).unwrap();
         std::fs::write(secret.join("data"), b"x").unwrap();
+        std::fs::write(root.join("real"), b"y").unwrap();
         // An *intermediate* directory symlink inside the root pointing outside it.
         std::os::unix::fs::symlink(&secret, root.join("link")).unwrap();
         let roots = vec![std::fs::canonicalize(&root).unwrap()];
@@ -1418,6 +1492,20 @@ mod tests {
             .unwrap();
         let real = fd_real_path(f.as_raw_fd()).unwrap();
         assert!(!under_any(&real, &roots), "escaped path {real:?} must be rejected");
+        assert!(
+            recheck_fd_confined(f.as_raw_fd(), &roots).is_err(),
+            "recheck must reject the escaped fd",
+        );
+
+        // A genuinely-confined open re-checks Ok.
+        let g = std::fs::OpenOptions::new()
+            .read(true)
+            .open(root.join("real"))
+            .unwrap();
+        assert!(
+            recheck_fd_confined(g.as_raw_fd(), &roots).is_ok(),
+            "recheck must accept an in-root fd",
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
