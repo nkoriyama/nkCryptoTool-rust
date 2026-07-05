@@ -125,6 +125,11 @@ pub const MAX_PUBLISH_BATCH: u32 = 128;
 /// this trims the oldest, bounding storage abuse by a malicious recipient.
 pub const MAX_PREKEYS_STORED: u64 = 256;
 
+/// Per-recipient cap on stored inbox envelopes. DEPOSIT is unauthenticated
+/// ("anyone can deposit to anyone"), so this — together with the store's global
+/// byte budget — bounds a disk-exhaustion flood; the newest envelopes win.
+pub const MAX_ENVELOPES_PER_RECIPIENT: u64 = 256;
+
 /// FETCH token-bucket burst capacity, per connecting NodeId: a sender may
 /// fetch this many prekeys back-to-back (e.g. fanning out to several
 /// recipients) before the refill rate gates it.
@@ -613,7 +618,12 @@ mod server {
             let at_rest_paths = crate::group::AtRestPaths::beside_db(path.as_ref());
             let dek = crate::group::resolve_dek(&at_rest_paths, passphrase)
                 .map_err(|e| InboxError::AtRest(e.to_string()))?;
-            let store = RedbInboxStore::open(path.as_ref(), &dek, MAX_PREKEYS_STORED as usize)?;
+            let store = RedbInboxStore::open(
+                path.as_ref(),
+                &dek,
+                MAX_PREKEYS_STORED as usize,
+                MAX_ENVELOPES_PER_RECIPIENT as usize,
+            )?;
             Ok(Self {
                 store,
                 fetch_rl: StdMutex::new(HashMap::new()),
