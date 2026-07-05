@@ -437,7 +437,7 @@ impl NetworkProcessor {
                 let sig = CommonProcessor::read_vec(&mut reader).await?;
 
                 // Verify the client signature over the partial transcript (#1–#6).
-                if !backend::pqc_verify(&config.pqc_dsa_algo, &client_dsa_pub, tb.snapshot(), &sig)? {
+                if !backend::pqc_verify(&config.pqc_dsa_algo, &client_dsa_pub, tb.snapshot(), &sig, &[])? {
                     return Err(CryptoError::SignatureVerification);
                 }
 
@@ -532,7 +532,7 @@ impl NetworkProcessor {
                 tb.append_lp(&server_kem_pub); // #11
 
                 // Sign the full transcript (#1–#11) — the same builder.
-                server_sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv_dsa, tb.snapshot(), None)?;
+                server_sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv_dsa, tb.snapshot(), &[])?;
             }
 
             // Salt = SHA3-256(full transcript) via the SAME builder — no separate
@@ -844,7 +844,7 @@ impl NetworkProcessor {
                         tb.append_lp(&client_dsa_pub); // #6
 
                         // Sign the partial transcript (#1–#6).
-                        let sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, tb.snapshot(), None)?;
+                        let sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, tb.snapshot(), &[])?;
                         CommonProcessor::write_vec(&mut writer, &sig).await?;
                     }
 
@@ -892,7 +892,7 @@ impl NetworkProcessor {
                         }
 
                         // Verify the server signature over the full transcript (#1–#11).
-                        if !backend::pqc_verify(&config.pqc_dsa_algo, &server_dsa_pub, tb.snapshot(), &sig)? {
+                        if !backend::pqc_verify(&config.pqc_dsa_algo, &server_dsa_pub, tb.snapshot(), &sig, &[])? {
                             return Err(CryptoError::SignatureVerification);
                         }
                         eprintln!("Server authenticated successfully (auth: {}).", config.pqc_dsa_algo);

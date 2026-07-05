@@ -94,7 +94,7 @@ pub fn create_binding<P: CipherSuiteProvider>(
     let mls_sig = suite
         .sign(mls_sk, &msg)
         .map_err(|e| BindingError::MlsSign(format!("{e:?}")))?;
-    let transport_sig = crate::backend::pqc_sign(transport_algo, transport_dsa_priv, &msg, None)
+    let transport_sig = crate::backend::pqc_sign(transport_algo, transport_dsa_priv, &msg, &[])
         .map_err(|e| BindingError::TransportSign(e.to_string()))?;
     Ok(MemberBinding {
         mls_sig,
@@ -116,7 +116,7 @@ pub fn verify_binding<P: CipherSuiteProvider>(
     let msg = binding_message(epoch, mls_pub.as_bytes(), transport_dsa_pub, peer_id);
     let mls_ok = suite.verify(mls_pub, &binding.mls_sig, &msg).is_ok();
     let transport_ok = matches!(
-        crate::backend::pqc_verify(transport_algo, transport_dsa_pub, &msg, &binding.transport_sig),
+        crate::backend::pqc_verify(transport_algo, transport_dsa_pub, &msg, &binding.transport_sig, &[]),
         Ok(true)
     );
     mls_ok && transport_ok
@@ -205,7 +205,7 @@ mod tests {
         let msg = binding_message(1, mpk.as_bytes(), &victim_tpk, &pid);
         let mls_sig = s.sign(&msk, &msg).unwrap();
         let transport_sig =
-            crate::backend::pqc_sign(TRANSPORT_DSA_ALGO, &attacker_tsk, &msg, None).unwrap();
+            crate::backend::pqc_sign(TRANSPORT_DSA_ALGO, &attacker_tsk, &msg, &[]).unwrap();
         let forged = MemberBinding { mls_sig, transport_sig };
         assert!(
             !verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &victim_tpk, 1, &pid, &forged),

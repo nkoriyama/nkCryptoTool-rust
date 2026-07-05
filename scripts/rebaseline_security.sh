@@ -14,11 +14,19 @@ set -euo pipefail
 # Security-critical files. Keep this list in sync with the codebase layout.
 # (iroh transport moved src/network/iroh.rs -> src/p2p/backend/iroh.rs during
 #  the p2p abstraction refactor.)
+#
+# INVARIANT: this list MUST include the handshake body (src/p2p/processor.rs and
+# src/network/tcp.rs) — the mutual-auth transcript signing lives there. This list
+# and the entries in .security-baseline.sha256 must be identical sets; a mismatch
+# means a security-critical file silently drops out of coverage on the next
+# rebaseline. (src/p2p/processor.rs was present in the baseline but missing from
+# this list — restored here to close that drift.)
 FILES=(
     src/backend/mod.rs
     src/backend/openssl_impl.rs
     src/backend/rustcrypto_impl.rs
     src/p2p/backend/iroh.rs
+    src/p2p/processor.rs
     src/network/mod.rs
     src/network/tcp.rs
     src/processor.rs
