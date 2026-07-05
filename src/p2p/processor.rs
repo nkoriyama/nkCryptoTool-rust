@@ -903,8 +903,17 @@ impl NetworkProcessor {
                                 return Err(CryptoError::Parameter("Server not in allowlist".to_string()));
                             }
                         }
-                    } else if config.signing_pubkey.is_some() || !config.allow_unauth {
-                        return Err(CryptoError::Parameter("Handshake failed: Server authentication required".to_string()));
+                    } else if config.signing_pubkey.is_some()
+                        || config.target_sign_fp.is_some()
+                        || config.target_enc_fp.is_some()
+                        || !config.allow_unauth
+                    {
+                        // A pinned server key or ticket fingerprint (target_*_fp) is a
+                        // MITM defence and must not be silently skipped when the server
+                        // declines to authenticate — the fp checks above live inside the
+                        // `server_auth_flag == 1` arm, so without this a server returning
+                        // flag 0 would bypass the pin under `--allow-unauth`.
+                        return Err(CryptoError::Parameter("Handshake failed: Server authentication required (pinned key/fingerprint or auth policy)".to_string()));
                     }
 
                     let client_ecc_priv_clone = client_ecc_priv.clone();

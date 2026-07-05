@@ -133,6 +133,16 @@ impl AeadBackend for RustCryptoAead {
         {
             use rc_internal::*;
             let normalized = cipher_name.to_lowercase();
+            // Both supported AEADs (AES-256-GCM, ChaCha20-Poly1305) use a 96-bit
+            // nonce. Without this guard a wrong length panics in the
+            // `GenericArray::from_slice` / `copy_from_slice` calls below — reachable
+            // as a DoS from a crafted v2 header whose IV field is not 12 bytes.
+            if iv.len() != 12 {
+                return Err(CryptoError::Parameter(format!(
+                    "invalid AEAD nonce length {} (expected 12)",
+                    iv.len()
+                )));
+            }
             let mode = if normalized == "aes-256-gcm" {
                 let aes =
                     Aes256::new_from_slice(key).map_err(|e| CryptoError::OpenSSL(e.to_string()))?;
@@ -206,6 +216,13 @@ impl AeadBackend for RustCryptoAead {
                 old_mode.zeroize(); // #25 Fix: Explicitly zeroize old mode before drop
             }
             let cipher_name = self._cipher_name.clone();
+            // 96-bit nonce required (see new_encrypt); guard against a panic.
+            if iv.len() != 12 {
+                return Err(CryptoError::Parameter(format!(
+                    "invalid AEAD nonce length {} (expected 12)",
+                    iv.len()
+                )));
+            }
 
             let new_mode = if cipher_name == "aes-256-gcm" {
                 let aes =

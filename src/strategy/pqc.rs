@@ -624,6 +624,14 @@ impl CryptoStrategy for PqcStrategy {
         self.kem_ciphertext = Zeroizing::new(read_vec(&mut pos)?);
         self.salt = read_vec(&mut pos)?;
         self.iv = read_vec(&mut pos)?;
+        // AES-256-GCM / ChaCha20-Poly1305 use a 96-bit IV; reject a malformed
+        // header here with a clear error rather than panicking downstream.
+        if self.iv.len() != 12 {
+            return Err(CryptoError::FileRead(format!(
+                "invalid IV length {} in header (expected 12)",
+                self.iv.len()
+            )));
+        }
 
         if version >= 2 {
             self.aead_algo = read_string(&mut pos)?;
