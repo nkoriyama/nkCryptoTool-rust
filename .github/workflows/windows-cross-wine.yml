@@ -45,7 +45,7 @@ jobs:
           cargo install --locked cargo-xwin
 
       - name: Cache the xwin Windows SDK/CRT
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/cargo-xwin
           key: xwin-sdk-${{ runner.os }}
