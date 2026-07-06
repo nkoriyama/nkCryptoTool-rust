@@ -110,6 +110,18 @@ pub trait CryptoStrategy: Send + Sync {
     /// Sets the chunk size to use for v3 encrypt operations.
     fn set_chunk_size(&mut self, _size: u32) {}
 
+    /// Inject the recipient's raw ML-KEM encapsulation key, already
+    /// authenticated in memory from a verified NKKB KeyBundle. When set,
+    /// `prepare_encryption` uses these bytes directly and skips reading a
+    /// `recipient-*-pubkey` PEM file — no recipient pubkey touches disk.
+    /// Default no-op: strategies that do not perform ML-KEM ignore it.
+    fn set_recipient_enc_key(&mut self, _raw_mlkem_ek: Vec<u8>) {}
+
+    /// Inject the recipient's P-256 public key as SubjectPublicKeyInfo DER,
+    /// already authenticated in memory from a verified NKKB KeyBundle. Default
+    /// no-op: strategies that do not perform P-256 ECDH ignore it.
+    fn set_recipient_hybrid_key(&mut self, _p256_spki_der: Vec<u8>) {}
+
     /// Returns the SHA-256(header_bytes)[..16] file session ID. Available
     /// only after `prepare_encryption` or after `deserialize_header` has
     /// consumed a v3 header.

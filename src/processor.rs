@@ -313,14 +313,22 @@ impl CryptoProcessor {
             .ok_or(CryptoError::Parameter("No output file".to_string()))?;
 
         let mut key_paths = HashMap::new();
-        if let Some(ref p) = config.recipient_pubkey {
-            key_paths.insert("recipient-pubkey".to_string(), p.clone());
-        }
-        if let Some(ref p) = config.recipient_mlkem_pubkey {
-            key_paths.insert("recipient-mlkem-pubkey".to_string(), p.clone());
-        }
-        if let Some(ref p) = config.recipient_ecdh_pubkey {
-            key_paths.insert("recipient-ecdh-pubkey".to_string(), p.clone());
+        // When the recipient key(s) came from a verified NKKB KeyBundle they are
+        // injected into the strategy in memory (below), so the recipient pubkey
+        // *paths* are intentionally not populated — the strategy prefers the
+        // injected bytes and never reads a pubkey file.
+        let from_bundle = config.recipient_enc_key_bytes.is_some()
+            || config.recipient_hybrid_key_bytes.is_some();
+        if !from_bundle {
+            if let Some(ref p) = config.recipient_pubkey {
+                key_paths.insert("recipient-pubkey".to_string(), p.clone());
+            }
+            if let Some(ref p) = config.recipient_mlkem_pubkey {
+                key_paths.insert("recipient-mlkem-pubkey".to_string(), p.clone());
+            }
+            if let Some(ref p) = config.recipient_ecdh_pubkey {
+                key_paths.insert("recipient-ecdh-pubkey".to_string(), p.clone());
+            }
         }
         key_paths.insert("digest-algo".to_string(), config.digest_algo.clone());
         key_paths.insert("kem-algo".to_string(), config.pqc_kem_algo.clone());
@@ -329,6 +337,16 @@ impl CryptoProcessor {
         let mut strategy = self.strategy.take().ok_or(CryptoError::Parameter(
             "Strategy already in use".to_string(),
         ))?;
+
+        // Feed KeyBundle-verified recipient keys (authenticated in memory) to
+        // the strategy before it prepares encryption. Strategies that do not use
+        // a given key type ignore its setter (default no-op).
+        if let Some(ref ek) = config.recipient_enc_key_bytes {
+            strategy.set_recipient_enc_key(ek.clone());
+        }
+        if let Some(ref der) = config.recipient_hybrid_key_bytes {
+            strategy.set_recipient_hybrid_key(der.clone());
+        }
 
         // All encryptions use the v3 chunked-AEAD format.
         // NKCT_V3_CHUNK_SIZE lets tests pick a small chunk size so the

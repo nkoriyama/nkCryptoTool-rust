@@ -18,6 +18,32 @@ fn get_bin() -> String {
 
 const TEST_PASSPHRASE: &str = "test-passphrase-123";
 
+/// Generate an ML-DSA-65 identity and a signed NKKB KeyBundle binding the
+/// ecc encryption pubkey already in `key_dir`. Returns the owner fingerprint.
+/// Encryption is bundle-only now (raw recipient-pubkey flags are abolished).
+fn make_bundle(bin: &str, key_dir: &str, bundle_path: &str) -> String {
+    Command::new(bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["--mode", "pqc", "--gen-sign-key", "--key-dir", key_dir, "--force"])
+        .status()
+        .unwrap();
+    let out = Command::new(bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args([
+            "--mode", "ecc", "--gen-keybundle", "--key-dir", key_dir,
+            "--signing-privkey", &format!("{key_dir}/private_sign_pqc.key"),
+            "--keybundle-handle", "t37", "--keybundle-output", bundle_path,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "gen-keybundle failed: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .find(|w| w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("fingerprint in gen-keybundle output")
+        .to_string()
+}
+
 #[test]
 fn test_threat_37_1_tampered_ciphertext_leaves_no_temp_file() {
     let bin = get_bin();
@@ -41,10 +67,14 @@ fn test_threat_37_1_tampered_ciphertext_leaves_no_temp_file() {
     let content = "Sensitive data that should not leak to disk before verification";
     fs::write(input_file, content).unwrap();
 
+    let bundle = format!("{}/recipient.nkkb", key_dir);
+    let fp = make_bundle(&bin, key_dir, &bundle);
     Command::new(&bin)
         .args([
             "--mode", "ecc", "--encrypt",
-            "--recipient-pubkey", &format!("{}/public_enc_ecc.key", key_dir),
+            "--recipient-keybundle", &bundle,
+            "--recipient-fingerprint", &fp,
+            "--key-dir", key_dir,
             "--output-file", encrypted_file,
             input_file,
         ])
@@ -117,10 +147,14 @@ fn test_threat_37_1_normal_decryption_regression() {
     let content = "Regression test for two-pass decryption";
     fs::write(input_file, content).unwrap();
 
+    let bundle = format!("{}/recipient.nkkb", key_dir);
+    let fp = make_bundle(&bin, key_dir, &bundle);
     Command::new(&bin)
         .args([
             "--mode", "ecc", "--encrypt",
-            "--recipient-pubkey", &format!("{}/public_enc_ecc.key", key_dir),
+            "--recipient-keybundle", &bundle,
+            "--recipient-fingerprint", &fp,
+            "--key-dir", key_dir,
             "--output-file", encrypted_file,
             input_file,
         ])

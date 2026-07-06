@@ -70,17 +70,24 @@ NEW=~/.nkkeys/2026-09
 nk-crypto-tool --mode pqc --gen-enc-key --key-dir "$NEW"
 #   → $NEW/public_enc_pqc.key, $NEW/private_enc_pqc.key（0600）
 
-# 2. 新しい公開鍵を、あなた宛に封緘する送信者へ配布する
-#    （指紋を out-of-band で確認させる運用が望ましい）
+# 2. 新しい暗号化鍵を束ねた署名済み KeyBundle を発行し、印字される指紋を
+#    out-of-band で送信者に配布する（生公開鍵の直接配布は廃止）。
+#    KeyBundle の identity は常に ML-DSA-65（$NEW に pqc の署名鍵がある前提）。
+nk-crypto-tool --mode pqc --gen-keybundle --key-dir "$NEW" \
+    --signing-privkey "$NEW/private_sign_pqc.key" \
+    --keybundle-handle me --keybundle-output "$NEW/me.nkkb"
+#   → "…fingerprint: <64-hex>" を控えて送信者に共有する
+FP=<上で表示された 64-hex>
 
-# 3. 旧鍵で封緘済みのファイルを新鍵へ再封緘（decrypt → encrypt）
+# 3. 旧鍵で封緘済みのファイルを新 KeyBundle へ再封緘（decrypt → encrypt）
 #    一時平文はメモリ上ではなく必ずディスクに落ちる点に注意（§4 の破棄対象）。
 for ct in archive/*.bin; do
     tmp=$(mktemp)
     nk-crypto-tool --mode pqc --decrypt \
         --user-privkey "$OLD/private_enc_pqc.key" --output-file "$tmp" "$ct"
     nk-crypto-tool --mode pqc --encrypt \
-        --recipient-pubkey "$NEW/public_enc_pqc.key" --output-file "$ct.new" "$tmp"
+        --recipient-keybundle "$NEW/me.nkkb" --recipient-fingerprint "$FP" \
+        --output-file "$ct.new" "$tmp"
     shred -u "$tmp"            # 一時平文を確実に破棄（§4 の caveat 参照）
     mv "$ct.new" "$ct"
 done
@@ -119,11 +126,15 @@ shred -u "$OLD/private_enc_pqc.key"     # ハイブリッドは mlkem/ecdh 両�
 ## 5. Hybrid モードの差分
 
 `--mode hybrid` では暗号化鍵が ML-KEM と ECDH の **2 対** に分かれる
-（`public_enc_hybrid_mlkem.key` / `public_enc_hybrid_ecdh.key` と各 private）。
+（`public_enc_hybrid_mlkem.key` / `public_enc_hybrid_ecdh.key` と各 private）。KeyBundle は
+両方を 1 つの署名済み束に収める（送信側は `--recipient-keybundle` 1 本で足りる）。
 
 ```bash
-# 生成
+# 生成 + KeyBundle 発行（両鍵を束ねる。identity は ML-DSA-65）
 nk-crypto-tool --mode hybrid --gen-enc-key --key-dir "$NEW"
+nk-crypto-tool --mode hybrid --gen-keybundle --key-dir "$NEW" \
+    --signing-privkey "$NEW/private_sign_hybrid.key" \
+    --keybundle-handle me --keybundle-output "$NEW/me.nkkb"    # → 指紋 $FP を控える
 
 # 再封緘（decrypt → encrypt）
 nk-crypto-tool --mode hybrid --decrypt \
@@ -131,8 +142,7 @@ nk-crypto-tool --mode hybrid --decrypt \
     --user-ecdh-privkey  "$OLD/private_enc_hybrid_ecdh.key" \
     --output-file "$tmp" "$ct"
 nk-crypto-tool --mode hybrid --encrypt \
-    --recipient-mlkem-pubkey "$NEW/public_enc_hybrid_mlkem.key" \
-    --recipient-ecdh-pubkey  "$NEW/public_enc_hybrid_ecdh.key" \
+    --recipient-keybundle "$NEW/me.nkkb" --recipient-fingerprint "$FP" \
     --output-file "$ct.new" "$tmp"
 ```
 

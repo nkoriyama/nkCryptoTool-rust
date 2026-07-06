@@ -342,23 +342,37 @@ Linux 環境では、TPM デバイス (`/dev/tpmrm0` 等) へのアクセス権�
 
 **Note**: パスフレーズはデフォルトで対話入力されます。CI 等の自動化用途では `NK_PASSPHRASE` 環境変数で指定可能 (セキュリティ警告が表示されます)。
 
-### **暗号化**
+### **暗号化 — 署名付き KeyBundle 経由**
 
-* **ECC モード**:
+生の受信者公開鍵の直接指定 (`--recipient-pubkey` 等) は **廃止** されました。生鍵は
+identity 束縛も真正性も持たず MITM が鍵をすり替えられるため、送信側は受信者の **署名済み
+NKKB KeyBundle** に暗号化します。KeyBundle は受信者の ML-DSA-65 identity (単一アンカー) が
+暗号化公開鍵を署名した自己完結ユニットで、送信側は out-of-band で受け取った指紋で pin
+すれば束縛された全鍵を transitive に信頼できます。
+
+1. **受信者**: 一度だけ、自分の暗号化公開鍵を束ねた署名済み KeyBundle を作り、印字される
+   指紋を out-of-band で送信側に渡す。KeyBundle の identity は暗号化 `--mode` に依らず常に
+   ML-DSA-65 (pqc/hybrid モードの `--gen-sign-key` で生成) を使う。
     ```bash
-    nk-crypto-tool --mode ecc --encrypt --recipient-pubkey <pub.key> --output-file <encrypted.bin> <input.txt>
+    # 暗号化鍵 (例: pqc) と ML-DSA-65 identity を用意済みとして
+    nk-crypto-tool --mode pqc --gen-keybundle --key-dir <dir> \
+        --signing-privkey <dir>/private_sign_pqc.key \
+        --keybundle-handle alice --keybundle-output alice.nkkb
+    # → "…fingerprint: <64-hex>" を表示。これを電話等で送信側に共有する
     ```
-* **PQC モード**:
+    `--keybundle-expiry-secs <N>` で有効期限 (現在から N 秒) を付与でき、期限切れは送信側の
+    `--encrypt` 入口で拒否される。
+
+2. **送信者**: pin した指紋で KeyBundle を検証し、束ねられた鍵で暗号化する。`--mode` が
+   束の usage を選ぶ (pqc→ML-KEM / ecc→P-256 / hybrid→両方)。
     ```bash
-    nk-crypto-tool --mode pqc --encrypt --recipient-pubkey <pub.key> --output-file <encrypted.bin> <input.txt>
-    ```
-* **Hybrid モード** (RFC 9180 的設計):
-    ```bash
-    nk-crypto-tool --mode hybrid --encrypt \
-        --recipient-mlkem-pubkey <mlkem_pub.key> \
-        --recipient-ecdh-pubkey <ecdh_pub.key> \
+    nk-crypto-tool --mode pqc --encrypt \
+        --recipient-keybundle alice.nkkb \
+        --recipient-fingerprint <64-hex> \
         --output-file <encrypted.bin> <input.txt>
     ```
+    `--mode ecc` / `--mode hybrid` も同じ形 (KeyBundle が対応 usage の鍵を持つ必要がある)。
+
 * **AEAD アルゴリズムの指定**: 全モードで `--aead-algo <ALGO>` (例: `AES-256-GCM` (default), `ChaCha20-Poly1305`)
 
 ### **復号**

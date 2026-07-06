@@ -67,6 +67,44 @@ fn cleanup(path: &str) {
 
 const TEST_PASSPHRASE: &str = "interop-test-pass";
 
+/// Generate an ML-DSA-65 identity (`sign_mode` = pqc) and a signed NKKB
+/// KeyBundle binding the `enc_mode` encryption public key(s) already in
+/// `key_dir`, using `bin`. Returns the owner fingerprint the sender pins.
+/// Encryption is bundle-only now (raw recipient-pubkey flags are abolished);
+/// keeping bundle-gen and encrypt on the same backend keeps this test about
+/// file-format interop, not KeyBundle cross-verification.
+fn gen_bundle(bin: &Path, key_dir: &str, enc_mode: &str, sign_mode: &str, bundle_path: &str) -> String {
+    assert!(Command::new(bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args(["--mode", sign_mode, "--gen-sign-key", "--key-dir", key_dir])
+        .status()
+        .unwrap()
+        .success());
+    let out = Command::new(bin)
+        .env("NK_PASSPHRASE", TEST_PASSPHRASE)
+        .args([
+            "--mode",
+            enc_mode,
+            "--gen-keybundle",
+            "--key-dir",
+            key_dir,
+            "--signing-privkey",
+            &format!("{key_dir}/private_sign_{sign_mode}.key"),
+            "--keybundle-handle",
+            "interop",
+            "--keybundle-output",
+            bundle_path,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "gen-keybundle failed: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .find(|w| w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("fingerprint in gen-keybundle output")
+        .to_string()
+}
+
 #[test]
 fn test_ecc_interop_encryption_bidirectional() {
     let openssl_bin = get_bin("openssl");
@@ -97,14 +135,18 @@ fn test_ecc_interop_encryption_bidirectional() {
         .status()
         .unwrap()
         .success());
-    // Encrypt with OpenSSL
+    // Encrypt with OpenSSL (to the recipient's signed KeyBundle)
+    let bundle_1 = key_dir_1.join("recipient.nkkb");
+    let fp_1 = gen_bundle(&openssl_bin, key_dir_1.to_str().unwrap(), "ecc", "pqc", bundle_1.to_str().unwrap());
     assert!(Command::new(&openssl_bin)
         .args([
             "--mode",
             "ecc",
             "--encrypt",
-            "--recipient-pubkey",
-            key_dir_1.join("public_enc_ecc.key").to_str().unwrap(),
+            "--recipient-keybundle",
+            bundle_1.to_str().unwrap(),
+            "--recipient-fingerprint",
+            &fp_1,
             "--output-file",
             enc_file_1.to_str().unwrap(),
             input_file.to_str().unwrap()
@@ -148,14 +190,18 @@ fn test_ecc_interop_encryption_bidirectional() {
         .status()
         .unwrap()
         .success());
-    // Encrypt with RustCrypto
+    // Encrypt with RustCrypto (to the recipient's signed KeyBundle)
+    let bundle_2 = key_dir_2.join("recipient.nkkb");
+    let fp_2 = gen_bundle(&rustcrypto_bin, key_dir_2.to_str().unwrap(), "ecc", "pqc", bundle_2.to_str().unwrap());
     assert!(Command::new(&rustcrypto_bin)
         .args([
             "--mode",
             "ecc",
             "--encrypt",
-            "--recipient-pubkey",
-            key_dir_2.join("public_enc_ecc.key").to_str().unwrap(),
+            "--recipient-keybundle",
+            bundle_2.to_str().unwrap(),
+            "--recipient-fingerprint",
+            &fp_2,
             "--output-file",
             enc_file_2.to_str().unwrap(),
             input_file.to_str().unwrap()
@@ -322,13 +368,17 @@ fn test_pqc_interop_encryption_bidirectional() {
     let enc_file = Path::new(data_dir).join("output.enc");
     let dec_file = Path::new(data_dir).join("output.dec");
 
+    let bundle = key_dir.join("recipient.nkkb");
+    let fp = gen_bundle(&rustcrypto_bin, key_dir.to_str().unwrap(), "pqc", "pqc", bundle.to_str().unwrap());
     assert!(Command::new(&rustcrypto_bin)
         .args([
             "--mode",
             "pqc",
             "--encrypt",
-            "--recipient-pubkey",
-            key_dir.join("public_enc_pqc.key").to_str().unwrap(),
+            "--recipient-keybundle",
+            bundle.to_str().unwrap(),
+            "--recipient-fingerprint",
+            &fp,
             "--output-file",
             enc_file.to_str().unwrap(),
             input_file.to_str().unwrap()

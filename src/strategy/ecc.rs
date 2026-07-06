@@ -37,6 +37,13 @@ pub struct EccStrategy {
     shared_secret: Zeroizing<Vec<u8>>,
     ephemeral_pubkey: Vec<u8>,
 
+    // Recipient P-256 public key as SubjectPublicKeyInfo DER, injected in memory
+    // from a verified NKKB KeyBundle. When `Some`, encryption uses it directly
+    // and skips reading a recipient pubkey file. A public key is not secret, so
+    // it is exempt from zeroization.
+    #[zeroize(skip)]
+    recipient_pub_der: Option<Vec<u8>>,
+
     // Signing keys (stored as DER to be backend-agnostic)
     sign_key_der: Option<Zeroizing<Vec<u8>>>,
     verify_key_der: Option<Zeroizing<Vec<u8>>>,
@@ -64,6 +71,7 @@ impl EccStrategy {
             salt: Vec::new(),
             shared_secret: Zeroizing::new(Vec::new()),
             ephemeral_pubkey: Vec::new(),
+            recipient_pub_der: None,
             sign_key_der: None,
             verify_key_der: None,
             chunk_size: V3_DEFAULT_CHUNK_SIZE,
@@ -88,15 +96,24 @@ impl EccStrategy {
             self.aead_algo = algo.clone();
         }
 
-        let pubkey_path = key_paths
-            .get("recipient-pubkey")
-            .or_else(|| key_paths.get("recipient-ecdh-pubkey"))
-            .ok_or(CryptoError::PublicKeyLoad(
-                "Missing recipient public key".to_string(),
-            ))?;
-
-        let pubkey_pem = fs::read_to_string(pubkey_path)?;
-        let recipient_pub_der = crate::utils::unwrap_from_pem(&pubkey_pem, "PUBLIC KEY")?;
+        // Prefer a KeyBundle-injected P-256 SPKI DER (already authenticated in
+        // memory): ECDH directly, no file read. Fall back to the recipient
+        // pubkey file only when no bundle key was injected.
+        // clone() (not take()): keep the injected key so the strategy stays
+        // reusable, matching the idempotent file-path branch.
+        let recipient_pub_der: Vec<u8> = match self.recipient_pub_der.clone() {
+            Some(der) => der,
+            None => {
+                let pubkey_path = key_paths
+                    .get("recipient-pubkey")
+                    .or_else(|| key_paths.get("recipient-ecdh-pubkey"))
+                    .ok_or(CryptoError::PublicKeyLoad(
+                        "Missing recipient public key".to_string(),
+                    ))?;
+                let pubkey_pem = fs::read_to_string(pubkey_path)?;
+                crate::utils::unwrap_from_pem(&pubkey_pem, "PUBLIC KEY")?.to_vec()
+            }
+        };
 
         let (ephem_priv, ephem_pub) = backend::generate_ecc_key_pair(&self.curve_name)?;
         self.shared_secret = backend::ecc_dh(&ephem_priv, &recipient_pub_der, None)?;
@@ -636,6 +653,10 @@ impl CryptoStrategy for EccStrategy {
 
     fn get_shared_secret(&self) -> Zeroizing<Vec<u8>> {
         self.shared_secret.clone()
+    }
+
+    fn set_recipient_hybrid_key(&mut self, p256_spki_der: Vec<u8>) {
+        self.recipient_pub_der = Some(p256_spki_der);
     }
 
     fn get_salt(&self) -> Vec<u8> {
