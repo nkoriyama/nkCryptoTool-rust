@@ -395,9 +395,14 @@ pub async fn replenish_to_target(
 
 const BUNDLE_MAGIC: &[u8; 4] = b"NKB1";
 const BUNDLE_VERSION: u8 = 1;
-/// Domain separator so a bundle self-signature can never be mistaken for a
-/// signature over a prekey, a handshake transcript, or a file header.
-const BUNDLE_SIG_CONTEXT: &[u8] = b"nkct-recipient-bundle-v1";
+/// FIPS 204 **native** signature context for the recipient-bundle self-signature
+/// (KEY_EXCHANGE_DESIGN.md §11). Migrated from a byte-prefix mixed into the
+/// message to a native ML-DSA ctx (same reason as prekey, §11.1): a byte-prefix
+/// under `ctx=""` does not separate this identity-key signature from the still-
+/// `ctx=""` file signature, so a file signature over crafted bytes could be
+/// replayed as a recipient bundle. A distinct native ctx closes that. Do NOT
+/// also prepend it to the message (that would re-mix the two mechanisms).
+const BUNDLE_CTX: &[u8] = b"nkct-recipient-bundle-v1";
 /// ML-DSA-65 public keys are 1952 B; the cap rejects a bogus length before
 /// any large copy.
 const MAX_DSA_PUB_LEN: usize = 4 * 1024;
@@ -466,10 +471,8 @@ impl RecipientBundle {
             )));
         }
         let payload = Self::payload_bytes(&dsa_pub, static_pk, &node_id, inbox_ticket);
-        let mut msg = Vec::with_capacity(BUNDLE_SIG_CONTEXT.len() + payload.len());
-        msg.extend_from_slice(BUNDLE_SIG_CONTEXT);
-        msg.extend_from_slice(&payload);
-        let sig = crate::backend::pqc_sign(prekey::PREKEY_SIGN_ALGO, dsa_priv, &msg, &[])
+        // Domain separation is the native BUNDLE_CTX; the payload is signed directly.
+        let sig = crate::backend::pqc_sign(prekey::PREKEY_SIGN_ALGO, dsa_priv, &payload, BUNDLE_CTX)
             .map_err(OneShotError::Crypto)?;
         let mut out = payload;
         out.extend_from_slice(&(sig.len() as u32).to_le_bytes());
@@ -533,10 +536,8 @@ impl RecipientBundle {
                 buf.len() - o
             )));
         }
-        let mut msg = Vec::with_capacity(BUNDLE_SIG_CONTEXT.len() + payload.len());
-        msg.extend_from_slice(BUNDLE_SIG_CONTEXT);
-        msg.extend_from_slice(payload);
-        let ok = crate::backend::pqc_verify(prekey::PREKEY_SIGN_ALGO, &dsa_pub, &msg, sig, &[])
+        // Domain separation is the native BUNDLE_CTX; the payload is verified directly.
+        let ok = crate::backend::pqc_verify(prekey::PREKEY_SIGN_ALGO, &dsa_pub, payload, sig, BUNDLE_CTX)
             .map_err(OneShotError::Crypto)?;
         if !ok {
             return Err(OneShotError::BundleUntrusted);
@@ -1000,6 +1001,32 @@ mod tests {
 
     fn inbox_ticket_for(peer: PeerId) -> String {
         crate::ticket::Ticket::new(PeerAddr::new(peer), None, None).to_string()
+    }
+
+    // §11 (increment 4): a ctx="" (file-style) signature over the exact recipient-
+    // bundle payload must NOT verify as a bundle. The native BUNDLE_CTX separates
+    // them, closing the file->recipient-bundle cross-replay — the signature the §11
+    // inventory originally missed. Message bytes are identical; only the ctx differs.
+    #[test]
+    fn file_ctx_signature_does_not_verify_as_recipient_bundle() {
+        let dir = tempdir().unwrap();
+        let r = make_recipient(dir.path());
+        let node_id = *r.peer_id.as_bytes();
+        let ticket = inbox_ticket_for(PeerId::new([99u8; 32]));
+        let payload = RecipientBundle::payload_bytes(&r.dsa_pub, r.static_pk.as_ref(), &node_id, &ticket);
+        // Forge a "file-style" ctx="" signature over the exact bundle payload.
+        let forged =
+            crate::backend::pqc_sign(prekey::PREKEY_SIGN_ALGO, &r.dsa_priv, &payload, &[]).unwrap();
+        let mut blob = payload.clone();
+        blob.extend_from_slice(&(forged.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&forged);
+        match RecipientBundle::parse_and_verify(&blob) {
+            Err(OneShotError::BundleUntrusted) => {}
+            other => panic!("a ctx=\"\" signature must not verify as a bundle, got {other:?}"),
+        }
+        // Sanity: the real build_signed (native BUNDLE_CTX) verifies.
+        let good = RecipientBundle::build_signed(&r.dsa_priv, &r.static_pk, node_id, &ticket).unwrap();
+        assert!(RecipientBundle::parse_and_verify(&good).is_ok());
     }
 
     /// A signed bundle round-trips, exposes the right fingerprint, and any

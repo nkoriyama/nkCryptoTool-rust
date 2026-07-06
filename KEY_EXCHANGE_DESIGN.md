@@ -288,16 +288,19 @@ dual-model レビューの重点 = A の両側 abort ／ B の fuzz ／ **cross-
 
 ## 11. 署名文脈のスコープとドメイン分離（全 identity-鍵文脈）
 
-同一 ML-DSA identity 鍵が署名する文脈は5つ（`pqc_sign` 全呼出し棚卸し）:
+同一 ML-DSA identity 鍵が署名する文脈（`pqc_sign` 全呼出し棚卸し）:
 
 | 文脈 | 鍵 | 本feature後の分離 |
 |---|---|---|
 | iroh handshake (`p2p/processor`) | identity | native ctx `nkct-handshake-iroh-v1` |
 | TCP handshake (`network/tcp`) | identity（同一 transcript） | native ctx `nkct-handshake-tcp-v1` |
-| prekey (`prekey.rs`, PQFS) | identity | **byte-prefix → native ctx `nkct-prekey-v1` に統一** |
+| prekey (`prekey.rs`, PQFS) | identity | **byte-prefix → native ctx `nkct-prekey-v1` に統一**（増分4） |
+| **recipient bundle (`one_shot.rs`)** | identity | **byte-prefix → native ctx `nkct-recipient-bundle-v1` に統一**（増分4） |
 | keybind / bundle（新規） | identity | native ctx `nkct-keybind-v1` / `nkct-bundle-v1` |
 | **file 署名 (`strategy/pqc`)** | identity | **ctx="" のまま据え置き（follow-up）** |
 | MLS transport binding (`group/binding`) | **別鍵**（standalone transport、identity と独立）＋既存 domain-sep | **対象外（別鍵ゆえ相互 replay 不能）** |
+
+> **【棚卸し訂正（増分4）】** 初版は「5つ」と数えていたが、`one_shot.rs` の **recipient bundle 署名（`nkct-recipient-bundle-v1`、identity 鍵で dsa_pub＋static_pk＋node_id＋inbox_ticket を署名、async/inbox 経路）を取りこぼしていた**。これも prekey と同型の byte-prefix＋ctx="" で、同じ file→X cross-replay を持つため、増分4 で prekey と同時に native ctx へ移行。§11.2 の「ctx="" に残るのは file 署名ただ1つ」の前提はこの追加で保たれる（recipient bundle が ctx="" のままだと孤立が崩れていた）。
 
 ### 11.1 prekey を native ctx に統一する理由と移行コスト
 - §2 の「ctx と byte-prefix を混在させない」不変条件と、prekey だけ byte-prefix という現状は**自己矛盾**。混在は「文脈ごとに実装がばらけ分離漏れ＝replay 経路」（論点4）そのもの。
