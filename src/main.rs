@@ -671,10 +671,12 @@ async fn main() -> anyhow::Result<()> {
     // stage the raw encryption key bytes for in-memory injection into the
     // strategy (config.recipient_*_key_bytes). Runs after mode/dsa are set.
     if operation == Operation::Encrypt {
-        if let Some(ref bundle_arg) = args.recipient_keybundle {
-            let bundle_path = resolve_key_path(&config.key_dir, Some(bundle_arg.clone()))
-                .unwrap_or_else(|| bundle_arg.clone());
-            let bytes = std::fs::read(&bundle_path)
+        if let Some(ref bundle_path) = args.recipient_keybundle {
+            // Use the path as given (not resolved under --key-dir): a recipient
+            // KeyBundle is a received/distributed artifact, not one of your own
+            // keys. This keeps it symmetric with `--keybundle-output` (also used
+            // as-is), so a bare `alice.nkkb` means the same file on both sides.
+            let bytes = std::fs::read(bundle_path)
                 .map_err(|e| anyhow::anyhow!("read recipient keybundle {bundle_path}: {e}"))?;
             // Pinning is mandatory: a bundle whose owner fingerprint is not pinned
             // out-of-band is unauthenticated key material (unlike seal's TOFU).
