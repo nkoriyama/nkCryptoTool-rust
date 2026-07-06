@@ -1683,4 +1683,38 @@ mod tests {
         let (_, p2) = backend::generate_ecc_key_pair("prime256v1").unwrap();
         assert_ne!(p1, p2, "ephemeral P-256 pubkeys must be fresh (no cache/persist)");
     }
+
+    // §7(A) flag-day, ctx side. The handshake signs/verifies under a NON-EMPTY
+    // native ctx (this value); the empty-ctx (`ctx=""`) handshake path of the
+    // pre-flag-day wire was removed in increment 3. This pins the ctx label —
+    // paired with the ALPN version guard in `network::mod` (both move together on
+    // any future handshake-wire change).
+    #[test]
+    fn handshake_ctx_is_the_flag_day_label() {
+        assert_eq!(HANDSHAKE_CTX_IROH, b"nkct-handshake-iroh-v1");
+        assert!(!HANDSHAKE_CTX_IROH.is_empty(), "handshake ctx must never be empty again");
+    }
+
+    // §7(A) flag-day, security essence: a signature an OLD (pre-flag-day) peer
+    // produced over the handshake transcript with `ctx=""` MUST NOT verify under
+    // the post-flag-day verifier (native ctx). This is what makes the ALPN bump a
+    // true cutover rather than cosmetic — even if an old signature reached a new
+    // verifier, the ctx domain separation rejects it. Faithful (real ML-DSA
+    // sign/verify), no ALPN-negotiation mock needed.
+    #[test]
+    fn pre_flag_day_empty_ctx_handshake_sig_is_rejected() {
+        let algo = "ML-DSA-65";
+        let (sk, pk, _) = backend::pqc_keygen_dsa(algo).unwrap();
+        let transcript = b"a canonical handshake transcript snapshot";
+        // Old peer: signs the transcript with the pre-flag-day empty ctx.
+        let old_sig = backend::pqc_sign(algo, &sk, transcript, b"").unwrap();
+        // New verifier: checks under the native handshake ctx → must reject.
+        assert!(
+            !backend::pqc_verify(algo, &pk, transcript, &old_sig, HANDSHAKE_CTX_IROH).unwrap(),
+            "a ctx=\"\" (old wire) handshake signature must not verify post-flag-day",
+        );
+        // Sanity: it does verify under the empty ctx it was made with (proving the
+        // rejection above is the ctx domain, not a broken signature).
+        assert!(backend::pqc_verify(algo, &pk, transcript, &old_sig, b"").unwrap());
+    }
 }
