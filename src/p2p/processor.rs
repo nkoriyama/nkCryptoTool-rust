@@ -30,11 +30,15 @@ mod hs_flags {
     /// `#5` bit0: the initiator authenticates itself (gates `#6` initiator
     /// ML-DSA pub + sig_I over the initiator transcript).
     pub const INITIATOR_SELF_AUTH: u8 = 0x01;
+    /// `#5` bit1: the initiator requires the responder to authenticate. Gates
+    /// `#7` (expected-responder-fingerprint pre-commit, raw32) and, on the
+    /// initiator, the both-sided pin verification of sig_R (A-init). Set iff the
+    /// initiator holds a responder pin it will verify against.
+    pub const EXPECTS_RESPONDER_AUTH: u8 = 0x02;
     /// `#10` bit0: the responder authenticates itself (gates `#11`/`#12` + sig_R).
     pub const RESPONDER_SELF_AUTH: u8 = 0x01;
     /// Initiator-flags bits currently honoured; others → reject as reserved.
-    /// (`#5` bit1 = expects_responder_auth is added with the `#7` pre-commit work.)
-    pub const INITIATOR_ALLOWED: u8 = INITIATOR_SELF_AUTH;
+    pub const INITIATOR_ALLOWED: u8 = INITIATOR_SELF_AUTH | EXPECTS_RESPONDER_AUTH;
     /// Responder-flags bits currently honoured; others → reject as reserved.
     pub const RESPONDER_ALLOWED: u8 = RESPONDER_SELF_AUTH;
 }
@@ -453,33 +457,52 @@ impl NetworkProcessor {
                 ));
             }
 
+            // #6 initiator ML-DSA pub (if self-auth) — read and append; defer sig_I
+            // verification until #7 is appended so it is checked over #1–#7.
+            let mut client_dsa_pub: Option<Vec<u8>> = None;
             if client_auth_flag[0] & hs_flags::INITIATOR_SELF_AUTH != 0 {
-                let client_dsa_pub = CommonProcessor::read_vec(&mut reader).await?;
-                tb.append_lp(&client_dsa_pub); // #6
+                let pk = CommonProcessor::read_vec(&mut reader).await?;
+                tb.append_lp(&pk); // #6
+                client_dsa_pub = Some(pk);
+            }
 
-                let sig = CommonProcessor::read_vec(&mut reader).await?;
+            // #7 expected-responder-fingerprint pre-commit (raw32, if bit1). Read and
+            // append so it is bound into sig_I (verified below) and later sig_R. The
+            // A-resp cross-check (#7 == fingerprint(own identity)) is applied once the
+            // responder's own pub is known, just before signing sig_R.
+            let expects_responder_auth = client_auth_flag[0] & hs_flags::EXPECTS_RESPONDER_AUTH != 0;
+            let mut expected_responder_fp = [0u8; 32];
+            if expects_responder_auth {
+                reader.read_exact(&mut expected_responder_fp).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                tb.append_raw(&expected_responder_fp); // #7 expected responder fingerprint
+            }
 
-                // Verify the client signature over the partial transcript (#1–#6).
-                if !backend::pqc_verify(&config.pqc_dsa_algo, &client_dsa_pub, tb.snapshot(), &sig, &[])? {
-                    return Err(CryptoError::SignatureVerification);
-                }
-
-                let hash: [u8; 32] = Sha3_256::digest(&client_dsa_pub).into();
-                peer_id_opt = Some(PeerId::Pubkey(hash));
-
+            // sig_I over the initiator transcript #1–#7 (if self-auth).
+            if let Some(ref pk) = client_dsa_pub {
+                // A-init (server side, §4.2 / §6.2): when a single client identity is
+                // pinned, bind the wire #6 to it BEFORE verifying sig_I, so the signature
+                // is checked against the pinned key — not a self-consistent wire key a
+                // MITM could substitute. Symmetric with the initiator's A-init: never
+                // trust the wire key. (The allowlist is a SET, so it stays an exact
+                // membership check applied after verify — there is no single key to bind.)
                 if let Some(ref pubkey_path) = config.signing_pubkey {
                     let pubkey_bytes = Zeroizing::new(std::fs::read(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
                     let pubkey_pem = std::str::from_utf8(&pubkey_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
                     let pubkey_der = crate::utils::unwrap_from_pem(pubkey_pem, "PUBLIC KEY")?;
                     let pinned_raw_pub = crate::utils::unwrap_pqc_pub_from_spki(&pubkey_der, &config.pqc_dsa_algo)?;
-                    
-                    if pinned_raw_pub != client_dsa_pub {
+                    if pinned_raw_pub != *pk {
                         return Err(CryptoError::Parameter("Client public key mismatch with pinned key".to_string()));
                     }
-                    eprintln!("Client authenticated successfully (pinned key).");
-                } else {
-                    eprintln!("Client authenticated successfully (allowlist-only mode).");
                 }
+
+                let sig = CommonProcessor::read_vec(&mut reader).await?;
+                if !backend::pqc_verify(&config.pqc_dsa_algo, pk, tb.snapshot(), &sig, &[])? {
+                    return Err(CryptoError::SignatureVerification);
+                }
+
+                let hash: [u8; 32] = Sha3_256::digest(pk).into();
+                peer_id_opt = Some(PeerId::Pubkey(hash));
+                eprintln!("Client authenticated successfully (auth: {}).", config.pqc_dsa_algo);
             } else if !config.allow_unauth || config.signing_pubkey.is_some() {
                 return Err(CryptoError::Parameter("Handshake failed: Client authentication required".to_string()));
             }
@@ -518,11 +541,11 @@ impl NetworkProcessor {
             combined_ss[..ss_ecc.len()].copy_from_slice(&ss_ecc);
             combined_ss[ss_ecc.len()..].copy_from_slice(&kem_ss);
 
-            tb.append_lp(&server_ecc_pub); // #7
-            tb.append_lp(&kem_ct); // #8
+            tb.append_lp(&server_ecc_pub); // #8
+            tb.append_lp(&kem_ct); // #9
 
             let server_auth_flag = if config.signing_privkey.is_some() { [hs_flags::RESPONDER_SELF_AUTH] } else { [0u8] };
-            tb.append_raw(&server_auth_flag); // #9 responder flags
+            tb.append_raw(&server_auth_flag); // #10 responder flags
 
             let mut server_sig = Vec::new();
             let mut server_dsa_pub = Vec::new();
@@ -549,12 +572,12 @@ impl NetworkProcessor {
                 };
                 
                 server_dsa_pub = backend::pqc_pub_from_priv_dsa(&config.pqc_dsa_algo, &raw_priv_dsa)?;
-                tb.append_lp(&server_dsa_pub); // #10
+                tb.append_lp(&server_dsa_pub); // #11
 
                 server_kem_pub = raw_pub_kem;
-                tb.append_lp(&server_kem_pub); // #11
+                tb.append_lp(&server_kem_pub); // #12
 
-                // Sign the full transcript (#1–#11) — the same builder.
+                // Sign the full transcript (#1–#12) — the same builder.
                 server_sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv_dsa, tb.snapshot(), &[])?;
             }
 
@@ -849,10 +872,56 @@ impl NetworkProcessor {
                     tb.append_lp(&client_ecc_pub); // #3
                     tb.append_lp(&client_kem_pub); // #4
 
-                    let client_auth_flag = if config.signing_privkey.is_some() { [hs_flags::INITIATOR_SELF_AUTH] } else { [0u8] };
+                    // #5 initiator flags: bit0 = self-auth (we hold a signing key);
+                    // bit1 = expects_responder_auth (we hold a responder pin and WILL
+                    // verify sig_R against it — A-init). §4.4: requiring responder auth
+                    // without a pin cannot be satisfied, so refuse rather than trust any
+                    // signer — this closes the `--allow-unauth` + no-pin node_id-only path
+                    // (the one behaviour change vs the pre-#7 handshake; everything else is
+                    // preserved).
+                    let has_responder_pin =
+                        config.signing_pubkey.is_some() || config.target_sign_fp.is_some();
+                    if !config.allow_unauth && !has_responder_pin {
+                        return Err(CryptoError::Parameter(
+                            "Handshake failed: responder authentication required but no pinned \
+                             identity to verify against (provide --signing-pubkey or a ticket \
+                             fingerprint, or set --allow-unauth for an anonymous connection)"
+                                .to_string(),
+                        ));
+                    }
+                    let expects_responder_auth = has_responder_pin;
+
+                    // #7 pre-commit = the pinned responder fingerprint (raw32 =
+                    // SHA3-256(dsa_pub_raw), no prefix — §3). Prefer the ticket fingerprint;
+                    // else derive it from the pinned pubkey file. Committing to it inside
+                    // sig_I lets the responder cross-check it is the intended peer (A-resp);
+                    // it is the same value A-init checks #11 against.
+                    let expected_responder_fp: Option<[u8; 32]> = if expects_responder_auth {
+                        if let Some(fp) = config.target_sign_fp {
+                            Some(fp)
+                        } else if let Some(ref pubkey_path) = config.signing_pubkey {
+                            let pubkey_bytes = Zeroizing::new(std::fs::read(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
+                            let pubkey_pem = std::str::from_utf8(&pubkey_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
+                            let pubkey_der = crate::utils::unwrap_from_pem(pubkey_pem, "PUBLIC KEY")?;
+                            let pinned_raw_pub = crate::utils::unwrap_pqc_pub_from_spki(&pubkey_der, &config.pqc_dsa_algo)?;
+                            Some(Sha3_256::digest(&pinned_raw_pub).into())
+                        } else {
+                            None // unreachable: expects_responder_auth ⇒ has_responder_pin
+                        }
+                    } else {
+                        None
+                    };
+
+                    let mut client_flags = 0u8;
+                    if config.signing_privkey.is_some() { client_flags |= hs_flags::INITIATOR_SELF_AUTH; }
+                    if expects_responder_auth { client_flags |= hs_flags::EXPECTS_RESPONDER_AUTH; }
+                    let client_auth_flag = [client_flags];
                     writer.write_all(&client_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
                     tb.append_raw(&client_auth_flag); // #5 initiator flags
 
+                    // #6 initiator ML-DSA pub (if self-auth). Load the signing key but
+                    // defer signing until after #7 is appended so sig_I covers #1–#7.
+                    let mut sign_priv: Option<Zeroizing<Vec<u8>>> = None;
                     if client_auth_flag[0] & hs_flags::INITIATOR_SELF_AUTH != 0 {
                         let raw_priv = {
                             let privkey_path = config.signing_privkey.as_ref().unwrap();
@@ -865,8 +934,18 @@ impl NetworkProcessor {
                         let client_dsa_pub = backend::pqc_pub_from_priv_dsa(&config.pqc_dsa_algo, &raw_priv)?;
                         CommonProcessor::write_vec(&mut writer, &client_dsa_pub).await?;
                         tb.append_lp(&client_dsa_pub); // #6
+                        sign_priv = Some(raw_priv);
+                    }
 
-                        // Sign the partial transcript (#1–#6).
+                    // #7 expected-responder-fingerprint pre-commit (raw32), if bit1.
+                    if client_auth_flag[0] & hs_flags::EXPECTS_RESPONDER_AUTH != 0 {
+                        let fp = expected_responder_fp.expect("bit1 set ⇒ responder fingerprint present");
+                        writer.write_all(&fp).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                        tb.append_raw(&fp); // #7 expected responder fingerprint
+                    }
+
+                    // sig_I over the initiator transcript #1–#7 (if self-auth).
+                    if let Some(raw_priv) = sign_priv {
                         let sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, tb.snapshot(), &[])?;
                         CommonProcessor::write_vec(&mut writer, &sig).await?;
                     }
@@ -876,24 +955,29 @@ impl NetworkProcessor {
                     let mut server_auth_flag = [0u8; 1];
                     reader.read_exact(&mut server_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
-                    tb.append_lp(&server_ecc_pub); // #7
-                    tb.append_lp(&kem_ct); // #8
-                    tb.append_raw(&server_auth_flag); // #9 responder flags
+                    tb.append_lp(&server_ecc_pub); // #8
+                    tb.append_lp(&kem_ct); // #9
+                    tb.append_raw(&server_auth_flag); // #10 responder flags
                     if server_auth_flag[0] & !hs_flags::RESPONDER_ALLOWED != 0 {
                         return Err(CryptoError::Parameter(
-                            "Handshake failed: reserved bit set in responder flags (#9)".to_string(),
+                            "Handshake failed: reserved bit set in responder flags (#10)".to_string(),
                         ));
                     }
 
                     if server_auth_flag[0] & hs_flags::RESPONDER_SELF_AUTH != 0 {
                         let server_dsa_pub = CommonProcessor::read_vec(&mut reader).await?;
-                        tb.append_lp(&server_dsa_pub); // #10
+                        tb.append_lp(&server_dsa_pub); // #11
 
                         let sig = CommonProcessor::read_vec(&mut reader).await?;
 
                         let server_kem_pub = CommonProcessor::read_vec(&mut reader).await?;
-                        tb.append_lp(&server_kem_pub); // #11
+                        tb.append_lp(&server_kem_pub); // #12
 
+                        // A-init (§4.2): chain sig_R to the PINNED identity. Every pin
+                        // input path is checked against the wire responder pub (#11)
+                        // BEFORE verifying sig_R, so a MITM presenting its own #11 cannot
+                        // pass by having its own key verify its own signature. bit1 ⇒
+                        // has_responder_pin, so at least one of these branches runs.
                         if let Some(ref pubkey_path) = config.signing_pubkey {
                             let pubkey_bytes = Zeroizing::new(std::fs::read(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
                             let pubkey_pem = std::str::from_utf8(&pubkey_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
@@ -919,7 +1003,8 @@ impl NetworkProcessor {
                             }
                         }
 
-                        // Verify the server signature over the full transcript (#1–#11).
+                        // Verify sig_R over the full transcript (#1–#12) with the
+                        // pin-checked #11 (server_dsa_pub).
                         if !backend::pqc_verify(&config.pqc_dsa_algo, &server_dsa_pub, tb.snapshot(), &sig, &[])? {
                             return Err(CryptoError::SignatureVerification);
                         }
@@ -931,16 +1016,13 @@ impl NetworkProcessor {
                                 return Err(CryptoError::Parameter("Server not in allowlist".to_string()));
                             }
                         }
-                    } else if config.signing_pubkey.is_some()
-                        || config.target_sign_fp.is_some()
-                        || config.target_enc_fp.is_some()
-                        || !config.allow_unauth
-                    {
-                        // A pinned server key or ticket fingerprint (target_*_fp) is a
-                        // MITM defence and must not be silently skipped when the server
-                        // declines to authenticate — the fp checks above live inside the
-                        // `server_auth_flag == 1` arm, so without this a server returning
-                        // flag 0 would bypass the pin under `--allow-unauth`.
+                    } else if expects_responder_auth || config.target_enc_fp.is_some() {
+                        // Downgrade detection (§4.2/§4.3): we required responder auth
+                        // (#5.bit1, or an enc-key pin) but the responder returned
+                        // #10.bit0 = 0 (declined to self-auth). The pin checks live in the
+                        // self-auth arm above, so a responder returning flag 0 must not be
+                        // able to bypass the pin — abort on the ABSENCE of the demanded
+                        // signature.
                         return Err(CryptoError::Parameter("Handshake failed: Server authentication required (pinned key/fingerprint or auth policy)".to_string()));
                     }
 
