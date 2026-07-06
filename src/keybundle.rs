@@ -558,4 +558,100 @@ mod tests {
         assert!(parse_and_verify(&bytes[..bytes.len() / 2], DSA, &fp).is_err(), "truncated");
         assert!(parse_and_verify(&[], DSA, &fp).is_err(), "empty");
     }
+
+    // ---- §8 deterministic byte-golden KATs (pre-signature layouts) ----
+    // ML-DSA signatures are randomized (hedged), so a signature-byte KAT would be
+    // flaky; verification covers them. Here we pin only the DETERMINISTIC parts:
+    // the fingerprint hash, the keybind_blob, and the KeyBundle body framing.
+
+    fn kat_hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    #[test]
+    fn fingerprint_kat_is_sha3_256_of_raw_without_prefix() {
+        use sha3::{Digest, Sha3_256};
+        // Fixed "raw pubkey" bytes — a value KAT for the fingerprint definition,
+        // not a real ML-DSA key. Pins fingerprint = SHA3-256(raw), which is what
+        // keeps allowlist / ticket / peer_id values stable (§8 line 238).
+        let raw: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+        let fp = kat_hex(&Sha3_256::digest(raw));
+        assert_eq!(
+            fp,
+            "c9ffb8f9d7ebc1adbcbc316cfee034cba158b7c6c93c34642a0b8429666a3d10"
+        );
+        // The retracted `nkct-id-v1` domain prefix (§3.1) must NOT be applied:
+        // fingerprint(raw) differs from SHA3-256("nkct-id-v1" ‖ raw). This pins the
+        // absence of the prefix that would have broken existing-identifier compat.
+        let mut prefixed = b"nkct-id-v1".to_vec();
+        prefixed.extend_from_slice(&raw);
+        assert_ne!(fp, kat_hex(&Sha3_256::digest(&prefixed)));
+    }
+
+    #[test]
+    fn keybind_blob_byte_kat() {
+        // Fixed inputs → the exact keybind_blob layout (§5): LP(owner) ‖ usage ‖
+        // LP(target) ‖ LP(handle) ‖ u64_be(created) ‖ has_exp ‖ [u64_be(exp)].
+        let owner_pk = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        let target_pk = [0x11u8, 0x22, 0x33];
+        let blob = keybind_blob(
+            &owner_pk,
+            KEY_USAGE_ENC,
+            &target_pk,
+            "svc",
+            0x0102_0304_0506_0708,
+            Some(0x1122_3344_5566_7788),
+        );
+        assert_eq!(kat_hex(&blob), "04000000aabbccdd0103000000112233030000007376630102030405060708011122334455667788");
+    }
+
+    #[test]
+    fn bundle_body_byte_kat() {
+        // Fixed inputs → the exact KeyBundle body layout (§6): NKKB ‖ ver ‖
+        // LP(owner) ‖ LP(handle) ‖ u64_be(created) ‖ u16_le(n) ‖ [entry]. The
+        // keybind_sig is a fixed dummy (real signatures are randomized).
+        let owner_pk = [0xAAu8, 0xBB, 0xCC, 0xDD];
+        let keys = vec![BoundKey {
+            key_usage: KEY_USAGE_ENC,
+            target_pk: vec![0x11, 0x22, 0x33],
+            created_at: 0x0102_0304_0506_0708,
+            expires_at: None,
+            keybind_sig: vec![0x99, 0x88],
+        }];
+        let body = bundle_body(&owner_pk, "svc", 0x0a0b_0c0d_0e0f_1011, &keys);
+        assert_eq!(kat_hex(&body), "4e4b4b420104000000aabbccdd030000007376630a0b0c0d0e0f101101000103000000112233010203040506070800020000009988");
+    }
+
+    // §10(B): fuzz the KeyBundle parser with deterministic (fixed-seed) malformed
+    // inputs — every one must be a clean Err (or, impossibly, a signature-failed
+    // Ok), never a panic / over-allocation on an attacker-controlled LP length.
+    #[test]
+    fn bundle_parser_fuzz_no_panic() {
+        let pin = [0u8; 32];
+        // SplitMix64, fixed seed → CI-reproducible.
+        let mut state: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for i in 0..2000u32 {
+            // Half the cases start from a valid NKKB magic+version so the fuzzer
+            // exercises the deeper LP/count parsing, not just the magic check.
+            let mut bytes = if i % 2 == 0 {
+                let mut v = BUNDLE_MAGIC.to_vec();
+                v.push(BUNDLE_VERSION);
+                v
+            } else {
+                Vec::new()
+            };
+            let n = (next() % 4096) as usize;
+            bytes.extend((0..n).map(|_| (next() >> 33) as u8));
+            // Must return without panicking. A forged bundle can never verify
+            // against a fixed pin, so the result is always Err in practice.
+            let _ = parse_and_verify(&bytes, DSA, &pin);
+        }
+    }
 }

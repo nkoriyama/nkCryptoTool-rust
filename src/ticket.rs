@@ -265,4 +265,27 @@ mod tests {
         body[33..35].copy_from_slice(&80u16.to_le_bytes());
         assert!(Ticket::from_str(&encode_ticket(&body)).is_err());
     }
+
+    // §10(B) fuzz: deterministic (fixed-seed) random strings — including
+    // `nkct1`-prefixed base32 garbage — must never panic the ticket parser.
+    #[test]
+    fn ticket_parser_fuzz_no_panic() {
+        const B32: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+        let mut state: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for i in 0..2000u32 {
+            let n = (next() % 128) as usize;
+            let mut s = if i % 2 == 0 { String::from("nkct1") } else { String::new() };
+            for _ in 0..n {
+                s.push(B32[(next() as usize) % B32.len()] as char);
+            }
+            let _ = Ticket::from_str(&s);
+        }
+    }
 }

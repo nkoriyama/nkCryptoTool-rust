@@ -1382,10 +1382,21 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
+    /// The fixed expected-responder-fingerprint used for the #7 pre-commit in the
+    /// KAT (raw32; a recognizable pattern distinct from CID/SID).
+    const KAT_EXP_FP: [u8; 32] = [0x33; 32];
+
     /// Build the canonical transcript for fixed inputs via `TranscriptBuilder`.
-    /// `full=false` stops after the client-auth block (#1–#6) — the slice the
-    /// client signs (returned as the builder's prefix snapshot).
-    fn kat_builder(client_auth: bool, server_auth: bool, full: bool) -> TranscriptBuilder {
+    /// `full=false` stops after the initiator-auth block (#1–#7) — the slice the
+    /// client signs (returned as the builder's prefix snapshot). `#5` is the
+    /// initiator flags byte: bit0 (`client_auth`) gates #6, bit1
+    /// (`expects_responder_auth`) gates the #7 expected-responder-fingerprint.
+    fn kat_builder(
+        client_auth: bool,
+        expects_responder_auth: bool,
+        server_auth: bool,
+        full: bool,
+    ) -> TranscriptBuilder {
         const CID: [u8; 32] = [0x11; 32];
         const SID: [u8; 32] = [0x22; 32];
         let mut tb = TranscriptBuilder::new();
@@ -1393,58 +1404,82 @@ mod tests {
         tb.append_raw(&SID); // #2 raw  server:370 / client:724
         tb.append_lp(b"CECC"); // #3 lp server:375/client:741
         tb.append_lp(b"CKEM"); // #4 lp server:376/client:742
-        tb.append_raw(&[client_auth as u8]); // #5 raw server:380 / client:746
+        // #5 initiator flags: bit0 = INITIATOR_SELF_AUTH (→#6), bit1 =
+        // EXPECTS_RESPONDER_AUTH (→#7). Mirrors hs_flags on server:380 / client:746.
+        let flags = (client_auth as u8) * hs_flags::INITIATOR_SELF_AUTH
+            + (expects_responder_auth as u8) * hs_flags::EXPECTS_RESPONDER_AUTH;
+        tb.append_raw(&[flags]);
         if client_auth {
             tb.append_lp(b"CDSA"); // #6 lp server:384/client:759
         }
-        if !full {
-            return tb; // client-signature view ends at #6
+        if expects_responder_auth {
+            tb.append_raw(&KAT_EXP_FP); // #7 raw32 server:507 / client:1009
         }
-        tb.append_lp(b"SECC"); // #7 lp server:448/client:771
-        tb.append_lp(b"KEMCT"); // #8 lp server:449/client:772
-        tb.append_raw(&[server_auth as u8]); // #9 raw server:452 / client:773
+        if !full {
+            return tb; // client-signature view ends at #7
+        }
+        tb.append_lp(b"SECC"); // #8 lp server / client
+        tb.append_lp(b"KEMCT"); // #9 lp server / client
+        tb.append_raw(&[server_auth as u8]); // #10 raw server / client
         if server_auth {
-            tb.append_lp(b"SDSA"); // #10 lp server:479/client:777
-            tb.append_lp(b"SKEM"); // #11 lp server:482/client:782
+            tb.append_lp(b"SDSA"); // #11 lp server / client
+            tb.append_lp(b"SKEM"); // #12 lp server / client
         }
         tb
     }
 
-    fn kat_transcript(client_auth: bool, server_auth: bool, full: bool) -> Vec<u8> {
-        kat_builder(client_auth, server_auth, full).snapshot().to_vec()
+    fn kat_transcript(
+        client_auth: bool,
+        expects_responder_auth: bool,
+        server_auth: bool,
+        full: bool,
+    ) -> Vec<u8> {
+        kat_builder(client_auth, expects_responder_auth, server_auth, full)
+            .snapshot()
+            .to_vec()
     }
 
     // Golden bytes of the canonical v3 transcript for the fixed KAT inputs above.
-    // Decoded layout (auth mode): client_id(32 raw) ‖ server_id(32 raw) ‖
-    // u32LE(4)"CECC" ‖ u32LE(4)"CKEM" ‖ 01 ‖ u32LE(4)"CDSA" ‖ u32LE(4)"SECC" ‖
-    // u32LE(5)"KEMCT" ‖ 01 ‖ u32LE(4)"SDSA" ‖ u32LE(4)"SKEM". The length prefix is
+    // Mutual-auth layout (client_auth + expects_responder_auth + server_auth):
+    // client_id(32 raw) ‖ server_id(32 raw) ‖ u32LE(4)"CECC" ‖ u32LE(4)"CKEM" ‖
+    // 03 (#5 flags: bit0|bit1) ‖ u32LE(4)"CDSA" (#6) ‖ 33*32 (#7 expected
+    // responder fingerprint, raw32) ‖ u32LE(4)"SECC" (#8) ‖ u32LE(5)"KEMCT" (#9) ‖
+    // 01 (#10) ‖ u32LE(4)"SDSA" (#11) ‖ u32LE(4)"SKEM" (#12). The length prefix is
     // u32 little-endian (the v3 wire format); changing it would break compat.
-    const KAT_FULL_AUTH: &str = "11111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222040000004345434304000000434b454d0104000000434453410400000053454343050000004b454d435401040000005344534104000000534b454d";
-    const KAT_PARTIAL_AUTH: &str = "11111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222040000004345434304000000434b454d010400000043445341";
+    const KAT_FULL_AUTH: &str = "11111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222040000004345434304000000434b454d03040000004344534133333333333333333333333333333333333333333333333333333333333333330400000053454343050000004b454d435401040000005344534104000000534b454d";
+    const KAT_PARTIAL_AUTH: &str = "11111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222040000004345434304000000434b454d0304000000434453413333333333333333333333333333333333333333333333333333333333333333";
     const KAT_FULL_NOAUTH: &str = "11111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222040000004345434304000000434b454d000400000053454343050000004b454d435400";
     const KAT_SALT_AUTH: &str =
-        "31a595b0ad7dbdb582a31d2d4d72e5f249e7be7e02523b46d61bd017318e479e";
+        "8d2e9988414f470b465700d3cb09ffa17ce571122dc482cb24071a11d17d9634";
 
     #[test]
     fn handshake_transcript_kat() {
-        use sha3::Digest as _;
-        // Full transcript bound into the salt (auth mode) — #1..#11.
-        assert_eq!(hex(&kat_transcript(true, true, true)), KAT_FULL_AUTH);
-        // Partial transcript the client signs — #1..#6.
-        assert_eq!(hex(&kat_transcript(true, true, false)), KAT_PARTIAL_AUTH);
-        // Unauthenticated mode still binds the KEM ciphertext (#8).
-        assert_eq!(hex(&kat_transcript(false, false, true)), KAT_FULL_NOAUTH);
+        // Mutual-auth full transcript bound into the salt — #1..#12 incl. the #7
+        // expected-responder-fingerprint pre-commit.
+        assert_eq!(hex(&kat_transcript(true, true, true, true)), KAT_FULL_AUTH);
+        // Partial transcript the initiator signs — #1..#7 (incl. #6 and #7).
+        assert_eq!(hex(&kat_transcript(true, true, true, false)), KAT_PARTIAL_AUTH);
+        // Unauthenticated mode: no #6, no #7; still binds the KEM ciphertext (#9).
+        assert_eq!(hex(&kat_transcript(false, false, false, true)), KAT_FULL_NOAUTH);
         // Salt = SHA3-256(full transcript), via the builder's finalize_salt().
-        assert_eq!(hex(&kat_builder(true, true, true).finalize_salt()), KAT_SALT_AUTH);
-        // The KEM ciphertext ("KEMCT") and both public keys MUST appear in the
-        // salt's preimage — the property the hybrid combiner relies on.
+        assert_eq!(
+            hex(&kat_builder(true, true, true, true).finalize_salt()),
+            KAT_SALT_AUTH
+        );
+        // The KEM ciphertext ("KEMCT") and both ephemeral pubkeys MUST appear in
+        // the salt's preimage — the property the hybrid combiner relies on.
         assert!(KAT_FULL_AUTH.contains(&hex(b"KEMCT")));
         assert!(KAT_FULL_AUTH.contains(&hex(b"CECC")) && KAT_FULL_AUTH.contains(&hex(b"SECC")));
-        // The client-signature view MUST be a strict prefix of the full transcript
-        // (it is the same buffer up to #6). This pins the invariant that a future
-        // `TranscriptBuilder::snapshot()` returns a genuine prefix of the buffer —
-        // not a separately built / trailing-padded value, which the three equality
-        // checks above would not catch on their own.
+        // The #7 expected-responder-fingerprint (raw32) MUST be bound into the
+        // signed transcript — this is the pre-commit that the responder cross-checks
+        // (A-resp) and that gets covered by sig_I. Its omission was the stale-KAT bug.
+        assert!(KAT_FULL_AUTH.contains(&hex(&KAT_EXP_FP)));
+        assert!(KAT_PARTIAL_AUTH.contains(&hex(&KAT_EXP_FP)));
+        // The unauth transcript must NOT carry a #7 (no pre-commit without bit1).
+        assert!(!KAT_FULL_NOAUTH.contains(&hex(&KAT_EXP_FP)));
+        // The initiator-signature view MUST be a strict prefix of the full
+        // transcript (same buffer up to #7). Pins that `snapshot()` returns a
+        // genuine prefix, not a separately built / trailing-padded value.
         assert!(
             KAT_FULL_AUTH.starts_with(KAT_PARTIAL_AUTH)
                 && KAT_PARTIAL_AUTH.len() < KAT_FULL_AUTH.len()
@@ -1487,5 +1522,165 @@ mod tests {
 
         assert!(client_res.is_ok(), "Client connection failed: {:?}", client_res.err());
         assert!(server_task.await.unwrap().is_ok(), "Server listening failed");
+    }
+
+    // ------------------------------------------------------------------
+    // §8 / §10(B): responder-side parser robustness (raw-byte injection).
+    //
+    // A pseudo-client writes attacker-controlled bytes straight to the server's
+    // handshake reader; the server MUST return a clean Err — never panic, hang,
+    // or over-allocate. One harness serves both the targeted malformed-frame
+    // negatives (reserved flag / missing pre-commit) and a deterministic fuzz
+    // sweep. Field-length gates (`ensure_field_len`) fire before any crypto, so a
+    // valid-length garbage prefix is enough to reach the flag/#7 logic.
+    // ------------------------------------------------------------------
+
+    /// LP-frame `b` (u32-LE length ‖ bytes) exactly as the wire encodes a field.
+    fn kx6_lp(b: &[u8]) -> Vec<u8> {
+        let mut v = (b.len() as u32).to_le_bytes().to_vec();
+        v.extend_from_slice(b);
+        v
+    }
+
+    /// #3 (P-256 SPKI, 91B) ‖ #4 (ML-KEM ek, 1184B) with garbage contents: the
+    /// exact lengths pass `ensure_field_len`, letting the parser reach the #5
+    /// flags byte (the flag checks fire before the garbage is used as a key).
+    fn kx6_valid_len_prefix() -> Vec<u8> {
+        let mut v = kx6_lp(&vec![0u8; backend::P256_SPKI_DER_LEN]);
+        v.extend_from_slice(&kx6_lp(&vec![
+            0u8;
+            backend::mlkem_ek_len("ML-KEM-768").unwrap()
+        ]));
+        v
+    }
+
+    /// Feed `client_bytes` verbatim to one server handshake and return the
+    /// server's result. The stream is shut down after the write so the server's
+    /// reads hit EOF (a clean Err) instead of blocking. A timeout turns any hang
+    /// into a test failure, and the join turns any panic into one.
+    async fn kx6_drive_raw_to_server(client_bytes: Vec<u8>) -> Result<()> {
+        // Unique peer ids per call: the server's auth-failure throttle is keyed by
+        // the remote NodeId and is a process-global — reusing one id across the
+        // fuzz sweep (or colliding with another test's ids) would throttle later
+        // handshakes and cause spurious failures. A per-call counter in a distinct
+        // high byte-range keeps every peer a first-time (un-throttled) failure and
+        // never collides with the fixed ids other tests use.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static KX6_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = KX6_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let mut sid = [0xE5u8; 32];
+        let mut cid = [0xC1u8; 32];
+        sid[24..32].copy_from_slice(&n.to_le_bytes());
+        cid[24..32].copy_from_slice(&n.to_le_bytes());
+        let net = crate::p2p::backend::mock::MockNetwork::new();
+        let server_id = P2pPeerId::new(sid);
+        let client_id = P2pPeerId::new(cid);
+        let proto = P2pProtocol(ALPN_CHAT);
+        let server_ep = Arc::new(net.register(server_id, vec![proto]));
+        let client_ep = Arc::new(net.register(client_id, vec![proto]));
+        let server_addr = server_ep.local_addr().await.unwrap();
+
+        let mut server_config = CryptoConfig::default();
+        server_config.chat_mode = false;
+        server_config.allow_unauth = true;
+        server_config.handshake_timeout = 3;
+
+        let server_proc =
+            NetworkProcessor::new(server_config, server_ep, Arc::new(TestIOProvider));
+        let server_task = tokio::spawn(async move {
+            server_proc
+                .run_listen_once_with_progress(|_| {}, || {}, None)
+                .await
+        });
+
+        let mut stream = client_ep.connect(&server_addr, proto).await.unwrap();
+        let _ = stream.write_all(&client_bytes).await;
+        let _ = stream.shutdown().await;
+
+        tokio::time::timeout(Duration::from_secs(8), server_task)
+            .await
+            .expect("server handshake hung on malformed input")
+            .expect("server handshake task panicked on malformed input")
+    }
+
+    // §8 item 10a: a reserved bit in the #5 initiator-flags byte → reject.
+    #[tokio::test]
+    async fn handshake_reserved_initiator_flag_bit_rejected() {
+        let mut msg = kx6_valid_len_prefix();
+        msg.push(0x04); // not in INITIATOR_ALLOWED (0x03) → reserved
+        assert!(
+            kx6_drive_raw_to_server(msg).await.is_err(),
+            "a reserved bit in #5 must be rejected"
+        );
+    }
+
+    // §8 item 10b: #5.bit1 (EXPECTS_RESPONDER_AUTH) set but the #7 pre-commit
+    // (raw32) missing (truncated) → reject, not panic.
+    #[tokio::test]
+    async fn handshake_expects_responder_but_precommit_missing_rejected() {
+        let mut msg = kx6_valid_len_prefix();
+        msg.push(hs_flags::EXPECTS_RESPONDER_AUTH); // 0x02: #7 now required
+        // ...and send no #7 at all (the stream ends here).
+        assert!(
+            kx6_drive_raw_to_server(msg).await.is_err(),
+            "#5.bit1 set with a missing #7 pre-commit must be rejected"
+        );
+    }
+
+    // §8 / §10(B): fuzz the responder handshake parser with deterministic
+    // (fixed-seed) malformed inputs — every one must be a clean Err, never a
+    // panic / hang / over-allocation. Catches remote-triggerable DoS in the LP /
+    // length parsing (this project has a peer-id-extraction panic in its history).
+    #[tokio::test]
+    async fn handshake_parser_fuzz_no_panic() {
+        // SplitMix64-style PRNG, fixed seed → CI-reproducible.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for i in 0..200u32 {
+            // Mix in some structurally-valid prefixes so the fuzzer reaches deeper
+            // parser states, not just the first length check.
+            let mut bytes = if i % 3 == 0 { kx6_valid_len_prefix() } else { Vec::new() };
+            let n = (next() % 2048) as usize;
+            bytes.extend((0..n).map(|_| (next() >> 33) as u8));
+            // The only assertion is implicit: kx6_drive_raw_to_server must return
+            // (Ok/Err) without panicking or hanging. A valid handshake is
+            // impossible from these bytes (no valid signatures), so it always Errs.
+            let _ = kx6_drive_raw_to_server(bytes).await;
+        }
+    }
+
+    // §8 item 11: the #12 responder static ML-KEM ek is OPTIONAL — the length
+    // check is three-way: empty → skipped (caller's `!is_empty()` guard),
+    // fixed-len → passes, intermediate (non-empty wrong) → Err. Pins the branch
+    // that keeps a stripped/short #12 from being length-confused.
+    #[test]
+    fn optional_static_kem_length_three_way() {
+        let ek = backend::mlkem_ek_len("ML-KEM-768");
+        // fixed length → Ok.
+        assert!(ensure_field_len("#12", ek.unwrap(), ek).is_ok());
+        // intermediate (non-empty, wrong length) → Err (never panic).
+        assert!(ensure_field_len("#12", ek.unwrap() - 1, ek).is_err());
+        assert!(ensure_field_len("#12", 1, ek).is_err());
+        // empty is handled by the caller's `!is_empty()` guard before this check
+        // runs — the length gate is only applied to a non-empty #12 (processor.rs
+        // ~1047). enc-pin closes the empty case separately (SHA3(empty) ≠ fp).
+    }
+
+    // §8 item 9 / §10(D): ephemeral freshness. The handshake generates a fresh
+    // P-256 (and ML-KEM) ephemeral each run — there is no cache/persist field —
+    // so two handshakes derive different transcripts and keys (replay/KCI
+    // resistance). Pin the underlying property: back-to-back ephemeral keygens
+    // never repeat.
+    #[test]
+    fn ephemeral_keys_are_fresh_each_time() {
+        let (_, p1) = backend::generate_ecc_key_pair("prime256v1").unwrap();
+        let (_, p2) = backend::generate_ecc_key_pair("prime256v1").unwrap();
+        assert_ne!(p1, p2, "ephemeral P-256 pubkeys must be fresh (no cache/persist)");
     }
 }
