@@ -108,7 +108,7 @@ bundle 署名は native ctx `nkct-recipient-bundle-v1` で file / prekey / hands
 
 ## **主な機能**
 
-* **データの暗号化・復号**: 秘密の情報を安全にやり取りできます。
+* **データの暗号化・復号（署名付き KeyBundle 経由）**: 受信者の暗号鍵を、その ML-DSA-65 identity が署名した **KeyBundle** として受け取り、out-of-band で確認した指紋に pin して検証してから暗号化します。生の公開鍵をそのまま信頼しないので、配送経路での鍵すり替え (MITM) を防ぎます。
 * **柔軟な認証付き暗号 (AEAD) の選択**:
     * **AES-256-GCM (デフォルト)**: ハードウェア加速 (AES-NI 等) が利用可能な環境で最高のパフォーマンスを発揮します。
     * **ChaCha20-Poly1305**: ハードウェア支援がない低電力デバイスや古い CPU 環境において、AES を上回る高速なソフトウェア処理が可能です。
@@ -336,6 +336,7 @@ Linux 環境では、TPM デバイス (`/dev/tpmrm0` 等) へのアクセス権�
 * **署名鍵ペア (PQC, ML-DSA)**: `nk-crypto-tool --mode pqc --gen-sign-key`
 * **暗号化鍵ペア (Hybrid)**: `nk-crypto-tool --mode hybrid --gen-enc-key`
     * これにより、ML-KEM と ECDH の鍵ペアがそれぞれ生成されます (例: `public_enc_hybrid_mlkem.key`, `private_enc_hybrid_mlkem.key`, `public_enc_hybrid_ecdh.key`, `private_enc_hybrid_ecdh.key`)
+* **受信者向け KeyBundle の発行 (`--gen-keybundle`)**: 生成済みの暗号化公開鍵を自分の ML-DSA-65 identity で署名して束ね、送信者に配布する署名付きユニット (`.nkkb`) を出力する。送信者はこれを暗号化に使う（下記「暗号化 — 署名付き KeyBundle 経由」参照）。鍵ペアではなく配布物なので、先に暗号化鍵ペアと署名鍵ペアの両方が必要。
 * **TPM 保護を有効化**: `--use-tpm` を追加
 * **アルゴリズム選択**: `--kem-algo ML-KEM-768` (デフォルト) / `--dsa-algo ML-DSA-65` (デフォルト)
 * **保存先指定**: `--key-dir <path>`
@@ -602,8 +603,12 @@ sequenceDiagram
     participant FS as File System
     participant Engine as Crypto Engine
 
+    Note over Sender, Recipient: 事前 (Recipient)
+    Recipient->>FS: --gen-keybundle で署名付き KeyBundle を発行し指紋を OOB 共有
+
     Note over Sender, Recipient: 暗号化 (Sender)
-    Sender->>FS: 受信者の公開鍵をロード
+    Sender->>FS: 受信者の署名付き KeyBundle をロード
+    Sender->>Engine: 指紋 pin で検証 (self_sig + keybind) し P-256 公開鍵を取り出す
     Sender->>Engine: エフェメラル鍵ペア生成 & ECDH 実行
     Engine-->>Sender: 共有秘密
     Sender->>Engine: HKDF-SHA3 で AES 鍵/IV を導出
@@ -625,8 +630,12 @@ sequenceDiagram
     participant FS as File System
     participant Engine as Crypto Engine
 
+    Note over Sender, Recipient: 事前 (Recipient)
+    Recipient->>FS: --gen-keybundle で署名付き KeyBundle を発行し指紋を OOB 共有
+
     Note over Sender, Recipient: 暗号化 (Sender)
-    Sender->>FS: 受信者の ML-KEM 公開鍵をロード
+    Sender->>FS: 受信者の署名付き KeyBundle をロード
+    Sender->>Engine: 指紋 pin で検証 (self_sig + keybind) し ML-KEM 公開鍵を取り出す
     Sender->>Engine: Encapsulate 実行
     Engine-->>Sender: 共有秘密 + KEM Ciphertext
     Sender->>Engine: HKDF-SHA3 で AES 鍵/IV を導出
@@ -650,7 +659,11 @@ sequenceDiagram
     actor Recipient
     participant Engine as Crypto Engine
 
+    Note over Sender, Recipient: 事前 (Recipient)
+    Recipient->>Sender: 署名付き KeyBundle を発行 (指紋を OOB 共有)
+
     Note over Sender, Recipient: 暗号化 (Sender)
+    Sender->>Engine: KeyBundle を指紋 pin で検証し ML-KEM + P-256 公開鍵を取り出す
     Sender->>Engine: ML-KEM Encapsulate ⇒ 共有秘密 A
     Sender->>Engine: ECDH 鍵共有 ⇒ 共有秘密 B
     Sender->>Engine: 共有秘密 A‖B を結合
