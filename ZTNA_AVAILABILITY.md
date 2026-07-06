@@ -59,7 +59,9 @@ nkpve（Proxmox）上に OpenZiti を構築（CT121=controller/router、CT122=en
 
 ## 4. 構成的可用性 — sanction すれば厳格 ZTNA 下でも通る
 
-厳格 ZTNA でも、nkct を**ブローカー許可サービスとして sanction すれば通る**。鍵は nkct の
+> **【履歴化 — TCP transport 削除済み】** 本章以降の `--transport tcp` を用いた実証は、**TCP transport が削除された**（deprecated かつ実運用で不使用、鍵交換の identity-misbinding が未修整だったため）時点で**再現不能**になりました。当時の検証記録として残します。**iroh は QUIC(UDP) ベースゆえ、ここで TCP が担っていた「単一 host:port として ZTNA の TCP fabric にトンネルする」用途は代替できません** ── QUIC を通さない TCP-only な ZTNA 経路で nkct を動かす需要が再び生じた場合は、TCP transport の再実装（または QUIC-over-TCP トンネル）が別途必要という制約が残ります。
+
+厳格 ZTNA でも、nkct を**ブローカー許可サービスとして sanction すれば通る**。鍵は（当時の）nkct の
 **TCP トランスポート**（`--transport tcp --listen/--connect host:port` = 素の TCP + PQC ハンドシェイク）。
 iroh の多宛先 UDP と違い、TCP なら単一 host:port として ZTNA サービスにトンネルできる。
 

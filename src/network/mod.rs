@@ -1,4 +1,3 @@
-pub mod tcp;
 #[cfg(feature = "mls")]
 pub mod inbox;
 
@@ -576,7 +575,6 @@ pub struct NetworkProcessor;
 impl NetworkProcessor {
     pub async fn listen(config: &CryptoConfig) -> Result<()> {
         match config.transport {
-            TransportKind::Tcp => tcp::NetworkProcessor::listen(config).await,
             TransportKind::Iroh => {
                 let endpoint = Arc::new(crate::p2p::backend::iroh::IrohEndpoint::new(config, false).await?);
                 let mut processor = crate::p2p::NetworkProcessor::new(config.clone(), endpoint, Arc::new(DefaultIOProvider));
@@ -588,7 +586,6 @@ impl NetworkProcessor {
 
     pub async fn connect(config: &CryptoConfig) -> Result<()> {
         match config.transport {
-            TransportKind::Tcp => tcp::NetworkProcessor::connect(config).await,
             TransportKind::Iroh => {
                 let endpoint = Arc::new(crate::p2p::backend::iroh::IrohEndpoint::new(config, false).await?);
                 let mut processor = crate::p2p::NetworkProcessor::new(config.clone(), endpoint, Arc::new(DefaultIOProvider));

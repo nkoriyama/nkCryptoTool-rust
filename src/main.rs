@@ -605,9 +605,6 @@ async fn main() -> anyhow::Result<()> {
     config.pqc_kem_algo = args.kem_algo;
     config.pqc_dsa_algo = args.dsa_algo;
     config.transport = args.transport;
-    if config.transport == nk_crypto_tool::config::TransportKind::Tcp {
-        eprintln!("[WARNING] TCP transport is deprecated and will be removed in a future version. Please use Iroh transport for better security and NAT traversal.");
-    }
     config.no_relay = args.no_relay;
     config.relay_url = args.relay_url;
     config.discovery = args.discovery;
@@ -1560,11 +1557,6 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
             nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&transport_config, false)
                 .await?,
         ),
-        nk_crypto_tool::config::TransportKind::Tcp => {
-            anyhow::bail!(
-                "MLS over TCP is not supported in this build; pass --transport iroh"
-            );
-        }
     };
 
     let key_dir = args.key_dir.clone().unwrap_or_else(|| "keys".to_string());
@@ -1703,9 +1695,6 @@ async fn run_inbox_server(args: Args) -> anyhow::Result<()> {
         nk_crypto_tool::config::TransportKind::Iroh => Arc::new(
             nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&transport_config, false).await?,
         ),
-        nk_crypto_tool::config::TransportKind::Tcp => {
-            anyhow::bail!("inbox server requires --transport iroh");
-        }
     };
 
     let local = endpoint
@@ -1760,11 +1749,6 @@ async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
             nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&transport_config, false)
                 .await?,
         ),
-        nk_crypto_tool::config::TransportKind::Tcp => {
-            anyhow::bail!(
-                "MLS over TCP is not supported in this build; pass --transport iroh"
-            );
-        }
     };
 
     let key_dir = args.key_dir.clone().unwrap_or_else(|| "keys".to_string());

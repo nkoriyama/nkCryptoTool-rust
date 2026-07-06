@@ -45,13 +45,13 @@ FIPS 204 は内部で `M' = 0x00 ‖ IntToBytes(|ctx|,1) ‖ ctx ‖ M` と符�
 | 文脈 | ラベル | 機構 |
 |---|---|---|
 | **iroh** handshake 署名 | `nkct-handshake-iroh-v1` | ML-DSA ctx |
-| **TCP** handshake 署名 | `nkct-handshake-tcp-v1` | ML-DSA ctx |
+| ~~**TCP** handshake 署名~~ | ~~`nkct-handshake-tcp-v1`~~ | **削除済み**（TCP transport ごと除去、§4.5）。iroh が唯一の transport ゆえ cross-transport replay 論点も消滅 |
 | prekey 署名(PQFS) | `nkct-prekey-v1` | ML-DSA ctx（**byte-prefix から統一移行**、§11） |
 | keybind 署名 | `nkct-keybind-v1` | ML-DSA ctx |
 | bundle self_sig | `nkct-bundle-v1` | ML-DSA ctx |
 | 指紋 | （前置なし） | `SHA3-256(raw)`。**`nkct-id-v1` 前置は撤回**（§3.1）— 識別子には分離相手が無く、署名材料箇所は署名層 ctx で分離済み |
 
-**iroh と TCP は別ラベル**: 同一 identity 鍵・同一 transcript フォーマットのため、**同一 ctx だと cross-transport replay**（iroh sig を TCP に差す/逆）が生じる。ctx を分けると FIPS 204 の M' が別空間になり塞げる。**transcript(#1–#12)のバイトは一切変えない**（ctx は M' 前置でメッセージ本体でない）。
+**~~iroh と TCP は別ラベル~~【TCP 削除で無効化】**: 当初は「同一 identity 鍵・同一 transcript のため同一 ctx だと iroh↔TCP cross-transport replay が生じる → ラベルを分ける」設計だった。**TCP transport 削除（§4.5）により transport は iroh 1つのみ**となり、cross-transport replay の対象が消滅。`nkct-handshake-iroh-v1` は他の identity-鍵文脈（prekey/keybind/bundle/file）との分離としてなお必要（transcript バイトは不変、ctx は M' 前置）。
 
 **不変条件**: 移行後、identity 鍵で**空 ctx 署名する native-ctx 文脈を1本も残さない**。5 署名ラベルは全相異かつ prefix-free。唯一 ctx="" に残すのは file 署名のみ（§11、孤立により分離）。（指紋は署名 ctx ではなく識別子 hash であり、この不変条件の対象外。指紋前置 `nkct-id-v1` は撤回＝§3.1。）
 
@@ -110,7 +110,7 @@ fingerprint = SHA3-256( mldsa_pk_owner_raw )      // 32 bytes, full。ドメイ�
 - **不変条件(b) responder 再導出**（§6.2 と同じ discipline）: responder は受信 #7 を**信頼の入力にせず**、自ら `SHA3-256(own_pub_raw)` を計算して #7 と**比較する標的**として扱う（増分4 prekey 再導出ガードと同型）。
 
 → `sig_I = ML-DSA-Sign(sk_I, msg=transcript[#1..#7], ctx=HANDSHAKE_CTX)`
-（`HANDSHAKE_CTX` = iroh なら `b"nkct-handshake-iroh-v1"` / TCP なら `b"nkct-handshake-tcp-v1"`。transcript バイトは共通・不変、ctx のみ transport で分岐 = cross-transport replay 封じ）
+（`HANDSHAKE_CTX` = `b"nkct-handshake-iroh-v1"`。TCP transport 削除により transport は iroh のみ。この ctx は他の identity-鍵文脈（prekey/keybind/bundle/file）との cross-context 分離を担う）
 
 **responder 署名対象（#1–#12、同一 builder の続き）:**
 | # | フィールド | enc | 条件 |
@@ -171,11 +171,10 @@ trust/anonymous は**呼び出し側の明示選択**（pin 有無から暗黙�
 - 「pin 無し → 黙って anonymous に落ちる」を禁止（pin 不在自体を downgrade ベクタにしない）。
 - TOFU 無し: 未検証初回接続を信頼する経路 0 本。既存 `allow_unauth`＋指紋無しの node_id-only 経路は trust モードで到達不能に。
 
-### 4.5 TCP handshake【増分3b に分離 — 着手前に §0 相当の被覆調査が必須】
-TCP（`network/tcp`）は iroh と構造が違うため §4.1–§4.4 をそのまま適用できない。**増分3(iroh)には混ぜず、独立した増分3b**として扱う。増分3b の**入口で必須の調査**（iroh の増分3 で確立したパターンを持てる分、軽くなる）:
-- **被覆マトリクス(field×方向)を TCP について一から埋める**（§0 を iroh でやったのと同じ作業）。特に「**server 署名が何を被覆しているか**」。現状 `server_transcript` は client transcript の連続だが **server_dsa_pub/static KEM を append せず署名**（server pub は検証鍵としてのみ）。iroh の #11（responder ML-DSA pub を署名被覆に含める）相当が TCP に無い → **A-resp を TCP でやるには server 署名の被覆拡張が要る**公算大。
-- **node_id 欠如の channel binding 影響**: iroh は #2(nodeid_B) で transport channel を identity に束縛。TCP は raw socket でこれが無い → 「どの socket が どの identity か」の束縛が iroh QUIC より弱く、#7 指紋 pre-commit だけで TCP の MITM モデルに十分かを別途詰める（cross-transport replay を ctx 分離で塞いだ話とは別レイヤーの、TCP 単体 channel binding の問題）。
-- ctx は既に transport-split（`nkct-handshake-tcp-v1`）で分離設計済み。TCP がまだ ctx 未配線なら現状維持（`ctx=""`）で放置してよく、増分3b で **tcp ctx 配線＋被覆修正＋#5flags/#7 マッピング**を一括投入する（iroh 先行で TCP に新たな穴は生じない）。
+### 4.5 TCP handshake【削除済み — 増分3b は harden でなく削除に転換】
+当初 TCP は「増分3b で iroh と同じ A/B/ctx を入れて harden」する予定だった。だが着手前調査で **TCP transport は deprecated（`main.rs` が "will be removed" を warning、default=iroh、prekey async は iroh 必須）** と判明。被覆調査でも iroh との構造差（2本の別 transcript／server_dsa_pub を署名にもワイヤにも載せず client は pin 済み pub で検証／node_id 不在の channel binding／fingerprint-pin モード無し）が確定し、**削除予定の経路に iroh 統一の harden を投資するのは非合理**と判断。
+
+→ **harden せず TCP transport ごと削除**（`network/tcp.rs`・`TransportKind::Tcp`・全 dispatch/CLI arm をコンパイラ駆動で網羅除去）。identity-misbinding gap も `ctx=""` 署名も **経路の消滅で解消**。これで §11.2 の孤立が完成する（下記）。外部利用者ゼロで deprecated を実削除する好機。**iroh は唯一の transport**。
 
 ---
 
@@ -240,7 +239,7 @@ ctx 非空化はワイヤ破壊 → **ALPN version bump**。旧 peer は ALPN �
 - **pre-commit すり替え(responder 側)**: initiator #7 を別 identity に → responder §4.2(A-resp) で abort。
 - **【A の欠落補完】responder identity 置換(initiator 側)**: MITM が #11=M・sk_M で sig_R 署名 → **initiator が §4.2(A-init) で abort**（`fingerprint(#11)≠pin` かつピン検証で不成立）。含める側と検証する側の両方に abort テストを置く。
 - **【C】pure ML-DSA(0x00) 固定**: interop verify-cross で「OpenSSL の context-string 経路が **pure ML-DSA(先頭 0x00)** で、pre-hash(0x01)に化けていない」を assertion 名 `mldsa_pure_ctx_both_backends` 等で明示。将来 OpenSSL 既定変更時に何が壊れたか即判別。
-- **【cross-transport replay】**: iroh handshake(ctx=`nkct-handshake-iroh-v1`)で採取した sig を TCP handshake の検証(ctx=`nkct-handshake-tcp-v1`)に差す → ctx 差で verify 落ち。逆方向も。同一 transcript/鍵でも transport をまたいだ使い回しが不能なことを固定。
+- **【cross-context replay】**（旧「cross-transport replay」= TCP 削除で iroh↔TCP は消滅）: iroh handshake(ctx=`nkct-handshake-iroh-v1`)で採取した sig を、**別文脈の検証**（prekey `nkct-prekey-v1` / recipient-bundle `nkct-recipient-bundle-v1` / file `ctx=""`）に差す → ctx 差で verify 落ち。逆も。同一 identity 鍵でも文脈をまたいだ使い回しが不能なことを固定（file↔prekey の cross-replay negative は増分4 で実装済み）。
 - **【D】エフェメラル鮮度**: 「2回のハンドシェイクが**異なる transcript と異なる導出鍵**を生む」。P-256/ML-KEM エフェメラルを cache/永続する経路が無いこと（鍵生成が握手毎に走る）。
 - **auth モード各組合せ**: §4.3 通りに #5/#6/#7/#10/#11 の presence と cross-bind 挙動が一致。
 - **presence フラグ**: #5 の reserved ビット非0 → 拒否。#5.bit1 有りで #7 欠落 → abort。
@@ -282,7 +281,7 @@ attacker-controlled な LP フィールドが handshake(#1–12)・keybind_blob�
 1. **A（initiator 側ピン検証）は #7 pre-commit と同一コミット**（照合の対を一緒に）。
 2. **B（パーサ堅牢化）は各 wire フォーマット実装と同時**（後付け禁止）。
 KAT/negative の最後で A の「responder identity 置換 → initiator abort」を必ず追加。
-dual-model レビューの重点 = A の両側 abort ／ B の fuzz ／ **cross-transport replay(iroh sig を TCP に差す negative)** の3点。
+dual-model レビューの重点 = A の両側 abort ／ B の fuzz ／ **cross-context replay(iroh sig を prekey/file 検証に差す negative。TCP 削除で旧 iroh↔TCP は消滅)** の3点。
 
 ---
 
@@ -293,7 +292,7 @@ dual-model レビューの重点 = A の両側 abort ／ B の fuzz ／ **cross-
 | 文脈 | 鍵 | 本feature後の分離 |
 |---|---|---|
 | iroh handshake (`p2p/processor`) | identity | native ctx `nkct-handshake-iroh-v1` |
-| TCP handshake (`network/tcp`) | identity（同一 transcript） | native ctx `nkct-handshake-tcp-v1` |
+| ~~TCP handshake (`network/tcp`)~~ | ~~identity~~ | **削除済み**（deprecated transport ごと除去、§4.5）— harden せず経路消滅で `ctx=""` 署名を解消 |
 | prekey (`prekey.rs`, PQFS) | identity | **byte-prefix → native ctx `nkct-prekey-v1` に統一**（増分4） |
 | **recipient bundle (`one_shot.rs`)** | identity | **byte-prefix → native ctx `nkct-recipient-bundle-v1` に統一**（増分4） |
 | keybind / bundle（新規） | identity | native ctx `nkct-keybind-v1` / `nkct-bundle-v1` |
@@ -307,10 +306,10 @@ dual-model レビューの重点 = A の両側 abort ／ B の fuzz ／ **cross-
 - **重要な訂正**: 「handshake が ctx を持てば handshake↔prekey は ctx 差で分離される」は**誤り**。機構が別レイヤー（prekey=M 本体前置、handshake=M' 前置）で、ctx が効くのは**両方が native ctx の時だけ**。よって prekey も native ctx に寄せる。
 - **移行コスト = 軽**: prekey は **one-time**（消費で削除・高頻度 replenish、`prekey.rs`）。受信者が新スキーム(`nkct-prekey-v1`)で再 publish すれば、旧 byte-prefix 分は消費/失効で自然消滅。handshake ほどの移行負荷なし。→ **native ctx 化で確定**（独立 flag-day 1系統）。
 
-### 11.2 file 署名を follow-up にする「正しい」論理
-- file 署名を最後まで ctx 化しなくても、**他の identity-鍵文脈（handshake iroh/tcp・prekey・keybind・bundle）が全て native ctx に移れば、ctx="" に残るのは file 署名ただ1つ**になる。
+### 11.2 file 署名を follow-up にする「正しい」論理【孤立が確定】
+- file 署名を最後まで ctx 化しなくても、**他の identity-鍵文脈が全て native ctx に移る（または経路ごと消える）と、ctx="" に残るのは file 署名ただ1つ**になる。
 - **孤立した ctx="" 文脈は、他の全 native-ctx 文脈と ctx 差で自動的に replay 不能**。これが (a) スコープを正当化する本当の論理（doc 前版の「prekey は ctx 差で分離」の誤記をこれに置換）。
-- したがって file 署名の据え置きは「低リスクだから」ではなく「**他が全部 native ctx になれば ctx="" 孤立で分離が成立するから**」。file 署名自身の domain-sep は望ましいが別ハードニングとして follow-up。
+- **【確定 — TCP 削除で完成】** 増分3(iroh=native ctx)・増分4(prekey/recipient-bundle=native ctx)・**TCP 削除（§4.5）**により、`ctx=""` で署名する identity 鍵文脈は **file 署名（`strategy/pqc`）ただ1つ**に確定した（`pqc_sign` 全呼出し棚卸しで裏取り: production の `ctx=""` identity 署名は file のみ。MLS binding は別鍵§11.3）。よって file 署名は他の全 native-ctx 文脈と ctx 差で replay 不能＝**孤立による分離が実際に成立**。file 署名自身の domain-sep は望ましいが別ハードニングとして follow-up（これが ctx="" 最後の1つ）。
 
 ### 11.3 MLS binding
 別鍵（standalone transport ML-DSA）かつ既存で domain-separated。identity 鍵と共有しないため相互 replay の対象外。本feature では触らない。

@@ -43,12 +43,12 @@ mod hs_flags {
     pub const RESPONDER_ALLOWED: u8 = RESPONDER_SELF_AUTH;
 }
 
-/// FIPS 204 signature context for the **iroh** handshake (KEY_EXCHANGE_DESIGN.md
-/// §2.1). Binds sig_I / sig_R to this transport + purpose, so a handshake
-/// signature cannot be replayed into another identity-key context (prekey,
-/// keybind, bundle) or into the TCP handshake (`nkct-handshake-tcp-v1`, wired in
-/// increment 3b). Both sign and verify sides use it — flipping from `""` is a
-/// wire break, paired with the ALPN bump below so old/new peers fail cleanly.
+/// FIPS 204 signature context for the iroh handshake (KEY_EXCHANGE_DESIGN.md
+/// §2.1). iroh is the only transport (the TCP transport was removed). Binds
+/// sig_I / sig_R to this purpose, so a handshake signature cannot be replayed
+/// into another identity-key context (prekey, keybind, bundle, file). Both sign
+/// and verify sides use it — flipping from `""` is a wire break, paired with the
+/// ALPN bump below so old/new peers fail cleanly.
 const HANDSHAKE_CTX_IROH: &[u8] = b"nkct-handshake-iroh-v1";
 
 /// Reject a handshake field whose length is not the fixed size expected for the

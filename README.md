@@ -394,7 +394,7 @@ P2P トランスポート Iroh を使用した、PQC 認証付きの安全な通
     許可リストは 1 行 1 件の SHA3-256 (公開鍵 raw bytes) を hex で記述します。
 * **認証必須化はデフォルト動作**です。
 
-> **⚠️ 注意**: 従来の TCP 直接接続モード (`--transport tcp`) は非推奨 (Deprecated) となりました。今後のアップデートで削除される予定です。
+> **⚠️ 注意**: 従来の TCP 直接接続モード (`--transport tcp`) は**削除されました**。トランスポートは iroh のみです（QUIC ベースで NAT 越え・相互認証ハンドシェイクを提供）。QUIC が通らない経路（TCP-only な ZTNA fabric 等）は iroh では非対応という制約が残ります。
 
 詳細は [`SECURITY.md`](./SECURITY.md) と [`SPEC.md`](./SPEC.md) を参照。
 
