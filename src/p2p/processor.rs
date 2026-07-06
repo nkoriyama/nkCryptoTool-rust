@@ -547,6 +547,16 @@ impl NetworkProcessor {
             let server_auth_flag = if config.signing_privkey.is_some() { [hs_flags::RESPONDER_SELF_AUTH] } else { [0u8] };
             tb.append_raw(&server_auth_flag); // #10 responder flags
 
+            // A-resp (§4.2): if the initiator required responder auth (#5.bit1), this
+            // node MUST actually self-authenticate. Without a signing key it cannot, so
+            // abort now rather than send an unauthenticated hello the initiator would
+            // (correctly) reject as a downgrade.
+            if expects_responder_auth && server_auth_flag[0] & hs_flags::RESPONDER_SELF_AUTH == 0 {
+                return Err(CryptoError::Parameter(
+                    "Handshake failed: initiator requires responder authentication but this node has no signing key".to_string(),
+                ));
+            }
+
             let mut server_sig = Vec::new();
             let mut server_dsa_pub = Vec::new();
             let mut server_kem_pub = Vec::new();
@@ -573,6 +583,30 @@ impl NetworkProcessor {
                 
                 server_dsa_pub = backend::pqc_pub_from_priv_dsa(&config.pqc_dsa_algo, &raw_priv_dsa)?;
                 tb.append_lp(&server_dsa_pub); // #11
+
+                // A-resp (§4.2, invariant b): if the initiator pre-committed #7, it must
+                // name THIS responder. Re-derive our OWN fingerprint and compare — #7 is a
+                // comparison target, never a trust input. This closes the relay/misbinding
+                // face (a MITM relaying the initiator's handshake to a different responder
+                // fails here).
+                //
+                // Works regardless of whether #7 was covered by sig_I. For an anonymous
+                // initiator (#5.bit0 = 0) #7 is NOT in sig_I, but misbinding is still
+                // closed by two independent facts: (i) A-resp only compares #7 to our own
+                // fingerprint, so #7's origin is irrelevant — a tampered #7 that does not
+                // equal our identity just aborts; (ii) the initiator verifies sig_R against
+                // its pinned P (A-init), so a responder != P is rejected on the initiator
+                // side. Tampering with an unsigned #7 is therefore at worst an availability
+                // issue (abort), never a misbinding. (Do NOT "optimise" this to only run
+                // when sig_I covered #7 — that would drop the anonymous-initiator guarantee.)
+                if expects_responder_auth {
+                    let own_fp: [u8; 32] = Sha3_256::digest(&server_dsa_pub).into();
+                    if own_fp != expected_responder_fp {
+                        return Err(CryptoError::Parameter(
+                            "Handshake failed: initiator's expected-responder fingerprint (#7) does not match this node's identity".to_string(),
+                        ));
+                    }
+                }
 
                 server_kem_pub = raw_pub_kem;
                 tb.append_lp(&server_kem_pub); // #12
