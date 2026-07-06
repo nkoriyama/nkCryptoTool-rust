@@ -47,6 +47,34 @@ fn mldsa_ctx_over_255_rejected() {
 }
 
 #[test]
+fn mldsa_ctx_is_fips204_pure_domain_not_message_concat() {
+    // §8(C)/§2: the ctx must be applied via the FIPS-204 *pure* ML-DSA domain
+    // encoding `M' = 0x00 ‖ len(ctx) ‖ ctx ‖ M` — NOT by appending ctx to the
+    // message, and NOT via HashML-DSA (leading 0x01). We cannot read the internal
+    // domain byte, but a naive "ctx = message suffix" encoding would make
+    // `sign(msg, ctx=C)` verify as `verify(msg‖C, ctx="")`; the domain encoding
+    // does not. This is the observable anchor that flags a backend (e.g. a future
+    // OpenSSL default change to pre-hash) silently leaving the pure-0x00 path.
+    let algo = "ML-DSA-65";
+    let msg: &[u8] = b"m";
+    let ctx: &[u8] = b"nkct-keybind-v1";
+    let (sk, pk, _) = backend::pqc_keygen_dsa(algo).expect("keygen");
+    let sig = backend::pqc_sign(algo, &sk, msg, ctx).expect("sign");
+    let mut msg_concat = msg.to_vec();
+    msg_concat.extend_from_slice(ctx);
+    assert!(
+        !backend::pqc_verify(algo, &pk, &msg_concat, &sig, &[]).expect("verify concat"),
+        "ctx must be the FIPS-204 0x00-domain, not a message suffix",
+    );
+    // And the same message under empty ctx (the file-signature path) is a
+    // distinct domain, so a ctx-C signature never verifies there either.
+    assert!(
+        !backend::pqc_verify(algo, &pk, msg, &sig, &[]).expect("verify empty"),
+        "ctx-C signature must not verify under empty ctx (distinct domain)",
+    );
+}
+
+#[test]
 fn mldsa_empty_ctx_roundtrips() {
     // The `ctx=""` path (all callers in increment 1) must still round-trip —
     // i.e. no behaviour change for the pre-context signatures.

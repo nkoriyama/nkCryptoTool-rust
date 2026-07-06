@@ -785,4 +785,23 @@ mod tests {
             Err(_) => {} // some KEMs reject the mismatch outright — also fine
         }
     }
+
+    // §10(B) fuzz: deterministic (fixed-seed) malformed bytes must never panic
+    // the prekey wire parser (attacker-controlled LP lengths → clean Err).
+    #[test]
+    fn prekey_from_bytes_fuzz_no_panic() {
+        let mut state: u64 = 0x0BAD_F00D_1234_5678;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for _ in 0..2000u32 {
+            let n = (next() % 4096) as usize;
+            let bytes: Vec<u8> = (0..n).map(|_| (next() >> 33) as u8).collect();
+            let _ = SignedPrekey::from_bytes(&bytes);
+        }
+    }
 }

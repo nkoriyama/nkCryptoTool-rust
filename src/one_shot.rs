@@ -1126,4 +1126,25 @@ mod tests {
 
         task.abort();
     }
+
+    // §10(B) fuzz: deterministic (fixed-seed) malformed bytes must never panic
+    // the recipient-bundle (NKB1) parser (attacker-controlled lengths → Err).
+    #[test]
+    fn recipient_bundle_parse_fuzz_no_panic() {
+        let mut state: u64 = 0xF00D_BABE_5EED_C0DE;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for i in 0..2000u32 {
+            // Half start from the NKB1 magic to reach the deeper length parsing.
+            let mut bytes = if i % 2 == 0 { b"NKB1".to_vec() } else { Vec::new() };
+            let n = (next() % 4096) as usize;
+            bytes.extend((0..n).map(|_| (next() >> 33) as u8));
+            let _ = RecipientBundle::parse_and_verify(&bytes);
+        }
+    }
 }
