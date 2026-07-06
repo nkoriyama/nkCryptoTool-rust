@@ -77,6 +77,19 @@ A が新たな scp エンドポイントになる。外側の scp クライア�
 どこにもポート開放は要らない。shell と scp は 1 プロセスでは排他だが、シェルの中で起動する
 scp は別プロセスなので両立する。
 
+## **デモ: 署名付き recipient bundle + One-Time Prekey inbox で非同期 PQC 配送（PQ-FS）**
+
+![署名付き recipient bundle と One-Time Prekey inbox による非同期 PQC 配送](./docs/p2p_bundle_demo.gif)
+
+送信者と受信者が**同時にオンラインにならない**非同期配送。受信者は自分の ML-DSA-65
+identity を単一アンカーに、静的 X-Wing 鍵・NodeId・inbox スロットを束ねた**署名付き
+recipient bundle** を publish し、One-Time Prekey を信頼しない store-and-forward inbox
+に補充してオフラインになる。送信者は out-of-band で共有された fingerprint に bundle を
+pin して検証し、prekey を 1 本引いて full PQ-FS でファイルをシールし、inbox に投函する。
+後刻オンラインに戻った受信者が inbox を poll して復号する。**inbox は平文も鍵も一切見ない**。
+bundle 署名は native ctx `nkct-recipient-bundle-v1` で file / prekey / handshake 署名と
+ドメイン分離される（[KEY_EXCHANGE_DESIGN.md](./KEY_EXCHANGE_DESIGN.md) 参照）。
+
 ## **チケットを端末に QR 表示（外部ツール不要）**
 
 ![端末に QR を表示するデモ](./docs/qr_demo.gif)
