@@ -188,9 +188,11 @@ keybind_sig = ML-DSA-Sign(sk_owner, msg=keybind_blob, ctx=b"nkct-keybind-v1")
 key_usage: `0x01=enc(ML-KEM)` / `0x02=hybrid(P-256)`。canonical=raw。
 
 ## 6. KeyBundle（§3.3）
+> **【magic 訂正 — `NKCB` → `NKKB`（増分5 着手前の棚卸しで衝突発見）】** 初版は `MAGIC(b"NKCB")` を予定していたが、実コードの magic 名前空間棚卸しで **`b"NKCB"` は既に MLS credential 結合（`group/processor.rs`、`strip_prefix(b"NKCB")`）が使用中**と判明。同一 magic を2つの別 wire が共有するとパーサが判別不可。→ KeyBundle は **`b"NKKB"`（NK KeyBundle）** に変更（既存全 magic〔NKCS/NKCT/NKCB/NKO1/NKB1/NKFILE1/NKCT-AR1〕と相異）。keybind_blob（§5）は magic を持たない署名 blob ゆえ影響なし。
+> **【NKKB と NKB1 は別物】** バイト相異で技術的衝突は無いが名前が近いので明記: **`NKKB`=KeyBundle（本§6、非対話配布の enc/hybrid 鍵束、identity anchor 下の self-signed 単位）**、**`NKB1`=recipient bundle（`one_shot.rs`、inbox/async 経路の別概念、dsa_pub+static_pk+node_id+inbox_ticket）**。2つの近縁 "bundle" は用途もフォーマットも独立。
 ```
 KeyBundle =
-    MAGIC(b"NKCB") ‖ u8(version=1) ‖
+    MAGIC(b"NKKB") ‖ u8(version=1) ‖
     LP(mldsa_pk_owner_raw) ‖ LP(handle_utf8) ‖ u64_be(created_at) ‖
     u16_le(n) ‖
       [ per i: u8(key_usage) ‖ LP(target_pubkey_raw) ‖ u64_be(created_at_i)

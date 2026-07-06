@@ -8,6 +8,7 @@ pub mod backend;
 pub mod config;
 pub mod error;
 pub mod key;
+pub mod keybundle;
 pub mod network;
 pub mod p2p;
 pub mod processor;
