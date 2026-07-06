@@ -21,6 +21,24 @@ use std::str::FromStr;
 use crate::ticket::Ticket;
 use sha3::{Digest, Sha3_256};
 
+/// Handshake presence-flag bits (KEY_EXCHANGE_DESIGN.md §4.0). Each is a single
+/// raw byte placed in the signed transcript BEFORE the fields it gates, so the
+/// peer reads it first and the presence of later fields is wire-deterministic.
+/// Any bit outside the per-direction "allowed" set is reserved and MUST be
+/// rejected (a non-zero reserved bit is a malformed / future-version frame).
+mod hs_flags {
+    /// `#5` bit0: the initiator authenticates itself (gates `#6` initiator
+    /// ML-DSA pub + sig_I over the initiator transcript).
+    pub const INITIATOR_SELF_AUTH: u8 = 0x01;
+    /// `#10` bit0: the responder authenticates itself (gates `#11`/`#12` + sig_R).
+    pub const RESPONDER_SELF_AUTH: u8 = 0x01;
+    /// Initiator-flags bits currently honoured; others → reject as reserved.
+    /// (`#5` bit1 = expects_responder_auth is added with the `#7` pre-commit work.)
+    pub const INITIATOR_ALLOWED: u8 = INITIATOR_SELF_AUTH;
+    /// Responder-flags bits currently honoured; others → reject as reserved.
+    pub const RESPONDER_ALLOWED: u8 = RESPONDER_SELF_AUTH;
+}
+
 pub struct NetworkProcessor {
     config: CryptoConfig,
     endpoint: Arc<dyn P2pEndpoint>,
@@ -428,9 +446,14 @@ impl NetworkProcessor {
 
             let mut client_auth_flag = [0u8; 1];
             reader.read_exact(&mut client_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            tb.append_raw(&client_auth_flag); // #5
+            tb.append_raw(&client_auth_flag); // #5 initiator flags
+            if client_auth_flag[0] & !hs_flags::INITIATOR_ALLOWED != 0 {
+                return Err(CryptoError::Parameter(
+                    "Handshake failed: reserved bit set in initiator flags (#5)".to_string(),
+                ));
+            }
 
-            if client_auth_flag[0] == 1 {
+            if client_auth_flag[0] & hs_flags::INITIATOR_SELF_AUTH != 0 {
                 let client_dsa_pub = CommonProcessor::read_vec(&mut reader).await?;
                 tb.append_lp(&client_dsa_pub); // #6
 
@@ -498,13 +521,13 @@ impl NetworkProcessor {
             tb.append_lp(&server_ecc_pub); // #7
             tb.append_lp(&kem_ct); // #8
 
-            let server_auth_flag = if config.signing_privkey.is_some() { [1u8] } else { [0u8] };
-            tb.append_raw(&server_auth_flag); // #9
+            let server_auth_flag = if config.signing_privkey.is_some() { [hs_flags::RESPONDER_SELF_AUTH] } else { [0u8] };
+            tb.append_raw(&server_auth_flag); // #9 responder flags
 
             let mut server_sig = Vec::new();
             let mut server_dsa_pub = Vec::new();
             let mut server_kem_pub = Vec::new();
-            if server_auth_flag[0] == 1 {
+            if server_auth_flag[0] & hs_flags::RESPONDER_SELF_AUTH != 0 {
                 let (raw_priv_dsa, raw_pub_kem) = {
                     let dsa_priv_path = config.signing_privkey.as_ref().unwrap();
                     let dsa_bytes = Zeroizing::new(std::fs::read(dsa_priv_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
@@ -826,11 +849,11 @@ impl NetworkProcessor {
                     tb.append_lp(&client_ecc_pub); // #3
                     tb.append_lp(&client_kem_pub); // #4
 
-                    let client_auth_flag = if config.signing_privkey.is_some() { [1u8] } else { [0u8] };
+                    let client_auth_flag = if config.signing_privkey.is_some() { [hs_flags::INITIATOR_SELF_AUTH] } else { [0u8] };
                     writer.write_all(&client_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                    tb.append_raw(&client_auth_flag); // #5
+                    tb.append_raw(&client_auth_flag); // #5 initiator flags
 
-                    if client_auth_flag[0] == 1 {
+                    if client_auth_flag[0] & hs_flags::INITIATOR_SELF_AUTH != 0 {
                         let raw_priv = {
                             let privkey_path = config.signing_privkey.as_ref().unwrap();
                             let privkey_bytes = Zeroizing::new(std::fs::read(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
@@ -855,9 +878,14 @@ impl NetworkProcessor {
 
                     tb.append_lp(&server_ecc_pub); // #7
                     tb.append_lp(&kem_ct); // #8
-                    tb.append_raw(&server_auth_flag); // #9
+                    tb.append_raw(&server_auth_flag); // #9 responder flags
+                    if server_auth_flag[0] & !hs_flags::RESPONDER_ALLOWED != 0 {
+                        return Err(CryptoError::Parameter(
+                            "Handshake failed: reserved bit set in responder flags (#9)".to_string(),
+                        ));
+                    }
 
-                    if server_auth_flag[0] == 1 {
+                    if server_auth_flag[0] & hs_flags::RESPONDER_SELF_AUTH != 0 {
                         let server_dsa_pub = CommonProcessor::read_vec(&mut reader).await?;
                         tb.append_lp(&server_dsa_pub); // #10
 
