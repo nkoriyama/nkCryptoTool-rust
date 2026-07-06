@@ -43,7 +43,6 @@ pub enum CryptoMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ValueEnum)]
 pub enum TransportKind {
     Iroh,
-    Tcp,
 }
 
 impl Default for TransportKind {

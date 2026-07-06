@@ -15,12 +15,13 @@ set -euo pipefail
 # (iroh transport moved src/network/iroh.rs -> src/p2p/backend/iroh.rs during
 #  the p2p abstraction refactor.)
 #
-# INVARIANT: this list MUST include the handshake body (src/p2p/processor.rs and
-# src/network/tcp.rs) — the mutual-auth transcript signing lives there. This list
-# and the entries in .security-baseline.sha256 must be identical sets; a mismatch
-# means a security-critical file silently drops out of coverage on the next
-# rebaseline. (src/p2p/processor.rs was present in the baseline but missing from
-# this list — restored here to close that drift.)
+# INVARIANT: this list MUST include the handshake body (src/p2p/processor.rs) —
+# the mutual-auth transcript signing lives there. This list and the entries in
+# .security-baseline.sha256 must be identical sets; a mismatch means a security-
+# critical file silently drops out of coverage on the next rebaseline.
+# (src/network/tcp.rs was removed here when the deprecated TCP transport was
+# deleted — iroh is the only transport. That is an INTENTIONAL deletion, not the
+# silent-drop drift #24 guarded against: the file no longer exists.)
 FILES=(
     src/backend/mod.rs
     src/backend/openssl_impl.rs
@@ -28,7 +29,6 @@ FILES=(
     src/p2p/backend/iroh.rs
     src/p2p/processor.rs
     src/network/mod.rs
-    src/network/tcp.rs
     src/processor.rs
     src/utils.rs
 )
