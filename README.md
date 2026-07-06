@@ -21,6 +21,13 @@
 
 Rust版は、C++版の設計思想を継承しつつ、Rustのメモリ安全性とTokioによる高性能な非同期パイプラインを組み合わせて再構築されました。
 
+> **▶ すぐ使いたい人へ**: ユースケース別（暗号化 / 復号 / 署名 / 検証 / P2P ssh / P2P scp）の
+> コピペで動くコマンド集は **[USAGE.md](./USAGE.md)** にまとめてあります。この README は
+> 機能一覧・性能・アーキテクチャの説明が中心です。
+>
+> なお本文プローズ中の `nkct` は実行バイナリ `nk-crypto-tool` の略です（コマンド例では
+> `nk-crypto-tool` を使用）。
+
 ## **デモ: 踏み台レス PQC P2P シェル**
 
 ![踏み台レス PQC P2P シェルのデモ](./docs/p2p_shell_demo.gif)
@@ -411,13 +418,13 @@ P2P トランスポート Iroh を使用した、PQC 認証付きの安全な通
 * **チャット (サーバ)**:
     ```bash
     nk-crypto-tool --mode pqc --listen --chat \
-        --my-sign-key <priv.key> --signing-pubkey <peer_pub.key>
+        --signing-privkey <priv.key> --signing-pubkey <peer_pub.key>
     ```
     表示された `nkct1...` Ticket を対向に共有してください。
 * **チャット (クライアント)**:
     ```bash
     nk-crypto-tool --mode pqc --connect <TICKET> --chat \
-        --my-sign-key <priv.key> --signing-pubkey <peer_pub.key>
+        --signing-privkey <priv.key> --signing-pubkey <peer_pub.key>
     ```
 * **高度なオプション**:
     - `--no-relay`: リレーサーバーを無効化し、ダイレクト接続のみを許可。
