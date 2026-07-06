@@ -50,6 +50,34 @@ struct Args {
     #[arg(long)]
     recipient_ecdh_pubkey: Option<String>,
 
+    /// Signed NKKB KeyBundle file (for `--encrypt`). The recipient's
+    /// encryption key(s) are taken from the *verified* bundle instead of a raw
+    /// pubkey flag; requires `--recipient-fingerprint` to pin the owner
+    /// identity out-of-band. Produced by the recipient's `--gen-keybundle`.
+    #[arg(long)]
+    recipient_keybundle: Option<String>,
+
+    /// Build a signed NKKB KeyBundle from this identity's encryption public
+    /// key(s) (owner side). Needs `--signing-privkey`, `--keybundle-handle`,
+    /// and `--keybundle-output`; `--mode` selects which enc keys are bound.
+    #[arg(long)]
+    gen_keybundle: bool,
+
+    /// Bundle-level handle (a human label) written into every keybind of a
+    /// `--gen-keybundle` bundle.
+    #[arg(long)]
+    keybundle_handle: Option<String>,
+
+    /// Optional lifetime, in seconds from now, after which the bound keys in a
+    /// `--gen-keybundle` bundle are considered expired (enforced at the
+    /// sender's `--encrypt` entry point).
+    #[arg(long)]
+    keybundle_expiry_secs: Option<u64>,
+
+    /// Output path for the `--gen-keybundle` bundle file.
+    #[arg(long)]
+    keybundle_output: Option<String>,
+
     #[arg(long, alias = "my-enc-key")]
     user_privkey: Option<String>,
 
@@ -533,6 +561,13 @@ async fn main() -> anyhow::Result<()> {
         None => return Err(anyhow::anyhow!("--mode is required for CLI operations")),
     };
 
+    // Owner-side producer: build a signed NKKB KeyBundle from this identity's
+    // encryption public key(s). Standalone (uses the keybundle library, not the
+    // strategy operation dispatch), so it returns before operation selection.
+    if args.gen_keybundle {
+        return run_gen_keybundle(&args, mode);
+    }
+
     let operation = if args.encrypt {
         Operation::Encrypt
     } else if args.decrypt {
@@ -560,6 +595,32 @@ async fn main() -> anyhow::Result<()> {
     } else {
         anyhow::bail!("No operation specified")
     };
+
+    // Raw recipient-pubkey abolition (encrypt only): a raw public key carries no
+    // identity binding or authenticity — a MITM can swap it — so `--encrypt` now
+    // takes the recipient's key(s) only from a signed, identity-anchored NKKB
+    // KeyBundle. The flags remain declared (clear domain error, not an
+    // unknown-flag error). Scoped to Encrypt so `--fingerprint`, which
+    // legitimately reads `--recipient-pubkey`, is unaffected.
+    if operation == Operation::Encrypt
+        && (args.recipient_pubkey.is_some()
+            || args.recipient_mlkem_pubkey.is_some()
+            || args.recipient_ecdh_pubkey.is_some())
+    {
+        anyhow::bail!(
+            "--recipient-pubkey / --recipient-mlkem-pubkey / --recipient-ecdh-pubkey are no \
+             longer accepted for --encrypt (a raw public key is unauthenticated). Encrypt to a \
+             signed, identity-anchored KeyBundle instead:\n  \
+             1. the recipient runs `--gen-keybundle` and shares the printed fingerprint out-of-band\n  \
+             2. you run `--encrypt --recipient-keybundle <file> --recipient-fingerprint <64-hex>`"
+        );
+    }
+    // Never encrypt to no one: an encrypt with no recipient source is a usage error.
+    if operation == Operation::Encrypt && args.recipient_keybundle.is_none() {
+        anyhow::bail!(
+            "--encrypt requires --recipient-keybundle <file> (with --recipient-fingerprint <64-hex>)"
+        );
+    }
 
     // Initial passphrase from CLI args is now removed for security.
     let mut passphrase = if let Ok(p) = std::env::var("NK_PASSPHRASE") {
@@ -604,6 +665,36 @@ async fn main() -> anyhow::Result<()> {
     config.aead_algo = args.aead_algo;
     config.pqc_kem_algo = args.kem_algo;
     config.pqc_dsa_algo = args.dsa_algo;
+
+    // Consume a recipient KeyBundle for encryption: verify it against the pinned
+    // owner fingerprint, enforce expiry on the key(s) this mode will use, and
+    // stage the raw encryption key bytes for in-memory injection into the
+    // strategy (config.recipient_*_key_bytes). Runs after mode/dsa are set.
+    if operation == Operation::Encrypt {
+        if let Some(ref bundle_arg) = args.recipient_keybundle {
+            let bundle_path = resolve_key_path(&config.key_dir, Some(bundle_arg.clone()))
+                .unwrap_or_else(|| bundle_arg.clone());
+            let bytes = std::fs::read(&bundle_path)
+                .map_err(|e| anyhow::anyhow!("read recipient keybundle {bundle_path}: {e}"))?;
+            // Pinning is mandatory: a bundle whose owner fingerprint is not pinned
+            // out-of-band is unauthenticated key material (unlike seal's TOFU).
+            let fp_hex = args.recipient_fingerprint.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--recipient-keybundle requires --recipient-fingerprint <64-hex> to pin the owner identity"
+                )
+            })?;
+            let pin = parse_fingerprint_hex(fp_hex)?;
+            // The KeyBundle identity is definitionally the ML-DSA-65 single anchor
+            // (see KEYBUNDLE_IDENTITY_DSA), not the sender-controlled --dsa-algo:
+            // the verifier dictates the algorithm so a bundle can never downgrade
+            // it, and this matches load_raw_dsa_priv's fixed ML-DSA-65 loader.
+            let vb = nk_crypto_tool::keybundle::parse_and_verify(&bytes, KEYBUNDLE_IDENTITY_DSA, &pin)
+                .map_err(|e| anyhow::anyhow!("recipient keybundle rejected: {e}"))?;
+            let (enc, hybrid) = select_bundle_keys_for_mode(&vb, config.mode)?;
+            config.recipient_enc_key_bytes = enc;
+            config.recipient_hybrid_key_bytes = hybrid;
+        }
+    }
     config.transport = args.transport;
     config.no_relay = args.no_relay;
     config.relay_url = args.relay_url;
@@ -846,7 +937,9 @@ async fn main() -> anyhow::Result<()> {
 /// the P2P handshake's key path (unwrap PEM → decrypt if encrypted →
 /// unwrap PKCS#8). `passphrase` decrypts an encrypted key; an empty
 /// passphrase is treated as "key is not encrypted".
-#[cfg(feature = "mls")]
+///
+/// Shared by the mls prekey commands and the default `--gen-keybundle`
+/// producer, so it is compiled unconditionally.
 fn load_raw_dsa_priv(
     path: &str,
     passphrase: &zeroize::Zeroizing<String>,
@@ -865,6 +958,168 @@ fn load_raw_dsa_priv(
     };
     let decrypted = utils::extract_raw_private_key(&der, pass)?;
     Ok(utils::unwrap_pqc_priv_from_pkcs8(&decrypted, "ML-DSA-65")?)
+}
+
+/// The KeyBundle identity is always the ML-DSA-65 single anchor, regardless of
+/// the encryption `--mode` or the sender-supplied `--dsa-algo`. Fixing it here
+/// keeps the producer, the `load_raw_dsa_priv` loader, and the consumer's
+/// `parse_and_verify` in agreement and forecloses any signature-algorithm
+/// downgrade on the verify side.
+const KEYBUNDLE_IDENTITY_DSA: &str = "ML-DSA-65";
+
+/// Decode a 64-hex fingerprint (`SHA3-256` of a raw pubkey) into 32 bytes.
+fn parse_fingerprint_hex(s: &str) -> anyhow::Result<[u8; 32]> {
+    let raw = hex::decode(s.trim())
+        .map_err(|e| anyhow::anyhow!("--recipient-fingerprint is not valid hex: {e}"))?;
+    <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| {
+        anyhow::anyhow!(
+            "--recipient-fingerprint must be 32 bytes (64 hex chars); got {} bytes",
+            raw.len()
+        )
+    })
+}
+
+/// Load a PEM public key file and return the raw algorithm bytes (SPKI
+/// unwrapped). Used for ML-KEM ek and the ML-DSA identity pub — the same raw
+/// form the KeyBundle stores and the fingerprint hashes.
+fn load_raw_pqc_pub(path: &str, algo: &str) -> anyhow::Result<Vec<u8>> {
+    let pem = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read public key {path}: {e}"))?;
+    let der = nk_crypto_tool::utils::unwrap_from_pem(&pem, "PUBLIC KEY")?;
+    Ok(nk_crypto_tool::utils::unwrap_pqc_pub_from_spki(&der, algo)?)
+}
+
+/// Load a PEM public key file and return its SubjectPublicKeyInfo DER as-is
+/// (P-256: the exact form the ECC strategy consumes and the KeyBundle stores).
+fn load_spki_der_pub(path: &str) -> anyhow::Result<Vec<u8>> {
+    let pem = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("read public key {path}: {e}"))?;
+    Ok(nk_crypto_tool::utils::unwrap_from_pem(&pem, "PUBLIC KEY")?.to_vec())
+}
+
+/// Pick the recipient encryption key(s) a KeyBundle must supply for `mode`, and
+/// enforce expiry on exactly those keys (authenticity was checked by
+/// `parse_and_verify`; the clock policy lives here). Returns
+/// `(enc_ml_kem_ek, hybrid_p256_spki_der)`.
+fn select_bundle_keys_for_mode(
+    vb: &nk_crypto_tool::keybundle::VerifiedKeyBundle,
+    mode: CryptoMode,
+) -> anyhow::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+    use nk_crypto_tool::keybundle::{KEY_USAGE_ENC, KEY_USAGE_HYBRID};
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("system clock is before the UNIX epoch: {e}"))?
+        .as_secs();
+    let need = |usage: u8, label: &str| -> anyhow::Result<Vec<u8>> {
+        let k = vb
+            .keys
+            .iter()
+            .find(|k| k.key_usage == usage)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "recipient keybundle has no {label} key (usage {usage:#04x}) required for --mode {mode}"
+                )
+            })?;
+        // Expiry: authenticated by parse_and_verify, enforced here as policy.
+        if let Some(exp) = k.expires_at {
+            if exp <= now {
+                anyhow::bail!(
+                    "recipient keybundle {label} key expired at {exp} (now {now}); \
+                     ask the recipient for a fresh --gen-keybundle"
+                );
+            }
+        }
+        Ok(k.target_pk.clone())
+    };
+    match mode {
+        CryptoMode::PQC => Ok((Some(need(KEY_USAGE_ENC, "ML-KEM")?), None)),
+        CryptoMode::ECC => Ok((None, Some(need(KEY_USAGE_HYBRID, "P-256")?))),
+        CryptoMode::Hybrid => Ok((
+            Some(need(KEY_USAGE_ENC, "ML-KEM")?),
+            Some(need(KEY_USAGE_HYBRID, "P-256")?),
+        )),
+    }
+}
+
+/// Owner-side producer: build a signed NKKB KeyBundle binding this identity's
+/// encryption public key(s) under its ML-DSA-65 signature, then print the owner
+/// fingerprint senders pin out-of-band. Default-compiled (keybundle is a
+/// default module).
+fn run_gen_keybundle(args: &Args, mode: CryptoMode) -> anyhow::Result<()> {
+    use nk_crypto_tool::keybundle::{self, KEY_USAGE_ENC, KEY_USAGE_HYBRID};
+
+    let key_dir = args.key_dir.clone().unwrap_or_else(|| "keys".to_string());
+    let handle = args.keybundle_handle.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("--keybundle-handle <label> is required for --gen-keybundle")
+    })?;
+    let output = args.keybundle_output.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("--keybundle-output <file> is required for --gen-keybundle")
+    })?;
+
+    // Owner ML-DSA identity: private key signs; public key is the self-referential
+    // anchor and hashes to the fingerprint senders pin.
+    let signing_priv = resolve_key_path(&key_dir, args.signing_privkey.clone())
+        .ok_or_else(|| anyhow::anyhow!("--signing-privkey is required for --gen-keybundle"))?;
+    let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+        .map_err(|e| anyhow::anyhow!("read signing key passphrase: {e}"))?;
+    let owner_sk = load_raw_dsa_priv(&signing_priv, &passphrase)?;
+
+    // The KeyBundle identity is ALWAYS the ML-DSA-65 single anchor, independent
+    // of the encryption `--mode` (which only selects which enc keys to bind). So
+    // `--signing-privkey` must be an ML-DSA-65 key (as made by `--mode pqc` or
+    // `--mode hybrid` `--gen-sign-key`), never the ecc-mode ECDSA key. The owner
+    // pub defaults to the signing key's sibling file (`private_sign…` →
+    // `public_sign…`), so it matches whatever identity was passed regardless of
+    // mode; override with `--signing-pubkey`.
+    let owner_pub_path = resolve_key_path(&key_dir, args.signing_pubkey.clone())
+        .unwrap_or_else(|| signing_priv.replacen("private_sign", "public_sign", 1));
+    // "any": match calculate_fingerprint's unwrap so owner_pk is byte-identical
+    // to the value the fingerprint hashes and parse_and_verify re-derives.
+    let owner_pk = load_raw_pqc_pub(&owner_pub_path, "any")?;
+
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("system clock is before the UNIX epoch: {e}"))?
+        .as_secs();
+    let expires_at = args
+        .keybundle_expiry_secs
+        .map(|s| created_at.saturating_add(s));
+
+    let mut keys: Vec<(u8, Vec<u8>, u64, Option<u64>)> = Vec::new();
+    match mode {
+        CryptoMode::PQC => {
+            let ek = load_raw_pqc_pub(&format!("{key_dir}/public_enc_pqc.key"), &args.kem_algo)?;
+            keys.push((KEY_USAGE_ENC, ek, created_at, expires_at));
+        }
+        CryptoMode::ECC => {
+            let der = load_spki_der_pub(&format!("{key_dir}/public_enc_ecc.key"))?;
+            keys.push((KEY_USAGE_HYBRID, der, created_at, expires_at));
+        }
+        CryptoMode::Hybrid => {
+            let ek =
+                load_raw_pqc_pub(&format!("{key_dir}/public_enc_hybrid_mlkem.key"), &args.kem_algo)?;
+            keys.push((KEY_USAGE_ENC, ek, created_at, expires_at));
+            let der = load_spki_der_pub(&format!("{key_dir}/public_enc_hybrid_ecdh.key"))?;
+            keys.push((KEY_USAGE_HYBRID, der, created_at, expires_at));
+        }
+    }
+
+    // Sign under the fixed ML-DSA-65 anchor — same algorithm the loader and the
+    // consumer's parse_and_verify use, so producer and verifier always agree.
+    let bundle =
+        keybundle::build_signed(KEYBUNDLE_IDENTITY_DSA, &owner_sk, &owner_pk, handle, created_at, &keys)
+            .map_err(|e| anyhow::anyhow!("build keybundle: {e}"))?;
+    nk_crypto_tool::utils::secure_write(output, &bundle, args.force)
+        .map_err(|e| anyhow::anyhow!("write keybundle {output}: {e}"))?;
+
+    use sha3::{Digest, Sha3_256};
+    let fp = hex::encode(Sha3_256::digest(&owner_pk));
+    println!(
+        "Wrote signed KeyBundle ({} key(s), handle {handle:?}) to {output}.\n\
+         Share this fingerprint out-of-band so senders can pin your identity:\n  {fp}",
+        keys.len()
+    );
+    Ok(())
 }
 
 /// One-Time Prekey maintenance (PQFS_DESIGN.md phase 1): `generate`,
