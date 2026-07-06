@@ -129,3 +129,56 @@ pub fn hkdf(
 ) -> Result<Zeroizing<Vec<u8>>> {
     crypto_impl::hkdf(ikm, length, salt, info, md_name)
 }
+
+// -- Fixed on-wire byte lengths of the handshake crypto objects ---------------
+// Single source of truth for the FIPS 203/204 sizes, so the handshake parser can
+// reject a length-confused frame at the door rather than relying on the crypto
+// backend to error later (KEY_EXCHANGE_DESIGN.md §10(B), parser robustness).
+// `None` = unknown algorithm; the caller skips the check and lets the backend
+// reject the algorithm.
+
+/// Raw ML-DSA (FIPS 204) **public key** length for `algo`.
+pub fn mldsa_pub_len(algo: &str) -> Option<usize> {
+    match algo {
+        "ML-DSA-44" => Some(1312),
+        "ML-DSA-65" => Some(1952),
+        "ML-DSA-87" => Some(2592),
+        _ => None,
+    }
+}
+
+/// Raw ML-DSA (FIPS 204) **signature** length for `algo`. Fixed per parameter set
+/// even though signing is randomized/hedged (only the value varies, not the size).
+pub fn mldsa_sig_len(algo: &str) -> Option<usize> {
+    match algo {
+        "ML-DSA-44" => Some(2420),
+        "ML-DSA-65" => Some(3309),
+        "ML-DSA-87" => Some(4627),
+        _ => None,
+    }
+}
+
+/// Raw ML-KEM (FIPS 203) **encapsulation key** length for `algo`.
+pub fn mlkem_ek_len(algo: &str) -> Option<usize> {
+    match algo {
+        "ML-KEM-512" => Some(800),
+        "ML-KEM-768" => Some(1184),
+        "ML-KEM-1024" => Some(1568),
+        _ => None,
+    }
+}
+
+/// Raw ML-KEM (FIPS 203) **ciphertext** length for `algo`.
+pub fn mlkem_ct_len(algo: &str) -> Option<usize> {
+    match algo {
+        "ML-KEM-512" => Some(768),
+        "ML-KEM-768" => Some(1088),
+        "ML-KEM-1024" => Some(1568),
+        _ => None,
+    }
+}
+
+/// P-256 public key as it travels in the handshake: `SubjectPublicKeyInfo` DER,
+/// **not** the raw 65-byte SEC1 point. Both backends emit SPKI DER here (measured
+/// 91 bytes); the design's "P-256=65" assumed raw SEC1, which this code does not use.
+pub const P256_SPKI_DER_LEN: usize = 91;

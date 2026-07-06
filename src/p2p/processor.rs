@@ -21,6 +21,55 @@ use std::str::FromStr;
 use crate::ticket::Ticket;
 use sha3::{Digest, Sha3_256};
 
+/// Handshake presence-flag bits (KEY_EXCHANGE_DESIGN.md §4.0). Each is a single
+/// raw byte placed in the signed transcript BEFORE the fields it gates, so the
+/// peer reads it first and the presence of later fields is wire-deterministic.
+/// Any bit outside the per-direction "allowed" set is reserved and MUST be
+/// rejected (a non-zero reserved bit is a malformed / future-version frame).
+mod hs_flags {
+    /// `#5` bit0: the initiator authenticates itself (gates `#6` initiator
+    /// ML-DSA pub + sig_I over the initiator transcript).
+    pub const INITIATOR_SELF_AUTH: u8 = 0x01;
+    /// `#5` bit1: the initiator requires the responder to authenticate. Gates
+    /// `#7` (expected-responder-fingerprint pre-commit, raw32) and, on the
+    /// initiator, the both-sided pin verification of sig_R (A-init). Set iff the
+    /// initiator holds a responder pin it will verify against.
+    pub const EXPECTS_RESPONDER_AUTH: u8 = 0x02;
+    /// `#10` bit0: the responder authenticates itself (gates `#11`/`#12` + sig_R).
+    pub const RESPONDER_SELF_AUTH: u8 = 0x01;
+    /// Initiator-flags bits currently honoured; others → reject as reserved.
+    pub const INITIATOR_ALLOWED: u8 = INITIATOR_SELF_AUTH | EXPECTS_RESPONDER_AUTH;
+    /// Responder-flags bits currently honoured; others → reject as reserved.
+    pub const RESPONDER_ALLOWED: u8 = RESPONDER_SELF_AUTH;
+}
+
+/// FIPS 204 signature context for the **iroh** handshake (KEY_EXCHANGE_DESIGN.md
+/// §2.1). Binds sig_I / sig_R to this transport + purpose, so a handshake
+/// signature cannot be replayed into another identity-key context (prekey,
+/// keybind, bundle) or into the TCP handshake (`nkct-handshake-tcp-v1`, wired in
+/// increment 3b). Both sign and verify sides use it — flipping from `""` is a
+/// wire break, paired with the ALPN bump below so old/new peers fail cleanly.
+const HANDSHAKE_CTX_IROH: &[u8] = b"nkct-handshake-iroh-v1";
+
+/// Reject a handshake field whose length is not the fixed size expected for the
+/// negotiated algorithm (KEY_EXCHANGE_DESIGN.md §10(B), parser robustness B):
+/// closes length-confusion at the parser door instead of trusting the crypto
+/// backend to error later. Returns `Err` — never panics — so an attacker-
+/// controlled length is a clean handshake failure, not a remote DoS (this
+/// project has a peer-id-parse remote-panic history; "assert" here is semantic,
+/// not the `assert!` macro). `expected == None` (unknown algorithm) skips the
+/// check and lets the backend reject the algorithm.
+fn ensure_field_len(field: &str, got: usize, expected: Option<usize>) -> Result<()> {
+    if let Some(n) = expected {
+        if got != n {
+            return Err(CryptoError::Parameter(format!(
+                "handshake field {field}: expected {n} bytes for the negotiated algorithm, got {got}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub struct NetworkProcessor {
     config: CryptoConfig,
     endpoint: Arc<dyn P2pEndpoint>,
@@ -223,19 +272,19 @@ impl NetworkProcessor {
                     // file receive: both modes false
                 } else if incoming.protocol.0 == crate::network::ALPN_SHELL {
                     if !shell_allowed {
-                        eprintln!("Rejecting nkct/shell/1: this node is not a shell server");
+                        eprintln!("Rejecting nkct/shell/2: this node is not a shell server");
                         return;
                     }
                     config.shell_mode = true;
                 } else if incoming.protocol.0 == crate::network::ALPN_FWD {
                     if !forward_allowed {
-                        eprintln!("Rejecting nkct/fwd/1: this node is not a forward server");
+                        eprintln!("Rejecting nkct/fwd/2: this node is not a forward server");
                         return;
                     }
                     config.forward_mode = true;
                 } else if incoming.protocol.0 == crate::network::ALPN_SCP {
                     if !scp_allowed {
-                        eprintln!("Rejecting nkct/scp/1: this node is not an scp server");
+                        eprintln!("Rejecting nkct/scp/2: this node is not an scp server");
                         return;
                     }
                     config.scp_mode = true;
@@ -343,21 +392,21 @@ impl NetworkProcessor {
         } else if incoming.protocol.0 == crate::network::ALPN_SHELL {
             if !shell_allowed {
                 return Err(CryptoError::Parameter(
-                    "shell (nkct/shell/1) is not enabled on this node".to_string(),
+                    "shell (nkct/shell/2) is not enabled on this node".to_string(),
                 ));
             }
             config.shell_mode = true;
         } else if incoming.protocol.0 == crate::network::ALPN_FWD {
             if !forward_allowed {
                 return Err(CryptoError::Parameter(
-                    "forward (nkct/fwd/1) is not enabled on this node".to_string(),
+                    "forward (nkct/fwd/2) is not enabled on this node".to_string(),
                 ));
             }
             config.forward_mode = true;
         } else if incoming.protocol.0 == crate::network::ALPN_SCP {
             if !scp_allowed {
                 return Err(CryptoError::Parameter(
-                    "scp (nkct/scp/1) is not enabled on this node".to_string(),
+                    "scp (nkct/scp/2) is not enabled on this node".to_string(),
                 ));
             }
             config.scp_mode = true;
@@ -421,42 +470,70 @@ impl NetworkProcessor {
             tb.append_raw(local_peer_id.as_bytes()); // #2 server id
 
             let client_ecc_pub = CommonProcessor::read_vec(&mut reader).await?;
+            ensure_field_len("#3 initiator P-256", client_ecc_pub.len(), Some(backend::P256_SPKI_DER_LEN))?;
             let client_kem_pub = CommonProcessor::read_vec(&mut reader).await?;
+            ensure_field_len("#4 initiator ML-KEM ek", client_kem_pub.len(), backend::mlkem_ek_len(&config.pqc_kem_algo))?;
 
             tb.append_lp(&client_ecc_pub); // #3
             tb.append_lp(&client_kem_pub); // #4
 
             let mut client_auth_flag = [0u8; 1];
             reader.read_exact(&mut client_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-            tb.append_raw(&client_auth_flag); // #5
+            tb.append_raw(&client_auth_flag); // #5 initiator flags
+            if client_auth_flag[0] & !hs_flags::INITIATOR_ALLOWED != 0 {
+                return Err(CryptoError::Parameter(
+                    "Handshake failed: reserved bit set in initiator flags (#5)".to_string(),
+                ));
+            }
 
-            if client_auth_flag[0] == 1 {
-                let client_dsa_pub = CommonProcessor::read_vec(&mut reader).await?;
-                tb.append_lp(&client_dsa_pub); // #6
+            // #6 initiator ML-DSA pub (if self-auth) — read and append; defer sig_I
+            // verification until #7 is appended so it is checked over #1–#7.
+            let mut client_dsa_pub: Option<Vec<u8>> = None;
+            if client_auth_flag[0] & hs_flags::INITIATOR_SELF_AUTH != 0 {
+                let pk = CommonProcessor::read_vec(&mut reader).await?;
+                ensure_field_len("#6 initiator ML-DSA pub", pk.len(), backend::mldsa_pub_len(&config.pqc_dsa_algo))?;
+                tb.append_lp(&pk); // #6
+                client_dsa_pub = Some(pk);
+            }
 
-                let sig = CommonProcessor::read_vec(&mut reader).await?;
+            // #7 expected-responder-fingerprint pre-commit (raw32, if bit1). Read and
+            // append so it is bound into sig_I (verified below) and later sig_R. The
+            // A-resp cross-check (#7 == fingerprint(own identity)) is applied once the
+            // responder's own pub is known, just before signing sig_R.
+            let expects_responder_auth = client_auth_flag[0] & hs_flags::EXPECTS_RESPONDER_AUTH != 0;
+            let mut expected_responder_fp = [0u8; 32];
+            if expects_responder_auth {
+                reader.read_exact(&mut expected_responder_fp).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                tb.append_raw(&expected_responder_fp); // #7 expected responder fingerprint
+            }
 
-                // Verify the client signature over the partial transcript (#1–#6).
-                if !backend::pqc_verify(&config.pqc_dsa_algo, &client_dsa_pub, tb.snapshot(), &sig, &[])? {
-                    return Err(CryptoError::SignatureVerification);
-                }
-
-                let hash: [u8; 32] = Sha3_256::digest(&client_dsa_pub).into();
-                peer_id_opt = Some(PeerId::Pubkey(hash));
-
+            // sig_I over the initiator transcript #1–#7 (if self-auth).
+            if let Some(ref pk) = client_dsa_pub {
+                // A-init (server side, §4.2 / §6.2): when a single client identity is
+                // pinned, bind the wire #6 to it BEFORE verifying sig_I, so the signature
+                // is checked against the pinned key — not a self-consistent wire key a
+                // MITM could substitute. Symmetric with the initiator's A-init: never
+                // trust the wire key. (The allowlist is a SET, so it stays an exact
+                // membership check applied after verify — there is no single key to bind.)
                 if let Some(ref pubkey_path) = config.signing_pubkey {
                     let pubkey_bytes = Zeroizing::new(std::fs::read(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
                     let pubkey_pem = std::str::from_utf8(&pubkey_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
                     let pubkey_der = crate::utils::unwrap_from_pem(pubkey_pem, "PUBLIC KEY")?;
                     let pinned_raw_pub = crate::utils::unwrap_pqc_pub_from_spki(&pubkey_der, &config.pqc_dsa_algo)?;
-                    
-                    if pinned_raw_pub != client_dsa_pub {
+                    if pinned_raw_pub != *pk {
                         return Err(CryptoError::Parameter("Client public key mismatch with pinned key".to_string()));
                     }
-                    eprintln!("Client authenticated successfully (pinned key).");
-                } else {
-                    eprintln!("Client authenticated successfully (allowlist-only mode).");
                 }
+
+                let sig = CommonProcessor::read_vec(&mut reader).await?;
+                ensure_field_len("sig_I", sig.len(), backend::mldsa_sig_len(&config.pqc_dsa_algo))?;
+                if !backend::pqc_verify(&config.pqc_dsa_algo, pk, tb.snapshot(), &sig, HANDSHAKE_CTX_IROH)? {
+                    return Err(CryptoError::SignatureVerification);
+                }
+
+                let hash: [u8; 32] = Sha3_256::digest(pk).into();
+                peer_id_opt = Some(PeerId::Pubkey(hash));
+                eprintln!("Client authenticated successfully (auth: {}).", config.pqc_dsa_algo);
             } else if !config.allow_unauth || config.signing_pubkey.is_some() {
                 return Err(CryptoError::Parameter("Handshake failed: Client authentication required".to_string()));
             }
@@ -495,16 +572,26 @@ impl NetworkProcessor {
             combined_ss[..ss_ecc.len()].copy_from_slice(&ss_ecc);
             combined_ss[ss_ecc.len()..].copy_from_slice(&kem_ss);
 
-            tb.append_lp(&server_ecc_pub); // #7
-            tb.append_lp(&kem_ct); // #8
+            tb.append_lp(&server_ecc_pub); // #8
+            tb.append_lp(&kem_ct); // #9
 
-            let server_auth_flag = if config.signing_privkey.is_some() { [1u8] } else { [0u8] };
-            tb.append_raw(&server_auth_flag); // #9
+            let server_auth_flag = if config.signing_privkey.is_some() { [hs_flags::RESPONDER_SELF_AUTH] } else { [0u8] };
+            tb.append_raw(&server_auth_flag); // #10 responder flags
+
+            // A-resp (§4.2): if the initiator required responder auth (#5.bit1), this
+            // node MUST actually self-authenticate. Without a signing key it cannot, so
+            // abort now rather than send an unauthenticated hello the initiator would
+            // (correctly) reject as a downgrade.
+            if expects_responder_auth && server_auth_flag[0] & hs_flags::RESPONDER_SELF_AUTH == 0 {
+                return Err(CryptoError::Parameter(
+                    "Handshake failed: initiator requires responder authentication but this node has no signing key".to_string(),
+                ));
+            }
 
             let mut server_sig = Vec::new();
             let mut server_dsa_pub = Vec::new();
             let mut server_kem_pub = Vec::new();
-            if server_auth_flag[0] == 1 {
+            if server_auth_flag[0] & hs_flags::RESPONDER_SELF_AUTH != 0 {
                 let (raw_priv_dsa, raw_pub_kem) = {
                     let dsa_priv_path = config.signing_privkey.as_ref().unwrap();
                     let dsa_bytes = Zeroizing::new(std::fs::read(dsa_priv_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
@@ -526,13 +613,37 @@ impl NetworkProcessor {
                 };
                 
                 server_dsa_pub = backend::pqc_pub_from_priv_dsa(&config.pqc_dsa_algo, &raw_priv_dsa)?;
-                tb.append_lp(&server_dsa_pub); // #10
+                tb.append_lp(&server_dsa_pub); // #11
+
+                // A-resp (§4.2, invariant b): if the initiator pre-committed #7, it must
+                // name THIS responder. Re-derive our OWN fingerprint and compare — #7 is a
+                // comparison target, never a trust input. This closes the relay/misbinding
+                // face (a MITM relaying the initiator's handshake to a different responder
+                // fails here).
+                //
+                // Works regardless of whether #7 was covered by sig_I. For an anonymous
+                // initiator (#5.bit0 = 0) #7 is NOT in sig_I, but misbinding is still
+                // closed by two independent facts: (i) A-resp only compares #7 to our own
+                // fingerprint, so #7's origin is irrelevant — a tampered #7 that does not
+                // equal our identity just aborts; (ii) the initiator verifies sig_R against
+                // its pinned P (A-init), so a responder != P is rejected on the initiator
+                // side. Tampering with an unsigned #7 is therefore at worst an availability
+                // issue (abort), never a misbinding. (Do NOT "optimise" this to only run
+                // when sig_I covered #7 — that would drop the anonymous-initiator guarantee.)
+                if expects_responder_auth {
+                    let own_fp: [u8; 32] = Sha3_256::digest(&server_dsa_pub).into();
+                    if own_fp != expected_responder_fp {
+                        return Err(CryptoError::Parameter(
+                            "Handshake failed: initiator's expected-responder fingerprint (#7) does not match this node's identity".to_string(),
+                        ));
+                    }
+                }
 
                 server_kem_pub = raw_pub_kem;
-                tb.append_lp(&server_kem_pub); // #11
+                tb.append_lp(&server_kem_pub); // #12
 
-                // Sign the full transcript (#1–#11) — the same builder.
-                server_sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv_dsa, tb.snapshot(), &[])?;
+                // Sign the full transcript (#1–#12) — the same builder.
+                server_sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv_dsa, tb.snapshot(), HANDSHAKE_CTX_IROH)?;
             }
 
             // Salt = SHA3-256(full transcript) via the SAME builder — no separate
@@ -826,11 +937,57 @@ impl NetworkProcessor {
                     tb.append_lp(&client_ecc_pub); // #3
                     tb.append_lp(&client_kem_pub); // #4
 
-                    let client_auth_flag = if config.signing_privkey.is_some() { [1u8] } else { [0u8] };
-                    writer.write_all(&client_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
-                    tb.append_raw(&client_auth_flag); // #5
+                    // #5 initiator flags: bit0 = self-auth (we hold a signing key);
+                    // bit1 = expects_responder_auth (we hold a responder pin and WILL
+                    // verify sig_R against it — A-init). §4.4: requiring responder auth
+                    // without a pin cannot be satisfied, so refuse rather than trust any
+                    // signer — this closes the `--allow-unauth` + no-pin node_id-only path
+                    // (the one behaviour change vs the pre-#7 handshake; everything else is
+                    // preserved).
+                    let has_responder_pin =
+                        config.signing_pubkey.is_some() || config.target_sign_fp.is_some();
+                    if !config.allow_unauth && !has_responder_pin {
+                        return Err(CryptoError::Parameter(
+                            "Handshake failed: responder authentication required but no pinned \
+                             identity to verify against (provide --signing-pubkey or a ticket \
+                             fingerprint, or set --allow-unauth for an anonymous connection)"
+                                .to_string(),
+                        ));
+                    }
+                    let expects_responder_auth = has_responder_pin;
 
-                    if client_auth_flag[0] == 1 {
+                    // #7 pre-commit = the pinned responder fingerprint (raw32 =
+                    // SHA3-256(dsa_pub_raw), no prefix — §3). Prefer the ticket fingerprint;
+                    // else derive it from the pinned pubkey file. Committing to it inside
+                    // sig_I lets the responder cross-check it is the intended peer (A-resp);
+                    // it is the same value A-init checks #11 against.
+                    let expected_responder_fp: Option<[u8; 32]> = if expects_responder_auth {
+                        if let Some(fp) = config.target_sign_fp {
+                            Some(fp)
+                        } else if let Some(ref pubkey_path) = config.signing_pubkey {
+                            let pubkey_bytes = Zeroizing::new(std::fs::read(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
+                            let pubkey_pem = std::str::from_utf8(&pubkey_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
+                            let pubkey_der = crate::utils::unwrap_from_pem(pubkey_pem, "PUBLIC KEY")?;
+                            let pinned_raw_pub = crate::utils::unwrap_pqc_pub_from_spki(&pubkey_der, &config.pqc_dsa_algo)?;
+                            Some(Sha3_256::digest(&pinned_raw_pub).into())
+                        } else {
+                            None // unreachable: expects_responder_auth ⇒ has_responder_pin
+                        }
+                    } else {
+                        None
+                    };
+
+                    let mut client_flags = 0u8;
+                    if config.signing_privkey.is_some() { client_flags |= hs_flags::INITIATOR_SELF_AUTH; }
+                    if expects_responder_auth { client_flags |= hs_flags::EXPECTS_RESPONDER_AUTH; }
+                    let client_auth_flag = [client_flags];
+                    writer.write_all(&client_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                    tb.append_raw(&client_auth_flag); // #5 initiator flags
+
+                    // #6 initiator ML-DSA pub (if self-auth). Load the signing key but
+                    // defer signing until after #7 is appended so sig_I covers #1–#7.
+                    let mut sign_priv: Option<Zeroizing<Vec<u8>>> = None;
+                    if client_auth_flag[0] & hs_flags::INITIATOR_SELF_AUTH != 0 {
                         let raw_priv = {
                             let privkey_path = config.signing_privkey.as_ref().unwrap();
                             let privkey_bytes = Zeroizing::new(std::fs::read(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
@@ -842,30 +999,61 @@ impl NetworkProcessor {
                         let client_dsa_pub = backend::pqc_pub_from_priv_dsa(&config.pqc_dsa_algo, &raw_priv)?;
                         CommonProcessor::write_vec(&mut writer, &client_dsa_pub).await?;
                         tb.append_lp(&client_dsa_pub); // #6
+                        sign_priv = Some(raw_priv);
+                    }
 
-                        // Sign the partial transcript (#1–#6).
-                        let sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, tb.snapshot(), &[])?;
+                    // #7 expected-responder-fingerprint pre-commit (raw32), if bit1.
+                    if client_auth_flag[0] & hs_flags::EXPECTS_RESPONDER_AUTH != 0 {
+                        let fp = expected_responder_fp.expect("bit1 set ⇒ responder fingerprint present");
+                        writer.write_all(&fp).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
+                        tb.append_raw(&fp); // #7 expected responder fingerprint
+                    }
+
+                    // sig_I over the initiator transcript #1–#7 (if self-auth).
+                    if let Some(raw_priv) = sign_priv {
+                        let sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, tb.snapshot(), HANDSHAKE_CTX_IROH)?;
                         CommonProcessor::write_vec(&mut writer, &sig).await?;
                     }
 
                     let server_ecc_pub = CommonProcessor::read_vec(&mut reader).await?;
+                    ensure_field_len("#8 responder P-256", server_ecc_pub.len(), Some(backend::P256_SPKI_DER_LEN))?;
                     let kem_ct = CommonProcessor::read_vec(&mut reader).await?;
+                    ensure_field_len("#9 ML-KEM ct", kem_ct.len(), backend::mlkem_ct_len(&config.pqc_kem_algo))?;
                     let mut server_auth_flag = [0u8; 1];
                     reader.read_exact(&mut server_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
-                    tb.append_lp(&server_ecc_pub); // #7
-                    tb.append_lp(&kem_ct); // #8
-                    tb.append_raw(&server_auth_flag); // #9
+                    tb.append_lp(&server_ecc_pub); // #8
+                    tb.append_lp(&kem_ct); // #9
+                    tb.append_raw(&server_auth_flag); // #10 responder flags
+                    if server_auth_flag[0] & !hs_flags::RESPONDER_ALLOWED != 0 {
+                        return Err(CryptoError::Parameter(
+                            "Handshake failed: reserved bit set in responder flags (#10)".to_string(),
+                        ));
+                    }
 
-                    if server_auth_flag[0] == 1 {
+                    if server_auth_flag[0] & hs_flags::RESPONDER_SELF_AUTH != 0 {
                         let server_dsa_pub = CommonProcessor::read_vec(&mut reader).await?;
-                        tb.append_lp(&server_dsa_pub); // #10
+                        ensure_field_len("#11 responder ML-DSA pub", server_dsa_pub.len(), backend::mldsa_pub_len(&config.pqc_dsa_algo))?;
+                        tb.append_lp(&server_dsa_pub); // #11
 
                         let sig = CommonProcessor::read_vec(&mut reader).await?;
+                        ensure_field_len("sig_R", sig.len(), backend::mldsa_sig_len(&config.pqc_dsa_algo))?;
 
                         let server_kem_pub = CommonProcessor::read_vec(&mut reader).await?;
-                        tb.append_lp(&server_kem_pub); // #11
+                        // #12 is OPTIONAL: empty when the responder publishes no static
+                        // ML-KEM key (ephemeral #9 still provides FS). Length-check it only
+                        // when present; an enc-key pin (target_enc_fp) separately rejects a
+                        // stripped/empty #12 via the fingerprint mismatch below.
+                        if !server_kem_pub.is_empty() {
+                            ensure_field_len("#12 responder ML-KEM ek", server_kem_pub.len(), backend::mlkem_ek_len(&config.pqc_kem_algo))?;
+                        }
+                        tb.append_lp(&server_kem_pub); // #12
 
+                        // A-init (§4.2): chain sig_R to the PINNED identity. Every pin
+                        // input path is checked against the wire responder pub (#11)
+                        // BEFORE verifying sig_R, so a MITM presenting its own #11 cannot
+                        // pass by having its own key verify its own signature. bit1 ⇒
+                        // has_responder_pin, so at least one of these branches runs.
                         if let Some(ref pubkey_path) = config.signing_pubkey {
                             let pubkey_bytes = Zeroizing::new(std::fs::read(pubkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
                             let pubkey_pem = std::str::from_utf8(&pubkey_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
@@ -891,8 +1079,9 @@ impl NetworkProcessor {
                             }
                         }
 
-                        // Verify the server signature over the full transcript (#1–#11).
-                        if !backend::pqc_verify(&config.pqc_dsa_algo, &server_dsa_pub, tb.snapshot(), &sig, &[])? {
+                        // Verify sig_R over the full transcript (#1–#12) with the
+                        // pin-checked #11 (server_dsa_pub).
+                        if !backend::pqc_verify(&config.pqc_dsa_algo, &server_dsa_pub, tb.snapshot(), &sig, HANDSHAKE_CTX_IROH)? {
                             return Err(CryptoError::SignatureVerification);
                         }
                         eprintln!("Server authenticated successfully (auth: {}).", config.pqc_dsa_algo);
@@ -903,16 +1092,13 @@ impl NetworkProcessor {
                                 return Err(CryptoError::Parameter("Server not in allowlist".to_string()));
                             }
                         }
-                    } else if config.signing_pubkey.is_some()
-                        || config.target_sign_fp.is_some()
-                        || config.target_enc_fp.is_some()
-                        || !config.allow_unauth
-                    {
-                        // A pinned server key or ticket fingerprint (target_*_fp) is a
-                        // MITM defence and must not be silently skipped when the server
-                        // declines to authenticate — the fp checks above live inside the
-                        // `server_auth_flag == 1` arm, so without this a server returning
-                        // flag 0 would bypass the pin under `--allow-unauth`.
+                    } else if expects_responder_auth || config.target_enc_fp.is_some() {
+                        // Downgrade detection (§4.2/§4.3): we required responder auth
+                        // (#5.bit1, or an enc-key pin) but the responder returned
+                        // #10.bit0 = 0 (declined to self-auth). The pin checks live in the
+                        // self-auth arm above, so a responder returning flag 0 must not be
+                        // able to bypass the pin — abort on the ABSENCE of the demanded
+                        // signature.
                         return Err(CryptoError::Parameter("Handshake failed: Server authentication required (pinned key/fingerprint or auth policy)".to_string()));
                     }
 
@@ -1164,6 +1350,22 @@ mod tests {
     use super::*;
     use crate::p2p::backend::mock::MockNetwork;
     use crate::network::TestIOProvider;
+
+    // Parser robustness (§10(B)): the fixed-length gate must REJECT a wrong length
+    // via Result — never panic — and must not fire on a match or an unknown algo.
+    #[test]
+    fn ensure_field_len_rejects_wrong_length_without_panic() {
+        // Match → Ok.
+        assert!(ensure_field_len("#6", 1952, backend::mldsa_pub_len("ML-DSA-65")).is_ok());
+        assert!(ensure_field_len("sig", 3309, backend::mldsa_sig_len("ML-DSA-65")).is_ok());
+        assert!(ensure_field_len("#3", 91, Some(backend::P256_SPKI_DER_LEN)).is_ok());
+        // Mismatch (incl. attacker-controlled 0 / oversize) → Err, not panic.
+        assert!(ensure_field_len("#6", 1951, backend::mldsa_pub_len("ML-DSA-65")).is_err());
+        assert!(ensure_field_len("#6", 0, backend::mldsa_pub_len("ML-DSA-65")).is_err());
+        assert!(ensure_field_len("sig", 100_000, backend::mldsa_sig_len("ML-DSA-65")).is_err());
+        // Unknown algorithm → None → skip (let the backend reject the algo).
+        assert!(ensure_field_len("#6", 7, backend::mldsa_pub_len("ML-DSA-999")).is_ok());
+    }
 
     // ------------------------------------------------------------------
     // Handshake transcript KAT (known-answer test).

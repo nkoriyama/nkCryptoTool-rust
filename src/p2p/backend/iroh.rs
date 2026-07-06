@@ -683,6 +683,55 @@ mod tests {
         assert!(client_res.unwrap().is_ok());
     }
 
+    // A-init (server side): the server pins client C via signing_pubkey; a different
+    // client A (valid self-signature, wrong identity) must be REJECTED. Locks in that
+    // the server binds the wire #6 to the pinned key before trusting sig_I — a
+    // regression guard for the pin-before-verify ordering (symmetric with the
+    // initiator's A-init).
+    #[tokio::test]
+    #[serial]
+    async fn test_iroh_handshake_server_pins_client_rejects_other() {
+        reset_state();
+        let dir = tempdir().unwrap();
+        let s_key_path = dir.path().join("s.priv.pem");
+        let c_pub_path = dir.path().join("c.pub.pem");
+        let a_key_path = dir.path().join("a.priv.pem");
+        let (s_priv, _s_pub, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+        let (_c_priv, c_pub, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+        let (a_priv, _a_pub, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+        fs::write(&s_key_path, utils::wrap_to_pem(&utils::wrap_pqc_priv_to_pkcs8(&s_priv, "ML-DSA-65").unwrap(), "PRIVATE KEY")).unwrap();
+        fs::write(&c_pub_path, utils::wrap_to_pem(&utils::wrap_pqc_pub_to_spki(&c_pub, "ML-DSA-65").unwrap(), "PUBLIC KEY")).unwrap();
+        fs::write(&a_key_path, utils::wrap_to_pem(&utils::wrap_pqc_priv_to_pkcs8(&a_priv, "ML-DSA-65").unwrap(), "PRIVATE KEY")).unwrap();
+        let (ticket_tx, ticket_rx) = tokio::sync::oneshot::channel();
+        let mut server_config = CryptoConfig::default();
+        server_config.transport = crate::config::TransportKind::Iroh;
+        server_config.chat_mode = false;
+        server_config.allow_unauth = false;
+        server_config.signing_privkey = Some(s_key_path.to_str().unwrap().to_string());
+        server_config.signing_pubkey = Some(c_pub_path.to_str().unwrap().to_string()); // pins client C
+        server_config.handshake_timeout = 30;
+        let _server_task = tokio::spawn(async move {
+            let mut processor = new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await;
+            processor.preload_allowlist().await.unwrap();
+            let _ = processor.start_with_ticket_callback(|ticket| {
+                let _ = ticket_tx.send(ticket.to_string());
+            }).await;
+        });
+        let ticket_str = ticket_rx.await.unwrap();
+        let mut client_config = CryptoConfig::default();
+        client_config.transport = crate::config::TransportKind::Iroh;
+        client_config.connect_addr = Some(modify_ticket(&ticket_str, None, None));
+        client_config.chat_mode = false;
+        client_config.allow_unauth = true; // A self-authenticates but does not pin the server
+        client_config.signing_privkey = Some(a_key_path.to_str().unwrap().to_string()); // WRONG identity (not C)
+        client_config.handshake_timeout = 30;
+        let client_res = tokio::time::timeout(Duration::from_secs(60), async {
+            let processor = new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await;
+            processor.run_connect().await
+        }).await;
+        assert!(client_res.unwrap().is_err(), "server must reject a client whose identity != the pinned key");
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_iroh_handshake_auth_fail_fingerprint_mismatch() {
@@ -830,7 +879,14 @@ mod tests {
         client_config.transport = crate::config::TransportKind::Iroh;
         client_config.connect_addr = Some(modify_ticket(&ticket_str, None, None));
         client_config.chat_mode = false;
-        client_config.allow_unauth = false;
+        // This test exercises CLIENT auth (the server allowlists the client); the
+        // client does not pin the server's identity. Under KEY_EXCHANGE_DESIGN.md
+        // §4.4, requiring responder auth (allow_unauth=false) without a server pin is
+        // refused — so the honest setting for a client that self-authenticates but
+        // does not pin the server is allow_unauth=true (anonymous-server mode).
+        // (Mutual auth with a server pin / #7 pre-commit is covered by
+        // test_iroh_handshake_auth_success.)
+        client_config.allow_unauth = true;
         client_config.signing_privkey = Some(c_key_path.to_str().unwrap().to_string());
         let client_res = tokio::time::timeout(Duration::from_secs(60), async {
             let processor = new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await;
