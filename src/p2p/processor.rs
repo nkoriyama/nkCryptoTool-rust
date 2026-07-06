@@ -253,19 +253,19 @@ impl NetworkProcessor {
                     // file receive: both modes false
                 } else if incoming.protocol.0 == crate::network::ALPN_SHELL {
                     if !shell_allowed {
-                        eprintln!("Rejecting nkct/shell/1: this node is not a shell server");
+                        eprintln!("Rejecting nkct/shell/2: this node is not a shell server");
                         return;
                     }
                     config.shell_mode = true;
                 } else if incoming.protocol.0 == crate::network::ALPN_FWD {
                     if !forward_allowed {
-                        eprintln!("Rejecting nkct/fwd/1: this node is not a forward server");
+                        eprintln!("Rejecting nkct/fwd/2: this node is not a forward server");
                         return;
                     }
                     config.forward_mode = true;
                 } else if incoming.protocol.0 == crate::network::ALPN_SCP {
                     if !scp_allowed {
-                        eprintln!("Rejecting nkct/scp/1: this node is not an scp server");
+                        eprintln!("Rejecting nkct/scp/2: this node is not an scp server");
                         return;
                     }
                     config.scp_mode = true;
@@ -373,21 +373,21 @@ impl NetworkProcessor {
         } else if incoming.protocol.0 == crate::network::ALPN_SHELL {
             if !shell_allowed {
                 return Err(CryptoError::Parameter(
-                    "shell (nkct/shell/1) is not enabled on this node".to_string(),
+                    "shell (nkct/shell/2) is not enabled on this node".to_string(),
                 ));
             }
             config.shell_mode = true;
         } else if incoming.protocol.0 == crate::network::ALPN_FWD {
             if !forward_allowed {
                 return Err(CryptoError::Parameter(
-                    "forward (nkct/fwd/1) is not enabled on this node".to_string(),
+                    "forward (nkct/fwd/2) is not enabled on this node".to_string(),
                 ));
             }
             config.forward_mode = true;
         } else if incoming.protocol.0 == crate::network::ALPN_SCP {
             if !scp_allowed {
                 return Err(CryptoError::Parameter(
-                    "scp (nkct/scp/1) is not enabled on this node".to_string(),
+                    "scp (nkct/scp/2) is not enabled on this node".to_string(),
                 ));
             }
             config.scp_mode = true;

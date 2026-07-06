@@ -28,19 +28,25 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const CUMULATIVE_TIMEOUT: Duration = Duration::from_secs(7200);
 pub const CHAT_SESSION_TIMEOUT: Duration = Duration::from_secs(7200); // 2 hours
 
-pub const ALPN_CHAT: &[u8] = b"nkct/chat/1";
-pub const ALPN_FILE: &[u8] = b"nkct/file/2";
+// KEY_EXCHANGE_DESIGN.md §7(A) flag-day: the increment-3 handshake (identity #7
+// pre-commit, #5/#10 presence flags, native ctx nkct-handshake-iroh-v1) is a
+// wire break. Every ALPN whose connection runs the NetworkProcessor mutual-auth
+// handshake is version-bumped together so an old and a new peer fail cleanly at
+// ALPN negotiation rather than mid-handshake. ALPN_MLS / ALPN_INBOX do NOT run
+// this handshake (separate subsystems), so they are intentionally left unbumped.
+pub const ALPN_CHAT: &[u8] = b"nkct/chat/2";
+pub const ALPN_FILE: &[u8] = b"nkct/file/3";
 /// P2P shell (bastion-less PQC SSH; see `P2P_SHELL_DESIGN.md`). Phase 0 carries
 /// an echo session; later phases carry a PTY bridge.
-pub const ALPN_SHELL: &[u8] = b"nkct/shell/1";
+pub const ALPN_SHELL: &[u8] = b"nkct/shell/2";
 /// P2P port forwarding (bastion-less `ssh -L`; see `P2P_SHELL_DESIGN.md` Phase 3).
 /// One connection multiplexes many TCP streams as channels; see
 /// [`crate::forward`].
-pub const ALPN_FWD: &[u8] = b"nkct/fwd/1";
+pub const ALPN_FWD: &[u8] = b"nkct/fwd/2";
 /// P2P scp (bastion-less file transfer; see `P2P_SCP_DESIGN.md`). Carries a
 /// single get/put request per connection, policy-gated and path-confined; see
 /// [`crate::scp`].
-pub const ALPN_SCP: &[u8] = b"nkct/scp/1";
+pub const ALPN_SCP: &[u8] = b"nkct/scp/2";
 /// MLS group chat ALPN (P4). Each accepted stream under this protocol
 /// carries exactly one length-prefixed `mls_rs::MlsMessage` per the
 /// [`crate::group::transport`] framing helpers — Welcome / Commit /
