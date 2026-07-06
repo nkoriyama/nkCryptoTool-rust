@@ -149,7 +149,6 @@ pub struct CryptoConfig {
     pub use_parallel: bool,
     pub is_recursive: bool,
 
-    pub listen_addr: Option<String>,
     pub connect_addr: Option<String>,
     pub chat_mode: bool,
     /// P2P shell mode (ALPN_SHELL). Mutually exclusive with chat/file; when set,
@@ -271,7 +270,6 @@ impl Default for CryptoConfig {
             pqc_dsa_algo: "ML-DSA-65".to_string(),
             use_parallel: false,
             is_recursive: false,
-            listen_addr: None,
             connect_addr: None,
             chat_mode: false,
             shell_mode: false,
