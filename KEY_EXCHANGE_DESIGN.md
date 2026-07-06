@@ -265,7 +265,10 @@ initiator は sig_R を **ピン済み指紋に鎖して**検証（`fingerprint(
 attacker-controlled な LP フィールドが handshake(#1–12)・keybind_blob・KeyBundle で大量に増える。**全 LP 解析を境界チェック必須・panic 禁止・明示 Result 化**:
 - LP length > 残バッファ → reject。
 - KeyBundle の `n` == 実パース数の一致検査。self_sig 後の trailing byte → reject。
-- **固定長暗号オブジェクトは LP 長 == 定数を assert**（length-confusion 防御）: ML-DSA-65 pub=1952 / sig=3309 / ML-KEM-768 ek=1184 / P-256=65。
+- **固定長暗号オブジェクトは LP 長 == 定数を assert**（length-confusion 防御）: ML-DSA-65 pub=1952 / sig=3309 / ML-KEM-768 ek=1184。
+  - **P-256 pub = 91B（SubjectPublicKeyInfo DER、増分3 で実測）**。raw SEC1 point の 65B ではない ── 本初版の "P-256=65" は raw 前提の誤りで、実装（`to_public_key_der` / SPKI）は DER で送る。65 で assert すると全ハンドシェイクが落ちる。定数はヘルパ（`backend::mldsa_pub_len`/`mldsa_sig_len`/`mlkem_ek_len`/`mlkem_ct_len`/`P256_SPKI_DER_LEN`）を単一ソースにし、doc の数値を手写ししない。
+  - **#12 responder 静的 ML-KEM ek は optional**: responder が静的 KEM 鍵を publish しない時は empty（エフェメラル #9 が FS を担う正当状態）。よって #12 の長さ検査は**非 empty 時のみ**（empty=スキップ / 固定長=通過 / 中間長=Err の三分岐）。enc pin(target_enc_fp)設定時は SHA3(empty)≠fp で empty が別途弾かれるので、この例外は enc pin の安全性を緩めない。
+  - 実装は Result 返し（`ensure_field_len`）で **`assert!` マクロ不使用**（attacker-controlled 長で panic すると remote DoS）。
 - handshake パーサと bundle パーサに **fuzz target を1本ずつ**。
 - 各 wire フォーマット実装と**同時に**堅牢化（後付けにしない）。
 

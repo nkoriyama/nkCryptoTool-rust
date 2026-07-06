@@ -51,6 +51,25 @@ mod hs_flags {
 /// wire break, paired with the ALPN bump below so old/new peers fail cleanly.
 const HANDSHAKE_CTX_IROH: &[u8] = b"nkct-handshake-iroh-v1";
 
+/// Reject a handshake field whose length is not the fixed size expected for the
+/// negotiated algorithm (KEY_EXCHANGE_DESIGN.md §10(B), parser robustness B):
+/// closes length-confusion at the parser door instead of trusting the crypto
+/// backend to error later. Returns `Err` — never panics — so an attacker-
+/// controlled length is a clean handshake failure, not a remote DoS (this
+/// project has a peer-id-parse remote-panic history; "assert" here is semantic,
+/// not the `assert!` macro). `expected == None` (unknown algorithm) skips the
+/// check and lets the backend reject the algorithm.
+fn ensure_field_len(field: &str, got: usize, expected: Option<usize>) -> Result<()> {
+    if let Some(n) = expected {
+        if got != n {
+            return Err(CryptoError::Parameter(format!(
+                "handshake field {field}: expected {n} bytes for the negotiated algorithm, got {got}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub struct NetworkProcessor {
     config: CryptoConfig,
     endpoint: Arc<dyn P2pEndpoint>,
@@ -451,7 +470,9 @@ impl NetworkProcessor {
             tb.append_raw(local_peer_id.as_bytes()); // #2 server id
 
             let client_ecc_pub = CommonProcessor::read_vec(&mut reader).await?;
+            ensure_field_len("#3 initiator P-256", client_ecc_pub.len(), Some(backend::P256_SPKI_DER_LEN))?;
             let client_kem_pub = CommonProcessor::read_vec(&mut reader).await?;
+            ensure_field_len("#4 initiator ML-KEM ek", client_kem_pub.len(), backend::mlkem_ek_len(&config.pqc_kem_algo))?;
 
             tb.append_lp(&client_ecc_pub); // #3
             tb.append_lp(&client_kem_pub); // #4
@@ -470,6 +491,7 @@ impl NetworkProcessor {
             let mut client_dsa_pub: Option<Vec<u8>> = None;
             if client_auth_flag[0] & hs_flags::INITIATOR_SELF_AUTH != 0 {
                 let pk = CommonProcessor::read_vec(&mut reader).await?;
+                ensure_field_len("#6 initiator ML-DSA pub", pk.len(), backend::mldsa_pub_len(&config.pqc_dsa_algo))?;
                 tb.append_lp(&pk); // #6
                 client_dsa_pub = Some(pk);
             }
@@ -504,6 +526,7 @@ impl NetworkProcessor {
                 }
 
                 let sig = CommonProcessor::read_vec(&mut reader).await?;
+                ensure_field_len("sig_I", sig.len(), backend::mldsa_sig_len(&config.pqc_dsa_algo))?;
                 if !backend::pqc_verify(&config.pqc_dsa_algo, pk, tb.snapshot(), &sig, HANDSHAKE_CTX_IROH)? {
                     return Err(CryptoError::SignatureVerification);
                 }
@@ -993,7 +1016,9 @@ impl NetworkProcessor {
                     }
 
                     let server_ecc_pub = CommonProcessor::read_vec(&mut reader).await?;
+                    ensure_field_len("#8 responder P-256", server_ecc_pub.len(), Some(backend::P256_SPKI_DER_LEN))?;
                     let kem_ct = CommonProcessor::read_vec(&mut reader).await?;
+                    ensure_field_len("#9 ML-KEM ct", kem_ct.len(), backend::mlkem_ct_len(&config.pqc_kem_algo))?;
                     let mut server_auth_flag = [0u8; 1];
                     reader.read_exact(&mut server_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
 
@@ -1008,11 +1033,20 @@ impl NetworkProcessor {
 
                     if server_auth_flag[0] & hs_flags::RESPONDER_SELF_AUTH != 0 {
                         let server_dsa_pub = CommonProcessor::read_vec(&mut reader).await?;
+                        ensure_field_len("#11 responder ML-DSA pub", server_dsa_pub.len(), backend::mldsa_pub_len(&config.pqc_dsa_algo))?;
                         tb.append_lp(&server_dsa_pub); // #11
 
                         let sig = CommonProcessor::read_vec(&mut reader).await?;
+                        ensure_field_len("sig_R", sig.len(), backend::mldsa_sig_len(&config.pqc_dsa_algo))?;
 
                         let server_kem_pub = CommonProcessor::read_vec(&mut reader).await?;
+                        // #12 is OPTIONAL: empty when the responder publishes no static
+                        // ML-KEM key (ephemeral #9 still provides FS). Length-check it only
+                        // when present; an enc-key pin (target_enc_fp) separately rejects a
+                        // stripped/empty #12 via the fingerprint mismatch below.
+                        if !server_kem_pub.is_empty() {
+                            ensure_field_len("#12 responder ML-KEM ek", server_kem_pub.len(), backend::mlkem_ek_len(&config.pqc_kem_algo))?;
+                        }
                         tb.append_lp(&server_kem_pub); // #12
 
                         // A-init (§4.2): chain sig_R to the PINNED identity. Every pin
@@ -1316,6 +1350,22 @@ mod tests {
     use super::*;
     use crate::p2p::backend::mock::MockNetwork;
     use crate::network::TestIOProvider;
+
+    // Parser robustness (§10(B)): the fixed-length gate must REJECT a wrong length
+    // via Result — never panic — and must not fire on a match or an unknown algo.
+    #[test]
+    fn ensure_field_len_rejects_wrong_length_without_panic() {
+        // Match → Ok.
+        assert!(ensure_field_len("#6", 1952, backend::mldsa_pub_len("ML-DSA-65")).is_ok());
+        assert!(ensure_field_len("sig", 3309, backend::mldsa_sig_len("ML-DSA-65")).is_ok());
+        assert!(ensure_field_len("#3", 91, Some(backend::P256_SPKI_DER_LEN)).is_ok());
+        // Mismatch (incl. attacker-controlled 0 / oversize) → Err, not panic.
+        assert!(ensure_field_len("#6", 1951, backend::mldsa_pub_len("ML-DSA-65")).is_err());
+        assert!(ensure_field_len("#6", 0, backend::mldsa_pub_len("ML-DSA-65")).is_err());
+        assert!(ensure_field_len("sig", 100_000, backend::mldsa_sig_len("ML-DSA-65")).is_err());
+        // Unknown algorithm → None → skip (let the backend reject the algo).
+        assert!(ensure_field_len("#6", 7, backend::mldsa_pub_len("ML-DSA-999")).is_ok());
+    }
 
     // ------------------------------------------------------------------
     // Handshake transcript KAT (known-answer test).
