@@ -45,10 +45,15 @@ pub const XWING_SK_LEN: usize = 32 + 2400;
 /// ML-DSA algorithm that signs prekeys. Matches the identity signing key.
 pub const PREKEY_SIGN_ALGO: &str = "ML-DSA-65";
 
-/// Domain-separation prefix mixed into the signed message so a prekey
-/// signature can never be confused with a signature over anything else
-/// (handshake transcript, file header, …).
-const PREKEY_SIG_CONTEXT: &[u8] = b"nkct-onetime-prekey-v1";
+/// FIPS 204 **native** signature context for prekey signatures
+/// (KEY_EXCHANGE_DESIGN.md §2.1/§11.1). Migrated from a byte-prefix mixed into
+/// the message to a native ML-DSA ctx: mixing the two mechanisms does not
+/// actually separate prekey from the still-`ctx=""` file signature (they share
+/// the same M'), so a file signature over crafted bytes could be replayed as a
+/// prekey. A distinct native ctx closes that — a `ctx=""` file signature can
+/// never verify under this ctx. Do NOT also prepend it to the message (that
+/// would re-mix the two mechanisms, §2 invariant).
+const PREKEY_CTX: &[u8] = b"nkct-prekey-v1";
 
 /// Upper bound accepted for a serialized signature length. ML-DSA-65
 /// signatures are 3309 B; the generous cap rejects malformed wire data
@@ -85,10 +90,10 @@ pub fn peer_id_from_dsa_pub(dsa_pub: &[u8]) -> [u8; 32] {
 }
 
 /// The exact byte string signed for (and verified against) a prekey:
-/// `context ‖ recipient_peer_id ‖ prekey_id(BE) ‖ xwing_pub`.
+/// `recipient_peer_id ‖ prekey_id(BE) ‖ xwing_pub`. Domain separation is the
+/// native `PREKEY_CTX` (§11.1) — the context is NOT prepended to the message.
 fn signed_message(recipient_peer_id: &[u8; 32], prekey_id: u32, xwing_pub: &[u8]) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(PREKEY_SIG_CONTEXT.len() + 32 + 4 + xwing_pub.len());
-    msg.extend_from_slice(PREKEY_SIG_CONTEXT);
+    let mut msg = Vec::with_capacity(32 + 4 + xwing_pub.len());
     msg.extend_from_slice(recipient_peer_id);
     msg.extend_from_slice(&prekey_id.to_be_bytes());
     msg.extend_from_slice(xwing_pub);
@@ -121,7 +126,7 @@ impl SignedPrekey {
         }
         let peer_id = peer_id_from_dsa_pub(dsa_pub);
         let msg = signed_message(&peer_id, self.prekey_id, &self.xwing_pub);
-        Ok(crate::backend::pqc_verify(PREKEY_SIGN_ALGO, dsa_pub, &msg, &self.signature, &[])?)
+        Ok(crate::backend::pqc_verify(PREKEY_SIGN_ALGO, dsa_pub, &msg, &self.signature, PREKEY_CTX)?)
     }
 
     /// Serialize to the wire form:
@@ -208,7 +213,7 @@ pub fn generate(count: u32, start_id: u32, dsa_priv: &[u8]) -> Result<Vec<Genera
             return Err(PrekeyError::BadPublicKeyLen(prekey_id, xwing_pub.len()));
         }
         let msg = signed_message(&recipient_peer_id, prekey_id, &xwing_pub);
-        let signature = crate::backend::pqc_sign(PREKEY_SIGN_ALGO, dsa_priv, &msg, &[])?;
+        let signature = crate::backend::pqc_sign(PREKEY_SIGN_ALGO, dsa_priv, &msg, PREKEY_CTX)?;
         out.push(GeneratedPrekey {
             signed: SignedPrekey { prekey_id, xwing_pub, signature },
             xwing_priv: sk,
@@ -517,6 +522,31 @@ mod tests {
     fn test_identity() -> (Zeroizing<Vec<u8>>, Vec<u8>) {
         let (priv_raw, pub_raw, _) = crate::backend::pqc_keygen_dsa(PREKEY_SIGN_ALGO).unwrap();
         (priv_raw, pub_raw)
+    }
+
+    // §11.1 completion criterion: a signature made under ctx="" (as file signing
+    // uses) over the exact prekey message must NOT verify as a prekey. The native
+    // PREKEY_CTX separates the two, closing the file->prekey cross-replay the
+    // dual-model flagged. Do not weaken this to "different message" — the message
+    // bytes are identical; only the ctx differs.
+    #[test]
+    fn file_ctx_signature_does_not_verify_as_prekey() {
+        let (priv_raw, pub_raw) = test_identity();
+        let xwing_pub = vec![7u8; XWING_PK_LEN];
+        let prekey_id = 3u32;
+        let peer_id = peer_id_from_dsa_pub(&pub_raw);
+        let msg = signed_message(&peer_id, prekey_id, &xwing_pub);
+        // Forge a "file-style" ctx="" signature over the exact prekey message bytes.
+        let forged = crate::backend::pqc_sign(PREKEY_SIGN_ALGO, &priv_raw, &msg, &[]).unwrap();
+        let replayed = SignedPrekey { prekey_id, xwing_pub: xwing_pub.clone(), signature: forged };
+        assert!(
+            !replayed.verify(&pub_raw).unwrap(),
+            "a ctx=\"\" (file-style) signature must not pass prekey verification"
+        );
+        // Sanity: the correct native ctx DOES verify.
+        let good = crate::backend::pqc_sign(PREKEY_SIGN_ALGO, &priv_raw, &msg, PREKEY_CTX).unwrap();
+        let ok = SignedPrekey { prekey_id, xwing_pub, signature: good };
+        assert!(ok.verify(&pub_raw).unwrap());
     }
 
     #[test]
