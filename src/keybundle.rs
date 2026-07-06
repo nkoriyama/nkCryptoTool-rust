@@ -58,10 +58,6 @@ pub(crate) fn put_lp(buf: &mut Vec<u8>, b: &[u8]) {
 
 /// Read one LP field starting at `*off`, advancing `*off` past it. Returns `Err`
 /// on truncation or an over-large length (never panics, never over-allocates).
-// Rationale: the read side of the shared LP codec, defined here alongside put_lp.
-// Future plan: consumed by §6 KeyBundle parsing (parse_and_verify) in the next
-// commit; already exercised by read_lp_rejects_* (§10(B) robustness) here.
-#[allow(dead_code)]
 pub(crate) fn read_lp(buf: &[u8], off: &mut usize) -> BResult<Vec<u8>> {
     if buf.len() < *off + 4 {
         return Err(KeyBundleError::Wire("truncated LP length prefix".into()));
@@ -153,6 +149,237 @@ pub fn verify_keybind(
     Ok(backend::pqc_verify(dsa_algo, owner_pk, &blob, sig, KEYBIND_CTX)?)
 }
 
+// -- §6 KeyBundle -------------------------------------------------------------
+
+/// KeyBundle magic (§6): `b"NKKB"` (NK KeyBundle). Distinct from every other
+/// 4-byte magic — in particular NOT `b"NKB1"` (the unrelated `one_shot` recipient
+/// bundle) nor `b"NKCB"` (the MLS credential binding).
+const BUNDLE_MAGIC: &[u8; 4] = b"NKKB";
+const BUNDLE_VERSION: u8 = 1;
+/// FIPS 204 native signature context for the KeyBundle self-signature (§2.1).
+const BUNDLE_CTX: &[u8] = b"nkct-bundle-v1";
+/// Upper bound on the bound-key count `n`: a malformed/huge count is rejected
+/// before allocating (§10(B)). A real bundle carries a handful of keys.
+const MAX_BUNDLE_KEYS: usize = 64;
+
+/// Upper bound on any single LP field written by `build_signed` (§10(B)). Far
+/// above any real key/handle (ML-DSA pub ≈ 2 KiB, ML-KEM ek ≈ 1.2 KiB), but well
+/// below `u32::MAX` so the `len as u32` LP cast can never truncate and corrupt
+/// the frame. On parse, `read_lp` already bounds each field by the remaining buffer.
+const MAX_FIELD_LEN: usize = 64 * 1024;
+
+/// One key bound into a KeyBundle: `target_pk` in role `key_usage`, with its own
+/// timestamps. On a verified bundle every field here was covered by BOTH the
+/// per-key keybind signature and the bundle self-signature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoundKey {
+    pub key_usage: u8,
+    pub target_pk: Vec<u8>,
+    pub created_at: u64,
+    /// Authenticated (untampered) but **not enforced** by `parse_and_verify`: the
+    /// caller MUST compare it to its clock and reject an expired key (see
+    /// `parse_and_verify`). Entry-point enforcement lives in the CLI increment.
+    pub expires_at: Option<u64>,
+    /// The §5 keybind signature over this key (carried in the wire bundle).
+    pub keybind_sig: Vec<u8>,
+}
+
+/// A parsed-and-verified KeyBundle. Every field is authenticated: the owner
+/// fingerprint matched the pin, the self-signature covered the whole body, and
+/// each `keys[i]` carried a valid keybind signature under the owner identity.
+#[derive(Clone, Debug)]
+pub struct VerifiedKeyBundle {
+    pub owner_pk: Vec<u8>,
+    pub handle: String,
+    pub created_at: u64,
+    pub keys: Vec<BoundKey>,
+}
+
+/// Serialize the bundle **body** — everything the self-signature covers: magic,
+/// version, owner, handle, created_at, count, and each entry. `LP(self_sig)` is
+/// appended by the caller. This is the single source of the signed layout, so
+/// `parse_and_verify` verifies the self-signature over exactly these bytes.
+fn bundle_body(owner_pk: &[u8], handle: &str, created_at: u64, keys: &[BoundKey]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(BUNDLE_MAGIC);
+    b.push(BUNDLE_VERSION);
+    put_lp(&mut b, owner_pk);
+    put_lp(&mut b, handle.as_bytes());
+    b.extend_from_slice(&created_at.to_be_bytes());
+    b.extend_from_slice(&(keys.len() as u16).to_le_bytes());
+    for k in keys {
+        b.push(k.key_usage);
+        put_lp(&mut b, &k.target_pk);
+        b.extend_from_slice(&k.created_at.to_be_bytes());
+        match k.expires_at {
+            Some(e) => {
+                b.push(1);
+                b.extend_from_slice(&e.to_be_bytes());
+            }
+            None => b.push(0),
+        }
+        put_lp(&mut b, &k.keybind_sig);
+    }
+    b
+}
+
+/// Build a signed KeyBundle: sign a keybind over each `(usage, target_pk,
+/// created_at, expires_at)`, assemble the body, then self-sign it under
+/// `nkct-bundle-v1`. `handle` is bundle-level and is signed into every keybind.
+pub fn build_signed(
+    dsa_algo: &str,
+    sk_owner: &[u8],
+    owner_pk: &[u8],
+    handle: &str,
+    created_at: u64,
+    keys: &[(u8, Vec<u8>, u64, Option<u64>)],
+) -> BResult<Vec<u8>> {
+    if keys.len() > MAX_BUNDLE_KEYS {
+        return Err(KeyBundleError::Wire(format!(
+            "{} keys exceeds the {MAX_BUNDLE_KEYS} bound",
+            keys.len()
+        )));
+    }
+    // §10(B): guard every caller-provided field that goes through a u32 LP length,
+    // so an over-large input cannot truncate on the `as u32` cast and corrupt the
+    // frame. (owner_pk / handle here; internally-generated sigs are ML-DSA-sized.)
+    if owner_pk.len() > MAX_FIELD_LEN || handle.len() > MAX_FIELD_LEN {
+        return Err(KeyBundleError::Wire("owner_pk or handle exceeds MAX_FIELD_LEN".into()));
+    }
+    if let Some((_, big, _, _)) = keys.iter().find(|(_, t, _, _)| t.len() > MAX_FIELD_LEN) {
+        return Err(KeyBundleError::Wire(format!("target_pk of {} bytes exceeds MAX_FIELD_LEN", big.len())));
+    }
+    let mut bound = Vec::with_capacity(keys.len());
+    for (usage, target_pk, k_created, k_exp) in keys {
+        let sig = sign_keybind(dsa_algo, sk_owner, owner_pk, *usage, target_pk, handle, *k_created, *k_exp)?;
+        bound.push(BoundKey {
+            key_usage: *usage,
+            target_pk: target_pk.clone(),
+            created_at: *k_created,
+            expires_at: *k_exp,
+            keybind_sig: sig,
+        });
+    }
+    let body = bundle_body(owner_pk, handle, created_at, &bound);
+    let self_sig = backend::pqc_sign(dsa_algo, sk_owner, &body, BUNDLE_CTX)?;
+    let mut out = body;
+    put_lp(&mut out, &self_sig);
+    Ok(out)
+}
+
+/// Parse and fully verify a KeyBundle against a **pinned owner fingerprint**
+/// (`SHA3-256(owner_pk_raw)`, obtained out-of-band). Verification (§6):
+/// (1) the wire owner pub hashes to the pin; (2) the self-signature verifies with
+/// that owner pub over the body; (3) each keybind reconstructs (§5) and verifies.
+/// §6.2: the owner is the pin-anchored value, the handle is bundle-level, and each
+/// keybind is reconstructed with its own per-entry `created_at` (E) — no
+/// signature-uncovered plaintext is trusted. §10(B): every LP is bounds-checked,
+/// `n` is capped and must match, trailing bytes are rejected, nothing panics.
+///
+/// **Expiry is NOT enforced here (authenticity vs policy — deliberate layering).**
+/// This function verifies *authenticity* only: it guarantees each `expires_at` is
+/// the value the owner signed (untampered, since it is inside the covered blob),
+/// but it does **not** compare it to a clock — verification stays time-independent
+/// so it is reproducible and KAT-testable, and each caller keeps its own policy.
+/// `BoundKey.expires_at` is returned; **the caller MUST reject an expired key
+/// against its own current time before using it.** The actual entry-point
+/// enforcement lands in the CLI increment (a `--recipient-bundle` past its expiry
+/// is rejected with a message) — expiry is enforced *there*, not silently dropped.
+pub fn parse_and_verify(
+    bytes: &[u8],
+    dsa_algo: &str,
+    pinned_owner_fp: &[u8; 32],
+) -> BResult<VerifiedKeyBundle> {
+    use sha3::{Digest, Sha3_256};
+
+    let mut off = 0usize;
+    if bytes.len() < 5 || &bytes[0..4] != BUNDLE_MAGIC {
+        return Err(KeyBundleError::Wire("bad magic (not an NKKB KeyBundle)".into()));
+    }
+    off += 4;
+    let version = read_u8(bytes, &mut off)?;
+    if version != BUNDLE_VERSION {
+        return Err(KeyBundleError::Wire(format!("unsupported version {version}")));
+    }
+    let owner_pk = read_lp(bytes, &mut off)?;
+    let handle = String::from_utf8(read_lp(bytes, &mut off)?)
+        .map_err(|_| KeyBundleError::Wire("handle is not valid UTF-8".into()))?;
+    let created_at = read_u64_be(bytes, &mut off)?;
+    let n = read_u16_le(bytes, &mut off)? as usize;
+    if n > MAX_BUNDLE_KEYS {
+        return Err(KeyBundleError::Wire(format!("{n} keys exceeds the {MAX_BUNDLE_KEYS} bound")));
+    }
+
+    let mut keys = Vec::with_capacity(n);
+    for _ in 0..n {
+        let key_usage = read_u8(bytes, &mut off)?;
+        let target_pk = read_lp(bytes, &mut off)?;
+        let k_created = read_u64_be(bytes, &mut off)?;
+        let expires_at = match read_u8(bytes, &mut off)? {
+            0 => None,
+            1 => Some(read_u64_be(bytes, &mut off)?),
+            other => return Err(KeyBundleError::Wire(format!("has_expiry must be 0/1, got {other}"))),
+        };
+        let keybind_sig = read_lp(bytes, &mut off)?;
+        keys.push(BoundKey { key_usage, target_pk, created_at: k_created, expires_at, keybind_sig });
+    }
+
+    // The self-signature covers exactly the body (magic .. last entry).
+    let body_end = off;
+    let self_sig = read_lp(bytes, &mut off)?;
+    if off != bytes.len() {
+        return Err(KeyBundleError::Wire(format!("{} trailing byte(s) after the bundle", bytes.len() - off)));
+    }
+
+    // (1) wire owner pub must hash to the pinned fingerprint.
+    let owner_fp: [u8; 32] = Sha3_256::digest(&owner_pk).into();
+    if &owner_fp != pinned_owner_fp {
+        return Err(KeyBundleError::Wire("owner fingerprint does not match the pinned identity".into()));
+    }
+    // (2) self-signature must verify with the pin-anchored owner pub over the body.
+    if !backend::pqc_verify(dsa_algo, &owner_pk, &bytes[..body_end], &self_sig, BUNDLE_CTX)? {
+        return Err(KeyBundleError::Wire("bundle self-signature failed".into()));
+    }
+    // (3) each keybind reconstructs (§5) with the pin-anchored owner, the
+    //     bundle-level handle, and its own per-entry created_at (§6.2 / (E)).
+    for k in &keys {
+        let ok = verify_keybind(
+            dsa_algo, &owner_pk, k.key_usage, &k.target_pk, &handle, k.created_at, k.expires_at, &k.keybind_sig,
+        )?;
+        if !ok {
+            return Err(KeyBundleError::Wire("a keybind signature failed".into()));
+        }
+    }
+
+    Ok(VerifiedKeyBundle { owner_pk, handle, created_at, keys })
+}
+
+// Fixed-width readers — bounds-checked, never panic (§10(B)).
+fn read_u8(buf: &[u8], off: &mut usize) -> BResult<u8> {
+    if buf.len() < *off + 1 {
+        return Err(KeyBundleError::Wire("truncated u8".into()));
+    }
+    let v = buf[*off];
+    *off += 1;
+    Ok(v)
+}
+fn read_u16_le(buf: &[u8], off: &mut usize) -> BResult<u16> {
+    if buf.len() < *off + 2 {
+        return Err(KeyBundleError::Wire("truncated u16".into()));
+    }
+    let v = u16::from_le_bytes(buf[*off..*off + 2].try_into().unwrap());
+    *off += 2;
+    Ok(v)
+}
+fn read_u64_be(buf: &[u8], off: &mut usize) -> BResult<u64> {
+    if buf.len() < *off + 8 {
+        return Err(KeyBundleError::Wire("truncated u64".into()));
+    }
+    let v = u64::from_be_bytes(buf[*off..*off + 8].try_into().unwrap());
+    *off += 8;
+    Ok(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,5 +450,112 @@ mod tests {
         let mut off = 0;
         assert_eq!(read_lp(&good, &mut off).unwrap(), b"hello");
         assert_eq!(off, good.len());
+    }
+
+    // -- §6 KeyBundle ------------------------------------------------------
+
+    fn sample_bundle(sk: &[u8], pk: &[u8]) -> (Vec<u8>, [u8; 32]) {
+        use sha3::{Digest, Sha3_256};
+        let bytes = build_signed(
+            DSA, sk, pk, "alice", 1000,
+            &[
+                (KEY_USAGE_ENC, vec![1u8; 1184], 1000, None),
+                (KEY_USAGE_HYBRID, vec![4u8; 91], 1001, Some(9999)),
+            ],
+        )
+        .unwrap();
+        let fp: [u8; 32] = Sha3_256::digest(pk).into();
+        (bytes, fp)
+    }
+
+    #[test]
+    fn bundle_roundtrips_and_verifies() {
+        let (sk, pk) = owner();
+        let (bytes, fp) = sample_bundle(&sk, &pk);
+        let vb = parse_and_verify(&bytes, DSA, &fp).unwrap();
+        assert_eq!(vb.owner_pk, pk);
+        assert_eq!(vb.handle, "alice");
+        assert_eq!(vb.keys.len(), 2);
+        assert_eq!(vb.keys[0].key_usage, KEY_USAGE_ENC);
+        assert_eq!(vb.keys[1].expires_at, Some(9999));
+    }
+
+    #[test]
+    fn bundle_wrong_pin_rejected() {
+        let (sk, pk) = owner();
+        let (bytes, _fp) = sample_bundle(&sk, &pk);
+        assert!(parse_and_verify(&bytes, DSA, &[0u8; 32]).is_err(), "owner fp must match the pin");
+    }
+
+    #[test]
+    fn bundle_body_tamper_rejected() {
+        let (sk, pk) = owner();
+        let (mut bytes, fp) = sample_bundle(&sk, &pk);
+        // Flip a byte well past owner_pk (so the fp check passes) but inside the
+        // signed body — the self-signature (and the covering keybind) must catch it.
+        let at = bytes.len() / 3;
+        bytes[at] ^= 0xff;
+        assert!(parse_and_verify(&bytes, DSA, &fp).is_err(), "body tamper must be caught");
+    }
+
+    #[test]
+    fn bundle_keybind_transplant_across_owners_rejected() {
+        // §6.2 transplant: a keybind signed under owner A cannot be presented in a
+        // bundle whose owner is B. Splice A's keybind_sig into a bundle B self-signs;
+        // parse must reject — the keybind reconstructs under B's owner_pk and fails.
+        use sha3::{Digest, Sha3_256};
+        let (sk_a, pk_a) = owner();
+        let (sk_b, pk_b) = owner();
+        let enc = vec![2u8; 1184];
+        let a_sig = sign_keybind(DSA, &sk_a, &pk_a, KEY_USAGE_ENC, &enc, "svc", 5, None).unwrap();
+        let bound = vec![BoundKey {
+            key_usage: KEY_USAGE_ENC,
+            target_pk: enc,
+            created_at: 5,
+            expires_at: None,
+            keybind_sig: a_sig,
+        }];
+        let body = bundle_body(&pk_b, "svc", 5, &bound);
+        let self_sig = backend::pqc_sign(DSA, &sk_b, &body, BUNDLE_CTX).unwrap();
+        let mut bytes = body;
+        put_lp(&mut bytes, &self_sig);
+        let fp_b: [u8; 32] = Sha3_256::digest(&pk_b).into();
+        assert!(parse_and_verify(&bytes, DSA, &fp_b).is_err(), "A's keybind must not verify under owner B");
+    }
+
+    #[test]
+    fn bundle_file_ctx_self_sig_rejected() {
+        // A ctx="" (file-style) self-signature over the body must not verify — the
+        // native BUNDLE_CTX separates the bundle self-sig from a file signature.
+        use sha3::{Digest, Sha3_256};
+        let (sk, pk) = owner();
+        let kb = sign_keybind(DSA, &sk, &pk, KEY_USAGE_ENC, &vec![1u8; 1184], "h", 1, None).unwrap();
+        let bound = vec![BoundKey {
+            key_usage: KEY_USAGE_ENC,
+            target_pk: vec![1u8; 1184],
+            created_at: 1,
+            expires_at: None,
+            keybind_sig: kb,
+        }];
+        let body = bundle_body(&pk, "h", 1, &bound);
+        let forged = backend::pqc_sign(DSA, &sk, &body, &[]).unwrap(); // ctx=""
+        let mut bytes = body;
+        put_lp(&mut bytes, &forged);
+        let fp: [u8; 32] = Sha3_256::digest(&pk).into();
+        assert!(parse_and_verify(&bytes, DSA, &fp).is_err(), "ctx=\"\" self-sig must not verify");
+    }
+
+    #[test]
+    fn bundle_parser_rejects_malformed_without_panic() {
+        let (sk, pk) = owner();
+        let (bytes, fp) = sample_bundle(&sk, &pk);
+        let mut bad_magic = bytes.clone();
+        bad_magic[0] = b'X';
+        assert!(parse_and_verify(&bad_magic, DSA, &fp).is_err(), "bad magic");
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(parse_and_verify(&trailing, DSA, &fp).is_err(), "trailing byte");
+        assert!(parse_and_verify(&bytes[..bytes.len() / 2], DSA, &fp).is_err(), "truncated");
+        assert!(parse_and_verify(&[], DSA, &fp).is_err(), "empty");
     }
 }
