@@ -1251,4 +1251,25 @@ mod tests {
         alice_res.unwrap().expect("Alice chat_loop failed");
         bob_res.unwrap().expect("Bob chat_loop failed");
     }
+
+    // KEY_EXCHANGE_DESIGN.md §7(A) flag-day tripwire. The increment-3 handshake
+    // change (native ctx `nkct-handshake-iroh-v1`, #7 pre-commit, #5/#10 presence
+    // flags) is a wire break, so EVERY ALPN whose connection runs the mutual-auth
+    // handshake was version-bumped together. This test pins those versions so a
+    // later refactor cannot silently revert one (which would let a post-flag-day
+    // node speak an old, ctx=""-era wire to a peer that reused the bumped ALPN).
+    // If you intentionally change the handshake wire again, bump the ctx AND every
+    // handshake ALPN AND this test — all three move together, by design.
+    #[test]
+    fn handshake_alpns_are_at_their_flag_day_versions() {
+        assert_eq!(ALPN_CHAT, b"nkct/chat/2", "chat ALPN reverted (flag-day break)");
+        assert_eq!(ALPN_FILE, b"nkct/file/3", "file ALPN reverted (flag-day break)");
+        assert_eq!(ALPN_SHELL, b"nkct/shell/2", "shell ALPN reverted (flag-day break)");
+        assert_eq!(ALPN_FWD, b"nkct/fwd/2", "fwd ALPN reverted (flag-day break)");
+        assert_eq!(ALPN_SCP, b"nkct/scp/2", "scp ALPN reverted (flag-day break)");
+        // MLS / inbox do NOT run the NetworkProcessor handshake (separate
+        // subsystems), so they are intentionally NOT bumped by this flag-day.
+        assert_eq!(ALPN_MLS, b"nkct/mls/1", "MLS ALPN is intentionally unbumped");
+        assert_eq!(ALPN_INBOX, b"nkct/inbox/1", "inbox ALPN is intentionally unbumped");
+    }
 }
