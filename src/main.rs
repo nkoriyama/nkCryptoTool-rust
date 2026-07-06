@@ -96,8 +96,10 @@ struct Args {
     #[arg(long)]
     signature: Option<String>,
 
+    /// Run as a P2P listener (chat / file-transfer server) and print a ticket;
+    /// pair with a client's `--connect <ticket>`. Combine with `--chat` for chat.
     #[arg(long)]
-    listen: Option<String>,
+    listen: bool,
 
     #[arg(long)]
     connect: Option<String>,
@@ -588,7 +590,7 @@ async fn main() -> anyhow::Result<()> {
         Operation::Listen
     } else if args.serve_scp {
         Operation::Listen
-    } else if args.listen.is_some() {
+    } else if args.listen {
         Operation::Listen
     } else if args.connect.is_some() {
         Operation::Connect
@@ -703,7 +705,6 @@ async fn main() -> anyhow::Result<()> {
     config.discovery = args.discovery;
     config.passphrase = passphrase;
     config.use_tpm = args.use_tpm;
-    config.listen_addr = args.listen;
     config.connect_addr = args.connect;
     config.chat_mode = args.chat;
     config.shell_mode =
