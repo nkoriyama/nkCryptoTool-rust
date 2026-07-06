@@ -81,12 +81,20 @@ scp は別プロセスなので両立する。
 
 ![署名付き recipient bundle と One-Time Prekey inbox による非同期 PQC 配送](./docs/p2p_bundle_demo.gif)
 
-送信者と受信者が**同時にオンラインにならない**非同期配送。受信者は自分の ML-DSA-65
-identity を単一アンカーに、静的 X-Wing 鍵・NodeId・inbox スロットを束ねた**署名付き
-recipient bundle** を publish し、One-Time Prekey を信頼しない store-and-forward inbox
-に補充してオフラインになる。送信者は out-of-band で共有された fingerprint に bundle を
-pin して検証し、prekey を 1 本引いて full PQ-FS でファイルをシールし、inbox に投函する。
-後刻オンラインに戻った受信者が inbox を poll して復号する。**inbox は平文も鍵も一切見ない**。
+送信者と受信者が**一度も同時にオンラインにならない**非同期配送。信頼しない
+store-and-forward inbox がエンベロープを中継するだけで、**inbox は平文も鍵も一切見ない**。
+映像は4ステップで進む:
+
+1. **inbox 起動** — 信頼しない中継 inbox を立ち上げ、slot ticket（`nkct1…`）を発行する。
+2. **受信者** — 自分の ML-DSA-65 identity を単一アンカーに、静的 X-Wing 鍵・NodeId・
+   inbox スロットを束ねた**署名付き recipient bundle** を publish し、One-Time Prekey を
+   4 本 inbox に補充してオフラインになる。画面には out-of-band で共有する 64 桁の
+   fingerprint が表示される。
+3. **送信者** — その fingerprint に bundle を pin して検証し（`... verified`）、prekey を
+   1 本引いて `--strict-pqfs` で full PQ-FS でファイルをシールし（`Sealed`）、inbox に投函する。
+4. **受信者** — 後刻オンラインに戻って inbox を poll し、復号する（`Decrypted` / `recv complete`）。
+
+最後に、untrusted な inbox 越しに**バイト単位で一致**した平文が復号されて表示される。
 bundle 署名は native ctx `nkct-recipient-bundle-v1` で file / prekey / handshake 署名と
 ドメイン分離される（[KEY_EXCHANGE_DESIGN.md](./KEY_EXCHANGE_DESIGN.md) 参照）。
 
