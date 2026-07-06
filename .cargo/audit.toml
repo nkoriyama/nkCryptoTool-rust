@@ -1,0 +1,24 @@
+# cargo-audit configuration (consumed by the CI "cargo audit (advisory)" job).
+#
+# Advisory IDs are ignored ONLY with a written rationale and a review date. An
+# entry here is a conscious, time-boxed decision — not a way to silence noise.
+# When CI shows a NEW red here, treat it as real until proven otherwise.
+
+[advisories]
+ignore = [
+    # quick-xml quadratic-time / unbounded-allocation DoS on malicious XML.
+    # Severity 7.5 (DoS only — no RCE / info-leak). Pulled in transitively along
+    # THREE paths, none of which parse attacker-controlled XML:
+    #   * notify-rust -> tauri-winrt-notification  (Windows toast notification
+    #     XML the app itself constructs)
+    #   * iroh -> netwatch -> netdev -> plist       (local macOS system network
+    #     plists, not P2P wire data)
+    #   * slint -> winit -> wayland-scanner         (compile-time Wayland protocol
+    #     XML, not runtime input)
+    # The P2P / handshake wire path never reaches quick-xml, so the DoS is not
+    # remotely triggerable. Fix (quick-xml >=0.41) is blocked upstream: plist
+    # pins ^0.39.2 and tauri-winrt-notification pins ^0.37, both excluding 0.41.
+    # Re-check by 2026-10-06 (or sooner if the parents release a >=0.41 bump).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]

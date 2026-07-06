@@ -17,7 +17,16 @@ version = 2
 # Fail on yanked crates; RUSTSEC advisories are reported by default.
 yanked = "deny"
 # Advisory IDs to consciously ignore go here, each with a one-line rationale.
-ignore = []
+# Keep in sync with .cargo/audit.toml (that file carries the full rationale).
+ignore = [
+    # quick-xml DoS (7.5, DoS-only): reachable only via attacker-controlled XML,
+    # but it is only pulled transitively for notify-rust (Windows toast XML),
+    # iroh->netdev->plist (local macOS system plists), and wayland-scanner
+    # (compile-time). The P2P wire path never reaches it. Fix (>=0.41) blocked
+    # upstream (plist ^0.39.2 / tauri-winrt-notification ^0.37). Re-check 2026-10-06.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
+]
 
 [licenses]
 version = 2
