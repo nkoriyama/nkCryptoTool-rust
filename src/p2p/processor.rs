@@ -43,6 +43,14 @@ mod hs_flags {
     pub const RESPONDER_ALLOWED: u8 = RESPONDER_SELF_AUTH;
 }
 
+/// FIPS 204 signature context for the **iroh** handshake (KEY_EXCHANGE_DESIGN.md
+/// §2.1). Binds sig_I / sig_R to this transport + purpose, so a handshake
+/// signature cannot be replayed into another identity-key context (prekey,
+/// keybind, bundle) or into the TCP handshake (`nkct-handshake-tcp-v1`, wired in
+/// increment 3b). Both sign and verify sides use it — flipping from `""` is a
+/// wire break, paired with the ALPN bump below so old/new peers fail cleanly.
+const HANDSHAKE_CTX_IROH: &[u8] = b"nkct-handshake-iroh-v1";
+
 pub struct NetworkProcessor {
     config: CryptoConfig,
     endpoint: Arc<dyn P2pEndpoint>,
@@ -496,7 +504,7 @@ impl NetworkProcessor {
                 }
 
                 let sig = CommonProcessor::read_vec(&mut reader).await?;
-                if !backend::pqc_verify(&config.pqc_dsa_algo, pk, tb.snapshot(), &sig, &[])? {
+                if !backend::pqc_verify(&config.pqc_dsa_algo, pk, tb.snapshot(), &sig, HANDSHAKE_CTX_IROH)? {
                     return Err(CryptoError::SignatureVerification);
                 }
 
@@ -612,7 +620,7 @@ impl NetworkProcessor {
                 tb.append_lp(&server_kem_pub); // #12
 
                 // Sign the full transcript (#1–#12) — the same builder.
-                server_sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv_dsa, tb.snapshot(), &[])?;
+                server_sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv_dsa, tb.snapshot(), HANDSHAKE_CTX_IROH)?;
             }
 
             // Salt = SHA3-256(full transcript) via the SAME builder — no separate
@@ -980,7 +988,7 @@ impl NetworkProcessor {
 
                     // sig_I over the initiator transcript #1–#7 (if self-auth).
                     if let Some(raw_priv) = sign_priv {
-                        let sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, tb.snapshot(), &[])?;
+                        let sig = backend::pqc_sign(&config.pqc_dsa_algo, &raw_priv, tb.snapshot(), HANDSHAKE_CTX_IROH)?;
                         CommonProcessor::write_vec(&mut writer, &sig).await?;
                     }
 
@@ -1039,7 +1047,7 @@ impl NetworkProcessor {
 
                         // Verify sig_R over the full transcript (#1–#12) with the
                         // pin-checked #11 (server_dsa_pub).
-                        if !backend::pqc_verify(&config.pqc_dsa_algo, &server_dsa_pub, tb.snapshot(), &sig, &[])? {
+                        if !backend::pqc_verify(&config.pqc_dsa_algo, &server_dsa_pub, tb.snapshot(), &sig, HANDSHAKE_CTX_IROH)? {
                             return Err(CryptoError::SignatureVerification);
                         }
                         eprintln!("Server authenticated successfully (auth: {}).", config.pqc_dsa_algo);
