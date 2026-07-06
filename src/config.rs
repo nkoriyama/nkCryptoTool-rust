@@ -131,6 +131,14 @@ pub struct CryptoConfig {
     pub user_mlkem_privkey: Option<String>,
     pub user_ecdh_privkey: Option<String>,
 
+    // Recipient encryption keys taken from a verified NKKB KeyBundle
+    // (`--recipient-keybundle`) instead of a raw pubkey file. Set by the CLI
+    // after `keybundle::parse_and_verify` + expiry enforcement; when present the
+    // encryption strategy is fed these authenticated bytes in memory (no pubkey
+    // ever touches disk) and the `recipient_*_pubkey` path lookups are skipped.
+    pub recipient_enc_key_bytes: Option<Vec<u8>>, // raw ML-KEM ek
+    pub recipient_hybrid_key_bytes: Option<Vec<u8>>, // P-256 SubjectPublicKeyInfo DER
+
     // Options
     pub passphrase: Option<Zeroizing<String>>,
     pub use_tpm: bool,
@@ -251,6 +259,8 @@ impl Default for CryptoConfig {
             signing_pubkey: None,
             recipient_mlkem_pubkey: None,
             recipient_ecdh_pubkey: None,
+            recipient_enc_key_bytes: None,
+            recipient_hybrid_key_bytes: None,
             user_mlkem_privkey: None,
             user_ecdh_privkey: None,
             passphrase: None,

@@ -61,6 +61,18 @@ impl CryptoStrategy for HybridStrategy {
         self.pqc.set_key_provider(provider);
     }
 
+    // Route KeyBundle-injected recipient keys to the sub-strategies: the ML-KEM
+    // ek to the PQC half, the P-256 SPKI DER to the ECC half. Hybrid encryption
+    // then needs neither `recipient-mlkem-pubkey` nor `recipient-ecdh-pubkey`
+    // path entries.
+    fn set_recipient_enc_key(&mut self, raw_mlkem_ek: Vec<u8>) {
+        self.pqc.set_recipient_enc_key(raw_mlkem_ek);
+    }
+
+    fn set_recipient_hybrid_key(&mut self, p256_spki_der: Vec<u8>) {
+        self.ecc.set_recipient_hybrid_key(p256_spki_der);
+    }
+
     fn generate_encryption_key_pair(
         &self,
         key_paths: &HashMap<String, String>,

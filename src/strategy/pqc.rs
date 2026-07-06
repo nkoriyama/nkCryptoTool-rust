@@ -33,6 +33,12 @@ pub struct PqcStrategy {
     kem_ciphertext: Zeroizing<Vec<u8>>,
     peer_public_key: Option<Zeroizing<Vec<u8>>>,
 
+    // Raw ML-KEM ek injected in memory from a verified NKKB KeyBundle. When
+    // `Some`, `prepare_shared_secret_encryption` encaps against it directly and
+    // never reads a recipient pubkey file. (A public key is not secret, but
+    // Zeroizing keeps the field type-uniform and costs nothing here.)
+    recipient_enc_key: Option<Zeroizing<Vec<u8>>>,
+
     // DSA specific
     dsa_privkey: Zeroizing<Vec<u8>>,
     sign_buffer: Zeroizing<Vec<u8>>,
@@ -63,6 +69,7 @@ impl PqcStrategy {
             aead_algo: "AES-256-GCM".to_string(),
             kem_ciphertext: Zeroizing::new(Vec::new()),
             peer_public_key: None,
+            recipient_enc_key: None,
             dsa_privkey: Zeroizing::new(Vec::new()),
             sign_buffer: Zeroizing::new(Vec::new()),
             signature: Vec::new(),
@@ -84,16 +91,25 @@ impl PqcStrategy {
         if let Some(algo) = key_paths.get("kem-algo") {
             self.kem_algo = algo.clone();
         }
-        let pubkey_path = key_paths
-            .get("recipient-pubkey")
-            .or_else(|| key_paths.get("recipient-mlkem-pubkey"))
-            .ok_or(CryptoError::PublicKeyLoad(
-                "Missing recipient public key".to_string(),
-            ))?;
-
-        let pem = Zeroizing::new(fs::read_to_string(pubkey_path)?);
-        let der = crate::utils::unwrap_from_pem(&pem, "PUBLIC KEY")?;
-        let raw_pub = crate::utils::unwrap_pqc_pub_from_spki(&der, &self.kem_algo)?;
+        // Prefer a KeyBundle-injected raw ek (already authenticated in memory):
+        // encaps directly, no file read, no PEM/SPKI unwrap. Fall back to the
+        // recipient pubkey file only when no bundle key was injected.
+        // clone() (not take()): keep the injected key so the strategy stays
+        // reusable, matching the idempotent file-path branch.
+        let raw_pub: Zeroizing<Vec<u8>> = match self.recipient_enc_key.clone() {
+            Some(ek) => ek,
+            None => {
+                let pubkey_path = key_paths
+                    .get("recipient-pubkey")
+                    .or_else(|| key_paths.get("recipient-mlkem-pubkey"))
+                    .ok_or(CryptoError::PublicKeyLoad(
+                        "Missing recipient public key".to_string(),
+                    ))?;
+                let pem = Zeroizing::new(fs::read_to_string(pubkey_path)?);
+                let der = crate::utils::unwrap_from_pem(&pem, "PUBLIC KEY")?;
+                Zeroizing::new(crate::utils::unwrap_pqc_pub_from_spki(&der, &self.kem_algo)?)
+            }
+        };
 
         let (ss_bytes, ct_bytes) = backend::pqc_encap(&self.kem_algo, &raw_pub)?;
         self.kem_shared_secret = ss_bytes;
@@ -546,6 +562,10 @@ impl CryptoStrategy for PqcStrategy {
         if size > 0 {
             self.chunk_size = size;
         }
+    }
+
+    fn set_recipient_enc_key(&mut self, raw_mlkem_ek: Vec<u8>) {
+        self.recipient_enc_key = Some(Zeroizing::new(raw_mlkem_ek));
     }
 
     fn file_session_id(&self) -> Option<[u8; V3_SESSION_ID_LEN]> {
