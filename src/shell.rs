@@ -877,6 +877,29 @@ pub fn nnp_exec_if_requested() {
 // pumps both directions.
 // ===========================================================================
 
+/// Send a terminal `Error` frame, then finish our send stream and wait (bounded)
+/// for the client to close its side, so the client reliably *receives and prints*
+/// the refusal reason. Returning immediately after `send_frame` resets the stream
+/// and the client's read races our teardown — it usually sees a bare EOF (clean
+/// close ⇒ silent exit 0) instead of the reason. Mirrors pairing's
+/// send-response-then-drain teardown (`drain_until_close`).
+#[cfg(shell_desktop)]
+async fn deny_and_drain<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    aead_name: &str,
+    tx_key: &[u8],
+    tx_ctr: &mut u64,
+    reason: &str,
+) where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    let _ = send_frame(writer, aead_name, tx_key, tx_ctr, &Frame::Error(reason.to_string())).await;
+    let _ = writer.shutdown().await;
+    crate::scp::drain_until_close(reader).await;
+}
+
 /// Server side of a real shell session: allocate a PTY, spawn the shell, and
 /// bridge it to the client over the secured frame stream until the shell exits.
 /// Authorization (who may reach this at all) is the transport allowlist / pinned
@@ -913,8 +936,8 @@ where
         match recv_frame(&mut reader, aead_name, rx_key, &mut rx_ctr).await? {
             Some(Frame::Open { cols, rows, term, cmd }) => (cols, rows, term, cmd),
             _ => {
-                let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
-                    &Frame::Error("expected OPEN".into())).await;
+                deny_and_drain(&mut reader, &mut writer, aead_name, tx_key, &mut tx_ctr,
+                    "expected OPEN").await;
                 return Err(CryptoError::Parameter("shell: first frame was not OPEN".into()));
             }
         };
@@ -952,8 +975,7 @@ where
                 ),
                 PolicyDecision::Deny(reason) => {
                     audit_best_effort(audit_path, &peer_fp, &format!("deny: {reason}")).await;
-                    let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
-                        &Frame::Error(reason.clone())).await;
+                    deny_and_drain(&mut reader, &mut writer, aead_name, tx_key, &mut tx_ctr, &reason).await;
                     return Err(CryptoError::Parameter(format!("shell denied: {reason}")));
                 }
             }
@@ -969,8 +991,8 @@ where
     let policy_user = allow_event.1;
     let confined = allow_event.3;
     if let Err(e) = audit(audit_path, &peer_fp, &allow_event.2).await {
-        let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
-            &Frame::Error("audit log unavailable; refusing".into())).await;
+        deny_and_drain(&mut reader, &mut writer, aead_name, tx_key, &mut tx_ctr,
+            "audit log unavailable; refusing").await;
         return Err(CryptoError::Parameter(format!("shell refused: audit write failed: {e}")));
     }
 
@@ -979,8 +1001,7 @@ where
     // become another user without the removed setuid path).
     if let Err(reason) = enforce_same_user(policy_user.as_deref()) {
         audit_best_effort(audit_path, &peer_fp, &format!("deny: {reason}")).await;
-        let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
-            &Frame::Error(reason.clone())).await;
+        deny_and_drain(&mut reader, &mut writer, aead_name, tx_key, &mut tx_ctr, &reason).await;
         return Err(CryptoError::Parameter(format!("shell denied: {reason}")));
     }
     // Sanitize the client-supplied TERM: it ends up in the shell's environment
@@ -1650,6 +1671,10 @@ where
 
     // Main loop: remote PTY output → stdout, until EXIT. A recv/write error breaks
     // (rather than `?`-returning) so the terminal-restoring teardown always runs.
+    // `self_reported` marks the arms that already printed their own reason (a
+    // remote refusal or a decode failure), so the teardown does not also print a
+    // misleading "remote shell exited with code N" — no shell ran in those cases.
+    let mut self_reported = false;
     let exit_code = loop {
         let frame = match recv_frame(&mut reader, aead_name, rx_key, &mut rx_ctr).await {
             Ok(f) => f,
@@ -1657,7 +1682,8 @@ where
             // desynced stream must not look like a clean disconnect.
             Err(e) => {
                 eprintln!("\r\n[shell] session ended: inbound frame decode failed: {e}");
-                break 1;
+                self_reported = true;
+                break 255;
             }
         };
         match frame {
@@ -1672,9 +1698,20 @@ where
                 // Terminal is restored uniformly after the loop; `\r\n` keeps this
                 // readable even while still in raw mode.
                 eprintln!("\r\n[shell] remote error: {m}");
+                self_reported = true;
                 break 1;
             }
-            None => break 0,
+            None => {
+                // A clean EOF here means the server closed the stream WITHOUT a
+                // final Exit/Error frame — it went away mid-session (Ctrl-C, kill,
+                // crash, or a dropped link). A normal end always arrives as
+                // Frame::Exit and a refusal as Frame::Error, so a bare EOF is
+                // unexpected: report it (ssh-style 255) instead of vanishing with
+                // status 0, which reads as "the command succeeded".
+                eprintln!("\r\n[shell] server closed the connection unexpectedly (no exit status)");
+                self_reported = true;
+                break 255;
+            }
             Some(_) => {}
         }
     };
@@ -1706,7 +1743,7 @@ where
     // Restore the terminal explicitly (its `Drop` would not run after the
     // `process::exit` below).
     drop(_raw);
-    if exit_code != 0 {
+    if exit_code != 0 && !self_reported {
         eprintln!("\r\n[shell] remote shell exited with code {exit_code}");
     }
     // The session is over and its keys are ephemeral; exit with the remote shell's
