@@ -23,4 +23,4 @@ Enter
 Sleep 1200ms
 Type "bash demos/pairing_demo.sh"
 Enter
-Sleep 29s
+Sleep 35s

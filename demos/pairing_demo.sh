@@ -9,6 +9,11 @@
 # the same fingerprint drives a policy-confined shell and an scp path jail over
 # the same iroh transport + mutual ML-DSA-65 auth. Loopback (one host); recorded
 # with VHS (see pairing.tape).
+#
+# Robustness: every refusal is asserted, not merely printed — if a negative case
+# stops producing its expected line (e.g. the server wording drifts) the demo
+# prints a loud "[DEMO BUG]" instead of a blank frame that would read as "the
+# attack silently succeeded".
 set -u
 
 BIN="$PWD/target/release/nk-crypto-tool"
@@ -35,8 +40,6 @@ start_server() {
 "$BIN" --mode pqc --gen-sign-key --key-dir "$ROOT/srv" --dsa-algo ML-DSA-65 >/dev/null 2>&1
 "$BIN" --mode pqc --gen-sign-key --key-dir "$ROOT/cli" --dsa-algo ML-DSA-65 >/dev/null 2>&1
 "$BIN" --mode pqc --gen-enc-key  --key-dir "$ROOT/cli"                      >/dev/null 2>&1
-CFP=$("$BIN" --mode pqc --fingerprint --signing-pubkey "$ROOT/cli/public_sign_pqc.key" 2>/dev/null \
-        | grep -aoE '[0-9a-f]{64}' | head -1)
 : > "$ROOT/srv/allowlist"   # the client is NOT pre-registered
 
 sleep 1
@@ -44,8 +47,36 @@ echo "# ssh-copy-id for bastion-less PQC P2P: pair once, then shell + scp over i
 sleep 1.4
 
 # ── 1. PAIR: an unregistered client registers itself over a one-time token ────
-echo "# [1/4] PAIR  — allowlist starts EMPTY; client self-registers via a one-time token"
+echo "# [1/4] PAIR  — allowlist starts EMPTY; only the holder of the out-of-band token registers"
 sleep 0.7
+
+# 1a. NEGATIVE: a client that does NOT hold the real token is refused — enrollment
+#     is default-deny, so the allowlist stays empty. (Each --serve-pairing is
+#     single-shot, so a token is one-use by construction. The stronger property —
+#     that a *token holder* still cannot register SOMEONE ELSE's bundle — is
+#     enforced structurally, not shown here: --copy-bundle always self-signs the
+#     bundle with the connecting ML-DSA key, so bundle-owner == handshake-identity
+#     by construction; the cross-identity rejection is covered by the
+#     `register_rejects_bundle_from_a_different_identity_refinement_1` unit test.)
+start_server "$ROOT/pair_bad.log" --serve-pairing --mode pqc \
+  --signing-privkey "$ROOT/srv/private_sign_pqc.key" \
+  --peer-allowlist "$ROOT/srv/allowlist" --key-dir "$ROOT/srv"
+echo "  \$ --copy-bundle --token WRONGTOK   (does not hold the real token)"
+sleep 0.5
+REFUSAL=$("$BIN" --copy-bundle --mode pqc --connect "$TICKET" --token "AAAA2345" \
+  --signing-privkey "$ROOT/cli/private_sign_pqc.key" --keybundle-handle laptop \
+  --key-dir "$ROOT/cli" 2>&1 | grep -aioE 'invalid pairing token' | head -1)
+kill $SRV 2>/dev/null; SRV=""
+if [ -n "$REFUSAL" ]; then
+  echo "  server refused: $REFUSAL  (allowlist still empty)"
+else
+  echo "  [DEMO BUG] wrong-token refusal not observed"
+fi
+if [ -s "$ROOT/srv/allowlist" ]; then echo "  [DEMO BUG] allowlist NOT empty after a refused enrollment"; fi
+sleep 1.3
+
+# 1b. The real token registers the client — and the bundle is pinned to the
+#     handshake-verified fingerprint (proof-of-possession), not merely the token.
 start_server "$ROOT/pair.log" --serve-pairing --mode pqc \
   --signing-privkey "$ROOT/srv/private_sign_pqc.key" \
   --peer-allowlist "$ROOT/srv/allowlist" --key-dir "$ROOT/srv"
@@ -54,8 +85,14 @@ echo "  server issued a one-time token (out-of-band):  $OTP"
 sleep 1
 "$BIN" --copy-bundle --mode pqc --connect "$TICKET" --token "$OTP" \
   --signing-privkey "$ROOT/cli/private_sign_pqc.key" --keybundle-handle laptop \
-  --key-dir "$ROOT/cli" 2>&1 | grep -aiE 'registered'
+  --key-dir "$ROOT/cli" 2>&1 | grep -aiE 'registered' \
+  || echo "  [DEMO BUG] registration not confirmed"
 sleep 0.6
+# `laptop` is a label AND the filename the saved bundle blob lands under
+# (<key-dir>/received/laptop.nkkb); a different identity cannot clobber it — the
+# server refuses a handle already owned by another fingerprint. The allowlist, by
+# contrast, is keyed by the 64-hex fingerprint: the single join key that threads
+# pair -> authorize -> shell -> scp.
 echo "  --peer-allowlist now pins the client that PROVED it holds the bundle's key:"
 echo "    $(cat "$ROOT/srv/allowlist")"
 sleep 1.6
@@ -63,10 +100,14 @@ sleep 1.6
 # ── 2. AUTHORIZE: pairing only added to the allowlist — grant what it may DO ──
 echo "# [2/4] AUTHORIZE — pairing added to the allowlist ONLY; admin grants capability (default-deny)"
 sleep 0.7
-printf '%s cmd-allow="id,uname -a"\n' "$CFP" > "$ROOT/shell.policy"
-printf '%s read="%s" write="%s"\n' "$CFP" "$ROOT/srv/jail" "$ROOT/srv/jail" > "$ROOT/scp.policy"
-echo "  shell-policy:  ${CFP:0:20}...  cmd-allow=\"id,uname -a\""
-echo "  scp-policy:    ${CFP:0:20}...  read=\"jail/\"  write=\"jail/\""
+# Read the fingerprint back from what pairing just wrote — the same 64-hex value
+# keys both policies, so the join key is visibly the one pairing produced.
+FP=$(grep -aoE '[0-9a-f]{64}' "$ROOT/srv/allowlist" | head -1)
+if ! printf '%s' "$FP" | grep -qE '^[0-9a-f]{64}$'; then echo "  [DEMO BUG] no fingerprint in allowlist to authorize"; fi
+printf '%s cmd-allow="id,uname -a"\n' "$FP" > "$ROOT/shell.policy"
+printf '%s read="%s" write="%s"\n' "$FP" "$ROOT/srv/jail" "$ROOT/srv/jail" > "$ROOT/scp.policy"
+echo "  shell-policy:  ${FP:0:20}...  cmd-allow=\"id,uname -a\"   (read from the allowlist)"
+echo "  scp-policy:    ${FP:0:20}...  read=\"jail/\"  write=\"jail/\""
 sleep 1.6
 
 # ── 3. SHELL: the paired fingerprint drives a command-confined shell ─────────
@@ -78,16 +119,18 @@ start_server "$ROOT/shell.log" --serve-shell --mode pqc \
 echo "  \$ nk-crypto-tool --shell --shell-cmd 'uname -a'   (allowed)"
 sleep 0.5
 "$BIN" --shell --mode pqc --connect "$TICKET" --shell-cmd "uname -a" \
-  --signing-privkey "$ROOT/cli/private_sign_pqc.key" --key-dir "$ROOT/cli" 2>&1 | grep -aiE 'Linux|GNU'
+  --signing-privkey "$ROOT/cli/private_sign_pqc.key" --key-dir "$ROOT/cli" 2>&1 | grep -aiE 'Linux|GNU' \
+  || echo "  [DEMO BUG] allowed command produced no output"
 sleep 1
 echo "  \$ nk-crypto-tool --shell --shell-cmd 'cat /etc/shadow'   (NOT in cmd-allow)"
 sleep 0.5
 # A denied command is refused server-side: the client just gets a closed session,
-# so surface the server's audit line to show the refusal.
+# so surface the server's audit line to show the refusal — and assert it appeared.
 "$BIN" --shell --mode pqc --connect "$TICKET" --shell-cmd "cat /etc/shadow" \
   --signing-privkey "$ROOT/cli/private_sign_pqc.key" --key-dir "$ROOT/cli" >/dev/null 2>&1
 sleep 0.5
-grep -ai 'denied' "$ROOT/shell.log" | tail -1 | sed -E 's/.*(shell denied[^"]*)/  server refused: \1/'
+DENY=$(grep -ai 'denied' "$ROOT/shell.log" | tail -1 | sed -E 's/.*(shell denied[^"]*)/  server refused: \1/')
+if [ -n "$DENY" ]; then echo "$DENY"; else echo "  [DEMO BUG] shell refusal not observed"; fi
 kill $SRV 2>/dev/null; SRV=""
 sleep 1.6
 
@@ -101,13 +144,15 @@ printf 'deploy key + config, delivered over nkct/scp/1\n' > "$ROOT/cli/release.t
 echo "  \$ scp-put release.txt -> jail/release.txt      (inside the jail: allowed)"
 sleep 0.5
 "$BIN" --scp-put "$ROOT/cli/release.txt" "$ROOT/srv/jail/release.txt" --connect "$TICKET" --mode pqc \
-  --signing-privkey "$ROOT/cli/private_sign_pqc.key" --key-dir "$ROOT/cli" 2>&1 | grep -aiE 'uploaded'
+  --signing-privkey "$ROOT/cli/private_sign_pqc.key" --key-dir "$ROOT/cli" 2>&1 | grep -aiE 'uploaded' \
+  || echo "  [DEMO BUG] in-jail upload not confirmed"
 sleep 0.8
 echo "  \$ scp-put release.txt -> /tmp/escape.txt       (outside the jail: refused)"
 sleep 0.5
-"$BIN" --scp-put "$ROOT/cli/release.txt" "/tmp/escape.txt" --connect "$TICKET" --mode pqc \
+JAIL_DENY=$("$BIN" --scp-put "$ROOT/cli/release.txt" "/tmp/escape.txt" --connect "$TICKET" --mode pqc \
   --signing-privkey "$ROOT/cli/private_sign_pqc.key" --key-dir "$ROOT/cli" 2>&1 \
-  | grep -aiE 'denied|outside|not permitted|policy' | head -1 | sed 's/^.*\(denied\|outside\|policy\).*/  refused: outside the write jail/'
+  | grep -aioE 'denied|outside|not permitted|policy' | head -1)
+if [ -n "$JAIL_DENY" ]; then echo "  refused: outside the write jail"; else echo "  [DEMO BUG] jail refusal not observed"; fi
 sleep 1
 if cmp -s "$ROOT/cli/release.txt" "$ROOT/srv/jail/release.txt"; then
   echo "# paired over a one-time token, then confined shell + scp — one ML-DSA-65 anchor, no open port"
