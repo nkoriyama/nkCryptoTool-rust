@@ -105,6 +105,23 @@ store-and-forward inbox がエンベロープを中継するだけで、**inbox 
 bundle 署名は native ctx `nkct-recipient-bundle-v1` で file / prekey / handshake 署名と
 ドメイン分離される（[KEY_EXCHANGE_DESIGN.md](./KEY_EXCHANGE_DESIGN.md) 参照）。
 
+## **デモ: ペアリング（KeyBundle 自動登録 = `ssh-copy-id` 相当）→ 認可付き shell / scp**
+
+![ワンタイムトークンでペアリングし、確定した指紋で confined shell と path-jail scp を張るデモ](./docs/pairing_demo.gif)
+
+未登録クライアントが**ワンタイムトークン**で自分を登録し、そのまま同じ ML-DSA-65 指紋で
+confined shell と path-jail された scp を張るまでを 4 ステップで示す（loopback iroh・相互 ML-DSA-65 認証）:
+
+1. **PAIR** — `--peer-allowlist` は**空**の状態から始まる。サーバは OTP を発行し、クライアントは
+   `--copy-bundle` で自己署名した KeyBundle を送る。サーバは*接続本人の*指紋（handshake 指紋 ==
+   bundle owner 指紋）を照合してから allowlist に追記する（トークン保持者が他人の bundle を代理登録できない）。
+2. **AUTHORIZE** — ペアリングは allowlist 追加**のみ**。管理者が shell-policy / scp-policy を書いて
+   初めて capability が付く（**default-deny を維持**）。
+3. **SHELL** — 許可コマンド (`uname -a`) は実行され、cmd-allow 外 (`cat /etc/shadow`) はサーバが拒否する。
+4. **SCP** — write jail 内への転送は成功し、jail 外のパスは拒否される。
+
+ペアリングは専用 ALPN `nkct/pairing/1`（緩和認証はこの ALPN 限定）。使い方は [USAGE.md §7](./USAGE.md)。
+
 ## **チケットを端末に QR 表示（外部ツール不要）**
 
 ![端末に QR を表示するデモ](./docs/qr_demo.gif)
