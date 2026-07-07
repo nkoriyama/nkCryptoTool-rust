@@ -1060,11 +1060,29 @@ where
     let (in_frame_tx, mut in_frame_rx) = tokio::sync::mpsc::channel::<Frame>(64);
     let aead_r = aead_name.to_string();
     let rx_key_v = Zeroizing::new(rx_key.to_vec());
+    let audit_path_r = audit_path.map(str::to_string);
     let reader_task = tokio::spawn(async move {
         let mut rx_ctr = rx_ctr;
-        while let Ok(Some(f)) = recv_frame(&mut reader, &aead_r, &rx_key_v, &mut rx_ctr).await {
-            if in_frame_tx.send(f).await.is_err() {
-                break;
+        loop {
+            match recv_frame(&mut reader, &aead_r, &rx_key_v, &mut rx_ctr).await {
+                Ok(Some(f)) => {
+                    if in_frame_tx.send(f).await.is_err() {
+                        break;
+                    }
+                }
+                // Clean EOF: the client closed its side.
+                Ok(None) => break,
+                // Decode/MAC failure still ends the session (fail fast), but is
+                // audited so tampering is distinguishable from a clean EOF.
+                Err(e) => {
+                    audit_best_effort(
+                        audit_path_r.as_deref(),
+                        &peer_fp,
+                        &format!("session end: inbound frame decode failed: {e}"),
+                    )
+                    .await;
+                    break;
+                }
             }
         }
     });
@@ -1635,7 +1653,12 @@ where
     let exit_code = loop {
         let frame = match recv_frame(&mut reader, aead_name, rx_key, &mut rx_ctr).await {
             Ok(f) => f,
-            Err(_) => break 1,
+            // Surface the decode/MAC failure before tearing down: a tampered or
+            // desynced stream must not look like a clean disconnect.
+            Err(e) => {
+                eprintln!("\r\n[shell] session ended: inbound frame decode failed: {e}");
+                break 1;
+            }
         };
         match frame {
             Some(Frame::Data(d)) => {
