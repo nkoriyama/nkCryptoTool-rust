@@ -382,10 +382,13 @@ pub struct ShellPolicy {
     entries: std::collections::HashMap<[u8; 32], PolicyEntry>,
 }
 
-/// Outcome of authorizing a peer's OPEN against the policy.
+/// Outcome of authorizing a peer's OPEN against the policy. `confined` is true
+/// when the fingerprint's entry carries a `cmd-allow` list — those sessions get
+/// extra hardening (NO_NEW_PRIVS on Linux) that a full login shell must not
+/// inherit (it would break sudo/su for legitimately unrestricted users).
 pub enum PolicyDecision {
     Deny(String),
-    Allow { user: Option<String>, run_cmd: String },
+    Allow { user: Option<String>, run_cmd: String, confined: bool },
 }
 
 impl ShellPolicy {
@@ -454,12 +457,20 @@ impl ShellPolicy {
                         "this fingerprint is restricted to specific commands (no login shell)".into(),
                     )
                 } else if allowed.iter().any(|c| c == requested_cmd) {
-                    PolicyDecision::Allow { user: entry.user.clone(), run_cmd: requested_cmd.to_string() }
+                    PolicyDecision::Allow {
+                        user: entry.user.clone(),
+                        run_cmd: requested_cmd.to_string(),
+                        confined: true,
+                    }
                 } else {
                     PolicyDecision::Deny("command not in this fingerprint's cmd-allow list".into())
                 }
             }
-            None => PolicyDecision::Allow { user: entry.user.clone(), run_cmd: requested_cmd.to_string() },
+            None => PolicyDecision::Allow {
+                user: entry.user.clone(),
+                run_cmd: requested_cmd.to_string(),
+                confined: false,
+            },
         }
     }
 }
@@ -767,9 +778,30 @@ fn enforce_same_user(policy_user: Option<&str>) -> std::result::Result<(), Strin
 /// as a login shell (`-l`) or `-c <cmd>`. Windows: `%COMSPEC%` (or `cmd.exe`),
 /// interactive or `/C <cmd>`. Runs as the server's own user (Tier 1).
 #[cfg(all(shell_desktop, unix))]
-fn build_shell_command(run_cmd: &str, term: &str) -> portable_pty::CommandBuilder {
+fn build_shell_command(
+    run_cmd: &str,
+    term: &str,
+    confined: bool,
+) -> Result<portable_pty::CommandBuilder> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    let mut cmd = portable_pty::CommandBuilder::new(shell);
+    // Confined (cmd-allow) sessions on Linux run under NO_NEW_PRIVS so an
+    // allowed setuid binary cannot elevate. portable-pty owns the fork's
+    // pre_exec hook, so the flag is applied by re-execing ourselves as a tiny
+    // wrapper (`nkct __nnp-exec <shell> -c <cmd>`) that sets the prctl and then
+    // execs the real command — NNP is inherited across exec. Fail closed: if
+    // our own path can't be resolved the session is refused, and the wrapper
+    // itself exits without running the command if the prctl fails.
+    let mut cmd = if confined && cfg!(target_os = "linux") {
+        let self_exe = std::env::current_exe().map_err(|e| {
+            CryptoError::Parameter(format!("resolve own executable for NNP wrapper: {e}"))
+        })?;
+        let mut cmd = portable_pty::CommandBuilder::new(self_exe);
+        cmd.arg(NNP_EXEC_ARG);
+        cmd.arg(shell);
+        cmd
+    } else {
+        portable_pty::CommandBuilder::new(shell)
+    };
     if run_cmd.is_empty() {
         cmd.arg("-l");
     } else {
@@ -780,11 +812,15 @@ fn build_shell_command(run_cmd: &str, term: &str) -> portable_pty::CommandBuilde
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
-    cmd
+    Ok(cmd)
 }
 
 #[cfg(all(shell_desktop, windows))]
-fn build_shell_command(run_cmd: &str, _term: &str) -> portable_pty::CommandBuilder {
+fn build_shell_command(
+    run_cmd: &str,
+    _term: &str,
+    _confined: bool,
+) -> Result<portable_pty::CommandBuilder> {
     let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
     let mut cmd = portable_pty::CommandBuilder::new(shell);
     if !run_cmd.is_empty() {
@@ -794,7 +830,44 @@ fn build_shell_command(run_cmd: &str, _term: &str) -> portable_pty::CommandBuild
     if let Ok(cwd) = std::env::current_dir() {
         cmd.cwd(cwd);
     }
-    cmd
+    Ok(cmd)
+}
+
+/// argv[1] marker for the internal NO_NEW_PRIVS exec wrapper (see
+/// `nnp_exec_if_requested`). Namespaced with `__` so it can never collide with
+/// a real CLI flag; running it by hand only ever *reduces* privilege.
+pub const NNP_EXEC_ARG: &str = "__nnp-exec";
+
+/// Internal helper mode: `nkct __nnp-exec <prog> [args...]`. Called at the very
+/// top of `main()` (before clap): if argv[1] is `__nnp-exec`, set
+/// `PR_SET_NO_NEW_PRIVS` and exec the given command in place; otherwise return
+/// and let normal CLI parsing proceed. Fail closed — if the prctl (or the exec)
+/// fails the process exits without running the command.
+#[cfg(target_os = "linux")]
+pub fn nnp_exec_if_requested() {
+    let mut args = std::env::args_os();
+    let _argv0 = args.next();
+    if args.next().as_deref() != Some(std::ffi::OsStr::new(NNP_EXEC_ARG)) {
+        return;
+    }
+    let prog = match args.next() {
+        Some(p) => p,
+        None => {
+            eprintln!("{NNP_EXEC_ARG}: missing program");
+            std::process::exit(127);
+        }
+    };
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+        eprintln!(
+            "{NNP_EXEC_ARG}: PR_SET_NO_NEW_PRIVS failed: {}",
+            std::io::Error::last_os_error()
+        );
+        std::process::exit(127);
+    }
+    use std::os::unix::process::CommandExt;
+    let err = std::process::Command::new(&prog).args(args).exec();
+    eprintln!("{NNP_EXEC_ARG}: exec {prog:?} failed: {err}");
+    std::process::exit(127);
 }
 
 // ===========================================================================
@@ -859,14 +932,23 @@ where
                 .map_err(std::io::Error::other)
                 .map_err(|e| CryptoError::Parameter(format!("load shell policy: {e}")))??;
             match policy.authorize(&peer_fp, &cmd) {
-                PolicyDecision::Allow { user, run_cmd } => (
+                PolicyDecision::Allow { user, run_cmd, confined } => (
                     run_cmd.clone(),
                     user.clone(),
                     format!(
-                        "allow user={} cmd={}",
+                        "allow user={} cmd={}{}",
                         user.as_deref().unwrap_or("<server>"),
-                        if run_cmd.is_empty() { "<login>" } else { run_cmd.as_str() }
+                        if run_cmd.is_empty() { "<login>" } else { run_cmd.as_str() },
+                        // Record whether the confined session actually gets
+                        // NO_NEW_PRIVS (Linux only) so a non-Linux operator can
+                        // see the reduced hardening in the audit trail.
+                        match (confined, cfg!(target_os = "linux")) {
+                            (true, true) => " nnp=on",
+                            (true, false) => " nnp=unavailable",
+                            (false, _) => "",
+                        }
                     ),
+                    confined,
                 ),
                 PolicyDecision::Deny(reason) => {
                     audit_best_effort(audit_path, &peer_fp, &format!("deny: {reason}")).await;
@@ -880,10 +962,12 @@ where
             cmd.clone(),
             None,
             format!("allow (no policy) cmd={}", if cmd.is_empty() { "<login>" } else { cmd.as_str() }),
+            false,
         ),
     };
     let run_cmd = allow_event.0;
     let policy_user = allow_event.1;
+    let confined = allow_event.3;
     if let Err(e) = audit(audit_path, &peer_fp, &allow_event.2).await {
         let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr,
             &Frame::Error("audit log unavailable; refusing".into())).await;
@@ -921,7 +1005,7 @@ where
     let pty = portable_pty::native_pty_system()
         .openpty(portable_pty::PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| CryptoError::Parameter(format!("openpty: {e}")))?;
-    let command = build_shell_command(&run_cmd, &safe_term);
+    let command = build_shell_command(&run_cmd, &safe_term, confined)?;
     let child = pty
         .slave
         .spawn_command(command)
@@ -1746,15 +1830,17 @@ mod tests {
         let b = parse_fp_hex(&fp_b).unwrap();
         let unknown = [0u8; 32];
 
-        // alice: no cmd-allow → login shell and any command allowed.
-        assert!(matches!(pol.authorize(&a, ""), PolicyDecision::Allow { .. }));
-        assert!(matches!(pol.authorize(&a, "whoami"), PolicyDecision::Allow { .. }));
+        // alice: no cmd-allow → login shell and any command allowed, not
+        // confined (a login shell must keep sudo/su working — no NNP).
+        assert!(matches!(pol.authorize(&a, ""), PolicyDecision::Allow { confined: false, .. }));
+        assert!(matches!(pol.authorize(&a, "whoami"), PolicyDecision::Allow { confined: false, .. }));
 
-        // deploy: cmd-allow → only the exact listed commands; no login shell.
+        // deploy: cmd-allow → only the exact listed commands; no login shell;
+        // confined (gets NO_NEW_PRIVS on Linux).
         assert!(matches!(pol.authorize(&b, ""), PolicyDecision::Deny(_)));
         assert!(matches!(
             pol.authorize(&b, "systemctl restart x"),
-            PolicyDecision::Allow { .. }
+            PolicyDecision::Allow { confined: true, .. }
         ));
         assert!(matches!(pol.authorize(&b, "rm -rf /"), PolicyDecision::Deny(_)));
 
@@ -1796,6 +1882,29 @@ mod tests {
         // Missing quotes on cmd-allow must error, not silently drop the limit.
         std::fs::write(&path, format!("{fp} user=x cmd-allow=echo\n")).unwrap();
         assert!(ShellPolicy::load(path.to_str().unwrap()).is_err());
+    }
+
+    /// A confined (cmd-allow) session on Linux must spawn through the
+    /// `__nnp-exec` trampoline; a login shell / unconfined session must not
+    /// (NNP would break sudo/su for legitimately unrestricted users).
+    #[test]
+    #[cfg(all(shell_desktop, target_os = "linux"))]
+    fn confined_command_spawns_via_nnp_trampoline() {
+        let confined = build_shell_command("id", "xterm", true).unwrap();
+        let argv = confined.get_argv();
+        assert_eq!(argv[0], std::env::current_exe().unwrap().into_os_string());
+        assert_eq!(argv[1], NNP_EXEC_ARG);
+        assert_eq!(argv[argv.len() - 2], "-c");
+        assert_eq!(argv[argv.len() - 1], "id");
+
+        for (run_cmd, confined) in [("id", false), ("", true), ("", false)] {
+            let cmd = build_shell_command(run_cmd, "xterm", confined).unwrap();
+            // Only a confined *command* gets the trampoline (a confined policy
+            // entry can never reach here with an empty run_cmd — authorize()
+            // denies the login shell — but the spawn layer stays conservative).
+            let has_tramp = cmd.get_argv().iter().any(|a| a == NNP_EXEC_ARG);
+            assert_eq!(has_tramp, confined, "run_cmd={run_cmd:?} confined={confined}");
+        }
     }
 
     #[test]

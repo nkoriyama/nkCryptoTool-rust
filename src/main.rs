@@ -471,6 +471,12 @@ fn private_key_file_is_encrypted(path: &Option<String>) -> bool {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Internal exec trampoline for confined shell sessions (`__nnp-exec`):
+    // sets NO_NEW_PRIVS and execs the real command, or returns immediately
+    // for every normal invocation. Must run before any CLI parsing.
+    #[cfg(target_os = "linux")]
+    nk_crypto_tool::shell::nnp_exec_if_requested();
+
     nk_crypto_tool::utils::disable_core_dumps();
 
     // Diagnostics: when RUST_LOG is set, install a tracing subscriber so iroh's
