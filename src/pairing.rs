@@ -295,7 +295,13 @@ where
         }
     };
     send_packet(&mut writer, aead_name, tx_key, &mut tx, &resp.encode()).await?;
-    let _ = writer.flush().await;
+    // Finish our send stream and wait for the client to drain the response and
+    // close its side, so the connection isn't torn down with the response still
+    // in flight (mirrors scp's terminal-frame teardown). Returning immediately
+    // resets the stream and the client sees "server closed before responding"
+    // even though the registration already committed.
+    let _ = writer.shutdown().await;
+    crate::scp::drain_until_close(&mut reader).await;
 
     outcome
         .map(|_| ())
@@ -324,9 +330,16 @@ where
     send_packet(&mut writer, aead_name, tx_key, &mut tx, &req.encode()).await?;
     let _ = writer.flush().await;
 
+    // Read the response *before* closing our send side. The server drains our
+    // send stream until EOF and only then tears down the connection, so closing
+    // early would release that drain and let the server close before the
+    // response reached us (a race lost over a real network, hidden on loopback).
     let pt = recv_packet(&mut reader, aead_name, rx_key, &mut rx)
         .await?
         .ok_or_else(|| CryptoError::Parameter("pairing: server closed before responding".into()))?;
+    // Now that we have the response, close our send side to signal the server's
+    // drain that we are done, letting it tear down cleanly.
+    let _ = writer.shutdown().await;
     let resp = PairingResponse::decode(&pt)?;
     if resp.ok {
         Ok(resp.msg)
