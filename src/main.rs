@@ -195,6 +195,25 @@ struct Args {
     #[arg(short = 'r', long = "recursive")]
     recursive: bool,
 
+    /// Run a P2P pairing server on ALPN `nkct/pairing/1` (ssh-copy-id equivalent).
+    /// Prints a one-time token, ticket, and this node's fingerprint; a client runs
+    /// `--copy-bundle --connect <ticket> --token <OTP>` to register its KeyBundle.
+    /// Requires `--peer-allowlist` (the file to append to) and `--key-dir` (where
+    /// received `<handle>.nkkb` are saved); refuses to run as root.
+    #[arg(long)]
+    serve_pairing: bool,
+
+    /// Pairing client: send our signed KeyBundle to a pairing server for
+    /// auto-registration. Use with `--connect <ticket>`, `--token <OTP>`,
+    /// `--signing-privkey` (our identity), `--signing-pubkey` (pin the server),
+    /// and `--keybundle-handle` (the name the server saves us under).
+    #[arg(long)]
+    copy_bundle: bool,
+
+    /// One-time token for `--copy-bundle`, as printed by the pairing server.
+    #[arg(long)]
+    token: Option<String>,
+
     /// Render TEXT (e.g. a `nkct1...` ticket) as a terminal QR code to stdout and
     /// exit. Self-contained — no external `qrencode`. Use `--qr -` to read the
     /// text from stdin instead of the command line (keeps it out of `ps`).
@@ -590,6 +609,8 @@ async fn main() -> anyhow::Result<()> {
         Operation::Listen
     } else if args.serve_scp {
         Operation::Listen
+    } else if args.serve_pairing {
+        Operation::Listen
     } else if args.listen {
         Operation::Listen
     } else if args.connect.is_some() {
@@ -732,6 +753,13 @@ async fn main() -> anyhow::Result<()> {
     if config.scp_put.is_some() && config.scp_get.is_some() {
         anyhow::bail!("--scp-put and --scp-get are mutually exclusive");
     }
+    // Pairing (ALPN_PAIRING). `pairing_mode` is set per-connection by the ALPN
+    // dispatch; here we only wire the server gate (`serve_pairing`), the client
+    // role (`copy_bundle`), and the token.
+    config.serve_pairing = args.serve_pairing;
+    config.copy_bundle = args.copy_bundle;
+    config.pairing_token = args.token;
+    config.keybundle_handle = args.keybundle_handle.clone();
     // Validate forward client specs early (fail fast on a bad spec) before any
     // network setup.
     for s in &config.forward_specs {
@@ -843,6 +871,54 @@ async fn main() -> anyhow::Result<()> {
              drop yet, so run it as the unprivileged user that should own the transferred files."
         );
     }
+    // Pairing is its own exclusive server/client role (one role per process).
+    if (config.serve_pairing || config.copy_bundle)
+        && (config.shell_mode || config.forward_mode || config.scp_mode)
+    {
+        anyhow::bail!("--serve-pairing/--copy-bundle cannot be combined with shell/forward/scp modes");
+    }
+    if config.serve_pairing && config.copy_bundle {
+        anyhow::bail!("--serve-pairing and --copy-bundle are mutually exclusive (one role per process)");
+    }
+    if args.serve_pairing {
+        // The allowlist is the file we append registered clients to; without it
+        // there is nowhere to record the pairing.
+        if args.peer_allowlist.is_none() {
+            anyhow::bail!(
+                "--serve-pairing requires --peer-allowlist <file> (the allowlist to register \
+                 paired clients into)"
+            );
+        }
+        // The client MUST self-authenticate (refinement 1): anonymous pairing would
+        // let anyone with the token register an arbitrary bundle.
+        if args.allow_unauth {
+            anyhow::bail!("--allow-unauth is not permitted with --serve-pairing (the client must self-authenticate)");
+        }
+        // Writing the allowlist / received bundles into the server user's key dir
+        // needs no privilege; refuse root for a consistent posture (like scp).
+        #[cfg(unix)]
+        if unsafe { libc::geteuid() == 0 || libc::getuid() == 0 } {
+            anyhow::bail!(
+                "refusing to run --serve-pairing as root: run it as the unprivileged user that \
+                 owns the allowlist and key directory."
+            );
+        }
+    }
+    if args.copy_bundle {
+        // These args are already moved into `config`; validate the config fields.
+        if config.connect_addr.is_none() {
+            anyhow::bail!("--copy-bundle requires --connect <ticket> (the pairing server's ticket)");
+        }
+        if config.pairing_token.is_none() {
+            anyhow::bail!("--copy-bundle requires --token <OTP> (as printed by the pairing server)");
+        }
+        if config.signing_privkey.is_none() {
+            anyhow::bail!(
+                "--copy-bundle requires --signing-privkey <key> (your identity) and \
+                 --keybundle-handle <name>"
+            );
+        }
+    }
     config.allow_unauth = args.allow_unauth;
     config.force = args.force;
     config.handshake_timeout = args.handshake_timeout;
@@ -886,9 +962,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if operation == Operation::Listen {
+        if config.serve_pairing {
+            return run_serve_pairing(config).await;
+        }
         nk_crypto_tool::network::NetworkProcessor::listen(&config).await?;
         return Ok(());
     } else if operation == Operation::Connect {
+        if config.copy_bundle {
+            return run_copy_bundle(config, mode).await;
+        }
         nk_crypto_tool::network::NetworkProcessor::connect(&config).await?;
         return Ok(());
     }
@@ -1122,6 +1204,122 @@ fn run_gen_keybundle(args: &Args, mode: CryptoMode) -> anyhow::Result<()> {
          Share this fingerprint out-of-band so senders can pin your identity:\n  {fp}",
         keys.len()
     );
+    Ok(())
+}
+
+/// Build this identity's signed KeyBundle bytes in memory (the same content
+/// `--gen-keybundle` writes) for `--copy-bundle` to send. Returns `(bytes, owner_fp)`.
+fn build_keybundle_bytes(
+    key_dir: &str,
+    mode: CryptoMode,
+    handle: &str,
+    signing_priv: &str,
+    signing_pub: Option<&str>,
+    kem_algo: &str,
+) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
+    use nk_crypto_tool::keybundle::{self, KEY_USAGE_ENC, KEY_USAGE_HYBRID};
+    use sha3::{Digest, Sha3_256};
+
+    let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+        .map_err(|e| anyhow::anyhow!("read signing key passphrase: {e}"))?;
+    let owner_sk = load_raw_dsa_priv(signing_priv, &passphrase)?;
+    let owner_pub_path = signing_pub
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| signing_priv.replacen("private_sign", "public_sign", 1));
+    let owner_pk = load_raw_pqc_pub(&owner_pub_path, "any")?;
+
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| anyhow::anyhow!("system clock is before the UNIX epoch: {e}"))?
+        .as_secs();
+
+    let mut keys: Vec<(u8, Vec<u8>, u64, Option<u64>)> = Vec::new();
+    match mode {
+        CryptoMode::PQC => {
+            let ek = load_raw_pqc_pub(&format!("{key_dir}/public_enc_pqc.key"), kem_algo)?;
+            keys.push((KEY_USAGE_ENC, ek, created_at, None));
+        }
+        CryptoMode::ECC => {
+            let der = load_spki_der_pub(&format!("{key_dir}/public_enc_ecc.key"))?;
+            keys.push((KEY_USAGE_HYBRID, der, created_at, None));
+        }
+        CryptoMode::Hybrid => {
+            let ek = load_raw_pqc_pub(&format!("{key_dir}/public_enc_hybrid_mlkem.key"), kem_algo)?;
+            keys.push((KEY_USAGE_ENC, ek, created_at, None));
+            let der = load_spki_der_pub(&format!("{key_dir}/public_enc_hybrid_ecdh.key"))?;
+            keys.push((KEY_USAGE_HYBRID, der, created_at, None));
+        }
+    }
+    let bundle = keybundle::build_signed(KEYBUNDLE_IDENTITY_DSA, &owner_sk, &owner_pk, handle, created_at, &keys)
+        .map_err(|e| anyhow::anyhow!("build keybundle: {e}"))?;
+    let fp: [u8; 32] = Sha3_256::digest(&owner_pk).into();
+    Ok((bundle, fp))
+}
+
+/// `--serve-pairing`: single-shot pairing server. Generate a one-time token +
+/// deadline, print the ticket / token / fingerprint, and accept one client to
+/// register (allowlist + `<key-dir>/received/<handle>.nkkb`).
+async fn run_serve_pairing(mut config: CryptoConfig) -> anyhow::Result<()> {
+    use std::sync::Arc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let token = nk_crypto_tool::pairing::generate_token();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    config.pairing_otp = Some(token.clone());
+    config.pairing_deadline_secs = Some(now + 300);
+
+    let endpoint =
+        Arc::new(nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&config, false).await?);
+    let mut processor = nk_crypto_tool::p2p::NetworkProcessor::new(
+        config.clone(),
+        endpoint,
+        Arc::new(nk_crypto_tool::network::DefaultIOProvider),
+    );
+    processor.preload_allowlist().await?;
+
+    eprintln!("[pairing] one-time token: {token}   (valid 5 minutes — give it to the client out-of-band)");
+    let tok = token.clone();
+    processor
+        .run_listen_once(
+            move |ticket| {
+                eprintln!("[pairing] server fingerprint: {}", hex::encode(ticket.pqc_sign_fp));
+                println!("[pairing] ticket: {ticket}");
+                eprintln!(
+                    "[pairing] client runs: nk-crypto-tool --copy-bundle --connect <ticket> \
+                     --token {tok} --signing-privkey <priv> --keybundle-handle <name> --key-dir <dir>"
+                );
+            },
+            || {},
+        )
+        .await?;
+    Ok(())
+}
+
+/// `--copy-bundle`: build our KeyBundle and send it to a pairing server for
+/// auto-registration. The server is pinned via the ticket's fingerprint.
+async fn run_copy_bundle(mut config: CryptoConfig, mode: CryptoMode) -> anyhow::Result<()> {
+    let handle = config
+        .keybundle_handle
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--copy-bundle requires --keybundle-handle <name>"))?;
+    let signing_priv = config
+        .signing_privkey
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("--copy-bundle requires --signing-privkey <key>"))?;
+    let (bytes, fp) = build_keybundle_bytes(
+        &config.key_dir,
+        mode,
+        &handle,
+        &signing_priv,
+        config.signing_pubkey.as_deref(),
+        &config.pqc_kem_algo,
+    )?;
+    eprintln!(
+        "[copy-bundle] sending KeyBundle (handle {handle:?}, fingerprint {})",
+        &hex::encode(fp)[..16]
+    );
+    config.pairing_bundle_bytes = Some(bytes);
+    nk_crypto_tool::network::NetworkProcessor::connect(&config).await?;
     Ok(())
 }
 

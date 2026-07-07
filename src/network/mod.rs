@@ -46,6 +46,16 @@ pub const ALPN_FWD: &[u8] = b"nkct/fwd/2";
 /// single get/put request per connection, policy-gated and path-confined; see
 /// [`crate::scp`].
 pub const ALPN_SCP: &[u8] = b"nkct/scp/2";
+/// Pairing / KeyBundle auto-registration ALPN (`ssh-copy-id` equivalent). A
+/// not-yet-registered client self-authenticates, proves it holds the OTP, and
+/// sends its signed KeyBundle; the server verifies (incl. handshake fingerprint
+/// == bundle owner fingerprint) and adds the fingerprint to its allowlist +
+/// saves the bundle. Runs the mutual-auth handshake like shell/scp, but is a
+/// distinct protocol so its deliberately-relaxed acceptance (an unregistered but
+/// self-authenticating client) never leaks into the other server modes. New
+/// protocol — not part of the increment-3 flag-day bump.
+pub const ALPN_PAIRING: &[u8] = b"nkct/pairing/1";
+
 /// MLS group chat ALPN (P4). Each accepted stream under this protocol
 /// carries exactly one length-prefixed `mls_rs::MlsMessage` per the
 /// [`crate::group::transport`] framing helpers — Welcome / Commit /

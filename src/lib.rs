@@ -28,6 +28,7 @@ pub mod gui;
 #[cfg(feature = "gui-camera")]
 pub mod camera { pub use crate::gui::camera::*; }
 pub mod forward;
+pub mod pairing;
 pub mod scp;
 pub mod shell;
 pub mod strategy;
