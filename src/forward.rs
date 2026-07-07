@@ -961,6 +961,15 @@ impl ForwardPolicy {
             if h.is_empty() {
                 return Err(err(format!("empty host in {item:?}")));
             }
+            // The matcher supports only `*` (any host) or an exact name. A
+            // partial glob like `*.internal` would be stored as a literal that
+            // never matches any real host — a silently dead rule — so refuse
+            // it here instead (fail closed on ambiguous patterns).
+            if h.contains('*') && h != "*" {
+                return Err(err(format!(
+                    "partial wildcard {h:?} is not supported: use \"*\" or an exact host"
+                )));
+            }
             let port = if p == "*" {
                 None
             } else {
@@ -1079,6 +1088,21 @@ mod tests {
         assert!(pol.authorize_bind(&fp, 9000).is_ok());
         assert!(pol.authorize_bind(&fp, 22).is_err());
         assert!(pol.authorize_bind(&[0u8; 32], 8080).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn policy_partial_wildcard_is_error_not_dead_rule() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("nkfwdpol_glob_{}.txt", std::process::id()));
+        let fph = "ab".repeat(32);
+        // `*.internal` would be stored as a literal hostname that never
+        // matches — reject at parse time instead of silently allowing nothing.
+        std::fs::write(&path, format!("{fph}  allow=\"*.internal:80\"\n")).unwrap();
+        assert!(ForwardPolicy::load(path.to_str().unwrap()).is_err());
+        // The two supported wildcard forms still parse.
+        std::fs::write(&path, format!("{fph}  allow=\"*:443, db.internal:*\"\n")).unwrap();
+        assert!(ForwardPolicy::load(path.to_str().unwrap()).is_ok());
         let _ = std::fs::remove_file(&path);
     }
 
