@@ -440,9 +440,16 @@ struct Args {
     // Keyring flags (redb-backed store of known KeyBundles, keyed by
     // handle; populated by pairing and by `--keyring-cmd add/import`).
     // -------------------------------------------------------------
-    /// Keyring subcommand: `add`, `list`, `remove`, or `import`.
-    #[arg(long, help = "Keyring subcommand (add|list|remove|import)")]
+    /// Keyring subcommand: `add`, `list`, `remove`, `import`, `authorize`, or
+    /// `revoke`.
+    #[arg(long, help = "Keyring subcommand (add|list|remove|import|authorize|revoke)")]
     keyring_cmd: Option<String>,
+
+    /// Comma-separated transports to grant a peer, for `--serve-pairing` (the
+    /// default a freshly-paired client gets) and `--keyring-cmd authorize`. One
+    /// or more of `shell`, `scp`, `forward`, or `all` (default `all`).
+    #[arg(long)]
+    pairing_grant: Option<String>,
 
     /// Path to the redb keyring. Defaults to `keyring.db` under `--key-dir`.
     #[arg(long)]
@@ -844,10 +851,10 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     if args.serve_forward {
-        if args.peer_allowlist.is_none() && config.signing_pubkey.is_none() {
+        if args.peer_allowlist.is_none() && config.signing_pubkey.is_none() && args.keyring_db.is_none() {
             anyhow::bail!(
-                "--serve-forward requires --peer-allowlist <file> and/or --signing-pubkey <key> \
-                 to restrict who may forward"
+                "--serve-forward requires --keyring-db <db>, --peer-allowlist <file>, and/or \
+                 --signing-pubkey <key> to restrict who may forward"
             );
         }
         if config.forward_policy_path.is_none() {
@@ -871,10 +878,14 @@ async fn main() -> anyhow::Result<()> {
     // or an allowlist, any peer that merely presents some valid signature is
     // accepted (authenticated but not authorized). Require an explicit
     // restriction so `--serve-shell` is never an open shell.
-    if args.serve_shell && args.peer_allowlist.is_none() && config.signing_pubkey.is_none() {
+    if args.serve_shell
+        && args.peer_allowlist.is_none()
+        && config.signing_pubkey.is_none()
+        && args.keyring_db.is_none()
+    {
         anyhow::bail!(
-            "--serve-shell requires --peer-allowlist <file> and/or --signing-pubkey <key> \
-             to restrict who may obtain a shell"
+            "--serve-shell requires --keyring-db <db>, --peer-allowlist <file>, and/or \
+             --signing-pubkey <key> to restrict who may obtain a shell"
         );
     }
     // Tier 1 (same-user): the shell runs as the server's own user — there is no
@@ -901,9 +912,9 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     if args.serve_scp {
-        if args.peer_allowlist.is_none() && config.signing_pubkey.is_none() {
+        if args.peer_allowlist.is_none() && config.signing_pubkey.is_none() && args.keyring_db.is_none() {
             anyhow::bail!(
-                "--serve-scp requires --peer-allowlist <file> and/or --signing-pubkey <key> \
+                "--serve-scp requires --keyring-db <db>, --peer-allowlist <file>, and/or --signing-pubkey <key> \
                  to restrict who may transfer files"
             );
         }
@@ -935,14 +946,10 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("--serve-pairing and --copy-bundle are mutually exclusive (one role per process)");
     }
     if args.serve_pairing {
-        // The allowlist is the file we append registered clients to; without it
-        // there is nowhere to record the pairing.
-        if args.peer_allowlist.is_none() {
-            anyhow::bail!(
-                "--serve-pairing requires --peer-allowlist <file> (the allowlist to register \
-                 paired clients into)"
-            );
-        }
+        // Pairing records the client in the redb keyring (authz grants + bundle)
+        // at <key-dir>/keyring.db (or --keyring-db), so no plaintext
+        // --peer-allowlist is required any more.
+        //
         // The client MUST self-authenticate (refinement 1): anonymous pairing would
         // let anyone with the token register an arbitrary bundle.
         if args.allow_unauth {
@@ -977,6 +984,8 @@ async fn main() -> anyhow::Result<()> {
     config.force = args.force;
     config.handshake_timeout = args.handshake_timeout;
     config.peer_allowlist = args.peer_allowlist;
+    config.keyring_db = args.keyring_db.clone();
+    config.pairing_grants = parse_grants(args.pairing_grant.as_deref())?;
 
     if config.chat_mode
         && !config.allow_unauth
@@ -1191,6 +1200,34 @@ fn keyring_db_path(keyring_db: Option<&str>, key_dir: Option<&str>) -> std::path
     }
 }
 
+/// Parse a comma-separated grant list (`shell,scp,forward` or `all`) into a
+/// `keyring::GRANT_*` bitmask. `None` defaults to every transport (`GRANT_ALL`).
+fn parse_grants(spec: Option<&str>) -> anyhow::Result<u8> {
+    use nk_crypto_tool::keyring::{GRANT_ALL, GRANT_FORWARD, GRANT_SCP, GRANT_SHELL};
+    let spec = match spec {
+        None => return Ok(GRANT_ALL),
+        Some(s) => s,
+    };
+    let mut g = 0u8;
+    for tok in spec.split(',') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        g |= match tok.to_ascii_lowercase().as_str() {
+            "shell" => GRANT_SHELL,
+            "scp" => GRANT_SCP,
+            "forward" => GRANT_FORWARD,
+            "all" => GRANT_ALL,
+            other => anyhow::bail!("unknown grant {other:?}; expected shell|scp|forward|all"),
+        };
+    }
+    if g == 0 {
+        anyhow::bail!("--pairing-grant must name at least one of shell|scp|forward|all");
+    }
+    Ok(g)
+}
+
 /// `--keyring-cmd`: manage the redb keyring of known KeyBundles (the `contacts`
 /// half — bundle + pinned fingerprint, keyed by handle).
 ///   `add`    — store a bundle file, pinned by `--recipient-fingerprint`
@@ -1285,11 +1322,51 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
             }
             println!("Imported {n} bundle(s) from {} into keyring {}", dir.display(), db.display());
         }
+        "authorize" => {
+            let fp = resolve_authz_fp(&store, args)?;
+            let grants = parse_grants(args.pairing_grant.as_deref())?;
+            store.authorize(&fp, grants).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "Authorized {} grants=0b{grants:03b} in keyring {}",
+                hex::encode(fp),
+                db.display()
+            );
+        }
+        "revoke" => {
+            let fp = resolve_authz_fp(&store, args)?;
+            if store.deauthorize(&fp).map_err(|e| anyhow::anyhow!("{e}"))? {
+                println!("Revoked {} from keyring {}", hex::encode(fp), db.display());
+            } else {
+                println!("{} was not authorized", hex::encode(fp));
+            }
+        }
         other => anyhow::bail!(
-            "unknown --keyring-cmd {other:?}; expected one of add|list|remove|import"
+            "unknown --keyring-cmd {other:?}; expected one of add|list|remove|import|authorize|revoke"
         ),
     }
     Ok(())
+}
+
+/// Resolve the fingerprint for `keyring authorize|revoke`: from
+/// `--keybundle-handle` (looked up in the contacts table) or an explicit
+/// `--recipient-fingerprint <64-hex>`.
+fn resolve_authz_fp(
+    store: &nk_crypto_tool::keyring::KeyringStore,
+    args: &Args,
+) -> anyhow::Result<[u8; 32]> {
+    if let Some(ref handle) = args.keybundle_handle {
+        let entry = store
+            .get(handle)
+            .map_err(|e| anyhow::anyhow!("keyring lookup {handle:?}: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("keyring has no contact {handle:?}"))?;
+        Ok(entry.fingerprint)
+    } else if let Some(ref fp_hex) = args.recipient_fingerprint {
+        parse_fingerprint_hex(fp_hex)
+    } else {
+        anyhow::bail!(
+            "keyring authorize/revoke needs --keybundle-handle <name> or --recipient-fingerprint <64-hex>"
+        )
+    }
 }
 
 /// encryption public key(s) under its ML-DSA-65 signature, then print the owner

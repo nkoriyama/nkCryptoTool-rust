@@ -159,37 +159,6 @@ fn validate_handle(handle: &str) -> Result<()> {
     Ok(())
 }
 
-/// Append `fp` (as 64-hex) to the allowlist file if absent, atomically. Parses
-/// the existing hex-per-line format (mirrors `preload_allowlist`), dedups via a
-/// set, and rewrites via `secure_write` (temp + rename, 0600).
-fn append_allowlist(path: &str, fp: &[u8; 32]) -> Result<bool> {
-    let mut set = std::collections::HashSet::new();
-    if let Ok(content) = std::fs::read_to_string(path) {
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') {
-                continue;
-            }
-            if let Ok(bytes) = hex::decode(line) {
-                if bytes.len() == 32 {
-                    let mut arr = [0u8; 32];
-                    arr.copy_from_slice(&bytes);
-                    set.insert(arr);
-                }
-            }
-        }
-    }
-    let already = !set.insert(*fp);
-    if already {
-        return Ok(false);
-    }
-    let mut lines: Vec<String> = set.iter().map(hex::encode).collect();
-    lines.sort();
-    let body = lines.join("\n") + "\n";
-    crate::utils::secure_write(path, body.as_bytes(), true)
-        .map_err(|e| CryptoError::FileWrite(format!("pairing: write allowlist {path}: {e}")))?;
-    Ok(true)
-}
 
 /// The core registration decision, returning a user-facing success message or an
 /// error string (sent back to the client). Verifies the token (constant-time +
@@ -224,37 +193,44 @@ fn register(req: &PairingRequest, client_fp: [u8; 32], config: &CryptoConfig) ->
     // 3. Handle → filename safety.
     validate_handle(&vb.handle).map_err(|e| e.to_string())?;
 
-    // 4. Register the fingerprint into the allowlist (dedup, atomic).
-    let allowlist = config
-        .peer_allowlist
-        .as_deref()
-        .ok_or_else(|| "server has no --peer-allowlist configured".to_string())?;
-    let added = append_allowlist(allowlist, &client_fp).map_err(|e| e.to_string())?;
-
-    // 5. Store the bundle in the keyring (<key-dir>/keyring.db), pinned to the
-    //    handshake-verified fingerprint. The store enforces handle-clobber
-    //    protection: a DIFFERENT identity cannot take over an existing handle
-    //    (which would redirect the server's mail to an attacker), while the SAME
-    //    identity may re-register idempotently. This replaces the former
-    //    per-file <key-dir>/received/<handle>.nkkb artefact.
-    let keyring_path = std::path::Path::new(&config.key_dir).join("keyring.db");
-    let store = crate::keyring::KeyringStore::open(&keyring_path)
-        .map_err(|e| format!("open keyring {keyring_path:?}: {e}"))?;
+    // 4-5. Authorize the fingerprint (grants) and store the bundle, both in the
+    //      keyring, pinned to the handshake-verified fingerprint. Authorization
+    //      replaces the former plaintext `--peer-allowlist` append — the grants
+    //      default to every transport (GRANT_ALL) and are overridable with
+    //      `--pairing-grant`, so authorization now lives off plaintext and is
+    //      per-service. The store enforces handle-clobber protection (a DIFFERENT
+    //      identity cannot take over an existing handle; the SAME identity
+    //      re-registers idempotently), replacing the per-file
+    //      <key-dir>/received/<handle>.nkkb artefact.
+    let keyring_path = config
+        .keyring_db
+        .clone()
+        .unwrap_or_else(|| format!("{}/keyring.db", config.key_dir));
+    let store = crate::keyring::KeyringStore::open(std::path::Path::new(&keyring_path))
+        .map_err(|e| format!("open keyring {keyring_path}: {e}"))?;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let already = store.grants(&client_fp).map_err(|e| e.to_string())? != 0;
+    // Store the bundle FIRST: its handle-clobber check must reject a colliding
+    // handle *before* we grant the fingerprint anything (otherwise a failed
+    // registration would still have authorized the peer).
     store
         .add(&vb.handle, &client_fp, &req.keybundle_bytes, now)
+        .map_err(|e| e.to_string())?;
+    store
+        .authorize(&client_fp, config.pairing_grants)
         .map_err(|e| e.to_string())?;
 
     let fp_hex = hex::encode(client_fp);
     Ok(format!(
-        "registered {} (fingerprint {}{}); stored bundle in keyring {}",
+        "registered {} (fingerprint {}, grants=0b{:03b}{}); keyring {}",
         vb.handle,
         &fp_hex[..16],
-        if added { "" } else { ", already in allowlist" },
-        keyring_path.display()
+        config.pairing_grants,
+        if already { ", re-authorized" } else { "" },
+        keyring_path
     ))
 }
 
@@ -432,7 +408,7 @@ mod tests {
     }
 
     #[test]
-    fn register_happy_path_writes_allowlist_and_bundle() {
+    fn register_happy_path_authorizes_and_stores_bundle() {
         let (bytes, fp) = sample_bundle("alice");
         let dir = tmp_dir(&format!("ok-{:02x}", fp[0]));
         let allow = dir.join("allowlist");
@@ -440,9 +416,12 @@ mod tests {
         let req = PairingRequest { token: "TOKEN123".into(), keybundle_bytes: bytes };
         let msg = register(&req, fp, &config).expect("should register");
         assert!(msg.contains("registered alice"));
-        let al = std::fs::read_to_string(&allow).unwrap();
-        assert!(al.contains(&hex::encode(fp)), "allowlist must contain the fingerprint");
         let store = crate::keyring::KeyringStore::open(&dir.join("keyring.db")).unwrap();
+        assert_eq!(
+            store.grants(&fp).unwrap(),
+            crate::keyring::GRANT_ALL,
+            "the fingerprint must be granted every transport by default"
+        );
         assert!(store.get("alice").unwrap().is_some(), "bundle must be stored in the keyring");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -460,7 +439,8 @@ mod tests {
         let req = PairingRequest { token: "T".into(), keybundle_bytes: bytes };
         let r = register(&req, fp_b, &config); // pin = wrong identity
         assert!(r.is_err(), "a bundle not signed by the connecting identity must be rejected");
-        assert!(!allow.exists() || std::fs::read_to_string(&allow).unwrap().is_empty());
+        let store = crate::keyring::KeyringStore::open(&dir.join("keyring.db")).unwrap();
+        assert_eq!(store.grants(&fp_b).unwrap(), 0, "a rejected pairing must not authorize");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -477,7 +457,8 @@ mod tests {
         let c2 = base_config(&dir, &allow, "RIGHT", 1);
         let req2 = PairingRequest { token: "RIGHT".into(), keybundle_bytes: bytes };
         assert!(register(&req2, fp, &c2).is_err(), "expired token must be rejected");
-        assert!(!allow.exists() || std::fs::read_to_string(&allow).unwrap().is_empty());
+        let store = crate::keyring::KeyringStore::open(&dir.join("keyring.db")).unwrap();
+        assert_eq!(store.grants(&fp).unwrap(), 0, "a rejected pairing must not authorize");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -504,6 +485,12 @@ mod tests {
             let entry = store.get("alice").unwrap().expect("alice's keyring entry present");
             assert_eq!(entry.fingerprint, fp_a, "keyring still holds A's fingerprint");
             assert!(crate::keybundle::parse_and_verify(&entry.bundle, "ML-DSA-65", &fp_a).is_ok());
+            assert_eq!(store.grants(&fp_a).unwrap(), crate::keyring::GRANT_ALL, "A is authorized");
+            assert_eq!(
+                store.grants(&fp_b).unwrap(),
+                0,
+                "B lost the handle-collision, so it must NOT have been authorized"
+            );
         }
         // The SAME identity may re-register (idempotent).
         register(&PairingRequest { token: "T".into(), keybundle_bytes: bytes_a }, fp_a, &ca)
