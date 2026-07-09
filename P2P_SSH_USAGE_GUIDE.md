@@ -74,7 +74,8 @@ nk-crypto-tool --shell-cmd 'systemctl restart app' --connect 'nkct1....' --mode 
 a4d889f8...c00e  user=deploy  cmd-allow="systemctl restart app, journalctl -u app"
 ```
 
-- `user=` … そのユーザに降格してシェルを起動する。
+- `user=` … このセッションを実行するユーザ。**サーバ起動ユーザ自身**しか指定できない
+  （Tier 1 はユーザ切替をしない。他ユーザを指すと拒否）。
 - `cmd-allow="..."` … 完全一致するコマンドのみ許可（ログインシェルは拒否、ssh の
   `command=` 相当）。Linux では該当セッションのコマンドは `NO_NEW_PRIVS` 付きで
   起動され、許可済みコマンド経由でも setuid/setgid/capabilities による特権昇格が
@@ -91,12 +92,17 @@ nk-crypto-tool --serve-shell --mode pqc \
 
 監査ログには `allow`/`deny`/`rate-limit`/`session-end` が時刻＋指紋付きで記録される。
 
-### root で serve する場合（権限分離）
+### 実行ユーザと権限（Tier 1：権限降格なし）
 
-root サーバは **`--shell-policy` 必須**。各セッションはポリシーの `user=` にマップした
-**非 root ユーザ**へ `setgroups → setgid → setuid` で降格し、そのユーザのログイン
-シェルを起動する。root へのマップ、gid 0（root グループ）を含むマップ、ポリシー無しの
-root 起動はいずれも拒否される。
+シェルは **サーバを起動したユーザ自身** として動く。in-process の権限降格
+（setuid/setgid）は行わない（PTY 層を portable-pty に統一した際に setuid 経路を撤去）。
+そのため `--serve-shell` は **root で起動すると起動時に拒否される**（全セッションが
+root シェルになってしまうため、ポリシーの有無に関わらず弾く）。`--serve-scp` /
+`--serve-pairing` も同じ理由で root 起動を拒否する。
+
+- 複数ユーザに serve したい場合は、**ユーザごとに非 root の個別インスタンス**を起動する。
+- ポリシーの `user=` は **起動ユーザ自身** のみ指定可（他ユーザへの切替はできない）。
+- Windows も、管理者（Administrator）昇格状態での起動は拒否される。
 
 ---
 
@@ -190,7 +196,8 @@ nk-crypto-tool --serve-shell --mode pqc \
 - `--peer-allowlist <file>` … 許可指紋を列挙したファイルでも認可できる（ピン留めの代替/併用）。
 - ピアが shell/forward の ALPN を要求しても、操作者が `--serve-shell` /
   `--serve-forward` で起動していない限りサービスは開かない。
-- root シェルサーバは `--shell-policy` 必須（セッションごとに非 root へ降格）。
+- `--serve-shell` / `--serve-scp` / `--serve-pairing` は **root では起動できない**
+  （Tier 1＝権限降格なし。非 root ユーザで、必要ならユーザごとに個別インスタンスを起動）。
 - ticket（`nkct1....`）はそのセッションの接続先情報。秘密ではないが、漏れても認可は
   指紋で守られる。
 
@@ -204,7 +211,8 @@ nk-crypto-tool --serve-shell --mode pqc \
   か `--signing-pubkey` で相手を認証する。
 - **`--serve-forward requires --forward-policy`**: フォワードサーバは default deny の
   ポリシーが必須。
-- **root で `--serve-shell` が拒否される**: `--shell-policy` を付けて非 root ユーザへ
-  マップする（root シェルは渡さない設計）。
+- **root で `--serve-shell` が拒否される**: 仕様（Tier 1＝権限降格なし）。シェルを
+  持たせたい**非 root ユーザ自身**で `--serve-shell` する。複数ユーザなら各ユーザで
+  個別インスタンスを起動する（`--shell-policy` を足しても root では起動できない）。
 - **MLS ストレージのパスフレーズ**: `--mls-storage` の redb は非空パスフレーズが必須
   （`NK_PASSPHRASE` を設定）。
