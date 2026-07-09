@@ -105,6 +105,25 @@ store-and-forward inbox がエンベロープを中継するだけで、**inbox 
 bundle 署名は native ctx `nkct-recipient-bundle-v1` で file / prekey / handshake 署名と
 ドメイン分離される（[KEY_EXCHANGE_DESIGN.md](./KEY_EXCHANGE_DESIGN.md) 参照）。
 
+## **デモ: ペアリング（KeyBundle 自動登録 = `ssh-copy-id` 相当）→ 認可付き shell / scp**
+
+![ワンタイムトークンでペアリングし、確定した指紋で confined shell と path-jail scp を張るデモ](./docs/pairing_demo.gif)
+
+未登録クライアントが**ワンタイムトークン**で自分を登録し、そのまま同じ ML-DSA-65 指紋で
+confined shell と path-jail された scp を張るまでを 4 ステップで示す（loopback iroh・相互 ML-DSA-65 認証）:
+
+1. **PAIR** — `--peer-allowlist` は**空**の状態から始まる。まず**トークンを持たない**クライアントは
+   拒否され allowlist は空のまま（登録も default-deny）。正しい OTP を持つクライアントだけが
+   `--copy-bundle` で自己署名 KeyBundle を送って登録される。サーバは*接続本人の*指紋（handshake 指紋 ==
+   bundle owner 指紋）を照合するので、トークン保持者が他人の bundle を代理登録できない（`--copy-bundle` は
+   接続鍵で必ず自己署名するため owner==identity が構造的に成立。異一致拒否は `refinement_1` 単体テストで担保）。
+2. **AUTHORIZE** — ペアリングは allowlist 追加**のみ**。管理者が shell-policy / scp-policy を書いて
+   初めて capability が付く（**default-deny を維持**）。
+3. **SHELL** — 許可コマンド (`uname -a`) は実行され、cmd-allow 外 (`cat /etc/shadow`) はサーバが拒否する。
+4. **SCP** — write jail 内への転送は成功し、jail 外のパスは拒否される。
+
+ペアリングは専用 ALPN `nkct/pairing/1`（緩和認証はこの ALPN 限定）。使い方は [USAGE.md §7](./USAGE.md)。
+
 ## **チケットを端末に QR 表示（外部ツール不要）**
 
 ![端末に QR を表示するデモ](./docs/qr_demo.gif)
@@ -138,7 +157,11 @@ bundle 署名は native ctx `nkct-recipient-bundle-v1` で file / prekey / hands
   P-256‖ML-KEM-768 KEM + ML-DSA-65 認証 (指紋ピンニング)、`--tui` でライブ接続バー、
   MLS グループ連動の認可 (Phase 6)、監査ログ・レート制限を備える。
   詳細は [`P2P_SSH_USAGE_GUIDE.md`](./P2P_SSH_USAGE_GUIDE.md)。
-* **グラフィカルユーザーインターフェース (GUI) のサポート**: Slint を用いた直感的な GUI を搭載。`--gui` オプションで起動可能で、QR コードのスキャンやチャット機能、ファイル転送をグラフィカルに実行できます。
+* **ペアリング (KeyBundle 自動登録 = `ssh-copy-id` 相当)**: 未登録クライアントを**ワンタイム
+  トークン**で初回だけ登録 (`--serve-pairing` / `--copy-bundle`)。クライアントの指紋を
+  `--peer-allowlist` に追加し KeyBundle を保存する。接続本人が鍵所持を証明した identity だけを
+  登録 (handshake 指紋 == bundle owner 指紋を照合)、default-deny は維持 (allowlist 追加のみ・
+  実行 policy は別)。使い方は [USAGE.md §7](./USAGE.md)。 Slint を用いた直感的な GUI を搭載。`--gui` オプションで起動可能で、QR コードのスキャンやチャット機能、ファイル転送をグラフィカルに実行できます。
 * **MLS (RFC 9420) グループチャット (オプション機能)**: `--features mls` で有効化。
   Ed25519 ‖ ML-DSA-65 + X25519 ‖ ML-KEM-768 (X-Wing) のハイブリッド PQC ciphersuite
   (private-use ID `0xF101`) で 3 人以上のグループ E2EE を実現。sqlite 永続化と

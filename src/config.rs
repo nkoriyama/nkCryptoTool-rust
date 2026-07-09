@@ -209,6 +209,34 @@ pub struct CryptoConfig {
     /// scp client recursive mode (`-r`/`--recursive`): `--scp-put`/`--scp-get`
     /// operate on a directory tree instead of a single file.
     pub scp_recursive: bool,
+
+    // Pairing / KeyBundle auto-registration (ALPN_PAIRING, ssh-copy-id equivalent).
+    /// This node serves pairing (`--serve-pairing`): accepts a self-authenticating
+    /// but not-yet-allowlisted client (gated by a one-time token), verifies its
+    /// KeyBundle, and registers it (allowlist + `<handle>.nkkb`). When true the
+    /// handshake skips ONLY the allowlist-membership rejection — signature
+    /// verification is unchanged — so an unregistered client can bootstrap trust.
+    pub pairing_mode: bool,
+    /// This node *serves* pairing (`--serve-pairing`). Only when true does an
+    /// inbound pairing-ALPN connection register a client. Gates `pairing_allowed`
+    /// in the ALPN dispatch (a pairing *client* never accepts pairing requests).
+    pub serve_pairing: bool,
+    /// `--copy-bundle` client: send our signed KeyBundle to a pairing server.
+    pub copy_bundle: bool,
+    /// One-time token the client presents to the pairing server (`--token`).
+    pub pairing_token: Option<String>,
+    /// Server-generated one-time token to accept (set at `--serve-pairing`
+    /// startup, not from args). The pairing handler compares the client's token
+    /// against this in constant time.
+    pub pairing_otp: Option<String>,
+    /// Unix-seconds deadline after which the pairing token is refused.
+    pub pairing_deadline_secs: Option<u64>,
+    /// The client's own signed KeyBundle bytes to send (built by `--copy-bundle`
+    /// before the handshake and consumed by the pairing client handler).
+    pub pairing_bundle_bytes: Option<Vec<u8>>,
+    /// Bundle handle (`--keybundle-handle`), the label the pairing server saves
+    /// the received bundle under (`<handle>.nkkb`).
+    pub keybundle_handle: Option<String>,
     pub allow_unauth: bool,
     pub force: bool,
     pub handshake_timeout: u64,
@@ -285,6 +313,14 @@ impl Default for CryptoConfig {
             remote_forward_specs: Vec::new(),
             forward_policy_path: None,
             scp_mode: false,
+            pairing_mode: false,
+            serve_pairing: false,
+            copy_bundle: false,
+            pairing_token: None,
+            pairing_otp: None,
+            pairing_deadline_secs: None,
+            pairing_bundle_bytes: None,
+            keybundle_handle: None,
             serve_scp: false,
             scp_put: None,
             scp_get: None,

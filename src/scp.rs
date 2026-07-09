@@ -234,7 +234,7 @@ async fn recv(r: &mut (impl AsyncReadExt + Unpin), aead: &str, key: &[u8], ctr: 
 /// drop the stream and reset it with bulk data still in flight — the peer would
 /// see "connection lost" mid-read. The client closes (or acks-then-closes) only
 /// once it has fully received and committed, so an EOF here means safe delivery.
-async fn drain_until_close(reader: &mut (impl AsyncReadExt + Unpin)) {
+pub(crate) async fn drain_until_close(reader: &mut (impl AsyncReadExt + Unpin)) {
     // Hard 10s cap on the whole wait (not reset per byte), so a client that
     // trickles bytes without closing cannot pin a connection slot / fd for long.
     // Well-behaved clients ack-and-close within milliseconds.

@@ -380,13 +380,19 @@ where
                     let _ = out.write_all(b"\n> ").await;
                     let _ = out.flush().await;
                 }
+                // Endpoint gone (shutdown): stop the inbound task.
+                Err(crate::group::GroupError::Transport(crate::p2p::P2pError::Closed)) => break,
+                // Any other error is scoped to one incoming connection (bad
+                // ALPN, handshake stall, undecodable message). Drop that
+                // connection and keep accepting — otherwise a single malformed
+                // inbound message would permanently stop MLS delivery for the
+                // whole session.
                 Err(e) => {
                     let mut out = inbound_stdout.lock().await;
                     let _ = out
-                        .write_all(format!("[err] {e}\n").as_bytes())
+                        .write_all(format!("[err] {e}\n> ").as_bytes())
                         .await;
                     let _ = out.flush().await;
-                    break;
                 }
             }
         }

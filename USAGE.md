@@ -212,6 +212,44 @@ nk-crypto-tool --scp-get /srv/remote.tar local.tar --connect <ticket> --mode pqc
 
 ---
 
+## 7. ペアリング（KeyBundle 自動登録 = `ssh-copy-id` 相当）
+
+未登録のクライアントを、**ワンタイムトークン**で初回だけ安全に登録する。クライアントの指紋を
+サーバの `--peer-allowlist` に追加し、KeyBundle を `<key-dir>/received/<handle>.nkkb` に保存する。
+手動での指紋登録・鍵手渡しが要らなくなる。
+
+### サーバ（登録を受け付ける側・単発）
+```bash
+nk-crypto-tool --serve-pairing --mode pqc \
+    --signing-privkey server/private_sign_pqc.key \
+    --peer-allowlist server/allowlist \
+    --key-dir server
+#   → ワンタイムトークン・ticket・server 指紋を印字。1 クライアント登録して終了
+```
+- **ワンタイムトークンをクライアントへ out-of-band（口頭等）で渡す**（ticket と一緒に）。
+- `--peer-allowlist <file>` が登録先（追記される）。`--key-dir` 配下に `received/<handle>.nkkb` が保存。
+- root では拒否（サーバ user のファイルを書くだけで特権不要）。
+
+### クライアント（自分を登録してもらう側）
+```bash
+nk-crypto-tool --copy-bundle --mode pqc --connect <ticket> --token <OTP> \
+    --signing-privkey client/private_sign_pqc.key \
+    --keybundle-handle alice --key-dir client
+#   → "registered alice …" が出れば成功
+```
+- サーバは **ticket に埋まった指紋**で自動的に pin される（`--signing-pubkey` 不要）。
+- クライアントは自身の identity で**自己署名**し、サーバは
+  「**handshake 指紋 == 送る KeyBundle の owner 指紋**」を照合してから登録する（接続本人が鍵所持を
+  証明した identity だけを登録＝他人の bundle を代理登録できない）。
+
+### 安全性
+- **default-deny は維持**: 登録は allowlist への追加**だけ**。ペアリング直後は「接続はできるが
+  shell/scp は不可」で、管理者が明示的に `--shell-policy`/`--scp-policy` を書くまで何もできない。
+- トークンは高エントロピー乱数＋失効（既定 5 分）＋定数時間比較。MITM はクライアントの server-pin
+  で防ぐ。
+
+---
+
 ## 認証モデル早見（P2P shell / scp 共通）
 
 | 誰が誰を | 手段 |

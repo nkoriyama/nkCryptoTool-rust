@@ -262,10 +262,12 @@ impl NetworkProcessor {
                 let shell_allowed = config.serve_shell;
                 let forward_allowed = config.serve_forward;
                 let scp_allowed = config.serve_scp;
+                let pairing_allowed = config.serve_pairing;
                 config.shell_mode = false;
                 config.chat_mode = false;
                 config.forward_mode = false;
                 config.scp_mode = false;
+                config.pairing_mode = false;
                 if incoming.protocol.0 == ALPN_CHAT {
                     config.chat_mode = true;
                 } else if incoming.protocol.0 == ALPN_FILE {
@@ -288,6 +290,12 @@ impl NetworkProcessor {
                         return;
                     }
                     config.scp_mode = true;
+                } else if incoming.protocol.0 == crate::network::ALPN_PAIRING {
+                    if !pairing_allowed {
+                        eprintln!("Rejecting nkct/pairing/1: this node is not a pairing server");
+                        return;
+                    }
+                    config.pairing_mode = true;
                 } else {
                     eprintln!("Unknown ALPN: {:?}", String::from_utf8_lossy(incoming.protocol.0));
                     return;
@@ -381,10 +389,12 @@ impl NetworkProcessor {
         let shell_allowed = config.serve_shell;
         let forward_allowed = config.serve_forward;
         let scp_allowed = config.serve_scp;
+        let pairing_allowed = config.serve_pairing;
         config.shell_mode = false;
         config.chat_mode = false;
         config.forward_mode = false;
         config.scp_mode = false;
+        config.pairing_mode = false;
         if incoming.protocol.0 == ALPN_CHAT {
             config.chat_mode = true;
         } else if incoming.protocol.0 == ALPN_FILE {
@@ -410,6 +420,13 @@ impl NetworkProcessor {
                 ));
             }
             config.scp_mode = true;
+        } else if incoming.protocol.0 == crate::network::ALPN_PAIRING {
+            if !pairing_allowed {
+                return Err(CryptoError::Parameter(
+                    "pairing (nkct/pairing/1) is not enabled on this node".to_string(),
+                ));
+            }
+            config.pairing_mode = true;
         } else {
             return Err(CryptoError::Parameter(format!(
                 "Unknown ALPN: {:?}", String::from_utf8_lossy(incoming.protocol.0)
@@ -543,7 +560,20 @@ impl NetworkProcessor {
             }
             let peer_id = peer_id_opt.unwrap();
 
-            if let Some(ref allowlist) = cached_allowlist {
+            if config.pairing_mode {
+                // Pairing bootstrap: accept a client that self-authenticated but is
+                // NOT yet in the allowlist (learning its identity is the whole
+                // point). The ONLY relaxation is skipping the membership check — the
+                // signature verification above is unchanged, so the client must have
+                // proven possession of its key (`PeerId::Pubkey`); an anonymous peer
+                // is refused. Registration is gated downstream by the OTP and by
+                // (handshake fingerprint == KeyBundle owner fingerprint).
+                if !matches!(peer_id, PeerId::Pubkey(_)) {
+                    return Err(CryptoError::Parameter(
+                        "pairing requires a self-authenticating client".to_string(),
+                    ));
+                }
+            } else if let Some(ref allowlist) = cached_allowlist {
                 match peer_id {
                     PeerId::Pubkey(hash) => {
                         if !allowlist.contains(&hash) {
@@ -777,6 +807,22 @@ impl NetworkProcessor {
                 config.audit_log_path.as_deref(),
             )
             .await?;
+        } else if config.pairing_mode {
+            // Pairing server: register the self-authenticated peer (its handshake
+            // fingerprint) + its signed KeyBundle, gated by the one-time token.
+            let fp = shell_peer_fp.ok_or_else(|| {
+                CryptoError::Parameter("pairing requires an authenticated peer".to_string())
+            })?;
+            crate::pairing::run_pairing_server(
+                reader,
+                writer,
+                &config.aead_algo,
+                &s2c_key,
+                &c2s_key,
+                fp,
+                &config,
+            )
+            .await?;
         } else if config.chat_mode {
             let stdin = io_provider.stdin();
             let stdout = Arc::new(tokio::sync::Mutex::new(io_provider.stdout()));
@@ -851,6 +897,8 @@ impl NetworkProcessor {
             crate::network::ALPN_FWD
         } else if config.scp_mode {
             crate::network::ALPN_SCP
+        } else if config.copy_bundle {
+            crate::network::ALPN_PAIRING
         } else if config.chat_mode {
             ALPN_CHAT
         } else {
@@ -1255,6 +1303,26 @@ impl NetworkProcessor {
                         &op,
                     )
                     .await
+                } else if config.copy_bundle {
+                    // Pairing client: send our pre-built KeyBundle + the one-time token.
+                    let token = config.pairing_token.as_deref().ok_or_else(|| {
+                        CryptoError::Parameter("copy-bundle requires --token".to_string())
+                    })?;
+                    let bytes = config.pairing_bundle_bytes.clone().ok_or_else(|| {
+                        CryptoError::Parameter("copy-bundle: no KeyBundle was built".to_string())
+                    })?;
+                    let msg = crate::pairing::run_pairing_client(
+                        reader,
+                        writer,
+                        &config.aead_algo,
+                        &s2c_key,
+                        &c2s_key,
+                        token,
+                        bytes,
+                    )
+                    .await?;
+                    println!("{msg}");
+                    Ok(())
                 } else if config.chat_mode {
                     let stdin = self.io_provider.stdin();
                     let stdout = Arc::new(tokio::sync::Mutex::new(self.io_provider.stdout()));
