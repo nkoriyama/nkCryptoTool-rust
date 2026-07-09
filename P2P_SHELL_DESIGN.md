@@ -85,7 +85,7 @@ type:
 
 ## 6. 認可モデル（最重要）
 
-**既定 deny。** allowlist（既存 `--peer-allowlist`）に無い指紋は handshake で拒否（既存挙動）。
+**既定 deny。** allowlist（現行は redb keyring の allowlist テーブル＝`--keyring-db`。設計当時は平文 `--peer-allowlist`、後に廃止）に無い指紋は handshake で拒否（既存挙動）。
 その上に **shell 専用の認可マップ**を足す:
 
 ```text
@@ -107,7 +107,7 @@ type:
 # サーバ（常駐。allowlist と shell-policy 必須）
 nk-crypto-tool --serve-shell \
   --signing-privkey host_sign.key \
-  --peer-allowlist allowed_fps.txt \
+  --keyring-db keyring.db \
   --shell-policy shell-policy.txt \
   --audit-log /var/log/nkct-shell.log
 # 起動時に自分の ticket を表示（クライアントに渡す）
@@ -119,7 +119,7 @@ nk-crypto-tool --shell --connect <server-ticket> \
 # 単発コマンド
 nk-crypto-tool --shell --connect <server-ticket> ... -- systemctl restart myapp
 ```
-- サーバ側 `--signing-pubkey`（クライアント公開鍵ピン）or `--peer-allowlist` で相手認証（既存と同形）。
+- サーバ側 `--signing-pubkey`（クライアント公開鍵ピン）or `--keyring-db` で相手認証（既存と同形）。
 - クライアントは `--signing-pubkey`（サーバ公開鍵ピン）で MITM 防止（chat と同じ作法）。
 
 ## 8. PTY 実装メモ
