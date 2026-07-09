@@ -77,6 +77,8 @@ nk-crypto-tool --mode pqc --encrypt \
 ```
 - 指紋 pin（`--recipient-fingerprint`）は**必須**。bundle 検証（指紋一致→self_sig→keybind）に
   通ってから暗号化する＝経路での鍵すり替え（MITM）を防ぐ。
+- keyring に貯めた相手なら `--recipient <handle>`（例 `--recipient alice`）で、束・指紋を
+  keyring から引ける（§7 参照）。`--recipient-keybundle`/`--recipient-fingerprint` は不要。
 - `--mode` が束から使う鍵を選ぶ: pqc→ML-KEM / ecc→P-256 / hybrid→両方。
 - 期限切れの鍵は暗号化入口で拒否される。
 - AEAD 切替: `--aead-algo AES-256-GCM`（既定）/ `ChaCha20-Poly1305`。
@@ -215,8 +217,8 @@ nk-crypto-tool --scp-get /srv/remote.tar local.tar --connect <ticket> --mode pqc
 ## 7. ペアリング（KeyBundle 自動登録 = `ssh-copy-id` 相当）
 
 未登録のクライアントを、**ワンタイムトークン**で初回だけ安全に登録する。クライアントの指紋を
-サーバの `--peer-allowlist` に追加し、KeyBundle を `<key-dir>/received/<handle>.nkkb` に保存する。
-手動での指紋登録・鍵手渡しが要らなくなる。
+サーバの `--peer-allowlist` に追加し、KeyBundle を **keyring（redb: `<key-dir>/keyring.db`）** に
+保存する。手動での指紋登録・鍵手渡しが要らなくなる。
 
 ### サーバ（登録を受け付ける側・単発）
 ```bash
@@ -227,7 +229,8 @@ nk-crypto-tool --serve-pairing --mode pqc \
 #   → ワンタイムトークン・ticket・server 指紋を印字。1 クライアント登録して終了
 ```
 - **ワンタイムトークンをクライアントへ out-of-band（口頭等）で渡す**（ticket と一緒に）。
-- `--peer-allowlist <file>` が登録先（追記される）。`--key-dir` 配下に `received/<handle>.nkkb` が保存。
+- `--peer-allowlist <file>` が指紋の登録先（追記される・**認可**）。KeyBundle 実体は
+  `--key-dir` 配下の **`keyring.db`（redb, 0600）** に保存（**鍵材料**。認可とは別レイヤ）。
 - root では拒否（サーバ user のファイルを書くだけで特権不要）。
 
 ### クライアント（自分を登録してもらう側）
@@ -247,6 +250,35 @@ nk-crypto-tool --copy-bundle --mode pqc --connect <ticket> --token <OTP> \
   shell/scp は不可」で、管理者が明示的に `--shell-policy`/`--scp-policy` を書くまで何もできない。
 - トークンは高エントロピー乱数＋失効（既定 5 分）＋定数時間比較。MITM はクライアントの server-pin
   で防ぐ。
+
+### keyring（受け取った KeyBundle の保管と利用）
+
+ペアリングで受け取った KeyBundle は、`handle → 固定指紋 + 束バイト` として **redb keyring**
+（既定 `<key-dir>/keyring.db`、`--keyring-db` で上書き）に貯まる。束は公開データなので **素 redb ＋
+0600** で保存（機密ではなく**完全性**を守る）。同じ handle を**別 identity** が乗っ取ることは拒否
+される（同一 identity の再登録は冪等）。
+
+```bash
+nk-crypto-tool --keyring-cmd list   --key-dir server                  # 一覧（<指紋>  <handle>）
+nk-crypto-tool --keyring-cmd add    --key-dir server \                # 手動追加（pin 必須）
+    --recipient-keybundle alice.nkkb --recipient-fingerprint <64-hex> --keybundle-handle alice
+nk-crypto-tool --keyring-cmd remove --key-dir server --keybundle-handle alice
+nk-crypto-tool --keyring-cmd import --key-dir server                  # 旧 received/*.nkkb を移行
+```
+
+貯めた束は、そのまま**暗号化の宛先**に使える（`--recipient-keybundle` + `--recipient-fingerprint`
+を毎回渡す代わりに handle で引く）:
+
+```bash
+nk-crypto-tool --encrypt --mode pqc --recipient alice --key-dir server \
+    secret.txt --output-file secret.enc
+```
+
+- `--recipient <handle>` は keyring から**束と固定指紋の両方**を引く。指紋は登録時（ペアリングの
+  OTP+PoP、または `add` の `--recipient-fingerprint`）に確定した**独立アンカー**であって、束から
+  導出したものではない（＝循環でない）。
+- 旧版は `<key-dir>/received/<handle>.nkkb` にファイル保存していた。`--keyring-cmd import` で
+  keyring に取り込める（取り込み後はファイル不要）。
 
 ---
 

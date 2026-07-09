@@ -435,6 +435,24 @@ struct Args {
     /// makes the send fail rather than fall back to a static-only envelope.
     #[arg(long)]
     strict_pqfs: bool,
+
+    // -------------------------------------------------------------
+    // Keyring flags (redb-backed store of known KeyBundles, keyed by
+    // handle; populated by pairing and by `--keyring-cmd add/import`).
+    // -------------------------------------------------------------
+    /// Keyring subcommand: `add`, `list`, `remove`, or `import`.
+    #[arg(long, help = "Keyring subcommand (add|list|remove|import)")]
+    keyring_cmd: Option<String>,
+
+    /// Path to the redb keyring. Defaults to `keyring.db` under `--key-dir`.
+    #[arg(long)]
+    keyring_db: Option<String>,
+
+    /// Recipient handle for `--encrypt`: look up the recipient's KeyBundle and
+    /// its pinned fingerprint in the keyring instead of passing
+    /// `--recipient-keybundle` + `--recipient-fingerprint` explicitly.
+    #[arg(long)]
+    recipient: Option<String>,
 }
 
 /// Resolve a key-file argument against `--key-dir`. A bare filename (no
@@ -570,6 +588,10 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    if args.keyring_cmd.is_some() {
+        return run_keyring_command(&args);
+    }
+
     if args.prekey_cmd.is_some() {
         #[cfg(feature = "mls")]
         {
@@ -645,9 +667,13 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     // Never encrypt to no one: an encrypt with no recipient source is a usage error.
-    if operation == Operation::Encrypt && args.recipient_keybundle.is_none() {
+    if operation == Operation::Encrypt
+        && args.recipient_keybundle.is_none()
+        && args.recipient.is_none()
+    {
         anyhow::bail!(
-            "--encrypt requires --recipient-keybundle <file> (with --recipient-fingerprint <64-hex>)"
+            "--encrypt requires --recipient <handle> (from the keyring) or --recipient-keybundle \
+             <file> (with --recipient-fingerprint <64-hex>)"
         );
     }
 
@@ -678,7 +704,7 @@ async fn main() -> anyhow::Result<()> {
     config.operation = operation;
     config.input_files = args.input_files;
     config.output_file = args.output_file;
-    config.key_dir = args.key_dir.unwrap_or_else(|| "keys".to_string());
+    config.key_dir = args.key_dir.clone().unwrap_or_else(|| "keys".to_string());
     // Bare key filenames resolve under --key-dir; explicit relative/
     // absolute paths are left as given.
     config.recipient_pubkey = resolve_key_path(&config.key_dir, args.recipient_pubkey);
@@ -698,9 +724,27 @@ async fn main() -> anyhow::Result<()> {
     // Consume a recipient KeyBundle for encryption: verify it against the pinned
     // owner fingerprint, enforce expiry on the key(s) this mode will use, and
     // stage the raw encryption key bytes for in-memory injection into the
-    // strategy (config.recipient_*_key_bytes). Runs after mode/dsa are set.
+    // strategy (config.recipient_*_key_bytes). Runs after mode/dsa are set. The
+    // (bundle bytes, pinned fingerprint) pair comes from either the keyring
+    // (`--recipient <handle>`) or explicit flags (`--recipient-keybundle` +
+    // `--recipient-fingerprint`). In BOTH cases the pin is an out-of-band trust
+    // anchor (the keyring's pin was set at add/pairing time, NOT derived from the
+    // bundle now — so a keyring lookup is not a circular self-attestation).
     if operation == Operation::Encrypt {
-        if let Some(ref bundle_path) = args.recipient_keybundle {
+        let resolved: Option<(Vec<u8>, [u8; 32])> = if let Some(ref handle) = args.recipient {
+            let db = keyring_db_path(args.keyring_db.as_deref(), args.key_dir.as_deref());
+            let store = nk_crypto_tool::keyring::KeyringStore::open(&db)
+                .map_err(|e| anyhow::anyhow!("open keyring {db:?}: {e}"))?;
+            let entry = store
+                .get(handle)
+                .map_err(|e| anyhow::anyhow!("keyring lookup {handle:?}: {e}"))?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "keyring has no contact {handle:?} — add it with `--keyring-cmd add` or pair first"
+                    )
+                })?;
+            Some((entry.bundle, entry.fingerprint))
+        } else if let Some(ref bundle_path) = args.recipient_keybundle {
             // Use the path as given (not resolved under --key-dir): a recipient
             // KeyBundle is a received/distributed artifact, not one of your own
             // keys. This keeps it symmetric with `--keybundle-output` (also used
@@ -714,7 +758,11 @@ async fn main() -> anyhow::Result<()> {
                     "--recipient-keybundle requires --recipient-fingerprint <64-hex> to pin the owner identity"
                 )
             })?;
-            let pin = parse_fingerprint_hex(fp_hex)?;
+            Some((bytes, parse_fingerprint_hex(fp_hex)?))
+        } else {
+            None
+        };
+        if let Some((bytes, pin)) = resolved {
             // The KeyBundle identity is definitionally the ML-DSA-65 single anchor
             // (see KEYBUNDLE_IDENTITY_DSA), not the sender-controlled --dsa-algo:
             // the verifier dictates the algorithm so a bundle can never downgrade
@@ -1133,6 +1181,117 @@ fn select_bundle_keys_for_mode(
 }
 
 /// Owner-side producer: build a signed NKKB KeyBundle binding this identity's
+/// Resolve the redb keyring path: `--keyring-db` if given, else `keyring.db`
+/// under `--key-dir` (default `keys`) — the same location pairing writes to.
+fn keyring_db_path(keyring_db: Option<&str>, key_dir: Option<&str>) -> std::path::PathBuf {
+    if let Some(p) = keyring_db {
+        std::path::PathBuf::from(p)
+    } else {
+        std::path::Path::new(key_dir.unwrap_or("keys")).join("keyring.db")
+    }
+}
+
+/// `--keyring-cmd`: manage the redb keyring of known KeyBundles (the `contacts`
+/// half — bundle + pinned fingerprint, keyed by handle).
+///   `add`    — store a bundle file, pinned by `--recipient-fingerprint`
+///   `list`   — print stored contacts (`<fingerprint>  <handle>`)
+///   `remove` — drop a handle (`--keybundle-handle`)
+///   `import` — migrate legacy `<key-dir>/received/*.nkkb` files into the keyring
+fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
+    use nk_crypto_tool::keyring::KeyringStore;
+
+    let cmd = args.keyring_cmd.as_deref().unwrap();
+    let db = keyring_db_path(args.keyring_db.as_deref(), args.key_dir.as_deref());
+    let store =
+        KeyringStore::open(&db).map_err(|e| anyhow::anyhow!("open keyring {db:?}: {e}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    match cmd {
+        "add" => {
+            let bundle_path = args.recipient_keybundle.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("keyring add requires --recipient-keybundle <file>")
+            })?;
+            let fp_hex = args.recipient_fingerprint.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "keyring add requires --recipient-fingerprint <64-hex> to pin the owner identity"
+                )
+            })?;
+            let pin = parse_fingerprint_hex(fp_hex)?;
+            let bytes = std::fs::read(bundle_path)
+                .map_err(|e| anyhow::anyhow!("read keybundle {bundle_path}: {e}"))?;
+            let vb = nk_crypto_tool::keybundle::parse_and_verify(&bytes, KEYBUNDLE_IDENTITY_DSA, &pin)
+                .map_err(|e| anyhow::anyhow!("keybundle rejected: {e}"))?;
+            let handle = args.keybundle_handle.clone().unwrap_or_else(|| vb.handle.clone());
+            store.add(&handle, &pin, &bytes, now).map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!("Added {handle:?} (fingerprint {}…) to keyring {}", &fp_hex[..16], db.display());
+        }
+        "list" => {
+            let entries = store.list().map_err(|e| anyhow::anyhow!("{e}"))?;
+            if entries.is_empty() {
+                println!("(keyring {} is empty)", db.display());
+            } else {
+                for (handle, fp) in entries {
+                    println!("{}  {}", hex::encode(fp), handle);
+                }
+            }
+        }
+        "remove" => {
+            let handle = args.keybundle_handle.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("keyring remove requires --keybundle-handle <name>")
+            })?;
+            if store.remove(handle).map_err(|e| anyhow::anyhow!("{e}"))? {
+                println!("Removed {handle:?} from keyring {}", db.display());
+            } else {
+                println!("{handle:?} was not in keyring {}", db.display());
+            }
+        }
+        "import" => {
+            // Migrate legacy per-file received bundles into the keyring. These are
+            // already-trusted LOCAL artefacts (pairing wrote them after PoP), so we
+            // recover the pin from the bundle's claimed owner and then verify.
+            let key_dir = args.key_dir.clone().unwrap_or_else(|| "keys".to_string());
+            let dir = std::path::Path::new(&key_dir).join("received");
+            let mut n = 0usize;
+            match std::fs::read_dir(&dir) {
+                Ok(rd) => {
+                    for ent in rd.flatten() {
+                        let p = ent.path();
+                        if p.extension().and_then(|s| s.to_str()) != Some("nkkb") {
+                            continue;
+                        }
+                        let bytes = std::fs::read(&p)
+                            .map_err(|e| anyhow::anyhow!("read {p:?}: {e}"))?;
+                        let fp = nk_crypto_tool::keybundle::owner_fingerprint(&bytes)
+                            .map_err(|e| anyhow::anyhow!("{p:?}: {e}"))?;
+                        let vb = nk_crypto_tool::keybundle::parse_and_verify(
+                            &bytes,
+                            KEYBUNDLE_IDENTITY_DSA,
+                            &fp,
+                        )
+                        .map_err(|e| anyhow::anyhow!("{p:?} rejected: {e}"))?;
+                        store
+                            .add(&vb.handle, &fp, &bytes, now)
+                            .map_err(|e| anyhow::anyhow!("import {}: {e}", vb.handle))?;
+                        n += 1;
+                    }
+                }
+                Err(e) => {
+                    println!("no legacy bundles to import ({}: {e})", dir.display());
+                    return Ok(());
+                }
+            }
+            println!("Imported {n} bundle(s) from {} into keyring {}", dir.display(), db.display());
+        }
+        other => anyhow::bail!(
+            "unknown --keyring-cmd {other:?}; expected one of add|list|remove|import"
+        ),
+    }
+    Ok(())
+}
+
 /// encryption public key(s) under its ML-DSA-65 signature, then print the owner
 /// fingerprint senders pin out-of-band. Default-compiled (keybundle is a
 /// default module).

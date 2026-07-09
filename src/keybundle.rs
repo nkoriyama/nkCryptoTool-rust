@@ -285,6 +285,30 @@ pub fn build_signed(
 /// against its own current time before using it.** The actual entry-point
 /// enforcement lands in the CLI increment (a `--recipient-bundle` past its expiry
 /// is rejected with a message) — expiry is enforced *there*, not silently dropped.
+/// Read the bundle's **claimed** owner fingerprint — `SHA3-256(owner_pk)` — from
+/// the header WITHOUT verifying any signature. This answers "which identity does
+/// this bundle *claim* as owner", not "is this bundle authentic". Use it only to
+/// recover a pin *candidate* for an already-trusted local bundle (e.g. importing
+/// `received/*.nkkb` into the keyring); ALWAYS follow it with
+/// [`parse_and_verify`] against the recovered fingerprint before trusting the
+/// contents. Never derive an encryption pin from an untrusted bundle this way —
+/// that would be circular (the bundle would attest to its own identity).
+pub fn owner_fingerprint(bytes: &[u8]) -> BResult<[u8; 32]> {
+    use sha3::{Digest, Sha3_256};
+
+    let mut off = 0usize;
+    if bytes.len() < 5 || &bytes[0..4] != BUNDLE_MAGIC {
+        return Err(KeyBundleError::Wire("bad magic (not an NKKB KeyBundle)".into()));
+    }
+    off += 4;
+    let version = read_u8(bytes, &mut off)?;
+    if version != BUNDLE_VERSION {
+        return Err(KeyBundleError::Wire(format!("unsupported version {version}")));
+    }
+    let owner_pk = read_lp(bytes, &mut off)?;
+    Ok(Sha3_256::digest(&owner_pk).into())
+}
+
 pub fn parse_and_verify(
     bytes: &[u8],
     dsa_algo: &str,

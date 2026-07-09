@@ -88,8 +88,8 @@ sleep 1
   --key-dir "$ROOT/cli" 2>&1 | grep -aiE 'registered' \
   || echo "  [DEMO BUG] registration not confirmed"
 sleep 0.6
-# `laptop` is a label AND the filename the saved bundle blob lands under
-# (<key-dir>/received/laptop.nkkb); a different identity cannot clobber it — the
+# `laptop` is a label AND the key the saved bundle blob lands under in the redb
+# keyring (<key-dir>/keyring.db); a different identity cannot clobber it — the
 # server refuses a handle already owned by another fingerprint. The allowlist, by
 # contrast, is keyed by the 64-hex fingerprint: the single join key that threads
 # pair -> authorize -> shell -> scp.

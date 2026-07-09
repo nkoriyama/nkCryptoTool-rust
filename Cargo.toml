@@ -86,7 +86,7 @@ rfd = { version = "0.14", optional = true }
 # `bundled-sqlcipher` pulls in, so the `mls` storage layer can cross-compile
 # to Android/iOS with no C crypto dependency. Values are encrypted at the
 # application layer with XChaCha20-Poly1305 (see `group::redb_storage`).
-redb = { version = "4", optional = true }
+redb = { version = "4" }
 
 # UniFFI: generates Kotlin/Swift bindings from `#[uniffi::export]` so the chat /
 # crypto core can be called from a mobile app. Opt-in via `mobile-ffi`; compiled
@@ -186,7 +186,6 @@ mls-base = [
 # libcrypto, so it cross-compiles to Android/iOS. See DB_PURERUST_DESIGN.md.
 mls = [
     "mls-base",
-    "redb",
     "hmac",
 ]
 # Adds the legacy SQLCipher reader for the one-time `migrate-from-sqlcipher`
