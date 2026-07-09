@@ -8,7 +8,7 @@
 //! `ssh-copy-id` equivalent. A not-yet-registered client self-authenticates in
 //! the iroh handshake, proves it holds a one-time token, and sends its signed
 //! KeyBundle; the server verifies it and registers the client (fingerprint →
-//! `--peer-allowlist`, bundle → `<key-dir>/received/<handle>.nkkb`).
+//! `--peer-allowlist`, bundle → the redb keyring at `<key-dir>/keyring.db`).
 //!
 //! **Trust model**: the OTP authorizes the enrollment; the client's handshake
 //! self-signature proves it owns the identity it is registering. The two are
@@ -231,32 +231,30 @@ fn register(req: &PairingRequest, client_fp: [u8; 32], config: &CryptoConfig) ->
         .ok_or_else(|| "server has no --peer-allowlist configured".to_string())?;
     let added = append_allowlist(allowlist, &client_fp).map_err(|e| e.to_string())?;
 
-    // 5. Save the bundle under <key-dir>/received/<handle>.nkkb (atomic, 0600).
-    let dir = std::path::Path::new(&config.key_dir).join("received");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {dir:?}: {e}"))?;
-    let out = dir.join(format!("{}.nkkb", vb.handle));
-    // Never let a client overwrite a bundle registered to a DIFFERENT identity by
-    // claiming the same handle (that would redirect the server's mail to the
-    // attacker). Overwrite is allowed ONLY when the existing bundle verifies under
-    // the SAME owner (idempotent re-pairing) — reusing the refinement-1 pin check.
-    if let Ok(existing) = std::fs::read(&out) {
-        if crate::keybundle::parse_and_verify(&existing, PAIRING_IDENTITY_DSA, &client_fp).is_err() {
-            return Err(format!(
-                "handle {:?} is already registered to a different identity — pick another handle",
-                vb.handle
-            ));
-        }
-    }
-    crate::utils::secure_write(&out, &req.keybundle_bytes, true)
-        .map_err(|e| format!("save bundle {out:?}: {e}"))?;
+    // 5. Store the bundle in the keyring (<key-dir>/keyring.db), pinned to the
+    //    handshake-verified fingerprint. The store enforces handle-clobber
+    //    protection: a DIFFERENT identity cannot take over an existing handle
+    //    (which would redirect the server's mail to an attacker), while the SAME
+    //    identity may re-register idempotently. This replaces the former
+    //    per-file <key-dir>/received/<handle>.nkkb artefact.
+    let keyring_path = std::path::Path::new(&config.key_dir).join("keyring.db");
+    let store = crate::keyring::KeyringStore::open(&keyring_path)
+        .map_err(|e| format!("open keyring {keyring_path:?}: {e}"))?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    store
+        .add(&vb.handle, &client_fp, &req.keybundle_bytes, now)
+        .map_err(|e| e.to_string())?;
 
     let fp_hex = hex::encode(client_fp);
     Ok(format!(
-        "registered {} (fingerprint {}{}); saved bundle to {}",
+        "registered {} (fingerprint {}{}); stored bundle in keyring {}",
         vb.handle,
         &fp_hex[..16],
         if added { "" } else { ", already in allowlist" },
-        out.display()
+        keyring_path.display()
     ))
 }
 
@@ -444,7 +442,8 @@ mod tests {
         assert!(msg.contains("registered alice"));
         let al = std::fs::read_to_string(&allow).unwrap();
         assert!(al.contains(&hex::encode(fp)), "allowlist must contain the fingerprint");
-        assert!(dir.join("received/alice.nkkb").exists(), "bundle must be saved");
+        let store = crate::keyring::KeyringStore::open(&dir.join("keyring.db")).unwrap();
+        assert!(store.get("alice").unwrap().is_some(), "bundle must be stored in the keyring");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -497,9 +496,15 @@ mod tests {
             register(&PairingRequest { token: "T".into(), keybundle_bytes: bytes_b }, fp_b, &cb).is_err(),
             "a different identity must not overwrite an existing handle"
         );
-        // A's bundle is intact (still owned by A).
-        let saved = std::fs::read(dir.join("received/alice.nkkb")).unwrap();
-        assert!(crate::keybundle::parse_and_verify(&saved, "ML-DSA-65", &fp_a).is_ok());
+        // A's bundle is intact in the keyring (still owned by A). Scope the store
+        // so its redb handle is released (one handle per process) before the
+        // idempotent re-register below reopens the same DB.
+        {
+            let store = crate::keyring::KeyringStore::open(&dir.join("keyring.db")).unwrap();
+            let entry = store.get("alice").unwrap().expect("alice's keyring entry present");
+            assert_eq!(entry.fingerprint, fp_a, "keyring still holds A's fingerprint");
+            assert!(crate::keybundle::parse_and_verify(&entry.bundle, "ML-DSA-65", &fp_a).is_ok());
+        }
         // The SAME identity may re-register (idempotent).
         register(&PairingRequest { token: "T".into(), keybundle_bytes: bytes_a }, fp_a, &ca)
             .expect("A re-registers (idempotent)");
