@@ -154,8 +154,8 @@ nk-crypto-tool --serve-shell --mode pqc \
     [--shell-policy policy.txt] [--audit-log audit.log]
 #   → 接続チケット nkct1… を表示（クライアントへ渡す）
 ```
-- `--signing-pubkey` で**許可するクライアントを 1 つ pin**。複数許可は `--peer-allowlist <file>`
-  （指紋を 1 行 1 つ列挙）。
+- `--signing-pubkey` で**許可するクライアントを 1 つ pin**。複数許可は `--keyring-db <db>`
+  （keyring の grants で認可。ペアリングか `--keyring-cmd authorize` で登録）。
 - `--shell-policy` の各行（省略時は pin した相手にフル shell）:
   ```
   <クライアント指紋>  user=NAME  cmd-allow="ls,cat,uname"
@@ -195,7 +195,7 @@ nk-crypto-tool --serve-scp --mode pqc \
   <クライアント指紋>  read="/srv"  write="/srv"
   ```
   そのクライアントが読める/書けるディレクトリを限定（配下にパス confinement）。
-- 複数クライアントは `--peer-allowlist <file>` 併用。
+- 複数クライアントは `--keyring-db <db>` 併用（keyring の grants で認可）。
 
 ### クライアント（送受信する側）
 ```bash
@@ -231,7 +231,7 @@ nk-crypto-tool --serve-pairing --mode pqc \
 - **ワンタイムトークンをクライアントへ out-of-band（口頭等）で渡す**（ticket と一緒に）。
 - 認可（grants）も KeyBundle 実体も **`<key-dir>/keyring.db`（redb, 0600）** に書かれる。
   `--pairing-grant` で付与サービスを絞れる（既定 `all`。例 `--pairing-grant scp` なら scp のみ）。
-  平文 `--peer-allowlist` はもう不要（legacy 後方互換として読み取りは可能）。
+  平文 allowlist（旧 `--peer-allowlist`）は廃止済みで、認可は keyring のみ。
 - root では拒否（サーバ user のファイルを書くだけで特権不要）。
 
 ### クライアント（自分を登録してもらう側）
@@ -293,7 +293,7 @@ nk-crypto-tool --encrypt --mode pqc --recipient alice --key-dir server \
 
 | 誰が誰を | 手段 |
 |---|---|
-| サーバ→クライアント | `--signing-pubkey <client_pub>`（1 つ pin）または `--peer-allowlist <file>`（複数） |
+| サーバ→クライアント | `--signing-pubkey <client_pub>`（1 つ pin）または `--keyring-db <db>`（複数、per-service grants） |
 | クライアント→サーバ | `--signing-pubkey <server_pub>`（サーバを pin、なりすまし防止） |
 | 認可（何ができるか） | サーバ側 policy を**クライアント指紋**でキーイング（shell=cmd-allow / scp=read・write） |
 

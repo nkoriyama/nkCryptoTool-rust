@@ -112,7 +112,7 @@ The server (Listener) registers both ALPNs and automatically switches its logic 
 ### 14.2 V3 Handshake and Channel Binding
 The V3 handshake extends the base NKCT protocol with additional security and flexibility:
 - **Public Key Transmission**: Both Client and Server transmit their long-term PQC public keys (DSA and KEM) during the handshake. This enables:
-    - **Multi-client Authentication**: Servers can verify any client present in their `peer_allowlist` without needing pinned key files for each specific peer.
+    - **Multi-client Authentication**: Servers can verify any client authorized in their keyring allowlist (`--keyring-db`) without needing pinned key files for each specific peer.
     - **MITM Fingerprint Verification**: Clients can verify that the server's public key matches a fingerprint provided in the connection ticket.
 - **Channel Binding**: The handshake transcript explicitly includes the Iroh `NodeId` of both the local and remote peers in a canonical order: `[Client_NodeId][Server_NodeId]`. This binds the PQC authentication layer to the underlying Iroh TLS 1.3 transport, preventing MITM attacks even if the classical TLS layer is compromised.
 
@@ -193,10 +193,10 @@ Chat sessions use a layered DoS-defense scheme based on peer identity:
 ### 3.9 Peer Allowlist
 For deployments requiring strict access control, an explicit allowlist can be configured:
 
-- **Configuration**: `--peer-allowlist <path>` accepts a text file with one SHA3-256 fingerprint per line (32 bytes hex). Comments (`#`) and blank lines are ignored.
-- **Enforcement**: When an allowlist is loaded, peers whose long-term pubkey fingerprint is not in the set are rejected immediately after handshake authentication.
+- **Configuration**: `--keyring-db <path>` points at a redb keyring whose `allowlist` table maps SHA3-256 fingerprints (32 bytes) to per-service grant bits. Entries are written by pairing (`nkct/pairing/1`) or `--keyring-cmd authorize`.
+- **Enforcement**: When an allowlist is loaded, peers whose long-term pubkey fingerprint is not in the set are rejected immediately after handshake authentication. Shell/scp/forward additionally require the matching grant bit; chat and file receive authorize on membership alone.
 - **Loading**: The allowlist is loaded once at startup. Reloading requires a process restart.
-- **Anonymous Peers**: When an allowlist is active, anonymous (unauthenticated) peers are rejected unless `--allow-unauth` is also set.
+- **Anonymous Peers**: When an allowlist is active, anonymous (unauthenticated) peers are rejected.
 - **Use Case**: Combined with the default `allow_unauth=false`, this raises the cost of "many-key DoS" attacks (an attacker would need to obtain a pubkey on the allowlist).
 
 ---
@@ -301,7 +301,7 @@ This guarantees that **no plaintext byte reaches the destination unless every ch
 - **Peer-level DoS Defense**:
     - PeerId-based cooldown (60 seconds) tied to the long-term ML-DSA signing pubkey fingerprint.
     - Early IP-based flood protection (2 seconds, pre-spawn) to mitigate connection storms from a single source.
-    - Optional `--peer-allowlist` for explicit access control.
+    - Optional keyring allowlist (`--keyring-db`) for explicit access control.
 
 ---
 

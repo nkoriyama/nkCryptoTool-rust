@@ -179,22 +179,20 @@ LAN 内なら問題なく接続。NAT 越えは hole-punching のみで relay �
 
 ### Allowlist で複数ピアを認証
 
-listener 側に許可リストを準備:
+listener 側の keyring（redb）の allowlist テーブルに許可指紋を登録:
 
 ```bash
-# bob と charlie の指紋を hex で書く (各 32B = 64 hex chars)
-cat > ~/nkct/allowlist.txt <<EOF
-# bob
-ee15...90b7
-# charlie
-8a91...c2d4
-EOF
+# bob と charlie の指紋を認可する (各 32B = 64 hex chars)
+./target/release/nk-crypto-tool --keyring-cmd authorize \
+  --keyring-db ~/nkct/keyring.db --recipient-fingerprint ee15...90b7   # bob
+./target/release/nk-crypto-tool --keyring-cmd authorize \
+  --keyring-db ~/nkct/keyring.db --recipient-fingerprint 8a91...c2d4   # charlie
 
-./target/release/nk-crypto-tool --chat --listen 0.0.0.0:0 \
+./target/release/nk-crypto-tool --chat --listen \
   --signing-privkey ~/nkct/alice/private_sign_pqc.key \
-  --peer-allowlist ~/nkct/allowlist.txt \
+  --keyring-db ~/nkct/keyring.db \
   --transport iroh
-# signing-pubkey は不要 (allowlist で複数ピアを許可)
+# signing-pubkey は不要 (keyring の allowlist で複数ピアを許可)
 ```
 
 公開鍵指紋の取得:

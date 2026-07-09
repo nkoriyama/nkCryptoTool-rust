@@ -8,7 +8,7 @@
 >
 > - **新規開発・機能追加は本 Rust 版で行います**。
 >   - 性能最適化 (10 GiB ファイルでも C++ 版同等の ~3 GiB/s)
->   - チャットモード、`--peer-allowlist`、PeerId ベース DoS 防御
+>   - チャットモード、keyring allowlist（per-service grants）、PeerId ベース DoS 防御
 >   - Lazy Loading 秘密鍵によるメモリダンプ攻撃耐性
 >   - ASN.1 構造的パースによる堅牢な鍵検証
 > - **[C++ 版](../nkCryptoTool/) は歴史的リファレンス実装として維持**されています。
@@ -327,13 +327,13 @@ flowchart TD
     KeyProvider -->|file load| FS[File System]
 
     CryptoProcessor --> Network[Network Mode]
-    Network --> Allowlist[peer_allowlist]
+    Network --> Allowlist[keyring allowlist]
     Network --> Cooldown[PEER_COOLDOWNS]
 ```
 
 - **KeyProvider による抽象化**: 暗号操作を鍵ストレージの実装から分離。メインロジックは具体的な保護メカニズム (TPM, ファイル, etc.) に依存しません。
 - **セキュアな TPM バックエンド**: TPM 2.0 HMAC セッションと `posix_spawn` ベースの安全なプロセス実行 (シェル排除) を活用。
-- **ネットワーク層の DoS 防御**: peer_allowlist + PeerId-based cooldown による多層防御 (詳細は SECURITY.md / SPEC.md)。
+- **ネットワーク層の DoS 防御**: keyring allowlist + PeerId-based cooldown による多層防御 (詳細は SECURITY.md / SPEC.md)。
 
 ## **TPM による秘密鍵の保護**
 
@@ -473,9 +473,10 @@ P2P トランスポート Iroh を使用した、PQC 認証付きの安全な通
     - `--discovery <none|local>`: 動的 peer discovery (既定 `none`)。`local` は mDNS で NodeId を LAN 上の現在のアドレスへ解決し、ticket に焼かれたアドレスが古くなっても (IP 変更後など) 自己修復する。非同期 inbox/prekey フローを `--no-relay` で運用する際に有用。プレゼンスは **LAN 内のみ**に広告され公開サービスには出ない ([SECURITY_PROFILE.md §5.2](./SECURITY_PROFILE.md) 参照)。
 * **ピア許可リスト併用 (推奨)**:
     ```bash
-    nk-crypto-tool ... --peer-allowlist <allowlist.txt>
+    nk-crypto-tool ... --keyring-db <keyring.db>
     ```
-    許可リストは 1 行 1 件の SHA3-256 (公開鍵 raw bytes) を hex で記述します。
+    許可指紋 (SHA3-256 (公開鍵 raw bytes) の hex 64 文字) は、ペアリングまたは
+    `--keyring-cmd authorize --recipient-fingerprint <fp>` で keyring の allowlist テーブルに登録します。
 * **認証必須化はデフォルト動作**です。
 
 > **⚠️ 注意**: 従来の TCP 直接接続モード (`--transport tcp`) は**削除されました**。トランスポートは iroh のみです（QUIC ベースで NAT 越え・相互認証ハンドシェイクを提供）。QUIC が通らない経路（TCP-only な ZTNA fabric 等）は iroh では非対応という制約が残ります。
@@ -768,8 +769,8 @@ sequenceDiagram
     participant CLI_S as Server CLI
 
     Note over Client, Server: 起動
-    Server->>CLI_S: --listen + --peer-allowlist
-    CLI_S->>CLI_S: 許可リストロード (起動時)
+    Server->>CLI_S: --listen + --keyring-db
+    CLI_S->>CLI_S: keyring allowlist ロード (起動時)
 
     Note over Client, Server: ハンドシェイク
     Client->>CLI_C: --connect

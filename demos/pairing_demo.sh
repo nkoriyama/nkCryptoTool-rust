@@ -3,9 +3,10 @@
 # what it unlocks. An UNREGISTERED client bootstraps trust over a one-time token
 # on a dedicated ALPN (nkct/pairing/1): it sends its signed KeyBundle, the server
 # verifies it against the *connecting* identity's fingerprint (self-signed, so a
-# token holder cannot register someone else's bundle) and appends that
-# fingerprint to its --peer-allowlist. Pairing adds to the allowlist ONLY — the
-# admin must still grant what the peer may DO, so default-deny is preserved. Then
+# token holder cannot register someone else's bundle) and records that
+# fingerprint with per-service grants in its redb keyring. Pairing grants
+# TRANSPORT only — the admin must still grant what the peer may DO via policy,
+# so default-deny is preserved. Then
 # the same fingerprint drives a policy-confined shell and an scp path jail over
 # the same iroh transport + mutual ML-DSA-65 auth. Loopback (one host); recorded
 # with VHS (see pairing.tape).

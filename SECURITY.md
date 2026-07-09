@@ -190,7 +190,7 @@ For maximum security:
 * Run on a trusted operating system with a modern kernel.
 * Use TPM-backed key protection (`--use-tpm`) for long-term keys **used in local file operations**. (Network mode does not currently consume TPM-wrapped keys.)
 * Enable mutual authentication using ML-DSA signatures (the default; do not pass `--allow-unauth`).
-* In chat mode, use `--peer-allowlist` to restrict access to known peer fingerprints.
+* In chat mode, use `--keyring-db` (the redb keyring's allowlist table) to restrict access to known peer fingerprints.
 * Regularly rotate signing keys.
 * Restrict `ptrace` (e.g., `kernel.yama.ptrace_scope=2`) on the host running the network mode to harden the in-memory signing-key cache.
 
@@ -214,7 +214,7 @@ To ensure server availability and protect against session-level attacks:
 *   **Resource Capping:** Simultaneous connections are limited to 100 via a global semaphore. Handshake vectors (`read_vec`) are capped at 8 KiB.
 *   **Anti-Replay (Chat Mode):** A memory-limited sliding window of used nonces (up to 100,000) is maintained per session; oldest entries are evicted on overflow.
 *   **Peer Identity Cooldown (Chat):** After a chat session ends, the peer (identified by long-term ML-DSA pubkey fingerprint, or by source IP for unauthenticated peers) is barred from reconnecting for 60 seconds.
-*   **Peer Allowlist (Optional):** `--peer-allowlist <file>` restricts chat to a fixed set of known peer fingerprints, raising the cost of "many-key DoS" attacks.
+*   **Peer Allowlist (Optional):** `--keyring-db <db>` (the redb keyring's allowlist table, written by pairing or `--keyring-cmd authorize`) restricts chat to a fixed set of known peer fingerprints, raising the cost of "many-key DoS" attacks.
 *   **Authentication Default:** `--allow-unauth` defaults to `false`. Mutual ML-DSA authentication is required by default.
 *   **CPU Load Mitigation:** Handshake costs (ML-KEM/ML-DSA) and strict timeouts provide defense against CPU exhaustion. Heavy crypto runs on `tokio::task::spawn_blocking`.
 

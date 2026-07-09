@@ -7,14 +7,14 @@
 //! P2P KeyBundle auto-registration (pairing, ALPN `nkct/pairing/1`) — the
 //! `ssh-copy-id` equivalent. A not-yet-registered client self-authenticates in
 //! the iroh handshake, proves it holds a one-time token, and sends its signed
-//! KeyBundle; the server verifies it and registers the client (fingerprint →
-//! `--peer-allowlist`, bundle → the redb keyring at `<key-dir>/keyring.db`).
+//! KeyBundle; the server verifies it and registers the client (authz grants and
+//! bundle both go to the redb keyring at `<key-dir>/keyring.db`).
 //!
 //! **Trust model**: the OTP authorizes the enrollment; the client's handshake
 //! self-signature proves it owns the identity it is registering. The two are
 //! tied together because `parse_and_verify` is pinned to the **handshake-verified
 //! client fingerprint** — so the bundle MUST be self-signed by the connecting
-//! identity (refinement 1). Registration adds only the allowlist entry, never a
+//! identity (refinement 1). Registration adds only the keyring allowlist entry, never a
 //! shell/scp policy, so a freshly-paired client can connect but do nothing until
 //! an admin writes an explicit policy (default-deny preserved).
 
@@ -164,7 +164,8 @@ fn validate_handle(handle: &str) -> Result<()> {
 /// error string (sent back to the client). Verifies the token (constant-time +
 /// deadline), verifies the KeyBundle **pinned to the handshake-verified client
 /// fingerprint** (refinement 1: the bundle must be self-signed by the connecting
-/// identity), validates the handle, appends the allowlist, and saves the bundle.
+/// identity), validates the handle, authorizes the fingerprint in the keyring
+/// (grants), and saves the bundle.
 fn register(req: &PairingRequest, client_fp: [u8; 32], config: &CryptoConfig) -> std::result::Result<String, String> {
     // 1. Token: constant-time compare + deadline.
     let expected = config
@@ -394,10 +395,9 @@ mod tests {
         (bytes, fp)
     }
 
-    fn base_config(dir: &std::path::Path, allowlist: &std::path::Path, token: &str, deadline: u64) -> CryptoConfig {
+    fn base_config(dir: &std::path::Path, token: &str, deadline: u64) -> CryptoConfig {
         let mut c = CryptoConfig::default();
         c.key_dir = dir.to_str().unwrap().to_string();
-        c.peer_allowlist = Some(allowlist.to_str().unwrap().to_string());
         c.pairing_otp = Some(token.to_string());
         c.pairing_deadline_secs = Some(deadline);
         c
@@ -411,8 +411,7 @@ mod tests {
     fn register_happy_path_authorizes_and_stores_bundle() {
         let (bytes, fp) = sample_bundle("alice");
         let dir = tmp_dir(&format!("ok-{:02x}", fp[0]));
-        let allow = dir.join("allowlist");
-        let config = base_config(&dir, &allow, "TOKEN123", future());
+        let config = base_config(&dir, "TOKEN123", future());
         let req = PairingRequest { token: "TOKEN123".into(), keybundle_bytes: bytes };
         let msg = register(&req, fp, &config).expect("should register");
         assert!(msg.contains("registered alice"));
@@ -434,8 +433,7 @@ mod tests {
         let (bytes, _fp_a) = sample_bundle("alice");
         let (_b, fp_b) = sample_bundle("bob"); // a different identity's fingerprint
         let dir = tmp_dir(&format!("r1-{:02x}", fp_b[0]));
-        let allow = dir.join("allowlist");
-        let config = base_config(&dir, &allow, "T", future());
+        let config = base_config(&dir, "T", future());
         let req = PairingRequest { token: "T".into(), keybundle_bytes: bytes };
         let r = register(&req, fp_b, &config); // pin = wrong identity
         assert!(r.is_err(), "a bundle not signed by the connecting identity must be rejected");
@@ -448,13 +446,12 @@ mod tests {
     fn register_rejects_wrong_and_expired_token() {
         let (bytes, fp) = sample_bundle("alice");
         let dir = tmp_dir(&format!("tok-{:02x}", fp[0]));
-        let allow = dir.join("allowlist");
         // wrong token
-        let c1 = base_config(&dir, &allow, "RIGHT", future());
+        let c1 = base_config(&dir, "RIGHT", future());
         let req = PairingRequest { token: "WRONG".into(), keybundle_bytes: bytes.clone() };
         assert!(register(&req, fp, &c1).is_err(), "wrong token must be rejected");
         // expired (deadline in the past)
-        let c2 = base_config(&dir, &allow, "RIGHT", 1);
+        let c2 = base_config(&dir, "RIGHT", 1);
         let req2 = PairingRequest { token: "RIGHT".into(), keybundle_bytes: bytes };
         assert!(register(&req2, fp, &c2).is_err(), "expired token must be rejected");
         let store = crate::keyring::KeyringStore::open(&dir.join("keyring.db")).unwrap();
@@ -467,12 +464,11 @@ mod tests {
         let (bytes_a, fp_a) = sample_bundle("alice");
         let (bytes_b, fp_b) = sample_bundle("alice"); // different identity, SAME handle
         let dir = tmp_dir(&format!("coll-{:02x}{:02x}", fp_a[0], fp_b[0]));
-        let allow = dir.join("allowlist");
-        let ca = base_config(&dir, &allow, "T", future());
+        let ca = base_config(&dir, "T", future());
         register(&PairingRequest { token: "T".into(), keybundle_bytes: bytes_a.clone() }, fp_a, &ca)
             .expect("A registers alice");
         // B claims the same handle with a different identity → refused.
-        let cb = base_config(&dir, &allow, "T", future());
+        let cb = base_config(&dir, "T", future());
         assert!(
             register(&PairingRequest { token: "T".into(), keybundle_bytes: bytes_b }, fp_b, &cb).is_err(),
             "a different identity must not overwrite an existing handle"

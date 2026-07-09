@@ -198,8 +198,8 @@ struct Args {
     /// Run a P2P pairing server on ALPN `nkct/pairing/1` (ssh-copy-id equivalent).
     /// Prints a one-time token, ticket, and this node's fingerprint; a client runs
     /// `--copy-bundle --connect <ticket> --token <OTP>` to register its KeyBundle.
-    /// Requires `--peer-allowlist` (the file to append to) and `--key-dir` (where
-    /// received `<handle>.nkkb` are saved); refuses to run as root.
+    /// Registration (authz grants + bundle) is written to the redb keyring at
+    /// `<key-dir>/keyring.db` (or `--keyring-db`); refuses to run as root.
     #[arg(long)]
     serve_pairing: bool,
 
@@ -234,9 +234,6 @@ struct Args {
 
     #[arg(long, default_value = "15", help = "Handshake timeout in seconds")]
     handshake_timeout: u64,
-
-    #[arg(long, help = "Path to file containing allowed peer public key fingerprints")]
-    peer_allowlist: Option<String>,
 
     #[arg(long, default_value = "SHA3-512")]
     digest_algo: String,
@@ -847,13 +844,13 @@ async fn main() -> anyhow::Result<()> {
     if config.forward_mode && args.allow_unauth {
         anyhow::bail!(
             "--allow-unauth is not permitted with --serve-forward/--forward; \
-             authenticate the peer (--peer-allowlist and/or --signing-pubkey)"
+             authenticate the peer (--keyring-db and/or --signing-pubkey)"
         );
     }
     if args.serve_forward {
-        if args.peer_allowlist.is_none() && config.signing_pubkey.is_none() && args.keyring_db.is_none() {
+        if config.signing_pubkey.is_none() && args.keyring_db.is_none() {
             anyhow::bail!(
-                "--serve-forward requires --keyring-db <db>, --peer-allowlist <file>, and/or \
+                "--serve-forward requires --keyring-db <db> and/or \
                  --signing-pubkey <key> to restrict who may forward"
             );
         }
@@ -866,12 +863,12 @@ async fn main() -> anyhow::Result<()> {
     }
     // A remote shell is the highest-value attack surface: never run it without
     // peer authentication (see P2P_SHELL_DESIGN.md threat model). `--allow-unauth`
-    // is rejected for shell mode; authenticate with --peer-allowlist and/or
+    // is rejected for shell mode; authenticate with --keyring-db grants and/or
     // pinned --signing-pubkey instead.
     if config.shell_mode && args.allow_unauth {
         anyhow::bail!(
             "--allow-unauth is not permitted with --serve-shell/--shell; \
-             authenticate the peer (--peer-allowlist and/or --signing-pubkey)"
+             authenticate the peer (--keyring-db and/or --signing-pubkey)"
         );
     }
     // A shell *server* must also restrict WHO may connect: without a pinned key
@@ -879,12 +876,11 @@ async fn main() -> anyhow::Result<()> {
     // accepted (authenticated but not authorized). Require an explicit
     // restriction so `--serve-shell` is never an open shell.
     if args.serve_shell
-        && args.peer_allowlist.is_none()
         && config.signing_pubkey.is_none()
         && args.keyring_db.is_none()
     {
         anyhow::bail!(
-            "--serve-shell requires --keyring-db <db>, --peer-allowlist <file>, and/or \
+            "--serve-shell requires --keyring-db <db> and/or \
              --signing-pubkey <key> to restrict who may obtain a shell"
         );
     }
@@ -908,13 +904,13 @@ async fn main() -> anyhow::Result<()> {
     if config.scp_mode && args.allow_unauth {
         anyhow::bail!(
             "--allow-unauth is not permitted with --serve-scp/--scp-put/--scp-get; \
-             authenticate the peer (--peer-allowlist and/or --signing-pubkey)"
+             authenticate the peer (--keyring-db and/or --signing-pubkey)"
         );
     }
     if args.serve_scp {
-        if args.peer_allowlist.is_none() && config.signing_pubkey.is_none() && args.keyring_db.is_none() {
+        if config.signing_pubkey.is_none() && args.keyring_db.is_none() {
             anyhow::bail!(
-                "--serve-scp requires --keyring-db <db>, --peer-allowlist <file>, and/or --signing-pubkey <key> \
+                "--serve-scp requires --keyring-db <db> and/or --signing-pubkey <key> \
                  to restrict who may transfer files"
             );
         }
@@ -947,8 +943,7 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.serve_pairing {
         // Pairing records the client in the redb keyring (authz grants + bundle)
-        // at <key-dir>/keyring.db (or --keyring-db), so no plaintext
-        // --peer-allowlist is required any more.
+        // at <key-dir>/keyring.db (or --keyring-db).
         //
         // The client MUST self-authenticate (refinement 1): anonymous pairing would
         // let anyone with the token register an arbitrary bundle.
@@ -983,7 +978,6 @@ async fn main() -> anyhow::Result<()> {
     config.allow_unauth = args.allow_unauth;
     config.force = args.force;
     config.handshake_timeout = args.handshake_timeout;
-    config.peer_allowlist = args.peer_allowlist;
     config.keyring_db = args.keyring_db.clone();
     config.pairing_grants = parse_grants(args.pairing_grant.as_deref())?;
 

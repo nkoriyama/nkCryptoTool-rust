@@ -240,7 +240,6 @@ pub struct CryptoConfig {
     pub allow_unauth: bool,
     pub force: bool,
     pub handshake_timeout: u64,
-    pub peer_allowlist: Option<String>,
     /// Path to the redb keyring (contacts + allowlist tables). Server-side authz
     /// is loaded from its `allowlist` table; defaults to `keyring.db` under
     /// `key_dir` when unset.
@@ -336,7 +335,6 @@ impl Default for CryptoConfig {
             allow_unauth: false,
             force: false,
             handshake_timeout: 15,
-            peer_allowlist: None,
             keyring_db: None,
             pairing_grants: crate::keyring::GRANT_ALL,
             transport: TransportKind::default(),

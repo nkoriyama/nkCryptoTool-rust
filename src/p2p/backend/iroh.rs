@@ -819,14 +819,17 @@ mod tests {
     async fn test_iroh_handshake_allowlist_reject() {
         reset_state();
         let dir = tempdir().unwrap();
-        let allowlist_path = dir.path().join("allowlist.txt");
-        fs::write(&allowlist_path, "0000000000000000000000000000000000000000000000000000000000000000\n").unwrap();
+        let keyring_path = dir.path().join("keyring.db");
+        {
+            let store = crate::keyring::KeyringStore::open(&keyring_path).unwrap();
+            store.authorize(&[0u8; 32], crate::keyring::GRANT_ALL).unwrap();
+        }
         let (ticket_tx, ticket_rx) = tokio::sync::oneshot::channel();
         let mut server_config = CryptoConfig::default();
         server_config.transport = crate::config::TransportKind::Iroh;
         server_config.chat_mode = false;
         server_config.allow_unauth = true;
-        server_config.peer_allowlist = Some(allowlist_path.to_str().unwrap().to_string());
+        server_config.keyring_db = Some(keyring_path.to_str().unwrap().to_string());
         server_config.handshake_timeout = 30;
         let _server_task = tokio::spawn(async move {
             let mut processor = new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await;
@@ -855,19 +858,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let s_key_path = dir.path().join("s.priv.pem");
         let c_key_path = dir.path().join("c.priv.pem");
-        let allowlist_path = dir.path().join("allowlist.txt");
+        let keyring_path = dir.path().join("keyring.db");
         let (s_priv, _, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
         let (c_priv, c_pub, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
         fs::write(&s_key_path, utils::wrap_to_pem(&utils::wrap_pqc_priv_to_pkcs8(&s_priv, "ML-DSA-65").unwrap(), "PRIVATE KEY")).unwrap();
         fs::write(&c_key_path, utils::wrap_to_pem(&utils::wrap_pqc_priv_to_pkcs8(&c_priv, "ML-DSA-65").unwrap(), "PRIVATE KEY")).unwrap();
-        fs::write(&allowlist_path, format!("{}\n", hex::encode(Sha3_256::digest(&c_pub)))).unwrap();
+        {
+            let store = crate::keyring::KeyringStore::open(&keyring_path).unwrap();
+            let c_fp: [u8; 32] = Sha3_256::digest(&c_pub).into();
+            store.authorize(&c_fp, crate::keyring::GRANT_ALL).unwrap();
+        }
         let (ticket_tx, ticket_rx) = tokio::sync::oneshot::channel();
         let mut server_config = CryptoConfig::default();
         server_config.transport = crate::config::TransportKind::Iroh;
         server_config.chat_mode = false;
         server_config.allow_unauth = false;
         server_config.signing_privkey = Some(s_key_path.to_str().unwrap().to_string());
-        server_config.peer_allowlist = Some(allowlist_path.to_str().unwrap().to_string());
+        server_config.keyring_db = Some(keyring_path.to_str().unwrap().to_string());
         server_config.handshake_timeout = 30;
         let _server_task = tokio::spawn(async move {
             let mut processor = new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await;

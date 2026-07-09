@@ -191,12 +191,10 @@ nk-crypto-tool --serve-shell --mode pqc \
 
 - **必ず相互ピン留め**: サーバは `--signing-pubkey <client 公開鍵>`、クライアントは
   `--signing-pubkey <server 公開鍵>` を指定する。`--serve-shell` / `--serve-forward` は
-  `--allow-unauth` を拒否し、`--keyring-db <db>` / `--peer-allowlist <file>` / pinned key の
-  いずれかが必須（無いと「認証済みなら誰でも」になる）。
+  `--allow-unauth` を拒否し、`--keyring-db <db>` か pinned key のいずれかが必須
+  （無いと「認証済みなら誰でも」になる）。
 - `--keyring-db <db>` … ペアリング（USAGE.md §7）で登録した keyring の **per-service grants** を
-  認可に使う（該当 grant が無い peer はサービス接続を拒否。推奨）。
-- `--peer-allowlist <file>` … 許可指紋を列挙した平文ファイルでも認可できる（legacy 互換。
-  ピン留めの代替/併用）。
+  認可に使う（該当 grant が無い peer はサービス接続を拒否）。複数クライアントの認可はこちら。
 - ピアが shell/forward の ALPN を要求しても、操作者が `--serve-shell` /
   `--serve-forward` で起動していない限りサービスは開かない。
 - `--serve-shell` / `--serve-scp` / `--serve-pairing` は **root では起動できない**
@@ -210,8 +208,8 @@ nk-crypto-tool --serve-shell --mode pqc \
 
 - **接続できない**: リレー経由のホールパンチに数秒かかることがある。サーバが ticket を
   表示し、クライアントが `Server authenticated successfully.` を出すか確認する。
-- **`--allow-unauth is not permitted ...`**: shell/forward サーバでは禁止。`--keyring-db` /
-  `--peer-allowlist` / `--signing-pubkey` のいずれかで相手を認可する。
+- **`--allow-unauth is not permitted ...`**: shell/forward サーバでは禁止。`--keyring-db` か
+  `--signing-pubkey` で相手を認可する。
 - **`--serve-forward requires --forward-policy`**: フォワードサーバは default deny の
   ポリシーが必須。
 - **root で `--serve-shell` が拒否される**: 仕様（Tier 1＝権限降格なし）。シェルを

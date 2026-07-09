@@ -71,8 +71,8 @@ fn ensure_field_len(field: &str, got: usize, expected: Option<usize>) -> Result<
 }
 
 /// The grant bit a connecting service requires, or `None` for services without a
-/// per-service grant (chat, file receive) — those authorize on allowlist
-/// membership alone (the pre-grants flat-allowlist behaviour).
+/// per-service grant (chat, file receive) — those authorize on keyring-allowlist
+/// membership alone (any grant bit set).
 fn required_grant_bit(config: &CryptoConfig) -> Option<u8> {
     if config.shell_mode {
         Some(crate::keyring::GRANT_SHELL)
@@ -108,55 +108,22 @@ impl NetworkProcessor {
         }
     }
 
-    /// Build the in-memory authorization map (`fingerprint -> grants`). Two
-    /// sources, unioned (OR on the grant bits):
+    /// Build the in-memory authorization map (`fingerprint -> grants`) from the
+    /// **redb keyring** (`--keyring-db`, per-service grants) — the canonical
+    /// authorization written by pairing / `keyring authorize`.
     ///
-    /// 1. **redb keyring** (`--keyring-db`, per-service grants) — the canonical,
-    ///    off-plaintext authorization written by pairing / `keyring authorize`.
-    /// 2. **legacy plaintext `--peer-allowlist`** — each listed fingerprint is
-    ///    granted every transport (`GRANT_ALL`), preserving the old flat-allowlist
-    ///    meaning ("listed ⇒ authorized for any service").
-    ///
-    /// Enforcement is activated only when at least one source is configured; with
-    /// neither, `cached_allowlist` stays `None` and authorization falls to
+    /// Enforcement is activated only when a keyring is configured; without one,
+    /// `cached_allowlist` stays `None` and authorization falls to
     /// `--signing-pubkey` pinning alone (unchanged behaviour).
     pub async fn preload_allowlist(&mut self) -> Result<()> {
-        let mut map: std::collections::HashMap<[u8; 32], u8> = std::collections::HashMap::new();
-        let mut active = false;
-
         if let Some(ref db) = self.config.keyring_db {
             let store = crate::keyring::KeyringStore::open(std::path::Path::new(db))
                 .map_err(|e| CryptoError::Parameter(format!("open keyring {db}: {e}")))?;
-            for (fp, g) in store
+            let map: std::collections::HashMap<[u8; 32], u8> = store
                 .load_authz()
                 .map_err(|e| CryptoError::Parameter(format!("load keyring authz: {e}")))?
-            {
-                *map.entry(fp).or_insert(0) |= g;
-            }
-            active = true;
-        }
-
-        if let Some(ref path) = self.config.peer_allowlist {
-            let content = std::fs::read_to_string(path)
-                .map_err(|e| CryptoError::FileRead(format!("Allowlist: {}", e)))?;
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let bytes = hex::decode(line)
-                    .map_err(|_| CryptoError::Parameter("Invalid hex in allowlist".to_string()))?;
-                if bytes.len() != 32 {
-                    return Err(CryptoError::Parameter("Invalid fingerprint length".to_string()));
-                }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                *map.entry(arr).or_insert(0) |= crate::keyring::GRANT_ALL;
-            }
-            active = true;
-        }
-
-        if active {
+                .into_iter()
+                .collect();
             self.cached_allowlist = Some(Arc::new(map));
         }
         Ok(())
@@ -628,8 +595,8 @@ impl NetworkProcessor {
                             }
                         };
                         // Per-service grant for shell/scp/forward; services without
-                        // a grant bit (chat, file receive) authorize on membership
-                        // alone, matching the pre-grants flat-allowlist behaviour.
+                        // a grant bit (chat, file receive) authorize on keyring
+                        // membership alone.
                         if let Some(bit) = required_grant_bit(config) {
                             if granted & bit == 0 {
                                 return Err(CryptoError::Parameter(format!(
