@@ -4,10 +4,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-// VmLck-observing tests serialise through this mutex because unit tests
-// in a single binary run on threads, and concurrent mlock activity on
-// other threads would race with the absolute-value assertions below.
-static MEMLOCK_OBS_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+// Every test in this binary is #[serial]: VmLck in /proc/self/status is
+// process-global, so ANY concurrently-running test that holds a SecureBuffer
+// (e.g. test_preload_encrypted_pem) races the absolute-value assertions in the
+// VmLck-observing tests below. A mutex around only those two is not enough.
+use serial_test::serial;
 
 fn read_vm_lck_kb() -> Option<usize> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -20,10 +21,8 @@ fn read_vm_lck_kb() -> Option<usize> {
 }
 
 #[test]
+#[serial]
 fn secure_buffer_drop_releases_mlock() {
-    let _guard = MEMLOCK_OBS_MUTEX
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
     let Some(baseline) = read_vm_lck_kb() else {
         return;
     };
@@ -46,10 +45,8 @@ fn secure_buffer_drop_releases_mlock() {
 }
 
 #[test]
+#[serial]
 fn secure_buffer_repeated_alloc_does_not_accumulate_locks() {
-    let _guard = MEMLOCK_OBS_MUTEX
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
     let Some(baseline) = read_vm_lck_kb() else {
         return;
     };
@@ -68,6 +65,7 @@ fn secure_buffer_repeated_alloc_does_not_accumulate_locks() {
 }
 
 #[test]
+#[serial]
 fn secure_erase_file_overwrites_with_zeros() {
     use std::io::Write as _;
     let mut tmp = tempfile::NamedTempFile::new().expect("tempfile");
@@ -87,12 +85,14 @@ fn secure_erase_file_overwrites_with_zeros() {
 }
 
 #[test]
+#[serial]
 fn secure_erase_file_handles_missing_path() {
     // Must not panic when the path does not exist.
     secure_erase_file("/nonexistent/secure-erase-target");
 }
 
 #[test]
+#[serial]
 fn secure_erase_file_handles_empty_file() {
     let tmp = tempfile::NamedTempFile::new().expect("tempfile");
     secure_erase_file(tmp.path());
@@ -101,6 +101,7 @@ fn secure_erase_file_handles_empty_file() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_secure_write_atomic_force() {
     let test_dir = "tests/temp_security";
     let _ = fs::remove_dir_all(test_dir);
@@ -131,6 +132,7 @@ async fn test_secure_write_atomic_force() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_preload_encrypted_pem() {
     use nk_crypto_tool::config::{CryptoConfig, Operation};
 
