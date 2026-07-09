@@ -183,9 +183,11 @@ listener 側の keyring（redb）の allowlist テーブルに許可指紋を登
 
 ```bash
 # bob と charlie の指紋を認可する (各 32B = 64 hex chars)
-./target/release/nk-crypto-tool --keyring-cmd authorize \
+# chat/file は allowlist の membership で認可される (grant bit は shell/scp/forward 用。
+# --pairing-grant は必須なので、chat 専用 listener なら任意の 1 つで良い)
+./target/release/nk-crypto-tool --keyring-cmd authorize --pairing-grant all \
   --keyring-db ~/nkct/keyring.db --recipient-fingerprint ee15...90b7   # bob
-./target/release/nk-crypto-tool --keyring-cmd authorize \
+./target/release/nk-crypto-tool --keyring-cmd authorize --pairing-grant all \
   --keyring-db ~/nkct/keyring.db --recipient-fingerprint 8a91...c2d4   # charlie
 
 ./target/release/nk-crypto-tool --chat --listen \

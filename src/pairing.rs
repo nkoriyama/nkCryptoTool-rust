@@ -196,13 +196,16 @@ fn register(req: &PairingRequest, client_fp: [u8; 32], config: &CryptoConfig) ->
 
     // 4-5. Authorize the fingerprint (grants) and store the bundle, both in the
     //      keyring, pinned to the handshake-verified fingerprint. Authorization
-    //      replaces the former plaintext `--peer-allowlist` append — the grants
-    //      default to every transport (GRANT_ALL) and are overridable with
-    //      `--pairing-grant`, so authorization now lives off plaintext and is
-    //      per-service. The store enforces handle-clobber protection (a DIFFERENT
+    //      replaces the former plaintext `--peer-allowlist` append: per-service
+    //      and explicit — the operator must state the grants (`--pairing-grant`),
+    //      there is no default, so a refused/empty configuration cannot silently
+    //      over-grant. The store enforces handle-clobber protection (a DIFFERENT
     //      identity cannot take over an existing handle; the SAME identity
     //      re-registers idempotently), replacing the per-file
     //      <key-dir>/received/<handle>.nkkb artefact.
+    if config.pairing_grants == 0 {
+        return Err("server has no pairing grants configured".into());
+    }
     let keyring_path = config
         .keyring_db
         .clone()
@@ -400,6 +403,7 @@ mod tests {
         c.key_dir = dir.to_str().unwrap().to_string();
         c.pairing_otp = Some(token.to_string());
         c.pairing_deadline_secs = Some(deadline);
+        c.pairing_grants = crate::keyring::GRANT_ALL; // grants are explicit — set by the CLI
         c
     }
 
@@ -419,9 +423,26 @@ mod tests {
         assert_eq!(
             store.grants(&fp).unwrap(),
             crate::keyring::GRANT_ALL,
-            "the fingerprint must be granted every transport by default"
+            "the fingerprint must receive exactly the configured grants"
         );
         assert!(store.get("alice").unwrap().is_some(), "bundle must be stored in the keyring");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn register_refuses_when_no_grants_configured() {
+        // Grants are explicit (least privilege): a server with pairing_grants=0
+        // is misconfigured and must refuse to register rather than authorize
+        // nothing / store a bundle for an unauthorized peer.
+        let (bytes, fp) = sample_bundle("alice");
+        let dir = tmp_dir(&format!("nog-{:02x}", fp[0]));
+        let mut config = base_config(&dir, "T", future());
+        config.pairing_grants = 0;
+        let req = PairingRequest { token: "T".into(), keybundle_bytes: bytes };
+        assert!(register(&req, fp, &config).is_err(), "zero grants must refuse registration");
+        let store = crate::keyring::KeyringStore::open(&dir.join("keyring.db")).unwrap();
+        assert_eq!(store.grants(&fp).unwrap(), 0, "a refused pairing must not authorize");
+        assert!(store.get("alice").unwrap().is_none(), "a refused pairing must not store the bundle");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

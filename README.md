@@ -115,7 +115,7 @@ confined shell と path-jail された scp を張るまでを 4 ステップで�
 1. **PAIR** — keyring（redb: `<key-dir>/keyring.db`）の認可は**空**の状態から始まる。まず**トークンを
    持たない**クライアントは拒否され keyring は空のまま（登録も default-deny）。正しい OTP を持つ
    クライアントだけが `--copy-bundle` で自己署名 KeyBundle を送り、**allowlist テーブルに per-service
-   grants 付き**で登録される（`--pairing-grant` で付与サービスを絞れる。既定 all）。サーバは*接続本人の*
+   grants 付き**で登録される（`--pairing-grant` で付与サービスを明示。必須・既定なし）。サーバは*接続本人の*
    指紋（handshake 指紋 == bundle owner 指紋）を照合するので、トークン保持者が他人の bundle を
    代理登録できない（`--copy-bundle` は接続鍵で必ず自己署名するため owner==identity が構造的に成立。
    異一致拒否は `refinement_1` 単体テストで担保）。

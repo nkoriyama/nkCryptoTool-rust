@@ -156,7 +156,8 @@ nk-crypto-tool --serve-shell --mode pqc \
 ```
 - `--signing-pubkey` で**許可するクライアントを 1 つ pin**。複数許可は `--keyring-db <db>`
   （keyring の grants で認可。ペアリングか `--keyring-cmd authorize` で登録）。
-- `--shell-policy` の各行（省略時は pin した相手にフル shell）:
+- `--shell-policy` の各行（`--signing-pubkey` 単独 pin なら省略可＝pin した相手にフル shell。
+  `--keyring-db` 使用時は**必須**＝複数ピアに無 policy のフル shell を出さない）:
   ```
   <クライアント指紋>  user=NAME  cmd-allow="ls,cat,uname"
   ```
@@ -225,12 +226,13 @@ KeyBundle も同じ keyring に保存する。手動での指紋登録・鍵手�
 nk-crypto-tool --serve-pairing --mode pqc \
     --signing-privkey server/private_sign_pqc.key \
     --key-dir server \
-    [--pairing-grant scp]      # 付与するサービス（既定 all＝shell,scp,forward）
+    --pairing-grant scp        # 付与するサービス（必須。shell|scp|forward|all）
 #   → ワンタイムトークン・ticket・server 指紋を印字。1 クライアント登録して終了
 ```
 - **ワンタイムトークンをクライアントへ out-of-band（口頭等）で渡す**（ticket と一緒に）。
 - 認可（grants）も KeyBundle 実体も **`<key-dir>/keyring.db`（redb, 0600）** に書かれる。
-  `--pairing-grant` で付与サービスを絞れる（既定 `all`。例 `--pairing-grant scp` なら scp のみ）。
+  `--pairing-grant` は**必須**（least privilege: 既定値はなく、付与するサービスを明示する。
+  例 `--pairing-grant scp` なら scp のみ）。
   平文 allowlist（旧 `--peer-allowlist`）は廃止済みで、認可は keyring のみ。
 - root では拒否（サーバ user のファイルを書くだけで特権不要）。
 

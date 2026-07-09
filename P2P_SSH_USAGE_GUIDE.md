@@ -195,6 +195,8 @@ nk-crypto-tool --serve-shell --mode pqc \
   （無いと「認証済みなら誰でも」になる）。
 - `--keyring-db <db>` … ペアリング（USAGE.md §7）で登録した keyring の **per-service grants** を
   認可に使う（該当 grant が無い peer はサービス接続を拒否）。複数クライアントの認可はこちら。
+  `--serve-shell` で `--keyring-db` を使う場合は **`--shell-policy` も必須**（policy なしの
+  フル shell は `--signing-pubkey` 単独 pin の時だけ）。
 - ピアが shell/forward の ALPN を要求しても、操作者が `--serve-shell` /
   `--serve-forward` で起動していない限りサービスは開かない。
 - `--serve-shell` / `--serve-scp` / `--serve-pairing` は **root では起動できない**

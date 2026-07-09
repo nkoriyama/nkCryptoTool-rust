@@ -442,9 +442,10 @@ struct Args {
     #[arg(long, help = "Keyring subcommand (add|list|remove|import|authorize|revoke)")]
     keyring_cmd: Option<String>,
 
-    /// Comma-separated transports to grant a peer, for `--serve-pairing` (the
-    /// default a freshly-paired client gets) and `--keyring-cmd authorize`. One
-    /// or more of `shell`, `scp`, `forward`, or `all` (default `all`).
+    /// Comma-separated transports to grant a peer. One or more of `shell`,
+    /// `scp`, `forward`, or `all`. Required by `--serve-pairing` and
+    /// `--keyring-cmd authorize` — grants are explicit (least privilege), there
+    /// is no default.
     #[arg(long)]
     pairing_grant: Option<String>,
 
@@ -884,6 +885,17 @@ async fn main() -> anyhow::Result<()> {
              --signing-pubkey <key> to restrict who may obtain a shell"
         );
     }
+    // A keyring allowlist may hold MANY paired peers, and without a shell
+    // policy the PTY server allows an unconfined shell to every authorized
+    // fingerprint. That "full shell when no policy" behaviour is only safe for
+    // a single explicitly pinned key (--signing-pubkey), so with --keyring-db
+    // require the default-deny policy — same discipline as scp/forward.
+    if args.serve_shell && args.keyring_db.is_some() && config.shell_policy_path.is_none() {
+        anyhow::bail!(
+            "--serve-shell with --keyring-db requires --shell-policy <file> (default deny); \
+             without one every granted peer would get an unconfined shell"
+        );
+    }
     // Tier 1 (same-user): the shell runs as the server's own user — there is no
     // in-process privilege drop (the setuid path was removed when the PTY layer
     // unified on portable-pty). So a root shell server is never safe: every
@@ -979,7 +991,16 @@ async fn main() -> anyhow::Result<()> {
     config.force = args.force;
     config.handshake_timeout = args.handshake_timeout;
     config.keyring_db = args.keyring_db.clone();
-    config.pairing_grants = parse_grants(args.pairing_grant.as_deref())?;
+    // Grants are explicit (least privilege): a pairing server must state what a
+    // freshly-paired client may reach — there is no implicit GRANT_ALL.
+    config.pairing_grants = match args.pairing_grant.as_deref() {
+        Some(spec) => parse_grants(spec)?,
+        None if args.serve_pairing => anyhow::bail!(
+            "--serve-pairing requires --pairing-grant <shell|scp|forward|all> \
+             (grants are explicit; there is no default)"
+        ),
+        None => 0,
+    };
 
     if config.chat_mode
         && !config.allow_unauth
@@ -1195,13 +1216,10 @@ fn keyring_db_path(keyring_db: Option<&str>, key_dir: Option<&str>) -> std::path
 }
 
 /// Parse a comma-separated grant list (`shell,scp,forward` or `all`) into a
-/// `keyring::GRANT_*` bitmask. `None` defaults to every transport (`GRANT_ALL`).
-fn parse_grants(spec: Option<&str>) -> anyhow::Result<u8> {
+/// `keyring::GRANT_*` bitmask. Grants are explicit by design (least privilege):
+/// callers that issue grants must require the flag rather than assume a default.
+fn parse_grants(spec: &str) -> anyhow::Result<u8> {
     use nk_crypto_tool::keyring::{GRANT_ALL, GRANT_FORWARD, GRANT_SCP, GRANT_SHELL};
-    let spec = match spec {
-        None => return Ok(GRANT_ALL),
-        Some(s) => s,
-    };
     let mut g = 0u8;
     for tok in spec.split(',') {
         let tok = tok.trim();
@@ -1318,7 +1336,13 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
         }
         "authorize" => {
             let fp = resolve_authz_fp(&store, args)?;
-            let grants = parse_grants(args.pairing_grant.as_deref())?;
+            let spec = args.pairing_grant.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--keyring-cmd authorize requires --pairing-grant <shell|scp|forward|all> \
+                     (grants are explicit; there is no default)"
+                )
+            })?;
+            let grants = parse_grants(spec)?;
             store.authorize(&fp, grants).map_err(|e| anyhow::anyhow!("{e}"))?;
             println!(
                 "Authorized {} grants=0b{grants:03b} in keyring {}",

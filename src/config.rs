@@ -245,7 +245,8 @@ pub struct CryptoConfig {
     /// `key_dir` when unset.
     pub keyring_db: Option<String>,
     /// Grants a freshly-paired client receives in the keyring allowlist (a
-    /// `keyring::GRANT_*` bitmask). Defaults to every transport (`GRANT_ALL`).
+    /// `keyring::GRANT_*` bitmask). No default: 0 means "not configured" and
+    /// pairing refuses to register (grants are explicit, least privilege).
     pub pairing_grants: u8,
     pub transport: TransportKind,
 
@@ -336,7 +337,7 @@ impl Default for CryptoConfig {
             force: false,
             handshake_timeout: 15,
             keyring_db: None,
-            pairing_grants: crate::keyring::GRANT_ALL,
+            pairing_grants: 0,
             transport: TransportKind::default(),
             target_sign_fp: None,
             target_enc_fp: None,

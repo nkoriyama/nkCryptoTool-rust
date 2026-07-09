@@ -65,7 +65,8 @@ sleep 0.7
 #     by construction; the cross-identity rejection is covered by the
 #     `register_rejects_bundle_from_a_different_identity_refinement_1` unit test.)
 start_server "$ROOT/pair_bad.log" --serve-pairing --mode pqc \
-  --signing-privkey "$ROOT/srv/private_sign_pqc.key" --key-dir "$ROOT/srv"
+  --signing-privkey "$ROOT/srv/private_sign_pqc.key" --key-dir "$ROOT/srv" \
+  --pairing-grant shell,scp
 echo "  \$ --copy-bundle --token WRONGTOK   (does not hold the real token)"
 sleep 0.5
 REFUSAL=$("$BIN" --copy-bundle --mode pqc --connect "$TICKET" --token "AAAA2345" \
@@ -82,7 +83,8 @@ sleep 1.3
 # 1b. The real token registers the client — and the bundle is pinned to the
 #     handshake-verified fingerprint (proof-of-possession), not merely the token.
 start_server "$ROOT/pair.log" --serve-pairing --mode pqc \
-  --signing-privkey "$ROOT/srv/private_sign_pqc.key" --key-dir "$ROOT/srv"
+  --signing-privkey "$ROOT/srv/private_sign_pqc.key" --key-dir "$ROOT/srv" \
+  --pairing-grant shell,scp
 OTP=$(grep -aoE 'one-time token: [A-Z2-7]+' "$ROOT/pair.log" | awk '{print $3}' | head -1)
 echo "  server issued a one-time token (out-of-band):  $OTP"
 sleep 1
@@ -97,7 +99,7 @@ sleep 0.6
 # contrast, is keyed by the 64-hex fingerprint: the single join key that threads
 # pair -> authorize -> shell -> scp.
 echo "  keyring now authorizes the client that PROVED it holds the bundle's key:"
-echo "    $CFP  (grants: shell,scp,forward — default; restrict with --pairing-grant)"
+echo "    $CFP  (grants: shell,scp — explicit --pairing-grant, no default)"
 sleep 1.6
 
 # ── 2. AUTHORIZE: pairing granted TRANSPORT in the keyring — grant CAPABILITY ──
