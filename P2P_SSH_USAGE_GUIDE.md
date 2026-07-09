@@ -76,7 +76,10 @@ a4d889f8...c00e  user=deploy  cmd-allow="systemctl restart app, journalctl -u ap
 
 - `user=` … そのユーザに降格してシェルを起動する。
 - `cmd-allow="..."` … 完全一致するコマンドのみ許可（ログインシェルは拒否、ssh の
-  `command=` 相当）。
+  `command=` 相当）。Linux では該当セッションのコマンドは `NO_NEW_PRIVS` 付きで
+  起動され、許可済みコマンド経由でも setuid/setgid/capabilities による特権昇格が
+  カーネルレベルで無効化される（監査ログに `nnp=on`。非 Linux では
+  `nnp=unavailable` と記録され、この防御なしで実行される）。
 
 ```bash
 nk-crypto-tool --serve-shell --mode pqc \
@@ -107,6 +110,10 @@ root 起動はいずれも拒否される。
 # <クライアント指紋 hex>  allow="host:port, host2:*, *:443"
 ce53fe1b...9cfd  allow="127.0.0.1:5432, db.internal:5432"
 ```
+
+ホストは **完全一致**（大小無視）か、単独の `*`（全ホスト）のみ。`*.internal` の
+ような部分ワイルドカードはどのホストにも一致しない死にルールになるため、
+パース時にエラーとして拒否される。ポートは数値の完全一致か `*`。
 
 ```bash
 # サーバ
