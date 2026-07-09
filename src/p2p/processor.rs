@@ -70,11 +70,26 @@ fn ensure_field_len(field: &str, got: usize, expected: Option<usize>) -> Result<
     Ok(())
 }
 
+/// The grant bit a connecting service requires, or `None` for services without a
+/// per-service grant (chat, file receive) — those authorize on allowlist
+/// membership alone (the pre-grants flat-allowlist behaviour).
+fn required_grant_bit(config: &CryptoConfig) -> Option<u8> {
+    if config.shell_mode {
+        Some(crate::keyring::GRANT_SHELL)
+    } else if config.scp_mode {
+        Some(crate::keyring::GRANT_SCP)
+    } else if config.forward_mode {
+        Some(crate::keyring::GRANT_FORWARD)
+    } else {
+        None
+    }
+}
+
 pub struct NetworkProcessor {
     config: CryptoConfig,
     endpoint: Arc<dyn P2pEndpoint>,
     semaphore: Arc<Semaphore>,
-    cached_allowlist: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
+    cached_allowlist: Option<Arc<std::collections::HashMap<[u8; 32], u8>>>,
     io_provider: Arc<dyn IOProvider>,
 }
 
@@ -93,11 +108,37 @@ impl NetworkProcessor {
         }
     }
 
+    /// Build the in-memory authorization map (`fingerprint -> grants`). Two
+    /// sources, unioned (OR on the grant bits):
+    ///
+    /// 1. **redb keyring** (`--keyring-db`, per-service grants) — the canonical,
+    ///    off-plaintext authorization written by pairing / `keyring authorize`.
+    /// 2. **legacy plaintext `--peer-allowlist`** — each listed fingerprint is
+    ///    granted every transport (`GRANT_ALL`), preserving the old flat-allowlist
+    ///    meaning ("listed ⇒ authorized for any service").
+    ///
+    /// Enforcement is activated only when at least one source is configured; with
+    /// neither, `cached_allowlist` stays `None` and authorization falls to
+    /// `--signing-pubkey` pinning alone (unchanged behaviour).
     pub async fn preload_allowlist(&mut self) -> Result<()> {
+        let mut map: std::collections::HashMap<[u8; 32], u8> = std::collections::HashMap::new();
+        let mut active = false;
+
+        if let Some(ref db) = self.config.keyring_db {
+            let store = crate::keyring::KeyringStore::open(std::path::Path::new(db))
+                .map_err(|e| CryptoError::Parameter(format!("open keyring {db}: {e}")))?;
+            for (fp, g) in store
+                .load_authz()
+                .map_err(|e| CryptoError::Parameter(format!("load keyring authz: {e}")))?
+            {
+                *map.entry(fp).or_insert(0) |= g;
+            }
+            active = true;
+        }
+
         if let Some(ref path) = self.config.peer_allowlist {
             let content = std::fs::read_to_string(path)
                 .map_err(|e| CryptoError::FileRead(format!("Allowlist: {}", e)))?;
-            let mut set = std::collections::HashSet::new();
             for line in content.lines() {
                 let line = line.trim();
                 if line.is_empty() || line.starts_with('#') {
@@ -110,9 +151,13 @@ impl NetworkProcessor {
                 }
                 let mut arr = [0u8; 32];
                 arr.copy_from_slice(&bytes);
-                set.insert(arr);
+                *map.entry(arr).or_insert(0) |= crate::keyring::GRANT_ALL;
             }
-            self.cached_allowlist = Some(Arc::new(set));
+            active = true;
+        }
+
+        if active {
+            self.cached_allowlist = Some(Arc::new(map));
         }
         Ok(())
     }
@@ -461,7 +506,7 @@ impl NetworkProcessor {
         config: &CryptoConfig,
         local_peer_id: P2pPeerId,
         remote_peer_id: P2pPeerId,
-        cached_allowlist: Option<Arc<std::collections::HashSet<[u8; 32]>>>,
+        cached_allowlist: Option<Arc<std::collections::HashMap<[u8; 32], u8>>>,
         io_provider: Arc<dyn IOProvider>,
         on_handshake_done: Option<Box<dyn FnOnce() + Send>>,
         on_progress: Option<crate::network::ProgressCallback>,
@@ -576,8 +621,21 @@ impl NetworkProcessor {
             } else if let Some(ref allowlist) = cached_allowlist {
                 match peer_id {
                     PeerId::Pubkey(hash) => {
-                        if !allowlist.contains(&hash) {
-                            return Err(CryptoError::Parameter("Peer not in allowlist".to_string()));
+                        let granted = match allowlist.get(&hash) {
+                            Some(g) => *g,
+                            None => {
+                                return Err(CryptoError::Parameter("Peer not in allowlist".to_string()))
+                            }
+                        };
+                        // Per-service grant for shell/scp/forward; services without
+                        // a grant bit (chat, file receive) authorize on membership
+                        // alone, matching the pre-grants flat-allowlist behaviour.
+                        if let Some(bit) = required_grant_bit(config) {
+                            if granted & bit == 0 {
+                                return Err(CryptoError::Parameter(format!(
+                                    "Peer is in the allowlist but not authorized for this service (grants=0b{granted:03b})"
+                                )));
+                            }
                         }
                     }
                     _ => {
@@ -1135,8 +1193,11 @@ impl NetworkProcessor {
                         eprintln!("Server authenticated successfully (auth: {}).", config.pqc_dsa_algo);
                         
                         if let Some(ref allowlist) = self.cached_allowlist {
+                            // Client side: we are pinning which SERVER we will talk
+                            // to, so membership (any grant) is what matters — grants
+                            // gate a server authorizing a client, not the reverse.
                             let hash: [u8; 32] = Sha3_256::digest(&server_dsa_pub).into();
-                            if !allowlist.contains(&hash) {
+                            if !allowlist.contains_key(&hash) {
                                 return Err(CryptoError::Parameter("Server not in allowlist".to_string()));
                             }
                         }

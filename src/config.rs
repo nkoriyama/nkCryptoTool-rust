@@ -241,6 +241,13 @@ pub struct CryptoConfig {
     pub force: bool,
     pub handshake_timeout: u64,
     pub peer_allowlist: Option<String>,
+    /// Path to the redb keyring (contacts + allowlist tables). Server-side authz
+    /// is loaded from its `allowlist` table; defaults to `keyring.db` under
+    /// `key_dir` when unset.
+    pub keyring_db: Option<String>,
+    /// Grants a freshly-paired client receives in the keyring allowlist (a
+    /// `keyring::GRANT_*` bitmask). Defaults to every transport (`GRANT_ALL`).
+    pub pairing_grants: u8,
     pub transport: TransportKind,
 
     // MITM verification fingerprints
@@ -330,6 +337,8 @@ impl Default for CryptoConfig {
             force: false,
             handshake_timeout: 15,
             peer_allowlist: None,
+            keyring_db: None,
+            pairing_grants: crate::keyring::GRANT_ALL,
             transport: TransportKind::default(),
             target_sign_fp: None,
             target_enc_fp: None,

@@ -5,19 +5,21 @@
  */
 
 //! redb-backed **keyring**: a local store of received/known KeyBundles, keyed by
-//! handle. Replaces the per-file `<key-dir>/received/<handle>.nkkb` artefacts
-//! pairing used to write. Each entry records the **trusted owner fingerprint**
-//! (the pin, established when the entry was written) alongside the bundle bytes,
-//! so a consumer can `parse_and_verify` the stored bundle against the stored pin
-//! at use time.
+//! handle, plus a fingerprint-keyed **allowlist** of per-service authorization
+//! grants. Two tables in one DB:
 //!
-//! **Not encrypted at rest**: a KeyBundle is public data (self-signed public
-//! keys), so there is no secret to protect — the store is plain redb, guarded by
-//! `0600` like `--peer-allowlist`. The anchor is the *integrity* of the file
-//! (who may write it), not confidentiality. Tampering that changes a bundle but
-//! not its stored fingerprint is caught at read time (the bundle no longer
-//! verifies against the pin); changing both requires write access, which the
-//! file permissions restrict.
+//! - `contacts` (`handle -> pinned fingerprint + bundle bytes`) — key material,
+//!   replacing the per-file `<key-dir>/received/<handle>.nkkb` artefacts.
+//! - `allowlist` (`fingerprint -> grants`) — transport authorization, replacing
+//!   the plaintext `--peer-allowlist` file with per-service grants.
+//!
+//! **Not encrypted at rest**: a KeyBundle and a fingerprint are public data, so
+//! there is no secret to protect — the store is plain redb, guarded by `0600`.
+//! The anchor is the *integrity* of the file (who may write it), not
+//! confidentiality. Tampering that changes a bundle but not its stored
+//! fingerprint is caught at read time (the bundle no longer verifies against the
+//! pin); changing either requires write access, which the file permissions
+//! restrict.
 
 use crate::error::CryptoError;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -28,7 +30,22 @@ type Result<T> = std::result::Result<T, CryptoError>;
 /// `handle -> fingerprint(32) ‖ added_at(8 LE) ‖ keybundle_bytes`.
 const CONTACTS: TableDefinition<&str, &[u8]> = TableDefinition::new("keyring_contacts_v1");
 
-/// Fixed prefix of every value: 32-byte fingerprint + 8-byte little-endian time.
+/// `fingerprint(32) -> grants(u8)` — per-service transport authorization. Keyed
+/// by fingerprint (the value the handshake proves), distinct from the
+/// handle-keyed contacts table.
+const ALLOWLIST: TableDefinition<&[u8], u8> = TableDefinition::new("keyring_allowlist_v1");
+
+/// Grant bitflags for the allowlist. These gate *transport* access to a service;
+/// the *capability* within a service (which shell commands, which scp paths)
+/// stays in the per-service policy files (`--shell-policy` / `--scp-policy`).
+pub const GRANT_SHELL: u8 = 1;
+pub const GRANT_SCP: u8 = 2;
+pub const GRANT_FORWARD: u8 = 4;
+/// All transport grants — the default a freshly-paired peer receives, matching
+/// the pre-keyring flat allowlist where membership authorized every service.
+pub const GRANT_ALL: u8 = GRANT_SHELL | GRANT_SCP | GRANT_FORWARD;
+
+/// Fixed prefix of every contacts value: 32-byte fingerprint + 8-byte LE time.
 const HEADER_LEN: usize = 32 + 8;
 
 /// One stored keyring entry.
@@ -50,21 +67,22 @@ pub enum AddOutcome {
     Updated,
 }
 
-/// A plain (unencrypted) redb keyring of KeyBundles.
+/// A plain (unencrypted) redb keyring of KeyBundles + authorization grants.
 pub struct KeyringStore {
     db: Database,
 }
 
 impl KeyringStore {
-    /// Open (or create) the keyring at `path`. Creates the table on first use and
-    /// tightens the file to `0600` on unix.
+    /// Open (or create) the keyring at `path`. Creates both tables on first use
+    /// and tightens the file to `0600` on unix.
     pub fn open(path: &Path) -> Result<Self> {
         let db = Database::create(path)
             .map_err(|e| CryptoError::Parameter(format!("keyring: open {path:?}: {e}")))?;
-        // Ensure the table exists so a read on a fresh DB does not error.
+        // Ensure both tables exist so a read on a fresh DB does not error.
         {
             let w = db.begin_write().map_err(map_err)?;
             w.open_table(CONTACTS).map_err(map_err)?;
+            w.open_table(ALLOWLIST).map_err(map_err)?;
             w.commit().map_err(map_err)?;
         }
         #[cfg(unix)]
@@ -153,6 +171,62 @@ impl KeyringStore {
         w.commit().map_err(map_err)?;
         Ok(existed)
     }
+
+    // -- allowlist (authorization) --------------------------------------------
+
+    /// Set `fp`'s grants (a `GRANT_*` bitmask), replacing any prior grants.
+    pub fn authorize(&self, fp: &[u8; 32], grants: u8) -> Result<()> {
+        let w = self.db.begin_write().map_err(map_err)?;
+        {
+            let mut t = w.open_table(ALLOWLIST).map_err(map_err)?;
+            t.insert(fp.as_slice(), grants).map_err(map_err)?;
+        }
+        w.commit().map_err(map_err)?;
+        Ok(())
+    }
+
+    /// The grants for `fp` (0 = not authorized / absent).
+    pub fn grants(&self, fp: &[u8; 32]) -> Result<u8> {
+        let r = self.db.begin_read().map_err(map_err)?;
+        let t = r.open_table(ALLOWLIST).map_err(map_err)?;
+        Ok(t.get(fp.as_slice()).map_err(map_err)?.map(|v| v.value()).unwrap_or(0))
+    }
+
+    /// Revoke all of `fp`'s grants (remove it). Returns whether it was present.
+    pub fn deauthorize(&self, fp: &[u8; 32]) -> Result<bool> {
+        let w = self.db.begin_write().map_err(map_err)?;
+        let existed;
+        {
+            let mut t = w.open_table(ALLOWLIST).map_err(map_err)?;
+            existed = t.remove(fp.as_slice()).map_err(map_err)?.is_some();
+        }
+        w.commit().map_err(map_err)?;
+        Ok(existed)
+    }
+
+    /// Load the whole allowlist as `fingerprint -> grants` (for the authz preload).
+    pub fn load_authz(&self) -> Result<std::collections::HashMap<[u8; 32], u8>> {
+        let r = self.db.begin_read().map_err(map_err)?;
+        let t = r.open_table(ALLOWLIST).map_err(map_err)?;
+        let mut map = std::collections::HashMap::new();
+        for row in t.iter().map_err(map_err)? {
+            let (k, v) = row.map_err(map_err)?;
+            let kb = k.value();
+            if kb.len() == 32 {
+                let mut fp = [0u8; 32];
+                fp.copy_from_slice(kb);
+                map.insert(fp, v.value());
+            }
+        }
+        Ok(map)
+    }
+
+    /// `(fingerprint, grants)` for every authorized peer, sorted by fingerprint.
+    pub fn list_grants(&self) -> Result<Vec<([u8; 32], u8)>> {
+        let mut v: Vec<_> = self.load_authz()?.into_iter().collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(v)
+    }
 }
 
 fn map_err<E: std::fmt::Display>(e: E) -> CryptoError {
@@ -214,6 +288,31 @@ mod tests {
         assert!(r.is_err(), "a different fingerprint must not overwrite the handle");
         // The original entry is intact.
         assert_eq!(ks.get("shared").unwrap().unwrap().bundle, b"a");
+    }
+
+    #[test]
+    fn allowlist_grants_roundtrip() {
+        let path = tmp("authz");
+        let ks = KeyringStore::open(&path).unwrap();
+        let a = [0xAAu8; 32];
+        let b = [0xBBu8; 32];
+        assert_eq!(ks.grants(&a).unwrap(), 0, "absent fp has no grants");
+        ks.authorize(&a, GRANT_SHELL | GRANT_SCP).unwrap();
+        ks.authorize(&b, GRANT_ALL).unwrap();
+        assert_eq!(ks.grants(&a).unwrap(), GRANT_SHELL | GRANT_SCP);
+        assert_eq!(ks.grants(&a).unwrap() & GRANT_FORWARD, 0, "a is not forward-granted");
+        assert_eq!(ks.grants(&b).unwrap(), GRANT_ALL);
+
+        let authz = ks.load_authz().unwrap();
+        assert_eq!(authz.get(&a).copied(), Some(GRANT_SHELL | GRANT_SCP));
+        assert_eq!(authz.get(&b).copied(), Some(GRANT_ALL));
+
+        // re-authorize replaces grants; deauthorize removes.
+        ks.authorize(&a, GRANT_FORWARD).unwrap();
+        assert_eq!(ks.grants(&a).unwrap(), GRANT_FORWARD);
+        assert!(ks.deauthorize(&a).unwrap());
+        assert!(!ks.deauthorize(&a).unwrap());
+        assert_eq!(ks.grants(&a).unwrap(), 0);
     }
 
     #[test]

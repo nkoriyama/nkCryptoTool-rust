@@ -216,21 +216,22 @@ nk-crypto-tool --scp-get /srv/remote.tar local.tar --connect <ticket> --mode pqc
 
 ## 7. ペアリング（KeyBundle 自動登録 = `ssh-copy-id` 相当）
 
-未登録のクライアントを、**ワンタイムトークン**で初回だけ安全に登録する。クライアントの指紋を
-サーバの `--peer-allowlist` に追加し、KeyBundle を **keyring（redb: `<key-dir>/keyring.db`）** に
-保存する。手動での指紋登録・鍵手渡しが要らなくなる。
+未登録のクライアントを、**ワンタイムトークン**で初回だけ安全に登録する。サーバは接続本人の指紋を
+**keyring（redb: `<key-dir>/keyring.db`）の allowlist テーブルに per-service grants 付きで認可**し、
+KeyBundle も同じ keyring に保存する。手動での指紋登録・鍵手渡し・平文 allowlist が要らなくなる。
 
 ### サーバ（登録を受け付ける側・単発）
 ```bash
 nk-crypto-tool --serve-pairing --mode pqc \
     --signing-privkey server/private_sign_pqc.key \
-    --peer-allowlist server/allowlist \
-    --key-dir server
+    --key-dir server \
+    [--pairing-grant scp]      # 付与するサービス（既定 all＝shell,scp,forward）
 #   → ワンタイムトークン・ticket・server 指紋を印字。1 クライアント登録して終了
 ```
 - **ワンタイムトークンをクライアントへ out-of-band（口頭等）で渡す**（ticket と一緒に）。
-- `--peer-allowlist <file>` が指紋の登録先（追記される・**認可**）。KeyBundle 実体は
-  `--key-dir` 配下の **`keyring.db`（redb, 0600）** に保存（**鍵材料**。認可とは別レイヤ）。
+- 認可（grants）も KeyBundle 実体も **`<key-dir>/keyring.db`（redb, 0600）** に書かれる。
+  `--pairing-grant` で付与サービスを絞れる（既定 `all`。例 `--pairing-grant scp` なら scp のみ）。
+  平文 `--peer-allowlist` はもう不要（legacy 後方互換として読み取りは可能）。
 - root では拒否（サーバ user のファイルを書くだけで特権不要）。
 
 ### クライアント（自分を登録してもらう側）
@@ -246,8 +247,11 @@ nk-crypto-tool --copy-bundle --mode pqc --connect <ticket> --token <OTP> \
   証明した identity だけを登録＝他人の bundle を代理登録できない）。
 
 ### 安全性
-- **default-deny は維持**: 登録は allowlist への追加**だけ**。ペアリング直後は「接続はできるが
-  shell/scp は不可」で、管理者が明示的に `--shell-policy`/`--scp-policy` を書くまで何もできない。
+- **default-deny＋per-service**: 認可は keyring の grants で、`--pairing-grant` で付与した
+  サービスだけ。さらに shell/scp の**中身**（コマンド／パス）は `--shell-policy`/`--scp-policy` で
+  別途絞る（＝トランスポート認可と capability の二段）。
+- サーバ側で `--serve-shell`/`--serve-scp`/`--serve-forward` は **`--keyring-db <db>`** を渡すと
+  この keyring の grants を認可に使う（該当 grant が無い peer はサービス接続を拒否）。
 - トークンは高エントロピー乱数＋失効（既定 5 分）＋定数時間比較。MITM はクライアントの server-pin
   で防ぐ。
 
@@ -264,6 +268,9 @@ nk-crypto-tool --keyring-cmd add    --key-dir server \                # 手動�
     --recipient-keybundle alice.nkkb --recipient-fingerprint <64-hex> --keybundle-handle alice
 nk-crypto-tool --keyring-cmd remove --key-dir server --keybundle-handle alice
 nk-crypto-tool --keyring-cmd import --key-dir server                  # 旧 received/*.nkkb を移行
+# 認可（allowlist テーブル）: handle か --recipient-fingerprint で指定
+nk-crypto-tool --keyring-cmd authorize --key-dir server --keybundle-handle alice --pairing-grant shell,scp
+nk-crypto-tool --keyring-cmd revoke    --key-dir server --keybundle-handle alice
 ```
 
 貯めた束は、そのまま**暗号化の宛先**に使える（`--recipient-keybundle` + `--recipient-fingerprint`
