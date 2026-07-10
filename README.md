@@ -470,7 +470,13 @@ P2P トランスポート Iroh を使用した、PQC 認証付きの安全な通
 * **高度なオプション**:
     - `--no-relay`: リレーサーバーを無効化し、ダイレクト接続のみを許可。
     - `--relay-url <url>`: 特定のプライベートリレーを使用。
-    - `--discovery <none|local>`: 動的 peer discovery (既定 `none`)。`local` は mDNS で NodeId を LAN 上の現在のアドレスへ解決し、ticket に焼かれたアドレスが古くなっても (IP 変更後など) 自己修復する。非同期 inbox/prekey フローを `--no-relay` で運用する際に有用。プレゼンスは **LAN 内のみ**に広告され公開サービスには出ない ([SECURITY_PROFILE.md §5.2](./SECURITY_PROFILE.md) 参照)。
+    - `--discovery <none|n0>`: 動的 peer discovery (既定 `none`)。`none` は ticket 経由 / 同一 LAN でのみ到達可能で、アドレスをどこにも publish しない。`n0` は NodeId↔アドレスを n0 の公開 DNS/pkarr に publish し cross-NAT 疎通を可能にするが、第三者の観測点になる。`local` (mDNS) は iroh 1.0 では未対応。
+
+* **メタデータ最小化 (プライバシー)**: 内容は常に E2EE で守られるが、**接続メタデータ**(自分の IP・相手 NodeId・通信の時刻/量) は経路次第で第三者に見える。nkct は匿名化ネットワーク (Tor/mixnet) ではないので、経路を選ぶ:
+    - **既定は n0 の公開リレー経由** — メタデータが n0 のインフラに渡る。この経路を使うと起動時に `[nkct] privacy: …` 警告を表示する。
+    - `--no-relay` (直結/LAN のみ) でリレー観測点を排除、または `--relay-url <自前リレー>` で観測点を自分の管理下に移す。
+    - discovery は既定の `none` を維持し ticket を out-of-band で渡す (`n0` は観測点が増える)。
+    - IP レベルの匿名性が要る場合は nkct を WireGuard 等の自前オーバーレイ上で `--no-relay` 直結するなど、別レイヤに委ねる (nkct 単体では扱わない)。
 * **ピア許可リスト併用 (推奨)**:
     ```bash
     nk-crypto-tool ... --keyring-db <keyring.db>

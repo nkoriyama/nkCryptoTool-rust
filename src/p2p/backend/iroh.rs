@@ -315,6 +315,14 @@ impl IrohEndpoint {
                 Endpoint::builder(iroh::endpoint::presets::Minimal)
             }
             crate::config::DiscoveryMode::N0 => {
+                if !is_test {
+                    eprintln!(
+                        "[nkct] privacy: --discovery n0 publishes this node's address to \
+                         n0's public DNS/pkarr, a third-party observation point. Use \
+                         --discovery none (out-of-band ticket) if you don't need cross-NAT \
+                         discovery."
+                    );
+                }
                 Endpoint::builder(iroh::endpoint::presets::N0)
             }
             crate::config::DiscoveryMode::Local => {
@@ -357,6 +365,14 @@ impl IrohEndpoint {
             // Set the relay mode explicitly regardless of preset (`Minimal` sets
             // none; `N0` already sets this): the historical default is n0 public
             // relays when neither `--no-relay` nor `--relay-url` is given.
+            // Warn: this routes through a third party that can observe the
+            // connection metadata (not content). Only reached outside tests.
+            eprintln!(
+                "[nkct] privacy: routing through n0's public relay infrastructure. A third \
+                 party can observe your IP, the peer NodeId, and connection timing/volume \
+                 (content stays end-to-end encrypted). Avoid with --no-relay (direct/LAN \
+                 only) or --relay-url <your own relay>."
+            );
             builder = builder.relay_mode(iroh::endpoint::default_relay_mode());
         }
 
