@@ -1,0 +1,10 @@
+# Pin the exact toolchain so every builder emits identical machine code. The
+# reproducible release artifact is built in packaging/Containerfile.repro, whose
+# base image (rust:1.96.1-alpine, digest-pinned there) ships this same version;
+# keeping this file in sync means a host `rustup`-managed build and the container
+# build agree. Bump this and the Containerfile base image together.
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-musl"]
+profile = "minimal"

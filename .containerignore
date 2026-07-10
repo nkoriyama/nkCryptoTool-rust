@@ -1,0 +1,17 @@
+# Keep the reproducible build context small and host-independent: never ship the
+# builder's target dirs, VCS state, or editor cruft into the image.
+target/
+target-musl/
+target_rustcrypto/
+target_vendored/
+.git/
+.jj/
+docs/*.gif
+demos/.state/
+bench_keys/
+scratch/
+android/
+bindings/
+packaging/out/
+**/*.o
+**/*.rmeta

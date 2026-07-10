@@ -1,0 +1,42 @@
+# Reproducible build of the distributable nk-crypto-tool (static musl x86_64).
+#
+# Purpose (Chat-Control / client-side-scanning threat model): let anyone rebuild
+# the released binary from public source and byte-compare it, so an injected
+# on-device scanner in a vendor binary would show up as a hash mismatch. The
+# whole environment is pinned:
+#   - base image pinned BY DIGEST (rustc 1.96.1, host target x86_64-unknown-linux-musl)
+#   - Cargo.lock enforced with --locked
+#   - default features only (backend-rustcrypto = pure Rust; no openssl-src /
+#     sqlcipher C builds, no gui/mls)
+#   - fixed WORKDIR + CARGO_HOME so rustc embeds identical (then remapped) paths
+#     (see the [target.x86_64-unknown-linux-musl] section in .cargo/config.toml)
+#
+# Do not `latest`-pin. Bump the digest and rust-toolchain.toml together.
+FROM docker.io/library/rust@sha256:a41f7740f8b45d45795624eec13a8b42263cc700f19f7e4e86e04d3dda08a479
+
+# C toolchain for crates that compile native code on musl (quinn/rustls crypto
+# provider, etc.). apk versions are a residual reproducibility variable pinned
+# only as tightly as the base image's Alpine repo snapshot — documented in
+# REPRODUCIBLE_BUILD.md. build-base pulls a fixed set for this Alpine release.
+RUN apk add --no-cache build-base
+
+# Determinism knobs. SOURCE_DATE_EPOCH is honoured by any dep that timestamps;
+# Rust itself embeds no build time. CARGO_HOME is already /usr/local/cargo.
+ARG SOURCE_DATE_EPOCH=0
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    CARGO_INCREMENTAL=0 \
+    CARGO_HOME=/usr/local/cargo \
+    TZ=UTC \
+    LC_ALL=C
+
+WORKDIR /build
+COPY . .
+
+# --locked: refuse to build if Cargo.lock would change (deps are still fetched
+# from crates.io, whose published tarballs are immutable, so the lock fully
+# determines inputs). Not --frozen: that implies --offline and the fresh image
+# has no cached registry.
+RUN cargo build --release --locked \
+        --target x86_64-unknown-linux-musl \
+    && cp target/x86_64-unknown-linux-musl/release/nk-crypto-tool /nk-crypto-tool \
+    && sha256sum /nk-crypto-tool

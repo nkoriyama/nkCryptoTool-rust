@@ -23,3 +23,24 @@ rustflags = [
   "-C", "target-cpu=x86-64-v3",
   "-C", "target-feature=+aes,+pclmulqdq",
 ]
+
+# Reproducible, distributable Linux artifact (static musl). This is the target a
+# third party rebuilds to verify a released binary matches public source (no
+# injected client-side scanner). Everything here is host-independent:
+#   - target-cpu=x86-64-v2 (Nehalem+/Bulldozer+): a portable floor, NOT the build
+#     host's CPU — same reasoning as the Windows section. AES-NI + PCLMULQDQ are
+#     universal on x86-64-v2.
+#   - remap-path-prefix scrubs the two build-time absolute paths that rustc would
+#     otherwise embed (panic Location strings). The values below are the FIXED
+#     in-container paths (WORKDIR /build, CARGO_HOME /usr/local/cargo) that
+#     packaging/Containerfile.repro guarantees, so two container builds embed the
+#     identical remapped strings. (A host cross-build uses different paths and is
+#     simply not scrubbed — reproducibility is claimed only for the container.)
+# Build via packaging/reproducible-build.sh; do NOT rely on host RUSTFLAGS.
+[target.x86_64-unknown-linux-musl]
+rustflags = [
+  "-C", "target-cpu=x86-64-v2",
+  "-C", "target-feature=+aes,+pclmulqdq",
+  "--remap-path-prefix=/build=nkct",
+  "--remap-path-prefix=/usr/local/cargo=cargo",
+]
