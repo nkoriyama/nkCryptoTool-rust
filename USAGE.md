@@ -303,6 +303,51 @@ pin する公開鍵の指紋は `--fingerprint --signing-pubkey <pub>` で確認
 
 ---
 
+## メタデータをさらに絞る運用パターン（自前オーバーレイ）
+
+内容は常に E2EE（PQC）で守られる。残るのは**接続メタデータ**——自分の IP・相手 NodeId・
+通信の時刻/量。既定では iroh の n0 公開リレー経由になり、この第三者にメタデータが渡る
+（起動時に `[nkct] privacy: …` 警告が出る）。これを**自分の管理下だけに閉じる**運用が
+自前オーバーレイ + `--no-relay` の組み合わせ。
+
+**構成**: 自分で運営する暗号ネットワーク（WireGuard 等）を一枚下に敷き、その内側で nkct を
+直結させる。
+
+```bash
+# 例: WireGuard で拠点間トンネルを張り、その内側(10.0.0.0/24 等)で nkct を --no-relay 直結。
+# サーバ側（オーバーレイ内アドレスで待ち受け）
+nk-crypto-tool --serve-scp --no-relay --mode pqc \
+    --signing-privkey server/private_sign_pqc.key \
+    --keyring-db server/keyring.db --scp-policy scp.policy
+#   → ticket を out-of-band で渡す（discovery は既定の none のまま）
+
+# クライアント側（オーバーレイ経由で接続）
+nk-crypto-tool --scp-get remote/file.enc local/file.enc --no-relay --mode pqc \
+    --connect <ticket> --signing-privkey client/private_sign_pqc.key --key-dir client
+```
+
+**これで実現できること**
+- **第三者観測点の排除**: n0 の公開リレー / discovery を使わない（`--no-relay` + `--discovery none`）。
+  「誰が誰と通信したか」を外部インフラに渡さない。
+- **実 IP の露出範囲を限定**: nkct から見える相手はオーバーレイ内の仮想 IP。実 IP は
+  オーバーレイの参加者＋運営者（＝自分）に閉じる。
+- **二重暗号**: オーバーレイ層 ＋ nkct の E2EE。
+- 受動的なネットワーク観測から通信グラフを把握しにくくする。
+
+**これは「匿名化」ではない（境界）**
+- オーバーレイの入口 IP は自 ISP・経路上・接続先から見える（実 IP を消すのではなく、
+  見せる先を替える）。
+- 通信相手はあなたを一意に識別できる（P2P 直結の性質）。
+- オーバーレイ運営者（自分）はメタデータを見られる（「第三者に渡さない」であって
+  「誰にも見えない」ではない）。「自前」が信頼境界の要。
+- トラフィック相関や「誰と通信しているか」の秘匿には mixnet 系が必要で、nkct のスコープ外。
+
+**要点**: 自前オーバーレイは *匿名性* ではなく **メタデータの信頼境界を自分の手元に引き戻す**
+手段。Tor は TCP のみで iroh（QUIC/UDP）とはそのまま組めないため、UDP を通す WireGuard/
+Nebula/Yggdrasil 等が適合する。
+
+---
+
 ## 動くデモ
 
 `demos/` に各ユースケースのワンショット・デモ（vhs 収録）がある:
