@@ -96,8 +96,6 @@ uniffi = { version = "0.31", optional = true, features = ["cli", "tokio"] }
 # RustCrypto ecosystem
 aes-gcm = { version = "0.10", optional = true, features = ["zeroize"] }
 p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pem", "pkcs8"], optional = true }
-ecdsa = { version = "0.16", optional = true }
-signature = { version = "2.2", optional = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
 
 # Pure-Rust classical primitives for the OpenSSL-free MLS cipher suite
@@ -159,8 +157,6 @@ backend-openssl-vendored = ["backend-openssl", "openssl/vendored", "openssl-src"
 backend-rustcrypto = [
     "aes-gcm",
     "p256",
-    "ecdsa",
-    "signature",
 ]
 
 # MLS group chat (P1: non-PQC base passthrough). P1.5 adds PQC adapter.
