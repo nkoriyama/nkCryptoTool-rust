@@ -142,7 +142,10 @@ impl MobileChatClient {
         let storage = open_at_rest_storage(&paths, &zeroize::Zeroizing::new(passphrase))
             .map_err(FfiError::chat)?;
 
-        let proc = GroupChatProcessor::new(&display_name, endpoint, storage)
+        // No NKCB transport-key binding on mobile yet: the FFI constructor
+        // exposes no ML-DSA signing-key path, so peers see this node as
+        // unbound (same as the CLI without --mls-signing-key).
+        let proc = GroupChatProcessor::new(&display_name, endpoint, storage, None)
             .map_err(FfiError::chat)?;
         Ok(Arc::new(Self { inner: tokio::sync::Mutex::new(proc) }))
     }
