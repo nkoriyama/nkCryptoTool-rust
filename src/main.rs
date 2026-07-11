@@ -96,10 +96,11 @@ struct Args {
     #[arg(long)]
     signature: Option<String>,
 
-    /// Run as a P2P listener (chat / file-transfer server) and print a ticket;
-    /// pair with a client's `--connect <ticket>`. Combine with `--chat` for chat.
-    #[arg(long)]
-    listen: bool,
+    /// Run a P2P chat / file-transfer server and print a ticket; pair with a
+    /// client's `--connect <ticket>`. Combine with `--chat` for chat.
+    /// `--listen` is accepted as a deprecated alias.
+    #[arg(long, alias = "listen")]
+    serve_chat: bool,
 
     #[arg(long)]
     connect: Option<String>,
@@ -644,7 +645,7 @@ async fn main() -> anyhow::Result<()> {
         Operation::Listen
     } else if args.serve_pairing {
         Operation::Listen
-    } else if args.listen {
+    } else if args.serve_chat {
         Operation::Listen
     } else if args.connect.is_some() {
         Operation::Connect
