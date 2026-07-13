@@ -427,28 +427,9 @@ fn absolutize(p: &Path) -> PathBuf {
     }
 }
 
-#[cfg(unix)]
 fn write_file_0600(path: &Path, data: &[u8]) -> Result<(), GroupError> {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| GroupError::Storage(format!("create {path:?}: {e}")))?;
-    f.write_all(data)
-        .and_then(|()| f.sync_all())
-        .map_err(|e| GroupError::Storage(format!("write {path:?}: {e}")))
-}
-
-#[cfg(not(unix))]
-fn write_file_0600(path: &Path, data: &[u8]) -> Result<(), GroupError> {
-    use std::io::Write as _;
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+    let mut f = crate::secure_fs::create_owner_only(path, false)
         .map_err(|e| GroupError::Storage(format!("create {path:?}: {e}")))?;
     f.write_all(data)
         .and_then(|()| f.sync_all())

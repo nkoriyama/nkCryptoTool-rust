@@ -90,22 +90,11 @@ fn load_or_create_node_secret(path: &Path) -> Result<SecretKey> {
 
 /// Write `bytes` to `path`, creating it exclusively (`O_EXCL`) so we never
 /// follow a symlink an attacker raced into place between the existence check
-/// and here, and never clobber a file that appeared concurrently. On unix
-/// the file is opened mode 0600 so it is never group/other-readable; other
-/// platforms fall back to an exclusive create (perms inherited from the
-/// parent dir, matching how the rest of the at-rest key files are handled).
+/// and here, and never clobber a file that appeared concurrently. Owner-only
+/// on unix (0600) and windows (owner-only DACL) alike — see
+/// [`crate::secure_fs`].
 fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let mut f = opts.open(path)?;
-    f.write_all(bytes)?;
-    f.flush()
+    crate::secure_fs::write_owner_only_new(path, bytes)
 }
 
 // ---------------------------------------------------------------------------

@@ -479,20 +479,12 @@ impl FileIOProvider {
             Some(dir) if !dir.as_os_str().is_empty() => dir.join(temp_name),
             _ => std::path::PathBuf::from(temp_name),
         };
-        // Create the staging file exclusively (create_new) and, on unix, with
-        // O_NOFOLLOW + mode 0600, so a pre-planted symlink/file at the temp path
-        // cannot redirect the write to or truncate another file. Mirrors the
-        // hardened temp creation in the local-file decrypt path (processor.rs).
-        let std_file = {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-            }
-            opts.open(&temp)?
-        };
+        // Create the staging file exclusively, owner-only, never following a
+        // pre-planted link at the temp path (unix: 0600 + O_NOFOLLOW; windows:
+        // owner-only DACL + reparse refusal), so it cannot redirect the write
+        // to or truncate another file. Mirrors the hardened temp creation in
+        // the local-file decrypt path (processor.rs).
+        let std_file = crate::secure_fs::create_owner_only(&temp, false)?;
         let file = tokio::fs::File::from_std(std_file);
         Ok(Self {
             send_file: parking_lot::Mutex::new(None),

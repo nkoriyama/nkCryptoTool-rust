@@ -31,6 +31,7 @@ pub mod forward;
 pub mod keyring;
 pub mod pairing;
 pub mod scp;
+pub mod secure_fs;
 pub mod shell;
 pub mod strategy;
 pub mod ticket;

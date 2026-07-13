@@ -25,19 +25,10 @@ pub type ProgressCallback = Arc<dyn Fn(f64) + Send + Sync>;
 const BUF_SIZE: usize = 1024 * 1024;
 
 /// Open an output file for exclusive creation with owner-only permissions and
-/// symlink protection. unix: 0600 + `O_NOFOLLOW`; on Windows those flags do not
-/// exist, so it falls back to a plain exclusive create — the output directory's
-/// ACLs provide owner access, but the symlink-swap TOCTOU guard is weaker there
-/// (documented limitation).
+/// symlink protection (unix: 0600 + `O_NOFOLLOW`; windows: owner-only DACL +
+/// reparse-point refusal — see [`crate::secure_fs`]).
 fn open_secure_create<P: AsRef<Path>>(path: P) -> std::io::Result<std::fs::File> {
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    o.open(path)
+    crate::secure_fs::create_owner_only(path.as_ref(), false)
 }
 
 pub struct CryptoProcessor {

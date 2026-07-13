@@ -1977,30 +1977,11 @@ async fn run_prekey_recv(
 /// overwrite path, where `mode()` (create-only) would not apply.
 #[cfg(feature = "mls")]
 fn write_plaintext_private(path: &str, bytes: &[u8]) -> anyhow::Result<()> {
-    use std::io::Write;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_NOFOLLOW: fail (ELOOP) instead of following a symlink planted at
-        // the target — atomic, no TOCTOU. mode() seeds 0600 on creation.
-        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    let mut f = opts
-        .open(path)
-        .map_err(|e| anyhow::anyhow!("open output {path}: {e}"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Cover the overwrite-existing-regular-file case: mode() above only
-        // applies when the file is newly created, so re-lock to 0600 here.
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| anyhow::anyhow!("set perms {path}: {e}"))?;
-    }
-    f.write_all(bytes).map_err(|e| anyhow::anyhow!("write {path}: {e}"))?;
-    f.flush().map_err(|e| anyhow::anyhow!("flush {path}: {e}"))?;
-    Ok(())
+    // Owner-only + never-follow-a-link, on unix (0600 + O_NOFOLLOW) and
+    // windows (owner-only DACL + reparse-point refusal) alike; overwriting an
+    // existing regular file re-locks its permissions.
+    nk_crypto_tool::secure_fs::write_owner_only_replace(std::path::Path::new(path), bytes)
+        .map_err(|e| anyhow::anyhow!("write output {path}: {e}"))
 }
 
 /// `seal`: sender side. Verify a recipient bundle (optionally pinning its

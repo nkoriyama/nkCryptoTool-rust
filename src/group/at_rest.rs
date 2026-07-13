@@ -1078,16 +1078,7 @@ fn write_atomic_secret(path: &Path, data: &[u8]) -> Result<(), GroupError> {
         None => PathBuf::from(tmp_name),
     };
 
-    let mut opts = fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-
-    let mut file = opts
-        .open(&tmp)
+    let mut file = crate::secure_fs::create_owner_only(&tmp, false)
         .map_err(|e| GroupError::Storage(format!("create temp {tmp:?}: {e}")))?;
 
     // Best-effort cleanup of the temp file if the write or rename fails,

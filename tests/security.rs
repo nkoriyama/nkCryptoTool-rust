@@ -1,6 +1,7 @@
 use nk_crypto_tool::strategy::CryptoStrategy;
 use nk_crypto_tool::utils::{secure_erase_file, secure_write, SecureBuffer};
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -124,9 +125,13 @@ async fn test_secure_write_atomic_force() {
     secure_write(&path, content2, true).expect("Force write failed");
     assert_eq!(fs::read(&path).unwrap(), content2);
 
-    // 4. Verify permissions
-    let metadata = fs::metadata(&path).unwrap();
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    // 4. Verify permissions (unix mode bits; the windows owner-only DACL
+    // equivalent is covered by secure_fs's native windows tests).
+    #[cfg(unix)]
+    {
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
 
     let _ = fs::remove_dir_all(test_dir);
 }

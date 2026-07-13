@@ -134,8 +134,10 @@ jobs:
   # build is release-blocking (the whole crate — incl. the crypto path and the
   # portable-pty/ConPTY shell — is verified to compile for windows). clippy and
   # test are advisory (continue-on-error) while windows is new: some tests still
-  # assume unix (paths / permissions), and the windows security-hardening
-  # degradations (O_NOFOLLOW / core-dump) are documented, not yet windows-native.
+  # assume unix (paths / permissions). The file-security hardening (owner-only
+  # DACL + reparse refusal, src/secure_fs.rs) IS windows-native now and its
+  # tests run as a release-blocking step below; the remaining documented
+  # degradation is core-dump suppression (OS/WER-level, out of process scope).
   #
   # macOS remains deferred (ring 0.17 aarch64-darwin build issue is separate).
   test-windows:
@@ -172,6 +174,13 @@ jobs:
       - name: cargo test (advisory — some tests still assume unix)
         continue-on-error: true  # F4-X13 explicit allowance
         run: cargo test --no-default-features --features "testing backend-rustcrypto"
+
+      # The windows file-security hardening (owner-only DACL + reparse-point
+      # refusal in src/secure_fs.rs) is release-blocking: these tests exercise
+      # the real NTFS ACL / symlink semantics that Wine cannot emulate, so this
+      # native-runner step is the only place they are actually verified.
+      - name: cargo test secure_fs (release-blocking — native windows ACL/reparse semantics)
+        run: cargo test --no-default-features --features backend-rustcrypto secure_fs -- --nocapture
 
   # Optional: cargo audit for security advisories (F4-O2 推奨).
   # Non-blocking — security advisories are reviewed but do not fail the

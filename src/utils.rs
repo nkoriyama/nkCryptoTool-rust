@@ -106,28 +106,41 @@ pub fn secure_write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C, force:
         }
     }
 
-    use tempfile::NamedTempFile;
-    let mut tmp = NamedTempFile::new_in(dir)
-        .map_err(|e| CryptoError::FileWrite(format!("Failed to create temporary file: {}", e)))?;
-
-    // F-48-2: owner-only (0600) permissions on the temp file via its fd (fchmod
-    // equivalent). Windows has no unix mode bits; there the temp directory's ACLs
-    // provide owner-only access (documented weaker guarantee).
-    #[cfg(unix)]
+    // F-48-2: create the staging file with owner-only permissions applied
+    // *atomically at creation* (unix: O_EXCL + 0600; windows: owner-only DACL
+    // via SECURITY_ATTRIBUTES, opened with no sharing) — there is no instant in
+    // which another local user could open it. (A `NamedTempFile` would be
+    // created under the directory's default ACL on windows and hardened only
+    // after the fact — a watch-and-open race.) The 128-bit random suffix makes
+    // the name unguessable and collision-free against stale temps from a
+    // crashed run.
+    let base = path_ref
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("secure");
+    let mut rand_suffix = [0u8; 16];
     {
-        use std::os::unix::fs::PermissionsExt;
-        tmp.as_file()
-            .set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| CryptoError::FileWrite(format!("Failed to set temp file permissions: {}", e)))?;
+        use rand_core::RngCore;
+        rand_core::OsRng.fill_bytes(&mut rand_suffix);
     }
-
-    use std::io::Write;
-    tmp.as_file_mut()
-        .write_all(contents.as_ref())
-        .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
-    tmp.as_file_mut()
-        .sync_all()
-        .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+    let tmp_path = dir.join(format!(".{base}.{}.tmp", hex::encode(rand_suffix)));
+    // TempPath deletes the staging file on drop, so every early-return below
+    // (write failure, persist failure) cleans up after itself.
+    let tmp = tempfile::TempPath::try_from_path(&tmp_path)
+        .map_err(|e| CryptoError::FileWrite(format!("Failed to stage temporary path: {}", e)))?;
+    {
+        let mut tmp_file = crate::secure_fs::create_owner_only(&tmp_path, false)
+            .map_err(|e| CryptoError::FileWrite(format!("Failed to create temporary file: {}", e)))?;
+        use std::io::Write;
+        tmp_file
+            .write_all(contents.as_ref())
+            .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+        tmp_file
+            .sync_all()
+            .map_err(|e| CryptoError::FileWrite(e.to_string()))?;
+        // The handle closes here — on windows it was opened with no sharing,
+        // which would otherwise block the rename below.
+    }
 
     // F-48-1 Note: O_NOFOLLOW is not explicitly needed here because:
     // 1. NamedTempFile uses a random name with O_EXCL, preventing pre-existing symlink attacks.
