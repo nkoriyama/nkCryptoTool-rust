@@ -176,11 +176,13 @@ jobs:
         run: cargo test --no-default-features --features "testing backend-rustcrypto"
 
       # The windows file-security hardening (owner-only DACL + reparse-point
-      # refusal in src/secure_fs.rs) is release-blocking: these tests exercise
-      # the real NTFS ACL / symlink semantics that Wine cannot emulate, so this
-      # native-runner step is the only place they are actually verified.
-      - name: cargo test secure_fs (release-blocking — native windows ACL/reparse semantics)
-        run: cargo test --no-default-features --features backend-rustcrypto secure_fs -- --nocapture
+      # refusal in src/secure_fs.rs, and the scp confinement real-path re-check
+      # via GetFinalPathNameByHandleW) is release-blocking: these tests exercise
+      # the real NTFS ACL / symlink / junction semantics that Wine cannot
+      # emulate, so this native-runner step is the only place they are actually
+      # verified. The two trailing args are OR'd libtest name filters.
+      - name: cargo test hardening (release-blocking — native windows ACL/reparse/junction semantics)
+        run: cargo test --no-default-features --features backend-rustcrypto -- --nocapture secure_fs windows_confine
 
   # Optional: cargo audit for security advisories (F4-O2 推奨).
   # Non-blocking — security advisories are reviewed but do not fail the
