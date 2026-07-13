@@ -122,6 +122,17 @@ pub trait CryptoStrategy: Send + Sync {
     /// no-op: strategies that do not perform P-256 ECDH ignore it.
     fn set_recipient_hybrid_key(&mut self, _p256_spki_der: Vec<u8>) {}
 
+    /// Inject the user's own private key as its passphrase-encrypted PKCS#8
+    /// **PEM text** (keyring my-identities auto-match). When set,
+    /// `prepare_decryption` uses it directly and skips reading the
+    /// `user-privkey` file. For PQC this is the ML-KEM key, for pure ECC the
+    /// P-256 key, for Hybrid the ML-KEM half. Default no-op.
+    fn set_user_enc_privkey_pem(&mut self, _pem: Zeroizing<String>) {}
+
+    /// Hybrid only: inject the P-256 ECDH half of the user's key pair, same
+    /// form as [`CryptoStrategy::set_user_enc_privkey_pem`]. Default no-op.
+    fn set_user_hybrid_privkey_pem(&mut self, _pem: Zeroizing<String>) {}
+
     /// Returns the SHA-256(header_bytes)[..16] file session ID. Available
     /// only after `prepare_encryption` or after `deserialize_header` has
     /// consumed a v3 header.
