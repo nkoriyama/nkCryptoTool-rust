@@ -22,19 +22,22 @@
 //! policy is parsed and audited but **not enforced** (no per-request privilege
 //! drop yet), so `--serve-scp` refuses to run as root and every file operation
 //! runs as the server's own user, confined to the policy's read/write roots.
-//! Directory recursion (`-r`) is a documented follow-up.
+//! Directory recursion (`-r`) is implemented: serial tree put/get with
+//! per-entry confinement (see `walk_tree` / `safe_join`).
 //!
 //! ## Path-confinement hardening by platform
 //!
-//! Every open pairs `O_NOFOLLOW` (final component) with an **after-open fd
-//! real-path re-check** against the policy roots ([`recheck_fd_confined`]),
-//! which closes the intermediate-directory symlink race a check-time
-//! `canonicalize` cannot. That re-check is available on **Linux**
-//! (`/proc/self/fd`) and **macOS** (`fcntl(F_GETPATH)`). On any other Unix the
-//! re-check **fails closed** — the operation is refused rather than served
-//! unconfined (porting FreeBSD `O_RESOLVE_BENEATH` would re-enable it). On
-//! non-Unix (Windows) the fd re-check does not run; that hardening is tracked
-//! separately.
+//! Every open pairs a no-follow final component (`O_NOFOLLOW` on unix; a
+//! reparse-point refusal on windows) with an **after-open real-path re-check**
+//! against the policy roots ([`recheck_fd_confined`] /
+//! [`recheck_handle_confined`]), which closes the intermediate-directory link
+//! race a check-time `canonicalize` cannot. That re-check is available on
+//! **Linux** (`/proc/self/fd`), **macOS** (`fcntl(F_GETPATH)`) and **windows**
+//! (`GetFinalPathNameByHandleW`). On any other Unix the re-check **fails
+//! closed** — the operation is refused rather than served unconfined (porting
+//! FreeBSD `O_RESOLVE_BENEATH` would re-enable it). Wire `mode` bits are unix
+//! permissions; windows does not map them (staged files keep their owner-only
+//! DACL, directories inherit the parent ACL).
 
 use crate::error::{CryptoError, Result};
 use crate::shell::{
@@ -400,12 +403,67 @@ fn fd_real_path(fd: std::os::fd::RawFd) -> Option<PathBuf> {
     Some(PathBuf::from(std::ffi::OsString::from_vec(buf)))
 }
 
+/// Windows analog of [`fd_real_path`]: the kernel's fully-resolved path of an
+/// open handle via `GetFinalPathNameByHandleW` (`FILE_NAME_NORMALIZED` +
+/// `VOLUME_NAME_DOS`, i.e. `\\?\C:\...`). `CreateFileW` silently follows
+/// junctions/symlinks in *intermediate* components even when the final
+/// component is opened with `FILE_FLAG_OPEN_REPARSE_POINT`, so this post-open
+/// re-check plays exactly the role `/proc/self/fd` does on Linux. The policy
+/// roots are canonicalized at load time, which yields the same `\\?\`-prefixed,
+/// true-case form, so `under_any`'s component-wise `starts_with` compares like
+/// with like.
+#[cfg(windows)]
+fn handle_real_path(handle: std::os::windows::io::RawHandle) -> Option<PathBuf> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+    let mut buf = vec![0u16; 512];
+    loop {
+        // Returns the LENGTH written (excl. NUL) on success, or the REQUIRED
+        // buffer size (incl. NUL) when the buffer is too small.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                handle as _,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        };
+        if n == 0 {
+            return None;
+        }
+        if (n as usize) < buf.len() {
+            buf.truncate(n as usize);
+            use std::os::windows::ffi::OsStringExt;
+            return Some(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
+        }
+        buf.resize(n as usize + 1, 0);
+    }
+}
+
+/// Windows twin of [`recheck_fd_confined`]: re-verify that an open handle
+/// actually landed under one of `roots` (closing the intermediate
+/// junction/symlink race that a check-time `canonicalize` plus a no-follow
+/// final component cannot).
+#[cfg(windows)]
+fn recheck_handle_confined(
+    handle: std::os::windows::io::RawHandle,
+    roots: &[PathBuf],
+) -> std::result::Result<(), String> {
+    match handle_real_path(handle) {
+        Some(p) if under_any(&p, roots) => Ok(()),
+        Some(_) => Err("path escaped root after open (intermediate-link race)".into()),
+        None => Err("could not verify the opened path against a policy root".into()),
+    }
+}
+
 /// Re-verify, after opening `fd` with `O_NOFOLLOW`, that the kernel actually
 /// landed on an inode under one of `roots` — closing the intermediate-directory
 /// symlink race that `O_NOFOLLOW` (final component only) plus a check-time
 /// `canonicalize` cannot.
 ///
-/// On Linux and macOS this consults [`fd_real_path`]. On any other Unix
+/// On Linux and macOS this consults [`fd_real_path`]; on windows,
+/// [`recheck_handle_confined`] is the handle-based twin. On any other Unix
 /// (FreeBSD and friends) there is no equivalent fd→realpath primitive here, so
 /// we **fail closed**: rather than silently skip the re-check and serve an
 /// operation we cannot confine, we refuse it. Serving scp on those platforms
@@ -482,7 +540,7 @@ fn confine_mkdir(req: &str, roots: &[PathBuf]) -> std::result::Result<PathBuf, S
 
 /// Open a confined source file for a `get`: `O_NOFOLLOW` on the final component
 /// plus the fd real-path re-check against `roots` (closing the intermediate-
-/// directory symlink race; Linux/macOS, fail-closed on other Unix — see
+/// directory link race; Linux/macOS/windows, fail-closed on other Unix — see
 /// [`recheck_fd_confined`]). Returns `(file, mode, size)`; `mode`
 /// comes from the open fd, not a second path lookup. Errors carry a reason for
 /// the audit log — the wire reply is uniformized to "denied" by the caller.
@@ -494,11 +552,30 @@ fn open_confined_read(src: &Path, roots: &[PathBuf]) -> std::result::Result<(std
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // O_NOFOLLOW analog: open a final-component link as the link entity
+        // (rejected right below) instead of following it.
+        opts.custom_flags(
+            windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+        );
+    }
     let file = opts.open(src).map_err(|e| format!("open {}: {e}", src.display()))?;
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
         recheck_fd_confined(file.as_raw_fd(), roots)?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use std::os::windows::io::AsRawHandle;
+        let attrs = file.metadata().map_err(|e| e.to_string())?.file_attributes();
+        if attrs & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!("{} is a reparse point (symlink/junction)", src.display()));
+        }
+        recheck_handle_confined(file.as_raw_handle(), roots)?;
     }
     let meta = file.metadata().map_err(|e| e.to_string())?;
     if !meta.is_file() {
@@ -562,14 +639,11 @@ impl Staged {
             Some(dir) if !dir.as_os_str().is_empty() => dir.join(temp_name),
             _ => PathBuf::from(temp_name),
         };
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let std_file = opts.open(&temp)?;
+        // Exclusive create, owner-only from birth on unix (0600) and windows
+        // (owner-only DACL via SECURITY_ATTRIBUTES) alike, link refusal
+        // included — see `crate::secure_fs`. Partial transfer bytes are never
+        // readable by other local users while staged.
+        let std_file = crate::secure_fs::create_owner_only(&temp, false)?;
         Ok(Self {
             temp,
             final_path,
@@ -581,19 +655,27 @@ impl Staged {
         self.file.as_mut().expect("staged file open").write_all(buf).await
     }
 
-    /// Re-verify the staging fd actually landed under a write root — a post-create
-    /// confinement check against an intermediate-symlink swap between confine and
-    /// open. Real check on Linux/macOS, fail-closed on other Unix (see
-    /// [`recheck_fd_confined`]).
-    #[cfg(unix)]
+    /// Re-verify the staging fd/handle actually landed under a write root — a
+    /// post-create confinement check against an intermediate-link swap between
+    /// confine and open. Real check on Linux/macOS/windows, fail-closed on
+    /// other Unix (see [`recheck_fd_confined`]).
     fn recheck_confined(&self, roots: &[PathBuf]) -> std::result::Result<(), String> {
-        use std::os::fd::AsRawFd;
-        let fd = self
-            .file
-            .as_ref()
-            .ok_or("staging file already closed")?
-            .as_raw_fd();
-        recheck_fd_confined(fd, roots)
+        let f = self.file.as_ref().ok_or("staging file already closed")?;
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            recheck_fd_confined(f.as_raw_fd(), roots)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            recheck_handle_confined(f.as_raw_handle(), roots)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (f, roots);
+            Err("scp path confinement is not implemented on this platform".into())
+        }
     }
 
     /// fsync, apply `mode`, then atomically rename onto the final path. Consumes
@@ -607,6 +689,11 @@ impl Staged {
     /// sticky are stripped** — an uploaded (server) or downloaded (client) file
     /// can never carry a privilege-escalation bit chosen by the peer.
     async fn commit(mut self, mode: u32) -> std::io::Result<()> {
+        // The wire `mode` is unix permission bits; on windows the staged file
+        // keeps the owner-only DACL it was created with (there is no
+        // meaningful mapping, and inheriting looser ACLs would be a downgrade).
+        #[cfg(not(unix))]
+        let _ = mode;
         if let Some(f) = self.file.as_mut() {
             f.flush().await?;
             f.sync_all().await?;
@@ -620,6 +707,12 @@ impl Staged {
         // Close the handle before the rename (Windows requires it); on unix the
         // fchmod above already landed on this same inode.
         let _ = self.file.take();
+        // The rename is path-based, but temp and final share the SAME parent
+        // directory: an attacker swapping an intermediate directory for a link
+        // here redirects source and destination alike, so the temp is simply
+        // not found (ENOENT) — the content is never published elsewhere. A
+        // swap of the root's own ancestry is outside the threat model (roots
+        // are server-user-owned, untrusted writers excluded by policy doc).
         std::fs::rename(&self.temp, &self.final_path)
     }
 }
@@ -1103,6 +1196,10 @@ where
         match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
             // ---- put: create a directory ----
             Some(ScpFrame::MkDir { file_id, path, mode }) => {
+                // unix permission bits; on windows the created directory keeps
+                // the parent-inherited ACL (no meaningful mapping).
+                #[cfg(not(unix))]
+                let _ = mode;
                 let made = match confine_mkdir(&path, policy.roots(&peer_fp, true)) {
                     Ok(dir) => {
                         let created = match tokio::fs::create_dir(&dir).await {
@@ -1120,7 +1217,7 @@ where
                         // path-based set_permissions that a symlink swap could
                         // redirect. Open with O_NOFOLLOW|O_DIRECTORY and re-check the
                         // fd's real path is under a write root (closes the
-                        // confine→create intermediate-symlink race, Linux).
+                        // confine→create intermediate-link race, Linux/macOS/windows).
                         let mut o = std::fs::OpenOptions::new();
                         o.read(true);
                         #[cfg(unix)]
@@ -1128,20 +1225,45 @@ where
                             use std::os::unix::fs::OpenOptionsExt;
                             o.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
                         }
+                        #[cfg(windows)]
+                        {
+                            use std::os::windows::fs::OpenOptionsExt;
+                            // BACKUP_SEMANTICS is required to open a directory
+                            // handle; OPEN_REPARSE_POINT opens a planted
+                            // junction as the link entity (rejected below).
+                            o.custom_flags(
+                                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS
+                                    | windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+                            );
+                        }
                         let ok = match o.open(&dir) {
                             Ok(dfd) => {
-                                // Re-check the opened directory fd is under a write
-                                // root (Linux/macOS; fail-closed on other Unix). On
-                                // non-unix there is no fd re-check — preserve the
-                                // prior behaviour (Windows hardening is tracked
-                                // separately) by treating the open as sufficient.
+                                // Re-check the opened directory handle is under a
+                                // write root (Linux/macOS/windows; fail-closed on
+                                // other platforms).
                                 #[cfg(unix)]
                                 let under = {
                                     use std::os::fd::AsRawFd;
                                     recheck_fd_confined(dfd.as_raw_fd(), policy.roots(&peer_fp, true)).is_ok()
                                 };
-                                #[cfg(not(unix))]
-                                let under = true;
+                                #[cfg(windows)]
+                                let under = {
+                                    use std::os::windows::fs::MetadataExt;
+                                    use std::os::windows::io::AsRawHandle;
+                                    let not_reparse = dfd.metadata().is_ok_and(|m| {
+                                        m.file_attributes()
+                                            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                                            == 0
+                                    });
+                                    not_reparse
+                                        && recheck_handle_confined(
+                                            dfd.as_raw_handle(),
+                                            policy.roots(&peer_fp, true),
+                                        )
+                                        .is_ok()
+                                };
+                                #[cfg(not(any(unix, windows)))]
+                                let under = false;
                                 if under {
                                     #[cfg(unix)]
                                     {
@@ -1189,11 +1311,11 @@ where
                     Ok(d) => Staged::create(d.clone()).ok(),
                     Err(_) => None,
                 };
-                // Post-create confinement re-check: if the staging fd did not land
-                // under a write root (intermediate-symlink swap between confine and
-                // open), or the platform cannot verify it, discard — we still
-                // consume the body below to keep the stream in sync, then Fail.
-                #[cfg(unix)]
+                // Post-create confinement re-check: if the staging fd/handle did
+                // not land under a write root (intermediate-link swap between
+                // confine and open), or the platform cannot verify it, discard —
+                // we still consume the body below to keep the stream in sync,
+                // then Fail.
                 if let Some(s) = &staged {
                     if s.recheck_confined(policy.roots(&peer_fp, true)).is_err() {
                         staged = None;
@@ -1506,6 +1628,93 @@ mod tests {
             recheck_fd_confined(g.as_raw_fd(), &roots).is_ok(),
             "recheck must accept an in-root fd",
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Create an NTFS directory junction (`mklink /J`) — needs no privilege,
+    /// unlike a file symlink, so it runs on any windows box.
+    #[cfg(windows)]
+    fn make_junction(link: &Path, target: &Path) {
+        let st = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .expect("spawn cmd mklink");
+        assert!(st.success(), "mklink /J failed");
+    }
+
+    /// Windows twin of `fd_real_path_reveals_intermediate_symlink_escape`: an
+    /// *intermediate* junction inside the root pointing outside it is followed
+    /// silently by CreateFileW, but `GetFinalPathNameByHandleW` reveals the
+    /// escape and `recheck_handle_confined` must reject it — while accepting a
+    /// genuinely in-root handle. `open_confined_read` wires both together and
+    /// must deny end-to-end.
+    #[cfg(windows)]
+    #[test]
+    fn windows_confine_handle_reveals_junction_escape() {
+        use std::os::windows::io::AsRawHandle;
+        let dir = std::env::temp_dir().join(format!("nkct-scp-wj-{:x}", std::process::id()));
+        let root = dir.join("root");
+        let secret = dir.join("secret");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("data"), b"x").unwrap();
+        std::fs::write(root.join("real"), b"y").unwrap();
+        make_junction(&root.join("link"), &secret);
+        let roots = vec![std::fs::canonicalize(&root).unwrap()];
+
+        // Final component ("data") is a real file, so the open succeeds even
+        // though it traversed the junction — the post-open re-check must catch it.
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .open(root.join("link").join("data"))
+            .unwrap();
+        let real = handle_real_path(f.as_raw_handle()).unwrap();
+        assert!(!under_any(&real, &roots), "escaped path {real:?} must be rejected");
+        assert!(
+            recheck_handle_confined(f.as_raw_handle(), &roots).is_err(),
+            "recheck must reject the escaped handle",
+        );
+        assert!(
+            open_confined_read(&root.join("link").join("data"), &roots).is_err(),
+            "open_confined_read must deny a junction escape",
+        );
+
+        // A genuinely-confined open re-checks Ok end-to-end.
+        let g = std::fs::OpenOptions::new().read(true).open(root.join("real")).unwrap();
+        assert!(recheck_handle_confined(g.as_raw_handle(), &roots).is_ok());
+        assert!(open_confined_read(&root.join("real"), &roots).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Windows: a staging file created under an intermediate junction that
+    /// escapes the write root must be caught by `Staged::recheck_confined`.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_confine_staged_rejects_junction_parent() {
+        let dir = std::env::temp_dir().join(format!("nkct-scp-wsj-{:x}", std::process::id()));
+        let root = dir.join("root");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        make_junction(&root.join("jdir"), &outside);
+        let roots = vec![std::fs::canonicalize(&root).unwrap()];
+
+        // Staged under the junction: physically lands outside the root.
+        let s = Staged::create(root.join("jdir").join("up.bin")).unwrap();
+        assert!(
+            s.recheck_confined(&roots).is_err(),
+            "staging under an escaping junction must be rejected",
+        );
+        drop(s);
+
+        // Staged directly under the root passes.
+        let ok = Staged::create(root.join("up.bin")).unwrap();
+        assert!(ok.recheck_confined(&roots).is_ok());
+        drop(ok);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
