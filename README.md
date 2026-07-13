@@ -458,7 +458,7 @@ P2P トランスポート Iroh を使用した、PQC 認証付きの安全な通
 
 * **チャット (サーバ)**:
     ```bash
-    nk-crypto-tool --mode pqc --listen --chat \
+    nk-crypto-tool --mode pqc --serve-chat --chat \
         --signing-privkey <priv.key> --signing-pubkey <peer_pub.key>
     ```
     表示された `nkct1...` Ticket を対向に共有してください。
@@ -765,7 +765,7 @@ sequenceDiagram
 
 ### **ネットワークハンドシェイク (チャット / ファイル転送)**
 
-`--listen` / `--connect` で動作する PQC 認証付きセッションのフロー。
+`--serve-chat` / `--connect` で動作する PQC 認証付きセッションのフロー。
 
 ```mermaid
 sequenceDiagram
@@ -775,7 +775,7 @@ sequenceDiagram
     participant CLI_S as Server CLI
 
     Note over Client, Server: 起動
-    Server->>CLI_S: --listen + --keyring-db
+    Server->>CLI_S: --serve-chat + --keyring-db
     CLI_S->>CLI_S: keyring allowlist ロード (起動時)
 
     Note over Client, Server: ハンドシェイク

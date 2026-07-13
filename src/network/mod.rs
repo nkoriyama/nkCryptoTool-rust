@@ -167,7 +167,7 @@ impl IOProvider for DefaultIOProvider {
 // spawned lazily on first use. A naive "one thread per `stdin()` call" leaks a
 // thread per connection — the previous reader stays parked in `read(2)` holding
 // the `std::io::stdin()` lock, so the next connection's thread blocks forever on
-// `lock()`. The persistent `--listen` server calls `stdin()` once per accepted
+// `lock()`. The persistent `--serve-chat` server calls `stdin()` once per accepted
 // connection (`processor::run_listen_loop`), so repeated connect/disconnect
 // would otherwise exhaust threads (DoS). The single reader forwards bytes to the
 // *currently registered* consumer (a chat session); when no consumer is

@@ -78,13 +78,13 @@ scp ~/nkct/bob/public_sign_pqc.key alice@host:~/nkct/bob_public.key
 ```bash
 NK_PASSPHRASE="" ./target/release/nk-crypto-tool \
   --mode pqc --chat \
-  --listen 0.0.0.0:0 \
+  --serve-chat \
   --signing-privkey ~/nkct/alice/private_sign_pqc.key \
   --signing-pubkey  ~/nkct/bob_public.key \
   --transport iroh
 ```
 
-> **注意**: `--listen 0.0.0.0:0` はダミー値。Iroh モードでは無視されるが、引数として必須 (CLI 仕様の名残)。
+> **注意**: `--serve-chat` は値を取らないフラグ。旧名 `--listen` も互換 alias として使える。
 
 ### 出力例
 
@@ -171,7 +171,7 @@ LAN 内なら問題なく接続。NAT 越えは hole-punching のみで relay �
 
 ```bash
 # 両端末とも:
-... --chat --listen 0.0.0.0:0 --allow-unauth
+... --chat --serve-chat --allow-unauth
 ... --chat --connect <ticket> --allow-unauth
 ```
 
@@ -190,7 +190,7 @@ listener 側の keyring（redb）の allowlist テーブルに許可指紋を登
 ./target/release/nk-crypto-tool --keyring-cmd authorize --pairing-grant all \
   --keyring-db ~/nkct/keyring.db --recipient-fingerprint 8a91...c2d4   # charlie
 
-./target/release/nk-crypto-tool --chat --listen \
+./target/release/nk-crypto-tool --chat --serve-chat \
   --signing-privkey ~/nkct/alice/private_sign_pqc.key \
   --keyring-db ~/nkct/keyring.db \
   --transport iroh
@@ -226,7 +226,7 @@ listener 側の keyring（redb）の allowlist テーブルに許可指紋を登
 
 ```bash
 # 受信 (端末 A)
-nkct ... --listen 0.0.0.0:0 --signing-privkey ... > received_file.bin
+nkct ... --serve-chat --signing-privkey ... > received_file.bin
 
 # 送信 (端末 B)
 cat my_file.bin | nkct ... --connect <ticket> --signing-privkey ...
@@ -242,7 +242,7 @@ cat my_file.bin | nkct ... --connect <ticket> --signing-privkey ...
 
 ```bash
 # Terminal 1 (listener)
-NK_PASSPHRASE="" /path/to/nk-crypto-tool --mode pqc --chat --listen 0.0.0.0:0 \
+NK_PASSPHRASE="" /path/to/nk-crypto-tool --mode pqc --chat --serve-chat \
   --allow-unauth --no-relay --transport iroh
 
 # Ticket をコピー、Terminal 2 へ:
@@ -262,7 +262,7 @@ sequenceDiagram
     participant B as 端末 B (Bob / Connector)
     Note over A,B: 事前: 公開鍵を安全な経路で交換済み
 
-    A->>A: --chat --listen で起動
+    A->>A: --chat --serve-chat で起動
     A->>A: nkct1... Ticket を生成・QR 表示
     A-->>B: Ticket を共有 (コピペ / QR スキャン)
 
