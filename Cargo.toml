@@ -126,7 +126,7 @@ windows = { version = "0.52", optional = true, features = ["Win32_UI_WindowsAndM
 # Console raw-mode + size for the interactive shell *client* on Windows (the
 # counterpart to termios on unix). Always-on on Windows (the shell client is
 # desktop-only). See src/shell.rs (RawModeGuard / term_size, cfg(windows)).
-windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_Memory"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_System_Memory"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.5", optional = true }

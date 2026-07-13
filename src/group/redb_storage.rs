@@ -295,20 +295,13 @@ impl RedbBackend {
             .map_err(|e| RedbStorageError::Backend(e.to_string()))
     }
 
-    /// Tighten the DB file to `0o600` on Unix (defence in depth, matching the
-    /// sqlite path). No-op elsewhere.
+    /// Tighten the DB file to owner-only (unix `0o600` / windows owner-only
+    /// DACL) — defence in depth, matching the sqlite path.
     fn tighten_permissions(&self, path: &Path) -> Result<(), RedbStorageError> {
-        #[cfg(unix)]
         if path.exists() {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(path)
-                .map_err(|e| RedbStorageError::Backend(format!("metadata: {e}")))?
-                .permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(path, perms)
-                .map_err(|e| RedbStorageError::Backend(format!("chmod: {e}")))?;
+            crate::secure_fs::harden_owner_only(path)
+                .map_err(|e| RedbStorageError::Backend(format!("tighten perms: {e}")))?;
         }
-        let _ = path;
         Ok(())
     }
 
@@ -845,28 +838,19 @@ fn seal_value(
     Ok(out)
 }
 
-/// Open (or create) a redb database, ensuring the file is `0o600` from the
+/// Open (or create) a redb database, ensuring the file is owner-only from the
 /// moment it exists. `Database::create` alone would create the file under the
-/// default umask (typically `0o644`) and leave a brief window before
-/// `tighten_permissions` chmods it; pre-creating with `create_new(0o600)`
-/// closes that window. An already-present DB is opened as-is (then still
-/// tightened by the caller). Best-effort/no-op on non-unix.
+/// default umask / inherited ACL and leave a brief window before
+/// `tighten_permissions` re-locks it; pre-creating exclusively with owner-only
+/// permissions (unix 0600 / windows owner-only DACL) closes that window. An
+/// already-present DB is opened as-is (then still tightened by the caller).
 fn open_db_secure(path: &Path) -> Result<Database, RedbStorageError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path)
-        {
-            // Pre-created an empty 0o600 file; redb initializes it as a new DB.
-            Ok(_) => {}
-            // Existing DB — open it (race-safe: create_new is atomic).
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(RedbStorageError::Backend(format!("precreate db: {e}"))),
-        }
+    match crate::secure_fs::create_owner_only(path, false) {
+        // Pre-created an empty owner-only file; redb initializes it as a new DB.
+        Ok(_) => {}
+        // Existing DB — open it (race-safe: exclusive create is atomic).
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(RedbStorageError::Backend(format!("precreate db: {e}"))),
     }
     Database::create(path).map_err(|e| RedbStorageError::Backend(e.to_string()))
 }
@@ -1703,17 +1687,10 @@ impl RedbPrekeyStore {
     }
 
     fn tighten(&self, path: &Path) -> Result<(), RedbStorageError> {
-        #[cfg(unix)]
         if path.exists() {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(path)
-                .map_err(|e| RedbStorageError::Backend(format!("metadata: {e}")))?
-                .permissions();
-            perms.set_mode(0o600);
-            std::fs::set_permissions(path, perms)
-                .map_err(|e| RedbStorageError::Backend(format!("chmod: {e}")))?;
+            crate::secure_fs::harden_owner_only(path)
+                .map_err(|e| RedbStorageError::Backend(format!("tighten perms: {e}")))?;
         }
-        let _ = path;
         Ok(())
     }
 

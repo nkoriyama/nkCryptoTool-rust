@@ -638,16 +638,10 @@ pub(crate) async fn audit(path: Option<&str>, fp: &[u8; 32], event: &str) -> std
     let path = path.to_string();
     tokio::task::spawn_blocking(move || {
         use std::io::Write as _;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.create(true).append(true);
         // Audit records (fingerprints, commands) are sensitive: create the file
-        // owner-only so other local users cannot read the access trail.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&path)?;
+        // owner-only (unix 0600 / windows owner-only DACL) so other local users
+        // cannot read the access trail.
+        let mut f = crate::secure_fs::open_append_owner_only(std::path::Path::new(&path))?;
         f.write_all(line.as_bytes())?;
         f.flush()
     })

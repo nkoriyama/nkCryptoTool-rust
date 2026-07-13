@@ -76,6 +76,21 @@ impl KeyringStore {
     /// Open (or create) the keyring at `path`. Creates both tables on first use
     /// and tightens the file to `0600` on unix.
     pub fn open(path: &Path) -> Result<Self> {
+        // Pre-create the file owner-only (exclusive, no-follow) so a fresh
+        // keyring is never readable by other users even for an instant —
+        // `Database::create` alone would create it under the default
+        // umask/inherited ACL. An existing DB just falls through (create_new
+        // is atomic, so this is race-safe). Same pattern as
+        // `redb_storage::open_db_secure`.
+        match crate::secure_fs::create_owner_only(path, false) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => {
+                return Err(CryptoError::Parameter(format!(
+                    "keyring: precreate {path:?}: {e}"
+                )))
+            }
+        }
         let db = Database::create(path)
             .map_err(|e| CryptoError::Parameter(format!("keyring: open {path:?}: {e}")))?;
         // Ensure both tables exist so a read on a fresh DB does not error.
@@ -85,11 +100,9 @@ impl KeyringStore {
             w.open_table(ALLOWLIST).map_err(map_err)?;
             w.commit().map_err(map_err)?;
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
+        // Best-effort tighten to owner-only (unix 0600 / windows owner-only
+        // DACL) — the keyring db is plaintext, holding contacts and grants.
+        let _ = crate::secure_fs::harden_owner_only(path);
         Ok(Self { db })
     }
 

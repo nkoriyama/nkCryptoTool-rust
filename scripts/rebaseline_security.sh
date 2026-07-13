@@ -30,6 +30,7 @@ FILES=(
     src/p2p/processor.rs
     src/network/mod.rs
     src/processor.rs
+    src/secure_fs.rs
     src/utils.rs
 )
 

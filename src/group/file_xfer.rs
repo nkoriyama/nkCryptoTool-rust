@@ -490,18 +490,11 @@ fn hex16(id: &[u8; ID_LEN]) -> String {
     id.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Create `path` for writing, failing if it already exists and (on unix) never
-/// following a symlink raced into place — the same exclusive-create discipline
-/// the node-key and at-rest temp files use.
+/// Create `path` for writing, failing if it already exists and never following
+/// a link raced into place — the same exclusive-create discipline the node-key
+/// and at-rest temp files use (owner-only on unix and windows alike).
 fn exclusive_create(path: &Path) -> std::io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    opts.open(path)
+    crate::secure_fs::create_owner_only(path, false)
 }
 
 #[cfg(test)]
