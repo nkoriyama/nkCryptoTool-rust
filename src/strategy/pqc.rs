@@ -39,6 +39,12 @@ pub struct PqcStrategy {
     // Zeroizing keeps the field type-uniform and costs nothing here.)
     recipient_enc_key: Option<Zeroizing<Vec<u8>>>,
 
+    // The user's own ML-KEM private key as passphrase-encrypted PKCS#8 PEM
+    // text, injected in memory from the keyring my-identities table
+    // (auto-match). When `Some`, `prepare_shared_secret_decryption` uses it
+    // and never reads a user-privkey file.
+    user_privkey_pem: Option<Zeroizing<String>>,
+
     // DSA specific
     dsa_privkey: Zeroizing<Vec<u8>>,
     sign_buffer: Zeroizing<Vec<u8>>,
@@ -70,6 +76,7 @@ impl PqcStrategy {
             kem_ciphertext: Zeroizing::new(Vec::new()),
             peer_public_key: None,
             recipient_enc_key: None,
+            user_privkey_pem: None,
             dsa_privkey: Zeroizing::new(Vec::new()),
             sign_buffer: Zeroizing::new(Vec::new()),
             signature: Vec::new(),
@@ -130,19 +137,26 @@ impl PqcStrategy {
         if let Some(algo) = key_paths.get("kem-algo") {
             self.kem_algo = algo.clone();
         }
-        let privkey_path = key_paths
-            .get("user-privkey")
-            .or_else(|| key_paths.get("recipient-mlkem-privkey"))
-            .ok_or(CryptoError::PrivateKeyLoad(
-                "Missing private key path".to_string(),
-            ))?;
-
-        let priv_bytes = Zeroizing::new(fs::read(privkey_path)?);
-        let pem_str = Zeroizing::new(
-            std::str::from_utf8(&priv_bytes)
-                .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
-                .to_string(),
-        );
+        // Prefer a keyring-injected encrypted-PKCS#8 PEM (auto-match): no file
+        // read. clone() (not take()) keeps the strategy reusable, matching the
+        // recipient_enc_key convention above.
+        let pem_str: Zeroizing<String> = match self.user_privkey_pem.clone() {
+            Some(pem) => pem,
+            None => {
+                let privkey_path = key_paths
+                    .get("user-privkey")
+                    .or_else(|| key_paths.get("recipient-mlkem-privkey"))
+                    .ok_or(CryptoError::PrivateKeyLoad(
+                        "Missing private key path".to_string(),
+                    ))?;
+                let priv_bytes = Zeroizing::new(fs::read(privkey_path)?);
+                Zeroizing::new(
+                    std::str::from_utf8(&priv_bytes)
+                        .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                        .to_string(),
+                )
+            }
+        };
 
         let decrypted_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             return Err(CryptoError::Parameter(
@@ -566,6 +580,10 @@ impl CryptoStrategy for PqcStrategy {
 
     fn set_recipient_enc_key(&mut self, raw_mlkem_ek: Vec<u8>) {
         self.recipient_enc_key = Some(Zeroizing::new(raw_mlkem_ek));
+    }
+
+    fn set_user_enc_privkey_pem(&mut self, pem: Zeroizing<String>) {
+        self.user_privkey_pem = Some(pem);
     }
 
     fn file_session_id(&self) -> Option<[u8; V3_SESSION_ID_LEN]> {

@@ -91,6 +91,15 @@ pub fn create_dir_owner_only(path: &Path) -> io::Result<()> {
     imp::create_dir_owner_only(path)
 }
 
+/// Open an *existing* file without following a link at the final component
+/// (unix: `O_NOFOLLOW`; windows: reparse-point refusal), read-only or
+/// read-write. Permissions are left untouched — this is for operating on a
+/// user-supplied file through a stable handle (e.g. read-then-shred without a
+/// path race), not for creating secrets.
+pub fn open_existing_no_follow(path: &Path, write: bool) -> io::Result<File> {
+    imp::open_existing_no_follow(path, write)
+}
+
 #[cfg(unix)]
 mod imp {
     use super::*;
@@ -172,6 +181,12 @@ mod imp {
 
     pub fn create_dir_owner_only(path: &Path) -> io::Result<()> {
         std::fs::DirBuilder::new().mode(0o700).create(path)
+    }
+
+    pub fn open_existing_no_follow(path: &Path, write: bool) -> io::Result<File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true).write(write).custom_flags(libc::O_NOFOLLOW);
+        opts.open(path)
     }
 }
 
@@ -511,6 +526,16 @@ mod imp {
         }
         Ok(())
     }
+
+    pub fn open_existing_no_follow(path: &Path, write: bool) -> io::Result<File> {
+        use windows_sys::Win32::Foundation::GENERIC_READ;
+        let access = if write {
+            GENERIC_READ | GENERIC_WRITE
+        } else {
+            GENERIC_READ
+        };
+        open_secure(path, access, 0, OPEN_EXISTING, 0, false)
+    }
 }
 
 // No silent degradation on exotic targets: a secret write that cannot be
@@ -536,6 +561,9 @@ mod imp {
         Err(unsupported())
     }
     pub fn open_append_owner_only(_path: &Path) -> io::Result<File> {
+        Err(unsupported())
+    }
+    pub fn open_existing_no_follow(_path: &Path, _write: bool) -> io::Result<File> {
         Err(unsupported())
     }
     pub fn create_dir_owner_only(_path: &Path) -> io::Result<()> {

@@ -44,6 +44,12 @@ pub struct EccStrategy {
     #[zeroize(skip)]
     recipient_pub_der: Option<Vec<u8>>,
 
+    // The user's own P-256 private key as passphrase-encrypted PKCS#8 PEM
+    // text, injected in memory from the keyring my-identities table
+    // (auto-match). When `Some`, decryption uses it and never reads a
+    // user-privkey file.
+    user_privkey_pem: Option<Zeroizing<String>>,
+
     // Signing keys (stored as DER to be backend-agnostic)
     sign_key_der: Option<Zeroizing<Vec<u8>>>,
     verify_key_der: Option<Zeroizing<Vec<u8>>>,
@@ -72,6 +78,7 @@ impl EccStrategy {
             shared_secret: Zeroizing::new(Vec::new()),
             ephemeral_pubkey: Vec::new(),
             recipient_pub_der: None,
+            user_privkey_pem: None,
             sign_key_der: None,
             verify_key_der: None,
             chunk_size: V3_DEFAULT_CHUNK_SIZE,
@@ -142,19 +149,26 @@ impl EccStrategy {
         key_paths: &HashMap<String, String>,
         passphrase: &mut Option<Zeroizing<String>>,
     ) -> Result<()> {
-        let privkey_path = key_paths
-            .get("user-privkey")
-            .or_else(|| key_paths.get("recipient-ecdh-privkey"))
-            .ok_or(CryptoError::PrivateKeyLoad(
-                "Missing private key path".to_string(),
-            ))?;
-
-        let priv_bytes = Zeroizing::new(fs::read(privkey_path)?);
-        let pem_str = Zeroizing::new(
-            std::str::from_utf8(&priv_bytes)
-                .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
-                .to_string(),
-        );
+        // Prefer a keyring-injected encrypted-PKCS#8 PEM (auto-match): no file
+        // read. clone() (not take()) keeps the strategy reusable, matching the
+        // recipient_pub_der convention.
+        let pem_str: Zeroizing<String> = match self.user_privkey_pem.clone() {
+            Some(pem) => pem,
+            None => {
+                let privkey_path = key_paths
+                    .get("user-privkey")
+                    .or_else(|| key_paths.get("recipient-ecdh-privkey"))
+                    .ok_or(CryptoError::PrivateKeyLoad(
+                        "Missing private key path".to_string(),
+                    ))?;
+                let priv_bytes = Zeroizing::new(fs::read(privkey_path)?);
+                Zeroizing::new(
+                    std::str::from_utf8(&priv_bytes)
+                        .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                        .to_string(),
+                )
+            }
+        };
 
         let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self
@@ -657,6 +671,10 @@ impl CryptoStrategy for EccStrategy {
 
     fn set_recipient_hybrid_key(&mut self, p256_spki_der: Vec<u8>) {
         self.recipient_pub_der = Some(p256_spki_der);
+    }
+
+    fn set_user_enc_privkey_pem(&mut self, pem: Zeroizing<String>) {
+        self.user_privkey_pem = Some(pem);
     }
 
     fn get_salt(&self) -> Vec<u8> {

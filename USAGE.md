@@ -105,6 +105,30 @@ nk-crypto-tool --mode hybrid --decrypt \
     secret.enc
 ```
 
+### 2.1 鍵リングで鍵ファイル指定を省略する（GPG 風）
+
+秘密鍵を一度 `keyring.db` に取り込めば（暗号化 PKCS#8 のまま格納・平文は書かれない）、
+以後の復号は鍵ファイル指定なしで動く。暗号文ヘッダからアルゴリズムを読み、
+鍵リングの該当スロットを自動で使う:
+
+```bash
+# 一度だけ: 取り込み（パスフレーズで検証してから格納。役割/アルゴは自動判定）
+nk-crypto-tool --keyring-cmd import-my-key --user-privkey keys/private_enc_pqc.key
+# 取り込み後に元ファイルを消すなら --shred-original を付ける
+
+# 以後: 鍵指定なしで復号（hybrid も同様 — 2 スロットとも取り込んでおけば自動で両方使う）
+nk-crypto-tool --mode pqc --decrypt --output-file plain.out secret.enc
+
+# 一覧・削除
+nk-crypto-tool --keyring-cmd list-my-keys
+nk-crypto-tool --keyring-cmd remove-my-key --key-role enc --key-algo ML-KEM-768
+```
+
+- P-256 鍵は enc/sign 両用のため取り込み時に `--key-role enc|sign` が必要。
+- 使うたびに秘密鍵から公開鍵を導出し直して DB のレコードと照合する
+  （レコードが差し替えられていれば復号前に失敗する）。
+- 平文（パスフレーズなし）の秘密鍵は取り込み拒否。
+
 ---
 
 ## 3. 署名 — ファイルの作成者を証明する

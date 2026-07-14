@@ -73,6 +73,16 @@ impl CryptoStrategy for HybridStrategy {
         self.ecc.set_recipient_hybrid_key(p256_spki_der);
     }
 
+    // Route keyring-injected own private keys the same way: the ML-KEM PEM to
+    // the PQC half, the P-256 PEM to the ECC half's single slot.
+    fn set_user_enc_privkey_pem(&mut self, pem: Zeroizing<String>) {
+        self.pqc.set_user_enc_privkey_pem(pem);
+    }
+
+    fn set_user_hybrid_privkey_pem(&mut self, pem: Zeroizing<String>) {
+        self.ecc.set_user_enc_privkey_pem(pem);
+    }
+
     fn generate_encryption_key_pair(
         &self,
         key_paths: &HashMap<String, String>,

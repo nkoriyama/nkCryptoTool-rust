@@ -426,6 +426,17 @@ impl CryptoProcessor {
         key_paths.insert("kem-algo".to_string(), config.pqc_kem_algo.clone());
         key_paths.insert("dsa-algo".to_string(), config.pqc_dsa_algo.clone());
 
+        // Feed keyring-resolved own private keys (encrypted PKCS#8 PEM,
+        // auto-match) to the strategy before it prepares decryption — the
+        // in-memory twin of the recipient KeyBundle injection on the encrypt
+        // side. Strategies that do not use a given slot ignore its setter.
+        if let Some(ref pem) = config.user_enc_privkey_pem {
+            strategy.set_user_enc_privkey_pem(pem.clone());
+        }
+        if let Some(ref pem) = config.user_hybrid_privkey_pem {
+            strategy.set_user_hybrid_privkey_pem(pem.clone());
+        }
+
         strategy.prepare_decryption(&key_paths, passphrase)?;
 
         let input_path_str = input_path.to_string();

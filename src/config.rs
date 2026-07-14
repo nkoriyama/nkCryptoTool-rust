@@ -139,6 +139,14 @@ pub struct CryptoConfig {
     pub recipient_enc_key_bytes: Option<Vec<u8>>, // raw ML-KEM ek
     pub recipient_hybrid_key_bytes: Option<Vec<u8>>, // P-256 SubjectPublicKeyInfo DER
 
+    // The user's own private key(s) taken from the keyring's my-identities
+    // table (auto-match) instead of a key file. The value is the
+    // passphrase-encrypted PKCS#8 PEM text exactly as a key file would hold it
+    // (never a plaintext key); when present the decryption strategy uses it
+    // in memory and the `user_*_privkey` path lookups are skipped.
+    pub user_enc_privkey_pem: Option<Zeroizing<String>>, // ML-KEM (pqc/hybrid) or P-256 (ecc)
+    pub user_hybrid_privkey_pem: Option<Zeroizing<String>>, // hybrid's P-256 ECDH half
+
     // Options
     pub passphrase: Option<Zeroizing<String>>,
     pub use_tpm: bool,
@@ -295,6 +303,8 @@ impl Default for CryptoConfig {
             recipient_ecdh_pubkey: None,
             recipient_enc_key_bytes: None,
             recipient_hybrid_key_bytes: None,
+            user_enc_privkey_pem: None,
+            user_hybrid_privkey_pem: None,
             user_mlkem_privkey: None,
             user_ecdh_privkey: None,
             passphrase: None,

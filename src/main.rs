@@ -93,6 +93,29 @@ struct Args {
     #[arg(long)]
     signing_pubkey: Option<String>,
 
+    /// Optional public-key file for `--keyring-cmd import-my-key`: the importer
+    /// always re-derives the public half from the private key, and when this is
+    /// given it must match (catches pairing the wrong files).
+    #[arg(long)]
+    user_pubkey: Option<String>,
+
+    /// Key role for `--keyring-cmd import-my-key|remove-my-key`: `enc` or
+    /// `sign`. Inferred automatically for ML-KEM (enc) / ML-DSA (sign);
+    /// required for P-256, which serves both roles.
+    #[arg(long)]
+    key_role: Option<String>,
+
+    /// Key algorithm for `--keyring-cmd remove-my-key` (e.g. `ML-KEM-768`,
+    /// `ML-DSA-65`, `P-256`) — names the exact keyring slot to remove.
+    #[arg(long)]
+    key_algo: Option<String>,
+
+    /// After a successful `import-my-key`, best-effort zero-overwrite and
+    /// delete the original private-key file (its bytes now live in the
+    /// keyring).
+    #[arg(long)]
+    shred_original: bool,
+
     #[arg(long)]
     signature: Option<String>,
 
@@ -727,6 +750,22 @@ async fn main() -> anyhow::Result<()> {
     config.pqc_kem_algo = args.kem_algo;
     config.pqc_dsa_algo = args.dsa_algo;
 
+    // Keyring auto-match (GPG-style): a `--decrypt` with no explicit private-key
+    // path resolves the needed key(s) from the keyring my-identities table via
+    // the ciphertext header — see `keyring_automatch_decrypt`.
+    if operation == Operation::Decrypt
+        && config.user_privkey.is_none()
+        && config.user_mlkem_privkey.is_none()
+        && config.user_ecdh_privkey.is_none()
+    {
+        keyring_automatch_decrypt(
+            args.keyring_db.as_deref(),
+            args.keybundle_handle.as_deref(),
+            &mut config,
+            &mut passphrase,
+        )?;
+    }
+
     // Consume a recipient KeyBundle for encryption: verify it against the pinned
     // owner fingerprint, enforce expiry on the key(s) this mode will use, and
     // stage the raw encryption key bytes for in-memory injection into the
@@ -1208,6 +1247,122 @@ fn select_bundle_keys_for_mode(
 /// Owner-side producer: build a signed NKKB KeyBundle binding this identity's
 /// Resolve the redb keyring path: `--keyring-db` if given, else `keyring.db`
 /// under `--key-dir` (default `keys`) — the same location pairing writes to.
+/// GPG-style keyring auto-match for `--decrypt`: peek the ciphertext's v3
+/// header, look the needed slot(s) up in the my-identities table, unlock them
+/// under one passphrase prompt (each unlock re-derives the public half and
+/// requires it to match the stored record — a tampered record fails closed),
+/// then inject the still-encrypted PEM(s) into the config for in-memory
+/// strategy loading. No plaintext key ever touches disk.
+fn keyring_automatch_decrypt(
+    keyring_db: Option<&str>,
+    handle: Option<&str>,
+    config: &mut CryptoConfig,
+    passphrase: &mut Option<Zeroizing<String>>,
+) -> anyhow::Result<()> {
+    use nk_crypto_tool::keyring::{self, KeyringStore};
+
+    fn strategy_name(b: u8) -> &'static str {
+        match b {
+            1 => "ecc",
+            2 => "pqc",
+            3 => "hybrid",
+            _ => "unknown",
+        }
+    }
+
+    let input = config
+        .input_files
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("--decrypt requires an input file"))?
+        .clone();
+    let mut head = vec![0u8; 8192];
+    let n = {
+        use std::io::Read as _;
+        let mut f =
+            std::fs::File::open(&input).map_err(|e| anyhow::anyhow!("open {input}: {e}"))?;
+        f.read(&mut head)
+            .map_err(|e| anyhow::anyhow!("read {input}: {e}"))?
+    };
+    head.truncate(n);
+    let peek = keyring::peek_v3_header(&head).map_err(|e| anyhow::anyhow!("{input}: {e}"))?;
+
+    let mode_byte = match config.mode {
+        CryptoMode::ECC => 1u8,
+        CryptoMode::PQC => 2,
+        CryptoMode::Hybrid => 3,
+    };
+    if peek.strategy != mode_byte {
+        anyhow::bail!(
+            "{input} is a {} ciphertext but --mode says {} — fix --mode",
+            strategy_name(peek.strategy),
+            strategy_name(mode_byte)
+        );
+    }
+
+    let handle = handle.unwrap_or("me");
+    let db = keyring_db_path(keyring_db, Some(&config.key_dir));
+    let store =
+        KeyringStore::open(&db).map_err(|e| anyhow::anyhow!("open keyring {db:?}: {e}"))?;
+
+    // The slot(s) this ciphertext needs: `(algo, goes_to_hybrid_ecc_half)`.
+    let mut slots: Vec<(String, bool)> = Vec::new();
+    if let Some(ref kem) = peek.kem_algo {
+        slots.push((kem.clone(), false));
+    }
+    if let Some(ref ecc) = peek.ecc_algo {
+        // For a pure-ECC file this is the main slot; for hybrid it is the
+        // P-256 half next to the ML-KEM main slot.
+        slots.push((ecc.clone(), peek.strategy == 3));
+    }
+
+    // Resolve every record before prompting, so a missing slot errors cheaply.
+    let mut found = Vec::new();
+    for (algo, hybrid_half) in &slots {
+        match store
+            .get_my_identity(handle, "enc", algo)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+        {
+            Some(rec) => found.push((algo.clone(), *hybrid_half, rec)),
+            None => anyhow::bail!(
+                "keyring {} has no key in slot {handle}:enc:{algo} — import it once with:\n  \
+                 nk-crypto-tool --keyring-cmd import-my-key --user-privkey <keyfile>{}",
+                db.display(),
+                if handle == "me" {
+                    String::new()
+                } else {
+                    format!(" --keybundle-handle {handle}")
+                }
+            ),
+        }
+    }
+
+    let pass = match passphrase.clone() {
+        Some(p) => p,
+        None => {
+            eprintln!("Keyring passphrase for {handle:?}:");
+            nk_crypto_tool::utils::get_masked_passphrase()
+                .map_err(|e| anyhow::anyhow!("read passphrase: {e}"))?
+        }
+    };
+    for (algo, hybrid_half, rec) in &found {
+        let pem = keyring::unlock_and_verify_identity(rec, algo, &pass)
+            .map_err(|e| anyhow::anyhow!("{handle}:enc:{algo}: {e}"))?;
+        eprintln!(
+            "[nkct] keyring: unlocked {handle}:enc:{algo} ({}…)",
+            hex::encode(&rec.fingerprint[..8])
+        );
+        if *hybrid_half {
+            config.user_hybrid_privkey_pem = Some(pem);
+        } else {
+            config.user_enc_privkey_pem = Some(pem);
+        }
+    }
+    // The strategy must not re-prompt: hand it the passphrase that just
+    // unlocked (and binding-checked) the key(s).
+    *passphrase = Some(pass);
+    Ok(())
+}
+
 fn keyring_db_path(keyring_db: Option<&str>, key_dir: Option<&str>) -> std::path::PathBuf {
     if let Some(p) = keyring_db {
         std::path::PathBuf::from(p)
@@ -1359,8 +1514,130 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
                 println!("{} was not authorized", hex::encode(fp));
             }
         }
+        "import-my-key" => {
+            // Encapsulate one of the user's OWN key pairs into the keyring
+            // (GPG-keyring style): validate, derive + bind the public half,
+            // then store the still-encrypted PKCS#8 PEM.
+            let priv_path = args.user_privkey.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("import-my-key requires --user-privkey <encrypted PKCS#8 PEM>")
+            })?;
+            // One no-follow handle for the whole import: the read AND the
+            // later --shred-original both go through it, so the path cannot be
+            // swapped for a link while we sit in the passphrase prompt (a
+            // path-based shred would follow the swap and destroy the target).
+            let mut priv_file = nk_crypto_tool::secure_fs::open_existing_no_follow(
+                std::path::Path::new(priv_path),
+                args.shred_original,
+            )
+            .map_err(|e| anyhow::anyhow!("open {priv_path}: {e}"))?;
+            let pem_bytes = {
+                use std::io::Read as _;
+                let mut v = Vec::new();
+                priv_file
+                    .read_to_end(&mut v)
+                    .map_err(|e| anyhow::anyhow!("read {priv_path}: {e}"))?;
+                v
+            };
+            eprintln!("Passphrase for {priv_path}:");
+            let pass = nk_crypto_tool::utils::get_masked_passphrase()
+                .map_err(|e| anyhow::anyhow!("read passphrase: {e}"))?;
+            let expected_pub = match args.user_pubkey.as_deref() {
+                Some(p) => {
+                    let pem = std::fs::read_to_string(p)
+                        .map_err(|e| anyhow::anyhow!("read {p}: {e}"))?;
+                    Some(
+                        nk_crypto_tool::utils::unwrap_from_pem(&pem, "PUBLIC KEY")
+                            .map_err(|e| anyhow::anyhow!("parse {p}: {e}"))?
+                            .to_vec(),
+                    )
+                }
+                None => None,
+            };
+            let (algo, inferred_role, rec) = nk_crypto_tool::keyring::build_my_identity_record(
+                &pem_bytes,
+                &pass,
+                expected_pub.as_deref(),
+                now,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let role = match (inferred_role, args.key_role.as_deref()) {
+                (Some(r), None) => r,
+                (Some(r), Some(given)) if given == r => r,
+                (Some(r), Some(given)) => anyhow::bail!(
+                    "--key-role {given} contradicts the key itself ({algo} is a {r} key)"
+                ),
+                (None, Some("enc")) => "enc",
+                (None, Some("sign")) => "sign",
+                (None, Some(other)) => anyhow::bail!("--key-role must be enc or sign, got {other}"),
+                (None, None) => anyhow::bail!(
+                    "{algo} serves both roles — say which with --key-role enc|sign"
+                ),
+            };
+            let handle = args.keybundle_handle.as_deref().unwrap_or("me");
+            let outcome = store
+                .put_my_identity(handle, role, &algo, &rec)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "{} {handle}:{role}:{algo} (fingerprint {}…) in keyring {}",
+                match outcome {
+                    nk_crypto_tool::keyring::AddOutcome::Added => "Imported",
+                    nk_crypto_tool::keyring::AddOutcome::Updated => "Re-imported",
+                },
+                hex::encode(&rec.fingerprint[..8]),
+                db.display()
+            );
+            if args.shred_original {
+                // Zero-overwrite through the handle we already hold (never by
+                // path), then unlink. Best-effort caveats as in
+                // `utils::secure_erase_file`: CoW filesystems / wear-levelled
+                // SSDs may keep old blocks — the goal is not leaving an easy
+                // copy, the durable protection is that the key is encrypted.
+                {
+                    use std::io::{Seek as _, SeekFrom, Write as _};
+                    let zeros = vec![0u8; pem_bytes.len()];
+                    priv_file
+                        .seek(SeekFrom::Start(0))
+                        .and_then(|_| priv_file.write_all(&zeros))
+                        .and_then(|_| priv_file.sync_all())
+                        .map_err(|e| anyhow::anyhow!("shred {priv_path}: {e}"))?;
+                }
+                drop(priv_file);
+                std::fs::remove_file(priv_path)
+                    .map_err(|e| anyhow::anyhow!("remove {priv_path}: {e}"))?;
+                println!("Shredded original {priv_path}");
+            }
+        }
+        "list-my-keys" => {
+            let ids = store.list_my_identities().map_err(|e| anyhow::anyhow!("{e}"))?;
+            if ids.is_empty() {
+                println!("(no own keys in keyring {})", db.display());
+            } else {
+                println!("{:<12} {:<6} {:<12} Fingerprint", "Handle", "Role", "Algorithm");
+                println!("{}", "-".repeat(96));
+                for (h, r, a, rec) in ids {
+                    println!("{h:<12} {r:<6} {a:<12} {}", hex::encode(rec.fingerprint));
+                }
+            }
+        }
+        "remove-my-key" => {
+            let handle = args.keybundle_handle.as_deref().unwrap_or("me");
+            let role = args.key_role.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("remove-my-key requires --key-role enc|sign")
+            })?;
+            let algo = args.key_algo.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("remove-my-key requires --key-algo (see list-my-keys)")
+            })?;
+            if store
+                .remove_my_identity(handle, role, algo)
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+            {
+                println!("Removed {handle}:{role}:{algo} from keyring {}", db.display());
+            } else {
+                println!("{handle}:{role}:{algo} was not in keyring {}", db.display());
+            }
+        }
         other => anyhow::bail!(
-            "unknown --keyring-cmd {other:?}; expected one of add|list|remove|import|authorize|revoke"
+            "unknown --keyring-cmd {other:?}; expected one of add|list|remove|import|authorize|revoke|import-my-key|list-my-keys|remove-my-key"
         ),
     }
     Ok(())
