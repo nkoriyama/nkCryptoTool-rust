@@ -45,6 +45,10 @@ pub struct PqcStrategy {
     // and never reads a user-privkey file.
     user_privkey_pem: Option<Zeroizing<String>>,
 
+    // The user's own ML-DSA signing key in the same keyring-injected form.
+    // When `Some`, `prepare_signing` uses it and ignores the key path.
+    signing_privkey_pem: Option<Zeroizing<String>>,
+
     // DSA specific
     dsa_privkey: Zeroizing<Vec<u8>>,
     sign_buffer: Zeroizing<Vec<u8>>,
@@ -77,6 +81,7 @@ impl PqcStrategy {
             peer_public_key: None,
             recipient_enc_key: None,
             user_privkey_pem: None,
+            signing_privkey_pem: None,
             dsa_privkey: Zeroizing::new(Vec::new()),
             sign_buffer: Zeroizing::new(Vec::new()),
             signature: Vec::new(),
@@ -312,12 +317,20 @@ impl CryptoStrategy for PqcStrategy {
         passphrase_opt: &mut Option<Zeroizing<String>>,
         _digest_algo: &str,
     ) -> Result<()> {
-        let priv_bytes = Zeroizing::new(fs::read(priv_key_path)?);
-        let pem_str = Zeroizing::new(
-            std::str::from_utf8(&priv_bytes)
-                .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
-                .to_string(),
-        );
+        // Prefer a keyring-injected encrypted-PKCS#8 PEM (auto-match): no file
+        // read. clone() (not take()) keeps the strategy reusable, matching the
+        // decryption-side convention.
+        let pem_str: Zeroizing<String> = match self.signing_privkey_pem.clone() {
+            Some(pem) => pem,
+            None => {
+                let priv_bytes = Zeroizing::new(fs::read(priv_key_path)?);
+                Zeroizing::new(
+                    std::str::from_utf8(&priv_bytes)
+                        .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                        .to_string(),
+                )
+            }
+        };
 
         let pass = crate::utils::get_passphrase_if_needed(
             &pem_str,
@@ -584,6 +597,10 @@ impl CryptoStrategy for PqcStrategy {
 
     fn set_user_enc_privkey_pem(&mut self, pem: Zeroizing<String>) {
         self.user_privkey_pem = Some(pem);
+    }
+
+    fn set_signing_privkey_pem(&mut self, pem: Zeroizing<String>) {
+        self.signing_privkey_pem = Some(pem);
     }
 
     fn file_session_id(&self) -> Option<[u8; V3_SESSION_ID_LEN]> {

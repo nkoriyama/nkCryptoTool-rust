@@ -83,6 +83,12 @@ impl CryptoStrategy for HybridStrategy {
         self.ecc.set_user_enc_privkey_pem(pem);
     }
 
+    // Hybrid signs via its PQC half (see `prepare_signing`), so the injected
+    // ML-DSA signing PEM routes there.
+    fn set_signing_privkey_pem(&mut self, pem: Zeroizing<String>) {
+        self.pqc.set_signing_privkey_pem(pem);
+    }
+
     fn generate_encryption_key_pair(
         &self,
         key_paths: &HashMap<String, String>,

@@ -133,6 +133,14 @@ pub trait CryptoStrategy: Send + Sync {
     /// form as [`CryptoStrategy::set_user_enc_privkey_pem`]. Default no-op.
     fn set_user_hybrid_privkey_pem(&mut self, _pem: Zeroizing<String>) {}
 
+    /// Inject the user's own signing key as its passphrase-encrypted PKCS#8
+    /// **PEM text** (keyring my-identities auto-match, the signing twin of
+    /// [`CryptoStrategy::set_user_enc_privkey_pem`]). When set,
+    /// `prepare_signing` uses it directly and ignores the key path. For
+    /// PQC/Hybrid this is the ML-DSA key, for pure ECC the P-256 ECDSA key.
+    /// Default no-op.
+    fn set_signing_privkey_pem(&mut self, _pem: Zeroizing<String>) {}
+
     /// Returns the SHA-256(header_bytes)[..16] file session ID. Available
     /// only after `prepare_encryption` or after `deserialize_header` has
     /// consumed a v3 header.

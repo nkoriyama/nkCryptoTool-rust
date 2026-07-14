@@ -8,7 +8,8 @@
 //! encrypt to an in-memory recipient key, then decrypt with the private key
 //! injected as its keyring form (passphrase-encrypted PKCS#8 PEM) — the exact
 //! path `--decrypt` takes when the key comes out of `keyring.db` instead of a
-//! file. No private-key file exists at any point.
+//! file — and the signing twin: `--sign` with the signing key injected the
+//! same way. No private-key file exists at any point.
 
 use nk_crypto_tool::config::{CryptoConfig, CryptoMode, Operation};
 use nk_crypto_tool::keyring;
@@ -156,5 +157,182 @@ async fn hybrid_decrypt_via_keyring_injected_pems() {
         .unwrap();
 
     assert_eq!(std::fs::read(&out_path).unwrap(), b"hybrid needs both halves");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn pqc_sign_via_keyring_injected_pem() {
+    const PASS: &str = "keyring-sign-pass";
+    let dir = tmp_dir("sign-pqc");
+    let msg_path = dir.join("msg.txt");
+    let sig_path = dir.join("msg.sig");
+    let pub_path = dir.join("sign.pub");
+    std::fs::write(&msg_path, b"keyring sign auto-match").unwrap();
+
+    // An ML-DSA key pair whose private half exists ONLY in keyring form.
+    let (raw_priv, raw_pub, _) = nk_crypto_tool::backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+    let pem = nk_crypto_tool::utils::wrap_to_pem(
+        &nk_crypto_tool::utils::wrap_pqc_priv_to_pkcs8_encrypted(&raw_priv, "ML-DSA-65", PASS)
+            .unwrap(),
+        "ENCRYPTED PRIVATE KEY",
+    );
+
+    // Import classifies the role from the OID alone (no --key-role needed)...
+    let (algo, role, rec) =
+        keyring::build_my_identity_record(pem.as_bytes(), PASS, None, 1).unwrap();
+    assert_eq!((algo.as_str(), role), ("ML-DSA-65", Some("sign")));
+    // ...and store/fetch round-trips through an actual keyring.db.
+    let store = keyring::KeyringStore::open(&dir.join("keyring.db")).unwrap();
+    store.put_my_identity("me", "sign", &algo, &rec).unwrap();
+    let rec = store.get_my_identity("me", "sign", &algo).unwrap().unwrap();
+
+    // Sign with the key injected as its keyring PEM — no key file anywhere.
+    let unlocked = keyring::unlock_and_verify_identity(&rec, &algo, PASS).unwrap();
+    let mut sign_cfg = CryptoConfig::default();
+    sign_cfg.mode = CryptoMode::PQC;
+    sign_cfg.operation = Operation::Sign;
+    sign_cfg.input_files = vec![msg_path.to_string_lossy().into_owned()];
+    sign_cfg.signature_file = Some(sig_path.to_string_lossy().into_owned());
+    sign_cfg.signing_privkey_pem = Some(unlocked);
+    sign_cfg.passphrase = Some(Zeroizing::new(PASS.to_string()));
+    CryptoProcessor::new(CryptoMode::PQC)
+        .process(&sign_cfg, None)
+        .await
+        .unwrap();
+
+    // The signature verifies against the matching public key from a file.
+    std::fs::write(
+        &pub_path,
+        nk_crypto_tool::utils::wrap_to_pem(
+            &nk_crypto_tool::utils::wrap_pqc_pub_to_spki(&raw_pub, "ML-DSA-65").unwrap(),
+            "PUBLIC KEY",
+        ),
+    )
+    .unwrap();
+    let mut ver_cfg = CryptoConfig::default();
+    ver_cfg.mode = CryptoMode::PQC;
+    ver_cfg.operation = Operation::Verify;
+    ver_cfg.input_files = vec![msg_path.to_string_lossy().into_owned()];
+    ver_cfg.signature_file = Some(sig_path.to_string_lossy().into_owned());
+    ver_cfg.signing_pubkey = Some(pub_path.to_string_lossy().into_owned());
+    CryptoProcessor::new(CryptoMode::PQC)
+        .process(&ver_cfg, None)
+        .await
+        .unwrap();
+
+    // A tampered message must fail verification.
+    std::fs::write(&msg_path, b"keyring sign auto-match TAMPERED").unwrap();
+    assert!(CryptoProcessor::new(CryptoMode::PQC)
+        .process(&ver_cfg, None)
+        .await
+        .is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn ecc_sign_via_keyring_injected_pem() {
+    const PASS: &str = "keyring-sign-ecc-pass";
+    let dir = tmp_dir("sign-ecc");
+    let msg_path = dir.join("msg.txt");
+    let sig_path = dir.join("msg.sig");
+    let pub_path = dir.join("sign.pub");
+    std::fs::write(&msg_path, b"ecdsa keyring sign").unwrap();
+
+    // P-256 serves both roles, so the importer is told `sign` (role None from
+    // classification) — exactly what `import-my-key --key-role sign` does.
+    let (priv_der, pub_spki) =
+        nk_crypto_tool::backend::generate_ecc_key_pair("prime256v1").unwrap();
+    let pem = nk_crypto_tool::utils::wrap_to_pem(
+        &nk_crypto_tool::utils::encrypt_pkcs8_der(&priv_der, PASS).unwrap(),
+        "ENCRYPTED PRIVATE KEY",
+    );
+    let (algo, role, rec) =
+        keyring::build_my_identity_record(pem.as_bytes(), PASS, None, 1).unwrap();
+    assert_eq!((algo.as_str(), role), ("P-256", None));
+    let store = keyring::KeyringStore::open(&dir.join("keyring.db")).unwrap();
+    store.put_my_identity("me", "sign", &algo, &rec).unwrap();
+    let rec = store.get_my_identity("me", "sign", &algo).unwrap().unwrap();
+
+    let unlocked = keyring::unlock_and_verify_identity(&rec, &algo, PASS).unwrap();
+    let mut sign_cfg = CryptoConfig::default();
+    sign_cfg.mode = CryptoMode::ECC;
+    sign_cfg.operation = Operation::Sign;
+    sign_cfg.input_files = vec![msg_path.to_string_lossy().into_owned()];
+    sign_cfg.signature_file = Some(sig_path.to_string_lossy().into_owned());
+    sign_cfg.signing_privkey_pem = Some(unlocked);
+    sign_cfg.passphrase = Some(Zeroizing::new(PASS.to_string()));
+    CryptoProcessor::new(CryptoMode::ECC)
+        .process(&sign_cfg, None)
+        .await
+        .unwrap();
+
+    std::fs::write(
+        &pub_path,
+        nk_crypto_tool::utils::wrap_to_pem(&pub_spki, "PUBLIC KEY"),
+    )
+    .unwrap();
+    let mut ver_cfg = CryptoConfig::default();
+    ver_cfg.mode = CryptoMode::ECC;
+    ver_cfg.operation = Operation::Verify;
+    ver_cfg.input_files = vec![msg_path.to_string_lossy().into_owned()];
+    ver_cfg.signature_file = Some(sig_path.to_string_lossy().into_owned());
+    ver_cfg.signing_pubkey = Some(pub_path.to_string_lossy().into_owned());
+    CryptoProcessor::new(CryptoMode::ECC)
+        .process(&ver_cfg, None)
+        .await
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn hybrid_sign_delegates_injected_pem_to_pqc_half() {
+    const PASS: &str = "keyring-sign-hybrid-pass";
+    let dir = tmp_dir("sign-hybrid");
+    let msg_path = dir.join("msg.txt");
+    let sig_path = dir.join("msg.sig");
+    let pub_path = dir.join("sign.pub");
+    std::fs::write(&msg_path, b"hybrid signs with its ML-DSA half").unwrap();
+
+    let (raw_priv, raw_pub, _) = nk_crypto_tool::backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+    let pem = nk_crypto_tool::utils::wrap_to_pem(
+        &nk_crypto_tool::utils::wrap_pqc_priv_to_pkcs8_encrypted(&raw_priv, "ML-DSA-65", PASS)
+            .unwrap(),
+        "ENCRYPTED PRIVATE KEY",
+    );
+    let (algo, _, rec) = keyring::build_my_identity_record(pem.as_bytes(), PASS, None, 1).unwrap();
+
+    // Hybrid signing goes through the PQC half; the injected PEM must be
+    // routed there by the hybrid strategy's setter.
+    let unlocked = keyring::unlock_and_verify_identity(&rec, &algo, PASS).unwrap();
+    let mut sign_cfg = CryptoConfig::default();
+    sign_cfg.mode = CryptoMode::Hybrid;
+    sign_cfg.operation = Operation::Sign;
+    sign_cfg.input_files = vec![msg_path.to_string_lossy().into_owned()];
+    sign_cfg.signature_file = Some(sig_path.to_string_lossy().into_owned());
+    sign_cfg.signing_privkey_pem = Some(unlocked);
+    sign_cfg.passphrase = Some(Zeroizing::new(PASS.to_string()));
+    CryptoProcessor::new(CryptoMode::Hybrid)
+        .process(&sign_cfg, None)
+        .await
+        .unwrap();
+
+    std::fs::write(
+        &pub_path,
+        nk_crypto_tool::utils::wrap_to_pem(
+            &nk_crypto_tool::utils::wrap_pqc_pub_to_spki(&raw_pub, "ML-DSA-65").unwrap(),
+            "PUBLIC KEY",
+        ),
+    )
+    .unwrap();
+    let mut ver_cfg = CryptoConfig::default();
+    ver_cfg.mode = CryptoMode::Hybrid;
+    ver_cfg.operation = Operation::Verify;
+    ver_cfg.input_files = vec![msg_path.to_string_lossy().into_owned()];
+    ver_cfg.signature_file = Some(sig_path.to_string_lossy().into_owned());
+    ver_cfg.signing_pubkey = Some(pub_path.to_string_lossy().into_owned());
+    CryptoProcessor::new(CryptoMode::Hybrid)
+        .process(&ver_cfg, None)
+        .await
+        .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

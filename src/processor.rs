@@ -153,15 +153,25 @@ impl CryptoProcessor {
                 "No signature output path".to_string(),
             ))?
             .clone();
-        let priv_key_path = config
-            .signing_privkey
-            .as_ref()
-            .ok_or(CryptoError::Parameter("No signing private key".to_string()))?
-            .clone();
+        // Keyring auto-match: an injected encrypted-PKCS#8 PEM replaces the key
+        // path — the strategy prefers it and never touches the (then empty)
+        // path. Signing twin of the decrypt-side user_*_privkey_pem injection.
+        let priv_key_path = match config.signing_privkey {
+            Some(ref p) => p.clone(),
+            None if config.signing_privkey_pem.is_some() => String::new(),
+            None => {
+                return Err(CryptoError::Parameter(
+                    "No signing private key".to_string(),
+                ))
+            }
+        };
 
         let mut strategy = self.strategy.take().ok_or(CryptoError::Parameter(
             "Strategy not initialized".to_string(),
         ))?;
+        if let Some(ref pem) = config.signing_privkey_pem {
+            strategy.set_signing_privkey_pem(pem.clone());
+        }
         strategy.prepare_signing(Path::new(&priv_key_path), passphrase, &config.digest_algo)?;
 
         let cb_clone = progress_callback.clone();

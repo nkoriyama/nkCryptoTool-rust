@@ -766,6 +766,19 @@ async fn main() -> anyhow::Result<()> {
         )?;
     }
 
+    // Signing twin: a `--sign` with no explicit signing-key path resolves the
+    // key from the keyring my-identities table. Unlike decrypt there is no
+    // ciphertext header to peek — the slot algo follows the mode/--dsa-algo
+    // the caller chose — see `keyring_automatch_sign`.
+    if operation == Operation::Sign && config.signing_privkey.is_none() {
+        keyring_automatch_sign(
+            args.keyring_db.as_deref(),
+            args.keybundle_handle.as_deref(),
+            &mut config,
+            &mut passphrase,
+        )?;
+    }
+
     // Consume a recipient KeyBundle for encryption: verify it against the pinned
     // owner fingerprint, enforce expiry on the key(s) this mode will use, and
     // stage the raw encryption key bytes for in-memory injection into the
@@ -1359,6 +1372,85 @@ fn keyring_automatch_decrypt(
     }
     // The strategy must not re-prompt: hand it the passphrase that just
     // unlocked (and binding-checked) the key(s).
+    *passphrase = Some(pass);
+    Ok(())
+}
+
+/// GPG-style keyring auto-match for `--sign`: the signing twin of
+/// [`keyring_automatch_decrypt`]. There is no ciphertext header to peek — the
+/// slot algo is dictated by the mode the caller chose (ECC signs with the
+/// P-256 ECDSA key; PQC/Hybrid sign with the `--dsa-algo` ML-DSA key, hybrid
+/// delegating to its PQC half). The unlock re-derives the public half and
+/// requires it to match the stored record, then the still-encrypted PEM is
+/// injected into the config for in-memory strategy loading.
+fn keyring_automatch_sign(
+    keyring_db: Option<&str>,
+    handle: Option<&str>,
+    config: &mut CryptoConfig,
+    passphrase: &mut Option<Zeroizing<String>>,
+) -> anyhow::Result<()> {
+    use nk_crypto_tool::keyring::{self, KeyringStore};
+
+    let algo = match config.mode {
+        CryptoMode::ECC => "P-256".to_string(),
+        CryptoMode::PQC | CryptoMode::Hybrid => config.pqc_dsa_algo.clone(),
+    };
+
+    let handle = handle.unwrap_or("me");
+    let db = keyring_db_path(keyring_db, Some(&config.key_dir));
+    let store =
+        KeyringStore::open(&db).map_err(|e| anyhow::anyhow!("open keyring {db:?}: {e}"))?;
+
+    let rec = match store
+        .get_my_identity(handle, "sign", &algo)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    {
+        Some(rec) => rec,
+        None => {
+            // List what sign keys the handle DOES have, so a mode/--dsa-algo
+            // mismatch is a one-glance fix.
+            let have: Vec<String> = store
+                .list_my_identities()
+                .map_err(|e| anyhow::anyhow!("{e}"))?
+                .into_iter()
+                .filter(|(h, ro, _, _)| h == handle && ro == "sign")
+                .map(|(_, _, al, _)| al)
+                .collect();
+            anyhow::bail!(
+                "keyring {} has no key in slot {handle}:sign:{algo}{} — import it once with:\n  \
+                 nk-crypto-tool --keyring-cmd import-my-key --user-privkey <keyfile>{}",
+                db.display(),
+                if have.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (available sign keys: {})", have.join(", "))
+                },
+                if handle == "me" {
+                    String::new()
+                } else {
+                    format!(" --keybundle-handle {handle}")
+                }
+            )
+        }
+    };
+
+    let pass = match passphrase.clone() {
+        Some(p) => p,
+        None => {
+            eprintln!("Keyring passphrase for {handle:?}:");
+            nk_crypto_tool::utils::get_masked_passphrase()
+                .map_err(|e| anyhow::anyhow!("read passphrase: {e}"))?
+        }
+    };
+    let pem = keyring::unlock_and_verify_identity(&rec, &algo, &pass)
+        .map_err(|e| anyhow::anyhow!("{handle}:sign:{algo}: {e}"))?;
+    eprintln!(
+        "[nkct] keyring: unlocked {handle}:sign:{algo} ({}…)",
+        hex::encode(&rec.fingerprint[..8])
+    );
+    config.signing_privkey_pem = Some(pem);
+    // The strategy must not re-prompt: hand it the passphrase that just
+    // unlocked (and binding-checked) the key.
     *passphrase = Some(pass);
     Ok(())
 }
