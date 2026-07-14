@@ -37,6 +37,24 @@ nk-crypto-tool --mode pqc --gen-enc-key --key-dir keys
   / `public_enc_hybrid_ecdh.key` と各 private）。署名 identity は常に ML-DSA-65。
 - TPM 封印: どの生成にも `--use-tpm` を足す。
 
+### 0.1 鍵ファイルを一切作らない（GPG 風・keyring 直生成）
+
+鍵リング運用（§2.1/§3.1）にするなら、最初から `gen-my-key` で **keyring.db の中に**生成できる
+（秘密鍵は暗号化 PKCS#8 のまま DB に入り、ファイルとしては一度もディスクに書かれない）:
+
+```bash
+nk-crypto-tool --keyring-cmd gen-my-key --key-algo ML-DSA-65 --key-dir keys   # 署名 identity
+nk-crypto-tool --keyring-cmd gen-my-key --key-algo ML-KEM-768 --key-dir keys  # 暗号化鍵
+# hybrid にするなら P-256 も（enc/sign 両用のため役割を指定）
+nk-crypto-tool --keyring-cmd gen-my-key --key-algo P-256 --key-role enc --key-dir keys
+```
+
+- パスフレーズは必須（keyring は暗号化秘密鍵しか持たない）。取り込み(import-my-key)と
+  同一の検証（OID 分類・公開鍵再導出束縛・ML-KEM 自己テスト）を通ってから格納される。
+- 既に鍵を持つスロットへの再生成は拒否（`remove-my-key` してから）。
+- 公開鍵の配布は §1 の `--gen-keybundle`（keyring 直読）で。以後 encrypt / decrypt /
+  sign / KeyBundle 生成まで鍵ファイル不要。TPM 封印鍵は対象外（ファイル運用のみ）。
+
 **指紋の確認**（相手を pin するとき out-of-band で照合する 64 hex）:
 ```bash
 nk-crypto-tool --mode pqc --fingerprint --signing-pubkey keys/public_sign_pqc.key

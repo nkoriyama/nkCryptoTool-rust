@@ -461,9 +461,10 @@ struct Args {
     // Keyring flags (redb-backed store of known KeyBundles, keyed by
     // handle; populated by pairing and by `--keyring-cmd add/import`).
     // -------------------------------------------------------------
-    /// Keyring subcommand: `add`, `list`, `remove`, `import`, `authorize`, or
-    /// `revoke`.
-    #[arg(long, help = "Keyring subcommand (add|list|remove|import|authorize|revoke)")]
+    /// Keyring subcommand: `add`, `list`, `remove`, `import`, `authorize`,
+    /// `revoke`, `gen-my-key`, `import-my-key`, `list-my-keys`, or
+    /// `remove-my-key`.
+    #[arg(long, help = "Keyring subcommand (add|list|remove|import|authorize|revoke|gen-my-key|import-my-key|list-my-keys|remove-my-key)")]
     keyring_cmd: Option<String>,
 
     /// Comma-separated transports to grant a peer. One or more of `shell`,
@@ -1637,6 +1638,15 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
 
     let cmd = args.keyring_cmd.as_deref().unwrap();
     let db = keyring_db_path(args.keyring_db.as_deref(), args.key_dir.as_deref());
+    // gen-my-key is a first-run entry point (it REPLACES --gen-*-key, which
+    // creates the key dir itself) — make the keyring's directory like the
+    // file-based path would.
+    if cmd == "gen-my-key" {
+        if let Some(parent) = db.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| anyhow::anyhow!("create {}: {e}", parent.display()))?;
+        }
+    }
     let store =
         KeyringStore::open(&db).map_err(|e| anyhow::anyhow!("open keyring {db:?}: {e}"))?;
     let now = std::time::SystemTime::now()
@@ -1744,6 +1754,78 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
                 println!("{} was not authorized", hex::encode(fp));
             }
         }
+        "gen-my-key" => {
+            // Generate one of the user's OWN key pairs straight into the
+            // keyring: the private key exists only as passphrase-encrypted
+            // PKCS#8 inside keyring.db and never touches disk as a file
+            // (unlike --gen-enc-key/--gen-sign-key + import-my-key, which
+            // pass through one).
+            let algo = args.key_algo.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "gen-my-key requires --key-algo \
+                     <ML-KEM-512|ML-KEM-768|ML-KEM-1024|ML-DSA-44|ML-DSA-65|ML-DSA-87|P-256>"
+                )
+            })?;
+            let pass = nk_crypto_tool::utils::get_and_verify_passphrase(
+                "Generate keyring key pair",
+            )?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "gen-my-key requires a passphrase (the keyring only stores \
+                     encrypted private keys)"
+                )
+            })?;
+            let enc_der = match algo {
+                "ML-KEM-512" | "ML-KEM-768" | "ML-KEM-1024" => {
+                    let (raw_priv, _, _) = nk_crypto_tool::backend::pqc_keygen_kem(algo)?;
+                    nk_crypto_tool::utils::wrap_pqc_priv_to_pkcs8_encrypted(
+                        &raw_priv, algo, &pass,
+                    )?
+                }
+                "ML-DSA-44" | "ML-DSA-65" | "ML-DSA-87" => {
+                    let (raw_priv, _, _) = nk_crypto_tool::backend::pqc_keygen_dsa(algo)?;
+                    nk_crypto_tool::utils::wrap_pqc_priv_to_pkcs8_encrypted(
+                        &raw_priv, algo, &pass,
+                    )?
+                }
+                "P-256" => {
+                    let (priv_der, _) =
+                        nk_crypto_tool::backend::generate_ecc_key_pair("prime256v1")?;
+                    let priv_der = Zeroizing::new(priv_der);
+                    nk_crypto_tool::utils::encrypt_pkcs8_der(&priv_der, &pass)?
+                }
+                other => anyhow::bail!(
+                    "unsupported --key-algo {other:?}; expected \
+                     ML-KEM-512|ML-KEM-768|ML-KEM-1024|ML-DSA-44|ML-DSA-65|ML-DSA-87|P-256"
+                ),
+            };
+            let pem = nk_crypto_tool::utils::wrap_to_pem(&enc_der, "ENCRYPTED PRIVATE KEY");
+            // Run the freshly generated key through the SAME validation as an
+            // import (decrypt, OID classification, pub re-derivation + binding,
+            // ML-KEM encap/decap self-test): what enters the keyring is checked
+            // by one code path regardless of where it came from.
+            let (algo, inferred_role, rec) = nk_crypto_tool::keyring::build_my_identity_record(
+                pem.as_bytes(),
+                &pass,
+                None,
+                now,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let role = resolve_my_key_role(inferred_role, args.key_role.as_deref(), &algo)?;
+            let handle = args.keybundle_handle.as_deref().unwrap_or("me");
+            let outcome = store
+                .put_my_identity(handle, role, &algo, &rec)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            println!(
+                "{} {handle}:{role}:{algo} (fingerprint {}) in keyring {} — no key file written",
+                match outcome {
+                    nk_crypto_tool::keyring::AddOutcome::Added => "Generated",
+                    nk_crypto_tool::keyring::AddOutcome::Updated => "Regenerated",
+                },
+                hex::encode(rec.fingerprint),
+                db.display()
+            );
+        }
         "import-my-key" => {
             // Encapsulate one of the user's OWN key pairs into the keyring
             // (GPG-keyring style): validate, derive + bind the public half,
@@ -1790,19 +1872,7 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
                 now,
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let role = match (inferred_role, args.key_role.as_deref()) {
-                (Some(r), None) => r,
-                (Some(r), Some(given)) if given == r => r,
-                (Some(r), Some(given)) => anyhow::bail!(
-                    "--key-role {given} contradicts the key itself ({algo} is a {r} key)"
-                ),
-                (None, Some("enc")) => "enc",
-                (None, Some("sign")) => "sign",
-                (None, Some(other)) => anyhow::bail!("--key-role must be enc or sign, got {other}"),
-                (None, None) => anyhow::bail!(
-                    "{algo} serves both roles — say which with --key-role enc|sign"
-                ),
-            };
+            let role = resolve_my_key_role(inferred_role, args.key_role.as_deref(), &algo)?;
             let handle = args.keybundle_handle.as_deref().unwrap_or("me");
             let outcome = store
                 .put_my_identity(handle, role, &algo, &rec)
@@ -1867,10 +1937,35 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
             }
         }
         other => anyhow::bail!(
-            "unknown --keyring-cmd {other:?}; expected one of add|list|remove|import|authorize|revoke|import-my-key|list-my-keys|remove-my-key"
+            "unknown --keyring-cmd {other:?}; expected one of add|list|remove|import|authorize|revoke|gen-my-key|import-my-key|list-my-keys|remove-my-key"
         ),
     }
     Ok(())
+}
+
+/// The my-identities slot role for a key: the classification's inferred role
+/// when the algorithm implies one (ML-KEM→enc, ML-DSA→sign; `--key-role` may
+/// restate but not contradict it), else the caller-supplied `--key-role`
+/// (P-256 serves both, so it must be told). Shared by `import-my-key` and
+/// `gen-my-key`.
+fn resolve_my_key_role(
+    inferred_role: Option<&'static str>,
+    given: Option<&str>,
+    algo: &str,
+) -> anyhow::Result<&'static str> {
+    match (inferred_role, given) {
+        (Some(r), None) => Ok(r),
+        (Some(r), Some(given)) if given == r => Ok(r),
+        (Some(r), Some(given)) => anyhow::bail!(
+            "--key-role {given} contradicts the key itself ({algo} is a {r} key)"
+        ),
+        (None, Some("enc")) => Ok("enc"),
+        (None, Some("sign")) => Ok("sign"),
+        (None, Some(other)) => anyhow::bail!("--key-role must be enc or sign, got {other}"),
+        (None, None) => anyhow::bail!(
+            "{algo} serves both roles — say which with --key-role enc|sign"
+        ),
+    }
 }
 
 /// Resolve the fingerprint for `keyring authorize|revoke`: from
