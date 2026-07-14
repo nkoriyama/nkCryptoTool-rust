@@ -144,6 +144,20 @@ nk-crypto-tool --mode pqc --sign \
 ```
 - ダイジェストは `--digest-algo`（既定 `SHA3-512`）で変更可。検証側は指定不要（署名から自動認識）。
 
+### 3.1 鍵リングで鍵ファイル指定を省略する（GPG 風）
+
+§2.1 と同じ仕組みが署名にも効く。署名鍵を一度取り込めば、以後は
+`--signing-privkey` なしで署名できる（スロットはモードから決まる:
+pqc/hybrid → `--dsa-algo` の ML-DSA 鍵、ecc → P-256 鍵）:
+
+```bash
+# 一度だけ: 取り込み（ML-DSA は役割自動判定。P-256 は --key-role sign が必要）
+nk-crypto-tool --keyring-cmd import-my-key --user-privkey keys/private_sign_pqc.key
+
+# 以後: 鍵指定なしで署名
+nk-crypto-tool --mode pqc --sign --signature doc.sig doc.txt
+```
+
 ---
 
 ## 4. 検証 — 署名が本物か確かめる

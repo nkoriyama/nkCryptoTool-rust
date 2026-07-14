@@ -50,6 +50,10 @@ pub struct EccStrategy {
     // user-privkey file.
     user_privkey_pem: Option<Zeroizing<String>>,
 
+    // The user's own P-256 ECDSA signing key in the same keyring-injected
+    // form. When `Some`, `prepare_signing` uses it and ignores the key path.
+    signing_privkey_pem: Option<Zeroizing<String>>,
+
     // Signing keys (stored as DER to be backend-agnostic)
     sign_key_der: Option<Zeroizing<Vec<u8>>>,
     verify_key_der: Option<Zeroizing<Vec<u8>>>,
@@ -79,6 +83,7 @@ impl EccStrategy {
             ephemeral_pubkey: Vec::new(),
             recipient_pub_der: None,
             user_privkey_pem: None,
+            signing_privkey_pem: None,
             sign_key_der: None,
             verify_key_der: None,
             chunk_size: V3_DEFAULT_CHUNK_SIZE,
@@ -354,12 +359,21 @@ impl CryptoStrategy for EccStrategy {
         passphrase: &mut Option<Zeroizing<String>>,
         digest_algo: &str,
     ) -> Result<()> {
-        let priv_bytes = Zeroizing::new(fs::read(priv_key_path)?);
-        let pem_str = Zeroizing::new(
-            std::str::from_utf8(&priv_bytes)
-                .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
-                .to_string(),
-        );
+        // Prefer a keyring-injected encrypted-PKCS#8 PEM (auto-match): no file
+        // read. The keyring never stores TPM blobs (import refuses anything
+        // that is not encrypted PKCS#8), so the TPM branch below stays
+        // file-path-only.
+        let pem_str: Zeroizing<String> = match self.signing_privkey_pem.clone() {
+            Some(pem) => pem,
+            None => {
+                let priv_bytes = Zeroizing::new(fs::read(priv_key_path)?);
+                Zeroizing::new(
+                    std::str::from_utf8(&priv_bytes)
+                        .map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?
+                        .to_string(),
+                )
+            }
+        };
 
         let priv_key_der = if pem_str.contains("-----BEGIN TPM WRAPPED BLOB-----") {
             let provider = self
@@ -675,6 +689,10 @@ impl CryptoStrategy for EccStrategy {
 
     fn set_user_enc_privkey_pem(&mut self, pem: Zeroizing<String>) {
         self.user_privkey_pem = Some(pem);
+    }
+
+    fn set_signing_privkey_pem(&mut self, pem: Zeroizing<String>) {
+        self.signing_privkey_pem = Some(pem);
     }
 
     fn get_salt(&self) -> Vec<u8> {

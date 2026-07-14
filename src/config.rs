@@ -146,6 +146,7 @@ pub struct CryptoConfig {
     // in memory and the `user_*_privkey` path lookups are skipped.
     pub user_enc_privkey_pem: Option<Zeroizing<String>>, // ML-KEM (pqc/hybrid) or P-256 (ecc)
     pub user_hybrid_privkey_pem: Option<Zeroizing<String>>, // hybrid's P-256 ECDH half
+    pub signing_privkey_pem: Option<Zeroizing<String>>, // ML-DSA (pqc/hybrid) or P-256 ECDSA (ecc)
 
     // Options
     pub passphrase: Option<Zeroizing<String>>,
@@ -305,6 +306,7 @@ impl Default for CryptoConfig {
             recipient_hybrid_key_bytes: None,
             user_enc_privkey_pem: None,
             user_hybrid_privkey_pem: None,
+            signing_privkey_pem: None,
             user_mlkem_privkey: None,
             user_ecdh_privkey: None,
             passphrase: None,
