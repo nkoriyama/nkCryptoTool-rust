@@ -65,6 +65,13 @@ out-of-band（電話等）で送信者へ**渡す。指紋は §0 の `--fingerp
 - **hybrid の場合**: `--mode hybrid` で発行すると、束に **ML-KEM と P-256 の両方**が入る
   （送信者側の「hybrid→両方」と対応）。identity は常に ML-DSA-65。
 - `--keybundle-expiry-secs <N>` で有効期限（現在から N 秒）を付与できる。
+- **鍵リング直読（GPG 風）**: 鍵を §2.1/§3.1 の手順で keyring に取り込み済みなら、
+  `--signing-privkey` を省略できる — identity も暗号化公開鍵も `keyring.db` の
+  my-identities から解決される（identity スロットは `--keybundle-handle` が自分の鍵を
+  持てばそれ、なければ取り込み既定の `me`）。束ねる**全スロットを 1 つのパスフレーズで
+  unlock して秘密鍵との束縛を検証してから**署名するため、DB 内のレコードを差し替えても
+  偽の公開鍵は束に入らない（鍵ファイル方式にはこの検証はない）。`--copy-bundle`
+  （§7 ペアリング）も同様に省略可。
 
 ### 送信者側（暗号化）
 ```bash
@@ -282,6 +289,7 @@ nk-crypto-tool --copy-bundle --mode pqc --connect <ticket> --token <OTP> \
 #   → "registered alice …" が出れば成功
 ```
 - サーバは **ticket に埋まった指紋**で自動的に pin される（`--signing-pubkey` 不要）。
+- 鍵を keyring に取り込み済みなら `--signing-privkey` は省略可（§1 の鍵リング直読と同じ解決）。
 - クライアントは自身の identity で**自己署名**し、サーバは
   「**handshake 指紋 == 送る KeyBundle の owner 指紋**」を照合してから登録する（接続本人が鍵所持を
   証明した identity だけを登録＝他人の bundle を代理登録できない）。

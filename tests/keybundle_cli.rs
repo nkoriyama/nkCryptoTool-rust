@@ -139,3 +139,94 @@ fn raw_flag_rejected_for_encrypt_but_fingerprint_still_works() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("Fingerprint:"));
     let _ = fs::remove_dir_all(dir);
 }
+
+/// Keyring direct-read: `--gen-keybundle` with NO `--signing-privkey` resolves
+/// the ML-DSA identity and the enc key from the my-identities table, and the
+/// resulting bundle round-trips (encrypt to it → keyring auto-match decrypt).
+/// After import, no explicit key path appears anywhere in the circle.
+#[test]
+fn keyring_gen_keybundle_full_circle() {
+    let dir = "tests/tmp_kb_keyring";
+    let b = bin();
+    let _ = fs::remove_dir_all(dir);
+    for kind in ["--gen-sign-key", "--gen-enc-key"] {
+        assert!(Command::new(&b)
+            .env("NK_PASSPHRASE", PASS)
+            .args(["--mode", "pqc", kind, "--key-dir", dir])
+            .status()
+            .unwrap()
+            .success());
+    }
+
+    // Empty keyring: the keyring path must fail with the import hint, not
+    // silently fall back to key files.
+    let out = Command::new(&b)
+        .env("NK_PASSPHRASE", PASS)
+        .args([
+            "--mode", "pqc", "--gen-keybundle",
+            "--key-dir", dir,
+            "--keybundle-handle", "me",
+            "--keybundle-output", &format!("{dir}/r.nkkb"),
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "empty keyring must not produce a bundle");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("import-my-key"), "expected import hint, got: {err}");
+
+    // Import both halves of the identity into the keyring.
+    for key in ["private_sign_pqc.key", "private_enc_pqc.key"] {
+        let out = Command::new(&b)
+            .env("NK_PASSPHRASE", PASS)
+            .args([
+                "--keyring-cmd", "import-my-key",
+                "--user-privkey", &format!("{dir}/{key}"),
+                "--key-dir", dir,
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "import {key}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    // Bundle from the keyring alone (no --signing-privkey).
+    let bundle = format!("{dir}/r.nkkb");
+    let out = Command::new(&b)
+        .env("NK_PASSPHRASE", PASS)
+        .args([
+            "--mode", "pqc", "--gen-keybundle",
+            "--key-dir", dir,
+            "--keybundle-handle", "me",
+            "--keybundle-output", &bundle,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "gen-keybundle: {}", String::from_utf8_lossy(&out.stderr));
+    let fp = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .find(|w| w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("fingerprint")
+        .to_string();
+
+    // Encrypt to the keyring-built bundle, then decrypt with keyring
+    // auto-match — no private-key path on either side.
+    let input = format!("{dir}/in.txt");
+    fs::write(&input, "keyfile-less full circle").unwrap();
+    let enc = format!("{dir}/out.enc");
+    let out = encrypt(dir, &bundle, &fp, &input, &enc);
+    assert!(out.status.success(), "encrypt: {}", String::from_utf8_lossy(&out.stderr));
+
+    let plain = format!("{dir}/out.txt");
+    let out = Command::new(&b)
+        .env("NK_PASSPHRASE", PASS)
+        .args([
+            "--mode", "pqc", "--decrypt",
+            "--key-dir", dir,
+            "--output-file", &plain,
+            &enc,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "decrypt: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(fs::read(&plain).unwrap(), b"keyfile-less full circle");
+    let _ = fs::remove_dir_all(dir);
+}
