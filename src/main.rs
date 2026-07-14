@@ -1033,12 +1033,9 @@ async fn main() -> anyhow::Result<()> {
         if config.pairing_token.is_none() {
             anyhow::bail!("--copy-bundle requires --token <OTP> (as printed by the pairing server)");
         }
-        if config.signing_privkey.is_none() {
-            anyhow::bail!(
-                "--copy-bundle requires --signing-privkey <key> (your identity) and \
-                 --keybundle-handle <name>"
-            );
-        }
+        // No --signing-privkey needed: build_keybundle_bytes falls back to the
+        // keyring my-identities table (keyring_bundle_keys), which errors with
+        // an import hint if the identity is not there either.
     }
     config.allow_unauth = args.allow_unauth;
     config.force = args.force;
@@ -1455,6 +1452,147 @@ fn keyring_automatch_sign(
     Ok(())
 }
 
+/// Everything a KeyBundle build needs, resolved from the keyring my-identities
+/// table instead of key files.
+struct KeyringBundleKeys {
+    /// Raw ML-DSA-65 private key (signs the bundle).
+    owner_sk: Zeroizing<Vec<u8>>,
+    /// Raw ML-DSA-65 public key (the identity anchor the fingerprint hashes).
+    owner_pk: Vec<u8>,
+    /// `(usage, key bytes)`: raw ML-KEM ek for ENC, P-256 SPKI DER for HYBRID.
+    enc_keys: Vec<(u8, Vec<u8>)>,
+}
+
+/// Resolve a KeyBundle's owner identity and encryption key(s) from the keyring
+/// (`--gen-keybundle` / `--copy-bundle` with no `--signing-privkey`). The
+/// identity handle is the bundle label when that handle holds its own sign
+/// key, else the import default `"me"`.
+///
+/// EVERY slot that enters the bundle — the signer AND the plaintext-stored
+/// public halves — is first unlocked and binding-checked under one shared
+/// passphrase, so a tampered my-identities record cannot smuggle a foreign
+/// public key into a bundle we then sign: it fails closed before
+/// `build_signed` runs. (The file-based path has no such check — a swapped
+/// pubkey file is signed as-is — so the keyring path is strictly stronger.)
+/// Keys imported under different passphrases must be re-imported to share one.
+fn keyring_bundle_keys(
+    keyring_db: Option<&str>,
+    key_dir: &str,
+    label: &str,
+    mode: CryptoMode,
+    kem_algo: &str,
+) -> anyhow::Result<KeyringBundleKeys> {
+    use nk_crypto_tool::keybundle::{KEY_USAGE_ENC, KEY_USAGE_HYBRID};
+    use nk_crypto_tool::keyring::{self, KeyringStore};
+
+    let db = keyring_db_path(keyring_db, Some(key_dir));
+    let store =
+        KeyringStore::open(&db).map_err(|e| anyhow::anyhow!("open keyring {db:?}: {e}"))?;
+
+    // The bundle label doubles as the identity handle when it has its own
+    // keys; otherwise "me" (the import-my-key default) is the identity.
+    let identity = if store
+        .get_my_identity(label, "sign", KEYBUNDLE_IDENTITY_DSA)
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+        .is_some()
+    {
+        label
+    } else {
+        "me"
+    };
+
+    let need = |role: &'static str, algo: &str| -> anyhow::Result<keyring::MyIdentityRecord> {
+        match store
+            .get_my_identity(identity, role, algo)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+        {
+            Some(rec) => Ok(rec),
+            None => {
+                let have: Vec<String> = store
+                    .list_my_identities()
+                    .map_err(|e| anyhow::anyhow!("{e}"))?
+                    .into_iter()
+                    .filter(|(h, ro, _, _)| h == identity && ro == role)
+                    .map(|(_, _, al, _)| al)
+                    .collect();
+                anyhow::bail!(
+                    "keyring {} has no key in slot {identity}:{role}:{algo}{} — import it once \
+                     with:\n  nk-crypto-tool --keyring-cmd import-my-key --user-privkey <keyfile>{}\n\
+                     (or pass explicit key files via --signing-privkey)",
+                    db.display(),
+                    if have.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (available {role} keys: {})", have.join(", "))
+                    },
+                    if identity == "me" {
+                        String::new()
+                    } else {
+                        format!(" --keybundle-handle {identity}")
+                    }
+                )
+            }
+        }
+    };
+
+    let sign_rec = need("sign", KEYBUNDLE_IDENTITY_DSA)?;
+    let mut enc_slots: Vec<(u8, String)> = Vec::new();
+    match mode {
+        CryptoMode::PQC => enc_slots.push((KEY_USAGE_ENC, kem_algo.to_string())),
+        CryptoMode::ECC => enc_slots.push((KEY_USAGE_HYBRID, "P-256".to_string())),
+        CryptoMode::Hybrid => {
+            enc_slots.push((KEY_USAGE_ENC, kem_algo.to_string()));
+            enc_slots.push((KEY_USAGE_HYBRID, "P-256".to_string()));
+        }
+    }
+    // Resolve every record before prompting, so a missing slot errors cheaply.
+    let enc_slots: Vec<(u8, String, keyring::MyIdentityRecord)> = enc_slots
+        .into_iter()
+        .map(|(usage, algo)| Ok((usage, algo.clone(), need("enc", &algo)?)))
+        .collect::<anyhow::Result<_>>()?;
+
+    eprintln!("Keyring passphrase for {identity:?}:");
+    let pass = nk_crypto_tool::utils::get_masked_passphrase()
+        .map_err(|e| anyhow::anyhow!("read passphrase: {e}"))?;
+
+    // Owner identity: unlock (binding check), then derive the raw signing key
+    // from the just-verified encrypted PEM — the in-memory twin of
+    // `load_raw_dsa_priv`.
+    let pem = keyring::unlock_and_verify_identity(&sign_rec, KEYBUNDLE_IDENTITY_DSA, &pass)
+        .map_err(|e| anyhow::anyhow!("{identity}:sign:{KEYBUNDLE_IDENTITY_DSA}: {e}"))?;
+    let der = nk_crypto_tool::utils::unwrap_from_pem(&pem, "PRIVATE KEY")?;
+    let plain = Zeroizing::new(nk_crypto_tool::utils::extract_raw_private_key(
+        &der,
+        Some(pass.as_str()),
+    )?);
+    let owner_sk =
+        nk_crypto_tool::utils::unwrap_pqc_priv_from_pkcs8(&plain, KEYBUNDLE_IDENTITY_DSA)?;
+    let owner_pk =
+        nk_crypto_tool::utils::unwrap_pqc_pub_from_spki(&sign_rec.public_key_der, "any")?;
+    eprintln!(
+        "[nkct] keyring: unlocked {identity}:sign:{KEYBUNDLE_IDENTITY_DSA} ({}…)",
+        hex::encode(&sign_rec.fingerprint[..8])
+    );
+
+    let mut enc_keys = Vec::with_capacity(enc_slots.len());
+    for (usage, algo, rec) in &enc_slots {
+        keyring::unlock_and_verify_identity(rec, algo, &pass)
+            .map_err(|e| anyhow::anyhow!("{identity}:enc:{algo}: {e}"))?;
+        let key = if *usage == KEY_USAGE_ENC {
+            nk_crypto_tool::utils::unwrap_pqc_pub_from_spki(&rec.public_key_der, algo)?
+        } else {
+            rec.public_key_der.clone()
+        };
+        enc_keys.push((*usage, key));
+    }
+
+    Ok(KeyringBundleKeys {
+        owner_sk,
+        owner_pk,
+        enc_keys,
+    })
+}
+
 fn keyring_db_path(keyring_db: Option<&str>, key_dir: Option<&str>) -> std::path::PathBuf {
     if let Some(p) = keyring_db {
         std::path::PathBuf::from(p)
@@ -1771,27 +1909,6 @@ fn run_gen_keybundle(args: &Args, mode: CryptoMode) -> anyhow::Result<()> {
         anyhow::anyhow!("--keybundle-output <file> is required for --gen-keybundle")
     })?;
 
-    // Owner ML-DSA identity: private key signs; public key is the self-referential
-    // anchor and hashes to the fingerprint senders pin.
-    let signing_priv = resolve_key_path(&key_dir, args.signing_privkey.clone())
-        .ok_or_else(|| anyhow::anyhow!("--signing-privkey is required for --gen-keybundle"))?;
-    let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
-        .map_err(|e| anyhow::anyhow!("read signing key passphrase: {e}"))?;
-    let owner_sk = load_raw_dsa_priv(&signing_priv, &passphrase)?;
-
-    // The KeyBundle identity is ALWAYS the ML-DSA-65 single anchor, independent
-    // of the encryption `--mode` (which only selects which enc keys to bind). So
-    // `--signing-privkey` must be an ML-DSA-65 key (as made by `--mode pqc` or
-    // `--mode hybrid` `--gen-sign-key`), never the ecc-mode ECDSA key. The owner
-    // pub defaults to the signing key's sibling file (`private_sign…` →
-    // `public_sign…`), so it matches whatever identity was passed regardless of
-    // mode; override with `--signing-pubkey`.
-    let owner_pub_path = resolve_key_path(&key_dir, args.signing_pubkey.clone())
-        .unwrap_or_else(|| signing_priv.replacen("private_sign", "public_sign", 1));
-    // "any": match calculate_fingerprint's unwrap so owner_pk is byte-identical
-    // to the value the fingerprint hashes and parse_and_verify re-derives.
-    let owner_pk = load_raw_pqc_pub(&owner_pub_path, "any")?;
-
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| anyhow::anyhow!("system clock is before the UNIX epoch: {e}"))?
@@ -1800,24 +1917,74 @@ fn run_gen_keybundle(args: &Args, mode: CryptoMode) -> anyhow::Result<()> {
         .keybundle_expiry_secs
         .map(|s| created_at.saturating_add(s));
 
-    let mut keys: Vec<(u8, Vec<u8>, u64, Option<u64>)> = Vec::new();
-    match mode {
-        CryptoMode::PQC => {
-            let ek = load_raw_pqc_pub(&format!("{key_dir}/public_enc_pqc.key"), &args.kem_algo)?;
-            keys.push((KEY_USAGE_ENC, ek, created_at, expires_at));
-        }
-        CryptoMode::ECC => {
-            let der = load_spki_der_pub(&format!("{key_dir}/public_enc_ecc.key"))?;
-            keys.push((KEY_USAGE_HYBRID, der, created_at, expires_at));
-        }
-        CryptoMode::Hybrid => {
-            let ek =
-                load_raw_pqc_pub(&format!("{key_dir}/public_enc_hybrid_mlkem.key"), &args.kem_algo)?;
-            keys.push((KEY_USAGE_ENC, ek, created_at, expires_at));
-            let der = load_spki_der_pub(&format!("{key_dir}/public_enc_hybrid_ecdh.key"))?;
-            keys.push((KEY_USAGE_HYBRID, der, created_at, expires_at));
-        }
-    }
+    let (owner_sk, owner_pk, keys): (_, _, Vec<(u8, Vec<u8>, u64, Option<u64>)>) =
+        match resolve_key_path(&key_dir, args.signing_privkey.clone()) {
+            Some(signing_priv) => {
+                // Owner ML-DSA identity: private key signs; public key is the
+                // self-referential anchor and hashes to the fingerprint senders pin.
+                let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+                    .map_err(|e| anyhow::anyhow!("read signing key passphrase: {e}"))?;
+                let owner_sk = load_raw_dsa_priv(&signing_priv, &passphrase)?;
+
+                // The KeyBundle identity is ALWAYS the ML-DSA-65 single anchor,
+                // independent of the encryption `--mode` (which only selects which enc
+                // keys to bind). So `--signing-privkey` must be an ML-DSA-65 key (as
+                // made by `--mode pqc` or `--mode hybrid` `--gen-sign-key`), never the
+                // ecc-mode ECDSA key. The owner pub defaults to the signing key's
+                // sibling file (`private_sign…` → `public_sign…`), so it matches
+                // whatever identity was passed regardless of mode; override with
+                // `--signing-pubkey`.
+                let owner_pub_path = resolve_key_path(&key_dir, args.signing_pubkey.clone())
+                    .unwrap_or_else(|| signing_priv.replacen("private_sign", "public_sign", 1));
+                // "any": match calculate_fingerprint's unwrap so owner_pk is
+                // byte-identical to the value the fingerprint hashes and
+                // parse_and_verify re-derives.
+                let owner_pk = load_raw_pqc_pub(&owner_pub_path, "any")?;
+
+                let mut keys: Vec<(u8, Vec<u8>, u64, Option<u64>)> = Vec::new();
+                match mode {
+                    CryptoMode::PQC => {
+                        let ek = load_raw_pqc_pub(
+                            &format!("{key_dir}/public_enc_pqc.key"),
+                            &args.kem_algo,
+                        )?;
+                        keys.push((KEY_USAGE_ENC, ek, created_at, expires_at));
+                    }
+                    CryptoMode::ECC => {
+                        let der = load_spki_der_pub(&format!("{key_dir}/public_enc_ecc.key"))?;
+                        keys.push((KEY_USAGE_HYBRID, der, created_at, expires_at));
+                    }
+                    CryptoMode::Hybrid => {
+                        let ek = load_raw_pqc_pub(
+                            &format!("{key_dir}/public_enc_hybrid_mlkem.key"),
+                            &args.kem_algo,
+                        )?;
+                        keys.push((KEY_USAGE_ENC, ek, created_at, expires_at));
+                        let der =
+                            load_spki_der_pub(&format!("{key_dir}/public_enc_hybrid_ecdh.key"))?;
+                        keys.push((KEY_USAGE_HYBRID, der, created_at, expires_at));
+                    }
+                }
+                (owner_sk, owner_pk, keys)
+            }
+            // No --signing-privkey: resolve identity AND enc keys from the
+            // keyring my-identities table (every slot binding-checked).
+            None => {
+                let kb = keyring_bundle_keys(
+                    args.keyring_db.as_deref(),
+                    &key_dir,
+                    handle,
+                    mode,
+                    &args.kem_algo,
+                )?;
+                let keys = kb
+                    .enc_keys
+                    .into_iter()
+                    .map(|(usage, key)| (usage, key, created_at, expires_at))
+                    .collect();
+                (kb.owner_sk, kb.owner_pk, keys)
+            }
+        };
 
     // Sign under the fixed ML-DSA-65 anchor — same algorithm the loader and the
     // consumer's parse_and_verify use, so producer and verifier always agree.
@@ -1839,47 +2006,70 @@ fn run_gen_keybundle(args: &Args, mode: CryptoMode) -> anyhow::Result<()> {
 
 /// Build this identity's signed KeyBundle bytes in memory (the same content
 /// `--gen-keybundle` writes) for `--copy-bundle` to send. Returns `(bytes, owner_fp)`.
+/// `signing_priv: None` resolves everything from the keyring my-identities
+/// table instead of key files (see `keyring_bundle_keys`).
 fn build_keybundle_bytes(
     key_dir: &str,
     mode: CryptoMode,
     handle: &str,
-    signing_priv: &str,
+    signing_priv: Option<&str>,
     signing_pub: Option<&str>,
     kem_algo: &str,
+    keyring_db: Option<&str>,
 ) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
     use nk_crypto_tool::keybundle::{self, KEY_USAGE_ENC, KEY_USAGE_HYBRID};
     use sha3::{Digest, Sha3_256};
-
-    let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
-        .map_err(|e| anyhow::anyhow!("read signing key passphrase: {e}"))?;
-    let owner_sk = load_raw_dsa_priv(signing_priv, &passphrase)?;
-    let owner_pub_path = signing_pub
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| signing_priv.replacen("private_sign", "public_sign", 1));
-    let owner_pk = load_raw_pqc_pub(&owner_pub_path, "any")?;
 
     let created_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| anyhow::anyhow!("system clock is before the UNIX epoch: {e}"))?
         .as_secs();
 
-    let mut keys: Vec<(u8, Vec<u8>, u64, Option<u64>)> = Vec::new();
-    match mode {
-        CryptoMode::PQC => {
-            let ek = load_raw_pqc_pub(&format!("{key_dir}/public_enc_pqc.key"), kem_algo)?;
-            keys.push((KEY_USAGE_ENC, ek, created_at, None));
-        }
-        CryptoMode::ECC => {
-            let der = load_spki_der_pub(&format!("{key_dir}/public_enc_ecc.key"))?;
-            keys.push((KEY_USAGE_HYBRID, der, created_at, None));
-        }
-        CryptoMode::Hybrid => {
-            let ek = load_raw_pqc_pub(&format!("{key_dir}/public_enc_hybrid_mlkem.key"), kem_algo)?;
-            keys.push((KEY_USAGE_ENC, ek, created_at, None));
-            let der = load_spki_der_pub(&format!("{key_dir}/public_enc_hybrid_ecdh.key"))?;
-            keys.push((KEY_USAGE_HYBRID, der, created_at, None));
-        }
-    }
+    let (owner_sk, owner_pk, keys): (_, _, Vec<(u8, Vec<u8>, u64, Option<u64>)>) =
+        match signing_priv {
+            Some(signing_priv) => {
+                let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+                    .map_err(|e| anyhow::anyhow!("read signing key passphrase: {e}"))?;
+                let owner_sk = load_raw_dsa_priv(signing_priv, &passphrase)?;
+                let owner_pub_path = signing_pub
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| signing_priv.replacen("private_sign", "public_sign", 1));
+                let owner_pk = load_raw_pqc_pub(&owner_pub_path, "any")?;
+
+                let mut keys: Vec<(u8, Vec<u8>, u64, Option<u64>)> = Vec::new();
+                match mode {
+                    CryptoMode::PQC => {
+                        let ek =
+                            load_raw_pqc_pub(&format!("{key_dir}/public_enc_pqc.key"), kem_algo)?;
+                        keys.push((KEY_USAGE_ENC, ek, created_at, None));
+                    }
+                    CryptoMode::ECC => {
+                        let der = load_spki_der_pub(&format!("{key_dir}/public_enc_ecc.key"))?;
+                        keys.push((KEY_USAGE_HYBRID, der, created_at, None));
+                    }
+                    CryptoMode::Hybrid => {
+                        let ek = load_raw_pqc_pub(
+                            &format!("{key_dir}/public_enc_hybrid_mlkem.key"),
+                            kem_algo,
+                        )?;
+                        keys.push((KEY_USAGE_ENC, ek, created_at, None));
+                        let der =
+                            load_spki_der_pub(&format!("{key_dir}/public_enc_hybrid_ecdh.key"))?;
+                        keys.push((KEY_USAGE_HYBRID, der, created_at, None));
+                    }
+                }
+                (owner_sk, owner_pk, keys)
+            }
+            None => {
+                let kb = keyring_bundle_keys(keyring_db, key_dir, handle, mode, kem_algo)?;
+                let keys = kb
+                    .enc_keys
+                    .into_iter()
+                    .map(|(usage, key)| (usage, key, created_at, None))
+                    .collect();
+                (kb.owner_sk, kb.owner_pk, keys)
+            }
+        };
     let bundle = keybundle::build_signed(KEYBUNDLE_IDENTITY_DSA, &owner_sk, &owner_pk, handle, created_at, &keys)
         .map_err(|e| anyhow::anyhow!("build keybundle: {e}"))?;
     let fp: [u8; 32] = Sha3_256::digest(&owner_pk).into();
@@ -1932,17 +2122,14 @@ async fn run_copy_bundle(mut config: CryptoConfig, mode: CryptoMode) -> anyhow::
         .keybundle_handle
         .clone()
         .ok_or_else(|| anyhow::anyhow!("--copy-bundle requires --keybundle-handle <name>"))?;
-    let signing_priv = config
-        .signing_privkey
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("--copy-bundle requires --signing-privkey <key>"))?;
     let (bytes, fp) = build_keybundle_bytes(
         &config.key_dir,
         mode,
         &handle,
-        &signing_priv,
+        config.signing_privkey.as_deref(),
         config.signing_pubkey.as_deref(),
         &config.pqc_kem_algo,
+        config.keyring_db.as_deref(),
     )?;
     eprintln!(
         "[copy-bundle] sending KeyBundle (handle {handle:?}, fingerprint {})",
