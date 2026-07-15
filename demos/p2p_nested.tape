@@ -1,7 +1,7 @@
 # Nested / chained bastion-less PQC P2P: shell into host A, run `nkct
 # --serve-scp` inside that shell, then fetch A's file from outside.
 # Render:  vhs demos/p2p_nested.tape
-Output docs/p2p_nested_demo.gif
+Output docs/demos/p2p_nested_demo.gif
 
 Set Shell "bash"
 Set FontSize 14

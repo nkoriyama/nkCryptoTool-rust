@@ -4,7 +4,7 @@
 # path-jailed scp — loopback iroh, default-deny preserved. Runs the self-pacing
 # demos/pairing_demo.sh.
 # Render:  vhs demos/pairing.tape
-Output docs/pairing_demo.gif
+Output docs/demos/pairing_demo.gif
 
 Set Shell "bash"
 Set FontSize 14
