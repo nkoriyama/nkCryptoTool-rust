@@ -1,0 +1,1 @@
+{"rustc":14808471010885219997,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[14643085759484013816,"build_script_build",false,626217337719055191]],"local":[{"Precalculated":"4.1.0"}],"rustflags":["-C","target-cpu=native","-C","target-feature=+aes,+ssse3,+avx2,+vaes,+pclmulqdq"],"config":0,"compile_kind":0}

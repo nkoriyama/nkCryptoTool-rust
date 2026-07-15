@@ -1,0 +1,9 @@
+Command failed: `git rev-parse --is-inside-work-tree`
+--- stdout:
+
+
+--- stderr:
+fatal: not a git repository (or any parent up to mount point /var)
+Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).
+
+

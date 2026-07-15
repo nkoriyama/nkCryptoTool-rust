@@ -254,7 +254,7 @@ Iroh トランスポート + V3.1 PQC ハンドシェイクによるチャット
 
 > 注: system OpenSSL が 3.5 未満の環境（Ubuntu 24.04 / Debian 12 / RHEL 9 等）で OpenSSL を使う場合は、PQC keygen が失敗するため `backend-openssl-vendored` を選んでください。
 >
-> 性能注: バルクファイル暗号化のスループットは OpenSSL が大きく上回ります。AES-NI 有効環境の実測（2 GiB, ECC, AES-256-GCM）で OpenSSL は暗号化で約 2.6 倍・復号で約 3.3 倍高速でした。数十 GB 規模を日常的に扱う用途では OpenSSL 系を推奨します。デフォルトの RustCrypto は依存ゼロ・移植性を優先した選択です。
+> 性能注: バルクファイル暗号化のスループットは OpenSSL が大きく上回ります。2026-07 の実測（4 GiB, tmpfs, AES-256-GCM — 下記「パフォーマンス」節）で OpenSSL は暗号化で約 2.6 倍・復号で約 3.7 倍高速でした。数十 GB 規模を日常的に扱う用途では OpenSSL 系を推奨します。デフォルトの RustCrypto は依存ゼロ・移植性を優先した選択です。
 
 ## **ビルド方法**
 
@@ -967,17 +967,18 @@ packet-beta
 
 ## **パフォーマンス**
 
-4.0 GiB のランダムデータを用いた **2026-05 再計測**のベンチマーク結果 (x86_64 / Linux / tmpfs 上, 全6構成を実測)。
+4.0 GiB のランダムデータを用いた **2026-07 再計測**のベンチマーク結果
+(Ryzen 7 9800X3D / Linux / tmpfs / system OpenSSL 3.6.3, 全6構成を無負荷・直列で各3反復)。
 v3 `ChunkedAead` 形式 + バッファ再利用最適化を適用した現行コードの値。
 
 | バックエンド | モード | 暗号化 | 復号 ※ |
 | :--- | :--- | :--- | :--- |
-| **OpenSSL (Rust)** | ECC (P-256) | ~3.4 GiB/s | ~2.9 GiB/s |
-| **OpenSSL (Rust)** | PQC (ML-KEM-768) | ~3.1 GiB/s | ~2.7 GiB/s |
-| **OpenSSL (Rust)** | Hybrid (ML-KEM + P-256) | ~3.4 GiB/s | ~2.9 GiB/s |
-| **RustCrypto (Rust)** | ECC (P-256) | ~1.1 GiB/s | ~0.6 GiB/s |
+| **OpenSSL (Rust)** | ECC (P-256) | ~3.1 GiB/s | ~2.5 GiB/s |
+| **OpenSSL (Rust)** | PQC (ML-KEM-768) | ~3.2 GiB/s | ~2.5 GiB/s |
+| **OpenSSL (Rust)** | Hybrid (ML-KEM + P-256) | ~3.1 GiB/s | ~2.4 GiB/s |
+| **RustCrypto (Rust)** | ECC (P-256) | ~1.2 GiB/s | ~0.7 GiB/s |
 | **RustCrypto (Rust)** | PQC (ML-KEM-768) | ~1.2 GiB/s | ~0.7 GiB/s |
-| **RustCrypto (Rust)** | Hybrid | ~1.1 GiB/s | ~0.7 GiB/s |
+| **RustCrypto (Rust)** | Hybrid | ~1.2 GiB/s | ~0.7 GiB/s |
 
 * **※ 復号は2パス構成**: v3 `ChunkedAead` の復号は「全チャンク認証 (Pass 1) → 平文書き出し (Pass 2)」の2パス (THREAT 37-1: 未認証平文をディスクに書かない) のため、暗号文を2回読む。復号スループットが暗号化より構造的に低いのはこのため (RustCrypto は純 Rust AEAD のため特に顕著)。チャンク毎タグ化に伴うバッファ確保・ゼロ化のオーバーヘッドはバッファ再利用最適化で解消済み (OpenSSL は v2 単一タグ方式と同等)。
 * **大規模ファイル対応**: 10 GiB 以上の巨大ファイルでも性能低下が発生しないストリーミング設計 (常時 **10 MiB 以下** の RSS で動作)。
@@ -993,6 +994,14 @@ v3 `ChunkedAead` 形式 + バッファ再利用最適化を適用した現行コ
   モード (ecc/pqc/hybrid) 間の差は誤差範囲 (無負荷実測で復号 0.66–0.67 GiB/s に収束)。
   OpenSSL との残差は同クレートが VAES/VPCLMULQDQ の stitched 実装を持たないことに由来し、
   クレート性能として妥当。
+* **復号/暗号化比がバックエンドで異なる理由**: 両バックエンドとも**同一の 2 パス実装**を通る
+  (処理系は共通で AEAD プリミティブのみ差し替え) が、比は RustCrypto ~0.55・OpenSSL ~0.78 と
+  異なる。これは 2 パスの追加コスト = 「書き込みなしのフルパス 1 回分」であり、その相対コストが
+  律速点で変わるため: RustCrypto は暗号計算律速 (~1.3 GiB/s) なので両パスがほぼ等価に効き
+  比 ~0.5、OpenSSL は VAES stitched 実装が高速すぎて書き込みを持たない Pass 1 が
+  実測から逆算で **~11 GiB/s** で走り (Zen5 の AES-GCM open として妥当)、書き込みを含む
+  Pass 2 (≈暗号化と同じ ~3.2 GiB/s、tmpfs 書き込み律速) が支配するため比 ~0.78 に留まる。
+  「2 パス化で常に半減する」は暗号計算律速の場合のみ成り立つ。
 
 ベンチ値はビルドフラグ・CPU 機能 (AES-NI 等)・ファイルシステム・ストレージにより変動します。
 

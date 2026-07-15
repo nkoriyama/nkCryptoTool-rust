@@ -1,0 +1,11 @@
+/var/home/bazzite/ドキュメント/src/nkCryptoTool-rust/target-ossl/release/deps/iroh_dns-5f981d03aef62eb1.d: /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/lib.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/attrs.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/dns.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/endpoint_info.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/pkarr.rs
+
+/var/home/bazzite/ドキュメント/src/nkCryptoTool-rust/target-ossl/release/deps/libiroh_dns-5f981d03aef62eb1.rlib: /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/lib.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/attrs.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/dns.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/endpoint_info.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/pkarr.rs
+
+/var/home/bazzite/ドキュメント/src/nkCryptoTool-rust/target-ossl/release/deps/libiroh_dns-5f981d03aef62eb1.rmeta: /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/lib.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/attrs.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/dns.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/endpoint_info.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/pkarr.rs
+
+/home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/lib.rs:
+/home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/attrs.rs:
+/home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/dns.rs:
+/home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/endpoint_info.rs:
+/home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/iroh-dns-1.0.2/src/pkarr.rs:

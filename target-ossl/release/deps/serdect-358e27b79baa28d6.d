@@ -1,0 +1,11 @@
+/var/home/bazzite/ドキュメント/src/nkCryptoTool-rust/target-ossl/release/deps/serdect-358e27b79baa28d6.d: /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/lib.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/array.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/common.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/slice.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/../README.md
+
+/var/home/bazzite/ドキュメント/src/nkCryptoTool-rust/target-ossl/release/deps/libserdect-358e27b79baa28d6.rlib: /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/lib.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/array.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/common.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/slice.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/../README.md
+
+/var/home/bazzite/ドキュメント/src/nkCryptoTool-rust/target-ossl/release/deps/libserdect-358e27b79baa28d6.rmeta: /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/lib.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/array.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/common.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/slice.rs /home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/../README.md
+
+/home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/lib.rs:
+/home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/array.rs:
+/home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/common.rs:
+/home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/slice.rs:
+/home/bazzite/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serdect-0.4.3/src/../README.md:
