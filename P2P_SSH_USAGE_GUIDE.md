@@ -32,6 +32,13 @@ nk-crypto-tool --mode pqc --fingerprint --signing-pubkey ~/nkkeys/public_sign_pq
 > 秘密鍵を暗号化するなら生成前に `NK_PASSPHRASE` を設定する（空なら非暗号）。
 > 以降のコマンドで暗号化鍵を使うときは同じ `NK_PASSPHRASE` を与える。
 
+> **鍵リング運用（GPG 風）**: 署名鍵を keyring に置く（`--keyring-cmd gen-my-key
+> --key-algo ML-DSA-65` で直接生成、または `import-my-key` で取り込み）なら、
+> 本ガイドの**自分側の `--signing-privkey` は以後すべて省略できる** — P2P identity は
+> keyring の `sign:<--dsa-algo>` スロットから自動解決される（keyring やスロットが
+> 無ければ従来どおり匿名動作）。相手を pin する `--signing-pubkey` は省略できない。
+> 詳細は [USAGE.md §0.1 / §5.1](./USAGE.md)。
+
 ---
 
 ## 1. シェル接続
