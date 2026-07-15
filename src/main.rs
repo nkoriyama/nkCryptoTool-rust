@@ -779,6 +779,24 @@ async fn main() -> anyhow::Result<()> {
         )?;
     }
 
+    // P2P twin: listen/connect self-authenticate the handshake with the
+    // ML-DSA key (`--dsa-algo`). With no `--signing-privkey`, resolve
+    // OPPORTUNISTICALLY from the keyring: anonymous operation is legitimate,
+    // so a missing keyring or empty slot just leaves the node unauthenticated
+    // (existing gates still apply), and `--allow-unauth` skips the lookup —
+    // and its passphrase prompt — entirely.
+    if matches!(operation, Operation::Listen | Operation::Connect)
+        && config.signing_privkey.is_none()
+        && !args.allow_unauth
+    {
+        keyring_automatch_p2p(
+            args.keyring_db.as_deref(),
+            args.keybundle_handle.as_deref(),
+            &mut config,
+            &mut passphrase,
+        )?;
+    }
+
     // Consume a recipient KeyBundle for encryption: verify it against the pinned
     // owner fingerprint, enforce expiry on the key(s) this mode will use, and
     // stage the raw encryption key bytes for in-memory injection into the
@@ -1055,6 +1073,7 @@ async fn main() -> anyhow::Result<()> {
     if config.chat_mode
         && !config.allow_unauth
         && config.signing_privkey.is_none()
+        && config.signing_privkey_pem.is_none()
         && config.signing_pubkey.is_none()
     {
         eprintln!("WARNING: --allow-unauth is false (default) and no signing keys are provided.");
@@ -1452,6 +1471,63 @@ fn keyring_automatch_sign(
     Ok(())
 }
 
+/// Opportunistic keyring resolution of the P2P handshake signing identity
+/// (`--serve-*` / `--connect` with no `--signing-privkey`). Unlike the
+/// sign/decrypt auto-match, a miss is NOT an error: anonymous operation is a
+/// legitimate mode (chat with `--allow-unauth`, servers behind their own
+/// gates), so a missing keyring or empty slot leaves the config untouched and
+/// the node runs exactly as before. When the slot exists it is unlocked
+/// (binding-checked, hard error on failure — the user typed a passphrase and
+/// meant to use this key) and the still-encrypted PEM is injected like the
+/// sign twin. The identity handle is `--keybundle-handle` when that handle
+/// holds its own sign key (the copy-bundle case), else `"me"`.
+fn keyring_automatch_p2p(
+    keyring_db: Option<&str>,
+    handle: Option<&str>,
+    config: &mut CryptoConfig,
+    passphrase: &mut Option<Zeroizing<String>>,
+) -> anyhow::Result<()> {
+    use nk_crypto_tool::keyring::{self, KeyringStore};
+
+    let db = keyring_db_path(keyring_db, Some(&config.key_dir));
+    // No keyring ⇒ nothing to resolve. Do NOT open (open would create the DB
+    // file as a side effect of a mere lookup).
+    if !db.exists() {
+        return Ok(());
+    }
+    let store =
+        KeyringStore::open(&db).map_err(|e| anyhow::anyhow!("open keyring {db:?}: {e}"))?;
+
+    let algo = config.pqc_dsa_algo.clone();
+    let label = handle.unwrap_or("me");
+    let get = |h: &str| store.get_my_identity(h, "sign", &algo);
+    let (identity, rec) = match get(label).map_err(|e| anyhow::anyhow!("{e}"))? {
+        Some(rec) => (label, rec),
+        None => match get("me").map_err(|e| anyhow::anyhow!("{e}"))? {
+            Some(rec) => ("me", rec),
+            None => return Ok(()), // no identity in the keyring — stay anonymous
+        },
+    };
+
+    let pass = match passphrase.clone() {
+        Some(p) => p,
+        None => {
+            eprintln!("Keyring passphrase for {identity:?} (P2P identity):");
+            nk_crypto_tool::utils::get_masked_passphrase()
+                .map_err(|e| anyhow::anyhow!("read passphrase: {e}"))?
+        }
+    };
+    let pem = keyring::unlock_and_verify_identity(&rec, &algo, &pass)
+        .map_err(|e| anyhow::anyhow!("{identity}:sign:{algo}: {e}"))?;
+    eprintln!(
+        "[nkct] keyring: unlocked {identity}:sign:{algo} as P2P identity ({}…)",
+        hex::encode(&rec.fingerprint[..8])
+    );
+    config.signing_privkey_pem = Some(pem);
+    *passphrase = Some(pass);
+    Ok(())
+}
+
 /// Everything a KeyBundle build needs, resolved from the keyring my-identities
 /// table instead of key files.
 struct KeyringBundleKeys {
@@ -1481,6 +1557,7 @@ fn keyring_bundle_keys(
     label: &str,
     mode: CryptoMode,
     kem_algo: &str,
+    passphrase: Option<Zeroizing<String>>,
 ) -> anyhow::Result<KeyringBundleKeys> {
     use nk_crypto_tool::keybundle::{KEY_USAGE_ENC, KEY_USAGE_HYBRID};
     use nk_crypto_tool::keyring::{self, KeyringStore};
@@ -1551,9 +1628,16 @@ fn keyring_bundle_keys(
         .map(|(usage, algo)| Ok((usage, algo.clone(), need("enc", &algo)?)))
         .collect::<anyhow::Result<_>>()?;
 
-    eprintln!("Keyring passphrase for {identity:?}:");
-    let pass = nk_crypto_tool::utils::get_masked_passphrase()
-        .map_err(|e| anyhow::anyhow!("read passphrase: {e}"))?;
+    // Reuse a passphrase that already unlocked this identity this run (e.g.
+    // the P2P auto-match in copy-bundle) instead of prompting twice.
+    let pass = match passphrase {
+        Some(p) => p,
+        None => {
+            eprintln!("Keyring passphrase for {identity:?}:");
+            nk_crypto_tool::utils::get_masked_passphrase()
+                .map_err(|e| anyhow::anyhow!("read passphrase: {e}"))?
+        }
+    };
 
     // Owner identity: unlock (binding check), then derive the raw signing key
     // from the just-verified encrypted PEM — the in-memory twin of
@@ -1976,6 +2060,7 @@ fn run_gen_keybundle(args: &Args, mode: CryptoMode) -> anyhow::Result<()> {
                     handle,
                     mode,
                     &args.kem_algo,
+                    None,
                 )?;
                 let keys = kb
                     .enc_keys
@@ -2016,6 +2101,7 @@ fn build_keybundle_bytes(
     signing_pub: Option<&str>,
     kem_algo: &str,
     keyring_db: Option<&str>,
+    passphrase: Option<Zeroizing<String>>,
 ) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
     use nk_crypto_tool::keybundle::{self, KEY_USAGE_ENC, KEY_USAGE_HYBRID};
     use sha3::{Digest, Sha3_256};
@@ -2061,7 +2147,8 @@ fn build_keybundle_bytes(
                 (owner_sk, owner_pk, keys)
             }
             None => {
-                let kb = keyring_bundle_keys(keyring_db, key_dir, handle, mode, kem_algo)?;
+                let kb =
+                    keyring_bundle_keys(keyring_db, key_dir, handle, mode, kem_algo, passphrase)?;
                 let keys = kb
                     .enc_keys
                     .into_iter()
@@ -2130,6 +2217,7 @@ async fn run_copy_bundle(mut config: CryptoConfig, mode: CryptoMode) -> anyhow::
         config.signing_pubkey.as_deref(),
         &config.pqc_kem_algo,
         config.keyring_db.as_deref(),
+        config.passphrase.clone(),
     )?;
     eprintln!(
         "[copy-bundle] sending KeyBundle (handle {handle:?}, fingerprint {})",

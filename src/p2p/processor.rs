@@ -85,6 +85,29 @@ fn required_grant_bit(config: &CryptoConfig) -> Option<u8> {
     }
 }
 
+/// Whether this node has a handshake signing identity: an explicit
+/// `--signing-privkey` file or a keyring-injected encrypted PEM (auto-match).
+/// Drives the SELF_AUTH handshake flags.
+fn has_signing_identity(config: &CryptoConfig) -> bool {
+    config.signing_privkey.is_some() || config.signing_privkey_pem.is_some()
+}
+
+/// The signing key's (still passphrase-encrypted) PKCS#8 PEM bytes, from
+/// whichever source holds it: the keyring-injected PEM is preferred, else the
+/// `--signing-privkey` file is read. `None` when the node has no signing
+/// identity (anonymous operation).
+fn signing_pem_bytes(config: &CryptoConfig) -> Result<Option<Zeroizing<Vec<u8>>>> {
+    if let Some(ref pem) = config.signing_privkey_pem {
+        return Ok(Some(Zeroizing::new(pem.as_bytes().to_vec())));
+    }
+    match config.signing_privkey {
+        Some(ref path) => Ok(Some(Zeroizing::new(std::fs::read(path).map_err(
+            |e| CryptoError::FileRead(format!("Key read failed ({path}): {e}")),
+        )?))),
+        None => Ok(None),
+    }
+}
+
 pub struct NetworkProcessor {
     config: CryptoConfig,
     endpoint: Arc<dyn P2pEndpoint>,
@@ -130,11 +153,25 @@ impl NetworkProcessor {
     }
 
     fn get_pqc_fingerprint(&self, path: &str, algo: &str, is_dsa: bool) -> Result<[u8; 32]> {
-        let bytes = std::fs::read(path).map_err(|e| CryptoError::FileRead(format!("Key read failed ({}): {}", path, e)))?;
-        let pem = std::str::from_utf8(&bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
+        let bytes = Zeroizing::new(std::fs::read(path).map_err(|e| CryptoError::FileRead(format!("Key read failed ({}): {}", path, e)))?);
+        Self::pqc_fingerprint_from_pem(
+            &bytes,
+            algo,
+            is_dsa,
+            self.config.passphrase.as_deref().map(|s| s.as_str()),
+        )
+    }
+
+    fn pqc_fingerprint_from_pem(
+        pem_bytes: &[u8],
+        algo: &str,
+        is_dsa: bool,
+        passphrase: Option<&str>,
+    ) -> Result<[u8; 32]> {
+        let pem = std::str::from_utf8(pem_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
         let der = crate::utils::unwrap_from_pem(pem, "PRIVATE KEY")?;
-        let decrypted = crate::utils::extract_raw_private_key(&der, self.config.passphrase.as_deref().map(|s| s.as_str()))?;
-        
+        let decrypted = crate::utils::extract_raw_private_key(&der, passphrase)?;
+
         let raw_pub = if is_dsa {
             let raw_priv = crate::utils::unwrap_pqc_priv_from_pkcs8(&decrypted, algo)?;
             backend::pqc_pub_from_priv_dsa(algo, &raw_priv)?
@@ -142,8 +179,24 @@ impl NetworkProcessor {
             let raw_priv = crate::utils::unwrap_pqc_priv_from_pkcs8(&decrypted, algo)?;
             backend::pqc_pub_from_priv_kem(algo, &raw_priv)?
         };
-        
+
         Ok(Sha3_256::digest(&raw_pub).into())
+    }
+
+    /// This node's handshake signing identity fingerprint, from whichever
+    /// source holds the key: the keyring-injected encrypted PEM (auto-match)
+    /// or the `--signing-privkey` file. `None` ⇒ the node runs anonymous.
+    fn signing_identity_fp(&self) -> Result<Option<[u8; 32]>> {
+        signing_pem_bytes(&self.config)?
+            .map(|pem| {
+                Self::pqc_fingerprint_from_pem(
+                    &pem,
+                    &self.config.pqc_dsa_algo,
+                    true,
+                    self.config.passphrase.as_deref().map(|s| s.as_str()),
+                )
+            })
+            .transpose()
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -163,9 +216,7 @@ impl NetworkProcessor {
             .map_err(|e| CryptoError::Parameter(format!("Local addr: {}", e)))?;
         eprintln!("[nkct] Listening as NodeId: {}", local_addr.peer_id);
 
-        let sign_fp = self.config.signing_privkey.as_ref()
-            .map(|path| self.get_pqc_fingerprint(path, &self.config.pqc_dsa_algo, true))
-            .transpose()?;
+        let sign_fp = self.signing_identity_fp()?;
 
         let enc_fp = self.config.user_privkey.as_ref()
             .map(|path| self.get_pqc_fingerprint(path, &self.config.pqc_kem_algo, false))
@@ -359,9 +410,7 @@ impl NetworkProcessor {
             .map_err(|e| CryptoError::Parameter(format!("Local addr: {}", e)))?;
         eprintln!("[nkct] Listening (single-shot) as NodeId: {}", local_addr.peer_id);
 
-        let sign_fp = self.config.signing_privkey.as_ref()
-            .map(|path| self.get_pqc_fingerprint(path, &self.config.pqc_dsa_algo, true))
-            .transpose()?;
+        let sign_fp = self.signing_identity_fp()?;
 
         let enc_fp = self.config.user_privkey.as_ref()
             .map(|path| self.get_pqc_fingerprint(path, &self.config.pqc_kem_algo, false))
@@ -630,7 +679,7 @@ impl NetworkProcessor {
             tb.append_lp(&server_ecc_pub); // #8
             tb.append_lp(&kem_ct); // #9
 
-            let server_auth_flag = if config.signing_privkey.is_some() { [hs_flags::RESPONDER_SELF_AUTH] } else { [0u8] };
+            let server_auth_flag = if has_signing_identity(config) { [hs_flags::RESPONDER_SELF_AUTH] } else { [0u8] };
             tb.append_raw(&server_auth_flag); // #10 responder flags
 
             // A-resp (§4.2): if the initiator required responder auth (#5.bit1), this
@@ -648,8 +697,8 @@ impl NetworkProcessor {
             let mut server_kem_pub = Vec::new();
             if server_auth_flag[0] & hs_flags::RESPONDER_SELF_AUTH != 0 {
                 let (raw_priv_dsa, raw_pub_kem) = {
-                    let dsa_priv_path = config.signing_privkey.as_ref().unwrap();
-                    let dsa_bytes = Zeroizing::new(std::fs::read(dsa_priv_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
+                    let dsa_bytes = signing_pem_bytes(&config)?
+                        .expect("RESPONDER_SELF_AUTH set ⇒ signing identity present");
                     let dsa_pem = std::str::from_utf8(&dsa_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
                     let dsa_der = crate::utils::unwrap_from_pem(dsa_pem, "PRIVATE KEY")?;
                     let dsa_decrypted = crate::utils::extract_raw_private_key(&dsa_der, config.passphrase.as_deref().map(|s| s.as_str()))?;
@@ -1051,7 +1100,7 @@ impl NetworkProcessor {
                     };
 
                     let mut client_flags = 0u8;
-                    if config.signing_privkey.is_some() { client_flags |= hs_flags::INITIATOR_SELF_AUTH; }
+                    if has_signing_identity(&config) { client_flags |= hs_flags::INITIATOR_SELF_AUTH; }
                     if expects_responder_auth { client_flags |= hs_flags::EXPECTS_RESPONDER_AUTH; }
                     let client_auth_flag = [client_flags];
                     writer.write_all(&client_auth_flag).await.map_err(|e| CryptoError::FileRead(e.to_string()))?;
@@ -1062,8 +1111,8 @@ impl NetworkProcessor {
                     let mut sign_priv: Option<Zeroizing<Vec<u8>>> = None;
                     if client_auth_flag[0] & hs_flags::INITIATOR_SELF_AUTH != 0 {
                         let raw_priv = {
-                            let privkey_path = config.signing_privkey.as_ref().unwrap();
-                            let privkey_bytes = Zeroizing::new(std::fs::read(privkey_path).map_err(|e| CryptoError::FileRead(e.to_string()))?);
+                            let privkey_bytes = signing_pem_bytes(&config)?
+                                .expect("INITIATOR_SELF_AUTH set ⇒ signing identity present");
                             let privkey_pem = std::str::from_utf8(&privkey_bytes).map_err(|_| CryptoError::Parameter("Invalid UTF-8 in key".to_string()))?;
                             let der = crate::utils::unwrap_from_pem(privkey_pem, "PRIVATE KEY")?;
                             let decrypted_der = crate::utils::extract_raw_private_key(&der, config.passphrase.as_deref().map(|s| s.as_str()))?;
