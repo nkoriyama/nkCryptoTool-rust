@@ -239,6 +239,15 @@ nk-crypto-tool --shell --connect <ticket> --mode pqc \
 - `--signing-pubkey` で**サーバを pin**（なりすまし防止）。
 - 一発コマンド実行は対話の代わりに `--shell-cmd "uname -a"`。
 
+### 5.1 自分の署名鍵を keyring から（GPG 風）
+
+自分の署名鍵を keyring に取り込み済み（§2.1/§3.1）なら、サーバ・クライアントとも
+**自分の** `--signing-privkey` を省略できる — P2P identity が keyring の
+`sign:<--dsa-algo>` スロットから自動解決される（scp §6・ペアリング §7 も同様）。
+keyring や該当スロットが無ければ従来どおり匿名で動く（勝手にエラーにはならない。
+匿名で行きたいときは `--allow-unauth` で解決自体をスキップ）。
+**相手** を pin する `--signing-pubkey` はこれまでどおり必要。
+
 ---
 
 ## 6. P2P scp（踏み台レス PQC ファイル転送）
@@ -307,7 +316,8 @@ nk-crypto-tool --copy-bundle --mode pqc --connect <ticket> --token <OTP> \
 #   → "registered alice …" が出れば成功
 ```
 - サーバは **ticket に埋まった指紋**で自動的に pin される（`--signing-pubkey` 不要）。
-- 鍵を keyring に取り込み済みなら `--signing-privkey` は省略可（§1 の鍵リング直読と同じ解決）。
+- 鍵を keyring に取り込み済みなら `--signing-privkey` は省略可 — **KeyBundle 構築**
+  （§1 の鍵リング直読）と**ハンドシェイク自己認証**（§5.1）の両方が keyring から賄われる。
 - クライアントは自身の identity で**自己署名**し、サーバは
   「**handshake 指紋 == 送る KeyBundle の owner 指紋**」を照合してから登録する（接続本人が鍵所持を
   証明した identity だけを登録＝他人の bundle を代理登録できない）。
