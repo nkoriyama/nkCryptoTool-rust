@@ -43,7 +43,7 @@ KEM では鍵ペアを提示する側（=クライアント）が ephemeral で�
 ## 1. 残存する PQ-FS ギャップ（本書の対象）
 
 ### 1.1 Harvest-Now-Decrypt-Later (HNDL) 脅威 — ワンショット経路
-非同期・ワンショット暗号化（[pqc.rs](src/strategy/pqc.rs) / [hybrid.rs](src/strategy/hybrid.rs)）では、受信者がオフラインのため双方向の ephemeral 交換ができず、受信者の**長期固定 KEM 公開鍵**に encap する：
+非同期・ワンショット暗号化（[pqc.rs](../../src/strategy/pqc.rs) / [hybrid.rs](../../src/strategy/hybrid.rs)）では、受信者がオフラインのため双方向の ephemeral 交換ができず、受信者の**長期固定 KEM 公開鍵**に encap する：
 
 $$\begin{aligned}
 SS_{ecc} &= \text{ECDH}(\text{sender\_ephemeral}, \text{recipient\_static}) \\
@@ -93,7 +93,7 @@ PQ-FS の達成可能性は、通信モデルの双方向性と同期性に大�
 送信者が受信者の長期固定公開鍵のみを知っている場合、生成される暗号文は受信者の長期秘密鍵のみで復号可能です。したがって、長期秘密鍵の漏洩＋量子計算機による ECDH 突破が起きると、過去の暗号化ファイルはすべて復号可能になります。
 
 ### 3.2 緩和策: One-Time Prekey 方式 (Signal PQXDH 模倣)
-非同期配送（inbox）を介するユースケースでは、One-Time Prekey 方式で PQ-FS を達成する。本方式は既存の **untrusted Delivery Service**（[inbox.rs](src/network/inbox.rs) の `nkct/inbox/1`）をそのまま拡張する形で実装する。
+非同期配送（inbox）を介するユースケースでは、One-Time Prekey 方式で PQ-FS を達成する。本方式は既存の **untrusted Delivery Service**（[inbox.rs](../../src/network/inbox.rs) の `nkct/inbox/1`）をそのまま拡張する形で実装する。
 
 #### 3.2.1 Prekey バンドルの形式と署名
 Prekey は **X-Wing（X25519 ‖ ML-KEM-768）公開鍵**として定義し、サーバが個別に払い出せるよう **1 つずつ ML-DSA-65 で署名**する。
@@ -207,7 +207,7 @@ gantt
 - **ゴール**: Prekey が使えないローカルファイル自己暗号化向けに、長期 KEM 鍵ローテーション運用を整備する。
 - **実装内容**:
   - 鍵ローテーション手順のドキュメント化と（任意の）補助コマンド。
-- **成果物**: [KEY_ROTATION_GUIDE.md](../../KEY_ROTATION_GUIDE.md)（脅威モデル・再封緘→旧鍵破棄のトレードオフ・
+- **成果物**: [KEY_ROTATION_GUIDE.md](../guides/KEY_ROTATION_GUIDE.md)（脅威モデル・再封緘→旧鍵破棄のトレードオフ・
   pqc/hybrid 手順・媒体別の破棄注意・運用推奨）。補助コマンドは既存 `--encrypt`/`--decrypt` + `shred` で
   完結するため当面不要と判断（機能候補として記録）。
 

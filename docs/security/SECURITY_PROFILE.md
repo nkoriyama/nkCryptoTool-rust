@@ -167,7 +167,7 @@ kem_ss = ML-KEM(static recipient KEM key)        ← Post-Quantum FS なし (鍵
 
 **緩和策**:
 - inbox 非同期配送: One-Time Prekey（PQXDH 風）で PQ-FS を達成（実装済み）。`--prekey-cmd init-identity|publish|seal|recv`。
-- ローカルファイル自己暗号化: 双方向交換も Prekey インフラも無いため原理的に PQ-FS 不可。長期 KEM 鍵の定期ローテーション（運用）が唯一の緩和策 → 手順は **[KEY_ROTATION_GUIDE.md](KEY_ROTATION_GUIDE.md)**。
+- ローカルファイル自己暗号化: 双方向交換も Prekey インフラも無いため原理的に PQ-FS 不可。長期 KEM 鍵の定期ローテーション（運用）が唯一の緩和策 → 手順は **[KEY_ROTATION_GUIDE.md](../guides/KEY_ROTATION_GUIDE.md)**。
 
 ### 5.2 メタデータ漏洩 (relay 経由時) 🟡
 
@@ -412,7 +412,7 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
   - **macOS / Windows の `strict`**: **非対応（正直にエラー）**。非特権アプリが使える
     オフラインのハードウェアモノトニックカウンタが存在しないため (macOS は Secure Enclave に
     公開カウンタ API 皆無、Windows は TPM ドライバが NV カウンタコマンドをブロック; 詳細は
-    [ATREST_ANTIROLLBACK_DESIGN.md §5.1](./docs/design/ATREST_ANTIROLLBACK_DESIGN.md))。`cfg(target_os)` で
+    [ATREST_ANTIROLLBACK_DESIGN.md §5.1](../design/ATREST_ANTIROLLBACK_DESIGN.md))。`cfg(target_os)` で
     分岐し、黙ってソフトカウンタへ降格せず拒否する。これらの OS の巻き戻し検知は
     `permissive`（ソフトカウンタ）＋ 後述のオンライン `inbox` CHECKPOINT が担う。
   - **共通の残存リスク**: カウンタ消失 (state ファイル削除、または `TPM2_Clear` で

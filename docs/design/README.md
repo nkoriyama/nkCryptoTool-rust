@@ -18,6 +18,7 @@
 | [MLS_P2P_SYNC_DESIGN.md](./MLS_P2P_SYNC_DESIGN.md) | MLS↔P2P 同期（transport-gate 投影） | 一部撤回（commit 履歴・delta resync・NKCB binding は実装済み、gate 投影は撤回） |
 
 - 実装後の**検証レポート・比較・エビデンス**（`*_REPORT.md` / `*_COMPARISON.md` /
-  `P2P_INTEROP_EVIDENCE.md` 等）は現状の能力を示す生きた記録として root に残している。
+  `P2P_INTEROP_EVIDENCE.md` 等）は現状の能力を示す生きた記録として
+  [../reports/](../reports/) にある。
 - ソースコード内のコメントはファイル名（例 `PQFS_DESIGN.md §3.2`）で参照しており、
   本フォルダへ移動後もその名前で一意に見つかる。

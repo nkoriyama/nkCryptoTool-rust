@@ -1,9 +1,9 @@
 # ローカルファイル暗号化のための長期 KEM 鍵ローテーション運用ガイド
 
-> 本書は [PQFS_DESIGN.md](docs/design/PQFS_DESIGN.md) フェーズ 3（§5.3 / des5）の成果物である。
+> 本書は [PQFS_DESIGN.md](../design/PQFS_DESIGN.md) フェーズ 3（§5.3 / des5）の成果物である。
 > 対象は **ローカルファイルの自己暗号化** (`--mode pqc|hybrid --encrypt`) に限る。
 > inbox 非同期配送経路は One-Time Prekey で PQ-FS を達成済みのため本書の対象外
-> （[PQFS_DESIGN.md §3.2](docs/design/PQFS_DESIGN.md) 参照）。ライブ P2P も達成済み。
+> （[PQFS_DESIGN.md §3.2](../design/PQFS_DESIGN.md) 参照）。ライブ P2P も達成済み。
 
 ---
 
@@ -11,14 +11,14 @@
 
 ローカルファイル暗号化では、暗号化時に受信者（ephemeral 性を提供する主体）が存在しない。
 送信者は受信者の **長期固定公開鍵のみ** を使って封緘するため、生成された暗号文は
-受信者の **長期秘密鍵のみで復号可能** である（[PQFS_DESIGN.md §3.1](docs/design/PQFS_DESIGN.md)）。
+受信者の **長期秘密鍵のみで復号可能** である（[PQFS_DESIGN.md §3.1](../design/PQFS_DESIGN.md)）。
 
 このため Prekey 方式（=対話相手が ephemeral 鍵を出すことに依存）は原理的に使えず、
 **完全な Forward Secrecy は技術的に保証できない**。唯一の緩和策が
 
 > 長期 KEM 鍵を高頻度でローテーションし、古い秘密鍵を確実に破棄（zeroize/shred）する
 
-ことである（[PQFS_DESIGN.md §3.2 NOTE / §6-1](docs/design/PQFS_DESIGN.md)）。
+ことである（[PQFS_DESIGN.md §3.2 NOTE / §6-1](../design/PQFS_DESIGN.md)）。
 
 ### 想定する鍵漏洩シナリオ
 1. **秘密鍵ファイルの流出**（バックアップ・盗難・マルウェア）。`--mode pqc`（ML-KEM）でも
@@ -143,7 +143,7 @@ shred -u "$OLD/private_enc_pqc.key"     # ハイブリッドは mlkem/ecdh 両�
 - **TPM 保護鍵（`--use-tpm`）**: 秘密鍵は TPM 封印された wrapped blob として保存される。
   破棄は **wrapped blob ファイルを削除** すれば足りる（TPM 外に平文秘密鍵は存在しない）。
   ※ TPM 保護鍵はネットワークリスナーモードでは未サポートだが、ローカル `--encrypt`/`--decrypt`
-  では利用可能（[README](README.md) 参照）。
+  では利用可能（[README](../../README.md) 参照）。
 
 ---
 
@@ -195,8 +195,8 @@ nk-crypto-tool --mode hybrid --encrypt \
 
 | 経路 | PQ-FS | 緩和 |
 |---|---|---|
-| ライブ P2P（対話） | ✅ 達成済み | 毎接続 ephemeral KEM（[PQFS_DESIGN.md §0](docs/design/PQFS_DESIGN.md)） |
-| inbox 非同期配送 | ✅ 達成可能 | One-Time Prekey（[PQFS_DESIGN.md §3.2](docs/design/PQFS_DESIGN.md)） |
+| ライブ P2P（対話） | ✅ 達成済み | 毎接続 ephemeral KEM（[PQFS_DESIGN.md §0](../design/PQFS_DESIGN.md)） |
+| inbox 非同期配送 | ✅ 達成可能 | One-Time Prekey（[PQFS_DESIGN.md §3.2](../design/PQFS_DESIGN.md)） |
 | **ローカルファイル自己暗号化** | ❌ 原理的に不可 | **本書の鍵ローテーション運用のみ** |
 
 ローカルファイル経路は、相手不在ゆえ ephemeral 性の源泉が無く、完全 FS を
@@ -204,7 +204,7 @@ nk-crypto-tool --mode hybrid --encrypt \
 その有効性は **旧秘密鍵を確実に破棄できるか** に全面的に依存する。
 
 ### 補助コマンドについて
-[PQFS_DESIGN.md §5.3](docs/design/PQFS_DESIGN.md) は「（任意の）補助コマンド」を挙げているが、
+[PQFS_DESIGN.md §5.3](../design/PQFS_DESIGN.md) は「（任意の）補助コマンド」を挙げているが、
 本フェーズの確定スコープは **運用ガイドの文書化**（本書）である。再封緘ループ（§3 手順 3）と
 破棄（§4）は既存の `--encrypt`/`--decrypt` と OS の `shred` で完結するため、専用サブコマンドは
 当面不要と判断する。将来「世代管理・一括再封緘・検証」を 1 コマンド化する価値が出た場合の

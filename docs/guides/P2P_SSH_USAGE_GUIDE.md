@@ -2,7 +2,7 @@
 
 nkCryptoTool の P2P シェル／ポートフォワード機能の実用コマンド手順。NAT/CGNAT
 配下のホストへ **踏み台なし・ポート開放なし・ポスト量子暗号** で接続する。設計の
-詳細は [P2P_SHELL_DESIGN.md](docs/design/P2P_SHELL_DESIGN.md) を参照。
+詳細は [P2P_SHELL_DESIGN.md](../design/P2P_SHELL_DESIGN.md) を参照。
 
 - 相手認証 … アプリ層 ML-DSA-65 チャレンジレスポンス（指紋 = `SHA3-256(署名公開鍵)`）
 - 暗号ストリーム … ハイブリッド ECDH‖ML-KEM 由来の AEAD（方向ごと単調カウンタ nonce）
@@ -37,7 +37,7 @@ nk-crypto-tool --mode pqc --fingerprint --signing-pubkey ~/nkkeys/public_sign_pq
 > 本ガイドの**自分側の `--signing-privkey` は以後すべて省略できる** — P2P identity は
 > keyring の `sign:<--dsa-algo>` スロットから自動解決される（keyring やスロットが
 > 無ければ従来どおり匿名動作）。相手を pin する `--signing-pubkey` は省略できない。
-> 詳細は [USAGE.md §0.1 / §5.1](./USAGE.md)。
+> 詳細は [USAGE.md §0.1 / §5.1](../../USAGE.md)。
 
 ---
 

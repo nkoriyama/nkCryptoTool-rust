@@ -79,7 +79,7 @@ iroh の多宛先 UDP と違い、TCP なら単一 host:port として ZTNA サ�
 - **アプリ層（nkct）**: その sanctioned 経路の上で、ML-KEM + ML-DSA 相互認証 + 指紋ピン + AEAD を重ねる。
 
 ZTNA が「経路の認可」、nkct が「端点の暗号認証」を担い、**排他でなく積層**する
-（設計思想は [`docs/design/TRUST_BOOTSTRAP_DESIGN.md`](./docs/design/TRUST_BOOTSTRAP_DESIGN.md) の
+（設計思想は [`docs/design/TRUST_BOOTSTRAP_DESIGN.md`](../design/TRUST_BOOTSTRAP_DESIGN.md) の
 「ネットワーク ZTNA が許可した経路の上に nkct のアプリ層相互認証を重ねる」の実データ裏付け）。
 
 ## 5. 制約と注意
