@@ -1,6 +1,6 @@
 # MLS グループチャット 実装完了レポート
 
-**対象計画書**: [`docs/design/MLS_GROUP_CHAT_PLAN.md`](./docs/design/MLS_GROUP_CHAT_PLAN.md)
+**対象計画書**: [`docs/design/MLS_GROUP_CHAT_PLAN.md`](../design/MLS_GROUP_CHAT_PLAN.md)
 **実装期間**: 2026-05 (P1 〜 P9)
 **ステータス**: ✅ 全 9 フェーズ完了 — `--features mls` で利用可能、CI 緑
 
@@ -11,7 +11,7 @@
 nkCryptoTool に **RFC 9420 (MLS) 準拠の PQC ハイブリッドグループチャット** を追加した。
 本実装の特徴は次の 3 点:
 
-1. **自前ハイブリッド `CipherSuiteProvider`** ([`src/group/crypto_adapter.rs`](./src/group/crypto_adapter.rs)) — `mls-rs` 0.55 の `CipherSuiteProvider` trait を実装し、private-use suite ID `0xF101` として:
+1. **自前ハイブリッド `CipherSuiteProvider`** ([`src/group/crypto_adapter.rs`](../../src/group/crypto_adapter.rs)) — `mls-rs` 0.55 の `CipherSuiteProvider` trait を実装し、private-use suite ID `0xF101` として:
    - 署名: **Ed25519 ‖ ML-DSA-65** (FIPS 204) — 連結ハイブリッド
    - KEM: **X25519 ‖ ML-KEM-768** (FIPS 203) — X-Wing combiner (`draft-connolly-cfrg-xwing-kem-01`)
    - KDF/Hash: SHA-256 / SHAKE-256、AEAD: AES-128-GCM
@@ -147,8 +147,8 @@ GUI (`--mls-gui`) も `--features gui-mls` ビルドで起動・ウィンドウ�
 
 ## 10. 参照
 
-- 計画書: [`docs/design/MLS_GROUP_CHAT_PLAN.md`](./docs/design/MLS_GROUP_CHAT_PLAN.md)
-- セキュリティプロファイル §7: [`SECURITY_PROFILE.md`](./SECURITY_PROFILE.md#7-mls-グループチャット---features-mls)
-- README 該当節: [`README.md` "MLS グループチャット"](./README.md#mls-グループチャット-オプション機能--features-mls)
+- 計画書: [`docs/design/MLS_GROUP_CHAT_PLAN.md`](../design/MLS_GROUP_CHAT_PLAN.md)
+- セキュリティプロファイル §7: [`SECURITY_PROFILE.md`](../security/SECURITY_PROFILE.md#7-mls-グループチャット---features-mls)
+- README 該当節: [`README.md` "MLS グループチャット"](../../README.md#mls-グループチャット-オプション機能--features-mls)
 - 関連標準: RFC 9420 (MLS), FIPS 203 (ML-KEM), FIPS 204 (ML-DSA), draft-connolly-cfrg-xwing-kem-01
 - 上流クレート: [`mls-rs`](https://crates.io/crates/mls-rs) 0.55, [`mls-rs-provider-sqlite`](https://crates.io/crates/mls-rs-provider-sqlite) 0.23

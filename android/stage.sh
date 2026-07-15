@@ -8,7 +8,7 @@
 #
 # Both are gitignored — run this before building the APK. Requires the Android
 # NDK (set ANDROID_NDK_HOME) + `cargo-ndk` + the aarch64/x86_64 rust targets.
-# See ../BUILD_ANDROID.md for the one-time toolchain setup.
+# See ../docs/guides/BUILD_ANDROID.md for the one-time toolchain setup.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

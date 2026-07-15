@@ -22,7 +22,7 @@ android/
 
 ## Build
 
-1. One-time Rust→Android toolchain (see `../BUILD_ANDROID.md`): `rustup target
+1. One-time Rust→Android toolchain (see `../docs/guides/BUILD_ANDROID.md`): `rustup target
    add aarch64-linux-android x86_64-linux-android`, `cargo install cargo-ndk`,
    and an Android NDK (export `ANDROID_NDK_HOME`).
 

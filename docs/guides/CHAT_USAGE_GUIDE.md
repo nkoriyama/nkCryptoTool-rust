@@ -53,7 +53,7 @@ NK_PASSPHRASE="" ./target/release/nk-crypto-tool \
 > **鍵リング運用（GPG 風）**: 署名鍵を keyring に置く（`--keyring-cmd gen-my-key
 > --key-algo ML-DSA-65` で直接生成、または `import-my-key` で取り込み）なら、
 > 以後の手順で**自分側の `--signing-privkey` は省略できる**（keyring から自動解決）。
-> 相手を pin する `--signing-pubkey` は必要。詳細は [USAGE.md §5.1](./USAGE.md)。
+> 相手を pin する `--signing-pubkey` は必要。詳細は [USAGE.md §5.1](../../USAGE.md)。
 
 ---
 

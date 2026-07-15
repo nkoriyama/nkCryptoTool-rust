@@ -36,9 +36,9 @@ NAT 配下のホストへ**踏み台なし・ポート開放なし**でシェル
 nkwire arm64、実機ホールパンチ）。ステータスバーが接続経路・レイテンシ・暗号スイートを
 ライブ表示する: `●Direct P2P ｜ Latency:4ms ｜ P-256+ML-KEM-768 / AES-256-GCM`。
 
-- 使い方: [`P2P_SSH_USAGE_GUIDE.md`](./P2P_SSH_USAGE_GUIDE.md)
-- 他手段との比較: [`P2P_SHELL_COMPARISON.md`](./P2P_SHELL_COMPARISON.md)
-- 実証エビデンス: [`P2P_INTEROP_EVIDENCE.md`](./P2P_INTEROP_EVIDENCE.md)
+- 使い方: [`P2P_SSH_USAGE_GUIDE.md`](./docs/guides/P2P_SSH_USAGE_GUIDE.md)
+- 他手段との比較: [`P2P_SHELL_COMPARISON.md`](./docs/reports/P2P_SHELL_COMPARISON.md)
+- 実証エビデンス: [`P2P_INTEROP_EVIDENCE.md`](./docs/reports/P2P_INTEROP_EVIDENCE.md)
 
 ## **デモ: 踏み台レス PQC P2P シェル — Linux → Windows (ConPTY)**
 
@@ -63,7 +63,7 @@ Linux クライアントから実 Windows ホストへ、**踏み台なし・ポ
 単位の read/write ポリシーとパス confinement 付き。put→ローカル削除→get で往復を実証している。
 
 - scp 設計: [`P2P_SCP_DESIGN.md`](./docs/design/P2P_SCP_DESIGN.md)
-- 他ファイル転送との比較: [`P2P_SCP_COMPARISON.md`](./P2P_SCP_COMPARISON.md)
+- 他ファイル転送との比較: [`P2P_SCP_COMPARISON.md`](./docs/reports/P2P_SCP_COMPARISON.md)
 
 ## **デモ: PQC P2P scp — 1 GiB 転送のライブ進捗バー**
 
@@ -172,7 +172,7 @@ confined shell と path-jail された scp を張るまでを 4 ステップで�
   なしで対話シェル (`--shell`)・ローカル/リモートフォワード (`-L`/`-R`) を張る。ハイブリッド
   P-256‖ML-KEM-768 KEM + ML-DSA-65 認証 (指紋ピンニング)、`--tui` でライブ接続バー、
   MLS グループ連動の認可 (Phase 6)、監査ログ・レート制限を備える。
-  詳細は [`P2P_SSH_USAGE_GUIDE.md`](./P2P_SSH_USAGE_GUIDE.md)。
+  詳細は [`P2P_SSH_USAGE_GUIDE.md`](./docs/guides/P2P_SSH_USAGE_GUIDE.md)。
 * **ペアリング (KeyBundle 自動登録 = `ssh-copy-id` 相当)**: 未登録クライアントを**ワンタイム
   トークン**で初回だけ登録 (`--serve-pairing` / `--copy-bundle`)。クライアントの指紋と KeyBundle を
   **redb keyring (`<key-dir>/keyring.db`) の allowlist テーブルに per-service grants 付き**で保存する
@@ -192,7 +192,7 @@ confined shell と path-jail された scp を張るまでを 4 ステップで�
   (private-use ID `0xF101`) で 3 人以上のグループ E2EE を実現。sqlite 永続化と
   Post-Compromise Security (`remove_member` で即時失効) を備える。
   CLI (`--mls-cmd ...`) と GUI (`--features gui-mls` + `--mls-gui`) の両対応。
-  詳細は [`MLS_GROUP_CHAT_REPORT.md`](./MLS_GROUP_CHAT_REPORT.md) を参照。
+  詳細は [`MLS_GROUP_CHAT_REPORT.md`](./docs/reports/MLS_GROUP_CHAT_REPORT.md) を参照。
 
 ## **セキュリティ (Security)**
 
@@ -218,7 +218,7 @@ Iroh トランスポート + V3.1 PQC ハンドシェイクによるチャット
 * ✅ Signal / WhatsApp / iMessage と同等以上、Telegram のデフォルトチャットとは**比較にならない強さ**
 * ⚠️ 完璧ではない領域 (Post-Quantum Forward Secrecy / メタデータ秘匿) は今後の改善対象
 
-**詳細な脅威モデル別評価・競合比較・正直な弱点**については [`SECURITY_PROFILE.md`](./SECURITY_PROFILE.md) を参照してください。
+**詳細な脅威モデル別評価・競合比較・正直な弱点**については [`SECURITY_PROFILE.md`](./docs/security/SECURITY_PROFILE.md) を参照してください。
 
 ### **プロセス終了時の鍵保護**
 
@@ -592,7 +592,7 @@ Members / Messages / 入力欄 / Add Member サブフォーム。すべての操
 > 意図された制約。
 
 詳細仕様は [`docs/design/MLS_GROUP_CHAT_PLAN.md`](./docs/design/MLS_GROUP_CHAT_PLAN.md) と
-[`MLS_GROUP_CHAT_REPORT.md`](./MLS_GROUP_CHAT_REPORT.md) を参照。
+[`MLS_GROUP_CHAT_REPORT.md`](./docs/reports/MLS_GROUP_CHAT_REPORT.md) を参照。
 
 ## **処理フロー**
 
@@ -997,10 +997,16 @@ v3 `ChunkedAead` 形式 + バッファ再利用最適化を適用した現行コ
 
 ## **ドキュメント**
 
-* [`SECURITY.md`](./SECURITY.md): セキュリティポリシー、脅威モデル、メモリ保護モデル、運用ベストプラクティス
+root は一次文書のみ。ガイド・検証記録・実装済み設計文書は `docs/` 配下に分類されている。
+
+* [`USAGE.md`](./USAGE.md): ユースケース別クックブック（コマンド実例）
 * [`SPEC.md`](./SPEC.md): プロトコル仕様、PQC アルゴリズム詳細、ネットワーク (NKCT) プロトコル、DoS 防御設計、不変性 (invariants) 定義
-* [`KEY_ROTATION_GUIDE.md`](./KEY_ROTATION_GUIDE.md): ローカルファイル暗号化向け長期 KEM 鍵ローテーション運用ガイド（暴露の時間的封じ込め）
-* [`PENDING_ROADMAP_v56.md`](./PENDING_ROADMAP_v56.md): 今後の機能拡張ロードマップ
+* [`SECURITY.md`](./SECURITY.md): セキュリティポリシー、脅威モデル、メモリ保護モデル、運用ベストプラクティス
+* [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md): 既知の制限事項
+* [`docs/guides/`](./docs/guides/): 運用ガイド（P2P ssh / チャット / 鍵ローテーション / Android ビルド / 再現ビルド）
+* [`docs/security/`](./docs/security/): セキュリティ評価（[SECURITY_PROFILE.md](./docs/security/SECURITY_PROFILE.md) / GUI 版）
+* [`docs/reports/`](./docs/reports/): 実装後の検証レポート・比較・エビデンス
+* [`docs/design/`](./docs/design/): 実装済み設計文書のアーカイブ（現行仕様は root が正）
 
 ## **ライセンス**
 
