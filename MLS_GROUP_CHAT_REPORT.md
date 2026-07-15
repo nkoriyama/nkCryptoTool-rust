@@ -1,6 +1,6 @@
 # MLS グループチャット 実装完了レポート
 
-**対象計画書**: [`MLS_GROUP_CHAT_PLAN.md`](./MLS_GROUP_CHAT_PLAN.md)
+**対象計画書**: [`docs/design/MLS_GROUP_CHAT_PLAN.md`](./docs/design/MLS_GROUP_CHAT_PLAN.md)
 **実装期間**: 2026-05 (P1 〜 P9)
 **ステータス**: ✅ 全 9 フェーズ完了 — `--features mls` で利用可能、CI 緑
 
@@ -147,7 +147,7 @@ GUI (`--mls-gui`) も `--features gui-mls` ビルドで起動・ウィンドウ�
 
 ## 10. 参照
 
-- 計画書: [`MLS_GROUP_CHAT_PLAN.md`](./MLS_GROUP_CHAT_PLAN.md)
+- 計画書: [`docs/design/MLS_GROUP_CHAT_PLAN.md`](./docs/design/MLS_GROUP_CHAT_PLAN.md)
 - セキュリティプロファイル §7: [`SECURITY_PROFILE.md`](./SECURITY_PROFILE.md#7-mls-グループチャット---features-mls)
 - README 該当節: [`README.md` "MLS グループチャット"](./README.md#mls-グループチャット-オプション機能--features-mls)
 - 関連標準: RFC 9420 (MLS), FIPS 203 (ML-KEM), FIPS 204 (ML-DSA), draft-connolly-cfrg-xwing-kem-01

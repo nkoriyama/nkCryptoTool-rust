@@ -62,7 +62,7 @@ Linux クライアントから実 Windows ホストへ、**踏み台なし・ポ
 各接続が `Server authenticated successfully (auth: ML-DSA-65)` を示し、scp は fingerprint
 単位の read/write ポリシーとパス confinement 付き。put→ローカル削除→get で往復を実証している。
 
-- scp 設計: [`P2P_SCP_DESIGN.md`](./P2P_SCP_DESIGN.md)
+- scp 設計: [`P2P_SCP_DESIGN.md`](./docs/design/P2P_SCP_DESIGN.md)
 - 他ファイル転送との比較: [`P2P_SCP_COMPARISON.md`](./P2P_SCP_COMPARISON.md)
 
 ## **デモ: PQC P2P scp — 1 GiB 転送のライブ進捗バー**
@@ -103,7 +103,7 @@ store-and-forward inbox がエンベロープを中継するだけで、**inbox 
 
 最後に、untrusted な inbox 越しに**バイト単位で一致**した平文が復号されて表示される。
 bundle 署名は native ctx `nkct-recipient-bundle-v1` で file / prekey / handshake 署名と
-ドメイン分離される（[KEY_EXCHANGE_DESIGN.md](./KEY_EXCHANGE_DESIGN.md) 参照）。
+ドメイン分離される（[KEY_EXCHANGE_DESIGN.md](./docs/design/KEY_EXCHANGE_DESIGN.md) 参照）。
 
 ## **デモ: ペアリング（KeyBundle 自動登録 = `ssh-copy-id` 相当）→ 認可付き shell / scp**
 
@@ -591,7 +591,7 @@ Members / Messages / 入力欄 / Add Member サブフォーム。すべての操
 > (RFC 9420 標準スイートのみ実装) とは通信できない。Plan §1 「PQC mandatory」が
 > 意図された制約。
 
-詳細仕様は [`MLS_GROUP_CHAT_PLAN.md`](./MLS_GROUP_CHAT_PLAN.md) と
+詳細仕様は [`docs/design/MLS_GROUP_CHAT_PLAN.md`](./docs/design/MLS_GROUP_CHAT_PLAN.md) と
 [`MLS_GROUP_CHAT_REPORT.md`](./MLS_GROUP_CHAT_REPORT.md) を参照。
 
 ## **処理フロー**

@@ -397,7 +397,7 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
   戻されても、現行カウンタとの `info` 不一致で HPKE AEAD 復号が失敗し**巻き戻しを
   検知**する。カウンタ更新と DB 再暗号化の 2 リソース整合は既存の `.pending`
   ステージング + `resolve_kek_to_dek` の 3 パターン復旧でクラッシュ安全。設計の
-  全体像は `ATREST_ANTIROLLBACK_DESIGN.md`。
+  全体像は `docs/design/ATREST_ANTIROLLBACK_DESIGN.md`。
   - **`permissive` (フェーズ1)**: software カウンタ (`SoftwareCounter`、
     `$XDG_STATE_HOME/nkct/rollback/<hash>.ctr` — ストレージ dir 外)。state ファイル
     ごと過去スナップショットに戻されると検知できない (case D 限界)。
@@ -412,7 +412,7 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
   - **macOS / Windows の `strict`**: **非対応（正直にエラー）**。非特権アプリが使える
     オフラインのハードウェアモノトニックカウンタが存在しないため (macOS は Secure Enclave に
     公開カウンタ API 皆無、Windows は TPM ドライバが NV カウンタコマンドをブロック; 詳細は
-    [ATREST_ANTIROLLBACK_DESIGN.md §5.1](./ATREST_ANTIROLLBACK_DESIGN.md))。`cfg(target_os)` で
+    [ATREST_ANTIROLLBACK_DESIGN.md §5.1](./docs/design/ATREST_ANTIROLLBACK_DESIGN.md))。`cfg(target_os)` で
     分岐し、黙ってソフトカウンタへ降格せず拒否する。これらの OS の巻き戻し検知は
     `permissive`（ソフトカウンタ）＋ 後述のオンライン `inbox` CHECKPOINT が担う。
   - **共通の残存リスク**: カウンタ消失 (state ファイル削除、または `TPM2_Clear` で
@@ -472,5 +472,5 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
 - `INTEROP_VERIFICATION_2026-05-07.md` — bazzite ↔ nkwire 異環境間動作実証
 - `SPEC.md` (リポジトリルート) — V3 ハンドシェイクとプロトコル仕様
 - `SECURITY.md` (リポジトリルート) — 公式セキュリティポリシー (もしあれば)
-- `MLS_GROUP_CHAT_PLAN.md` — MLS グループチャット実装計画
+- `docs/design/MLS_GROUP_CHAT_PLAN.md` — MLS グループチャット実装計画
 - `MLS_GROUP_CHAT_REPORT.md` — MLS グループチャット完了レポート

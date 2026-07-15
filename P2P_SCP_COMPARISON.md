@@ -22,7 +22,7 @@ ZTNA / egress 制御下の可用性は [`ZTNA_AVAILABILITY.md`](./ZTNA_AVAILABIL
 
 - **※1 暗号**: アプリ層で ML-KEM-768（P-256 とのハイブリッド）＋ ML-DSA-65 相互認証の AEAD を
   QUIC トランスポート上に重ねる。QUIC 自体の TLS は古典なので、**ポスト量子の機密性/認証は
-  アプリ層 AEAD が担う**（＝二重暗号は PQC の代償。詳細 `P2P_SCP_DESIGN.md`）。
+  アプリ層 AEAD が担う**（＝二重暗号は PQC の代償。詳細 `docs/design/P2P_SCP_DESIGN.md`）。
 - **※2 認可**: `--scp-policy` で指紋ごとに read/write ルートを default-deny で与え、各パスを
   ルート配下に confine（`..`/絶対/symlink escape を封じ、Linux は `/proc/self/fd` で open 後
   再検証）。受信は O_NOFOLLOW|0600 の temp にステージし、**認証（AEAD タグ）が通った時だけ**
