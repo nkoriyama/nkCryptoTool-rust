@@ -230,3 +230,83 @@ fn keyring_gen_keybundle_full_circle() {
     assert_eq!(fs::read(&plain).unwrap(), b"keyfile-less full circle");
     let _ = fs::remove_dir_all(dir);
 }
+
+/// `gen-my-key`: keys are born inside the keyring — no key file ever exists.
+/// Generate the identity + enc key directly into keyring.db, bundle, encrypt
+/// to it, auto-match decrypt. Also: P-256 must be told its role, and a held
+/// slot refuses silent regeneration (clobber guard).
+#[test]
+fn keyring_gen_my_key_never_touches_disk() {
+    let dir = "tests/tmp_kb_genmykey";
+    let b = bin();
+    let _ = fs::remove_dir_all(dir);
+
+    for algo in ["ML-DSA-65", "ML-KEM-768"] {
+        let out = Command::new(&b)
+            .env("NK_PASSPHRASE", PASS)
+            .args(["--keyring-cmd", "gen-my-key", "--key-algo", algo, "--key-dir", dir])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "gen-my-key {algo}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(String::from_utf8_lossy(&out.stdout).contains("no key file written"));
+    }
+    // The key dir holds ONLY the keyring — no private/public key files.
+    let names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, vec!["keyring.db"], "unexpected files: {names:?}");
+
+    // P-256 serves both roles: without --key-role it must refuse.
+    let out = Command::new(&b)
+        .env("NK_PASSPHRASE", PASS)
+        .args(["--keyring-cmd", "gen-my-key", "--key-algo", "P-256", "--key-dir", dir])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--key-role"));
+
+    // A held slot refuses silent regeneration.
+    let out = Command::new(&b)
+        .env("NK_PASSPHRASE", PASS)
+        .args(["--keyring-cmd", "gen-my-key", "--key-algo", "ML-DSA-65", "--key-dir", dir])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "regeneration into a held slot must be refused");
+    assert!(String::from_utf8_lossy(&out.stderr).contains("remove-my-key"));
+
+    // The generated-in-DB keys drive the whole circle: bundle → encrypt → decrypt.
+    let bundle = format!("{dir}/r.nkkb");
+    let out = Command::new(&b)
+        .env("NK_PASSPHRASE", PASS)
+        .args([
+            "--mode", "pqc", "--gen-keybundle",
+            "--key-dir", dir,
+            "--keybundle-handle", "me",
+            "--keybundle-output", &bundle,
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "gen-keybundle: {}", String::from_utf8_lossy(&out.stderr));
+    let fp = String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .find(|w| w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit()))
+        .expect("fingerprint")
+        .to_string();
+
+    let input = format!("{dir}/in.txt");
+    fs::write(&input, "born in the keyring").unwrap();
+    let enc = format!("{dir}/out.enc");
+    let out = encrypt(dir, &bundle, &fp, &input, &enc);
+    assert!(out.status.success(), "encrypt: {}", String::from_utf8_lossy(&out.stderr));
+
+    let plain = format!("{dir}/out.txt");
+    let out = Command::new(&b)
+        .env("NK_PASSPHRASE", PASS)
+        .args(["--mode", "pqc", "--decrypt", "--key-dir", dir, "--output-file", &plain, &enc])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "decrypt: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(fs::read(&plain).unwrap(), b"born in the keyring");
+    let _ = fs::remove_dir_all(dir);
+}
