@@ -2,7 +2,7 @@
 # Real hole-punch over the LAN to a live Windows box. Render while the Windows
 # server is running (ticket in /var/home/bazzite/win_ticket2.txt).
 # Render:  vhs demos/p2p_shell_win_linux.tape
-Output docs/p2p_shell_win_linux_demo.gif
+Output docs/demos/p2p_shell_win_linux_demo.gif
 
 Set Shell "bash"
 Set FontSize 14

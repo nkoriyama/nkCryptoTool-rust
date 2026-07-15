@@ -29,7 +29,7 @@
 > 以下の §3 (gate/eviction 設計) は**歴史的記録**であり、現行コードには対応しない。
 
 本書は `nkCryptoTool-rust` の MLS グループメンバーシップを P2P トランスポート層
-(`P2pEndpoint` / `NetworkProcessor` の allowlist) に同期させ、[SPEC.md §16](SPEC.md)
+(`P2pEndpoint` / `NetworkProcessor` の allowlist) に同期させ、[SPEC.md §16](../../SPEC.md)
 の不変条件 (Invariant 0〜5) を満たすための実装設計である。
 
 > [!IMPORTANT]

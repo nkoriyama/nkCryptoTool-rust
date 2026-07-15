@@ -1,6 +1,6 @@
 # Bastion-less PQC P2P shell — Linux <-> Linux (loopback iroh).
 # Render:  vhs demos/p2p_shell_linux.tape
-Output docs/p2p_shell_linux_demo.gif
+Output docs/demos/p2p_shell_linux_demo.gif
 
 Set Shell "bash"
 Set FontSize 14

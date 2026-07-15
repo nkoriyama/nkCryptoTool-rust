@@ -52,7 +52,7 @@ trade-off is explicit rather than forgotten.
    auth-critical paths for no security gain.
 5. **Per-record at-rest rollback** (redb AAD binds slot but not a version):
    whole-DB anti-rollback (`rollback.rs`, default Off) and MLS epoch
-   monotonicity cover this; see `ATREST_ANTIROLLBACK_DESIGN.md`.
+   monotonicity cover this; see `docs/design/ATREST_ANTIROLLBACK_DESIGN.md`.
 6. **redb create→chmod window** (`group/redb_storage.rs`): only AEAD ciphertext
    exists in the brief window before the file is tightened to 0600.
 

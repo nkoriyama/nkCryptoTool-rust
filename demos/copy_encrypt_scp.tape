@@ -4,7 +4,7 @@
 # ciphertext over nkct/scp/1, and only the client can decrypt it. One ML-DSA-65
 # identity, no open port. Runs the self-pacing demos/copy_encrypt_scp_demo.sh.
 # Render:  vhs demos/copy_encrypt_scp.tape
-Output docs/copy_encrypt_scp_demo.gif
+Output docs/demos/copy_encrypt_scp_demo.gif
 
 Set Shell "bash"
 Set FontSize 14

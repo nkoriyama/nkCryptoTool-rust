@@ -1,7 +1,7 @@
 # Bastion-less PQC P2P file transfer (scp) — Linux <-> Linux, loopback iroh.
 # Runs the self-pacing demos/p2p_scp_demo.sh.
 # Render:  vhs demos/p2p_scp.tape
-Output docs/p2p_scp_demo.gif
+Output docs/demos/p2p_scp_demo.gif
 
 Set Shell "bash"
 Set FontSize 14

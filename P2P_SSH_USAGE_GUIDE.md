@@ -2,7 +2,7 @@
 
 nkCryptoTool の P2P シェル／ポートフォワード機能の実用コマンド手順。NAT/CGNAT
 配下のホストへ **踏み台なし・ポート開放なし・ポスト量子暗号** で接続する。設計の
-詳細は [P2P_SHELL_DESIGN.md](P2P_SHELL_DESIGN.md) を参照。
+詳細は [P2P_SHELL_DESIGN.md](docs/design/P2P_SHELL_DESIGN.md) を参照。
 
 - 相手認証 … アプリ層 ML-DSA-65 チャレンジレスポンス（指紋 = `SHA3-256(署名公開鍵)`）
 - 暗号ストリーム … ハイブリッド ECDH‖ML-KEM 由来の AEAD（方向ごと単調カウンタ nonce）

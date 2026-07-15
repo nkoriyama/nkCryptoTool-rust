@@ -30,7 +30,7 @@ Rust版は、C++版の設計思想を継承しつつ、Rustのメモリ安全性
 
 ## **デモ: 踏み台レス PQC P2P シェル**
 
-![踏み台レス PQC P2P シェルのデモ](./docs/p2p_shell_demo.gif)
+![踏み台レス PQC P2P シェルのデモ](./docs/demos/p2p_shell_demo.gif)
 
 NAT 配下のホストへ**踏み台なし・ポート開放なし**でシェル接続する様子（bazzite x86_64 →
 nkwire arm64、実機ホールパンチ）。ステータスバーが接続経路・レイテンシ・暗号スイートを
@@ -42,7 +42,7 @@ nkwire arm64、実機ホールパンチ）。ステータスバーが接続経�
 
 ## **デモ: 踏み台レス PQC P2P シェル — Linux → Windows (ConPTY)**
 
-![Linux から Windows への PQC P2P シェルのデモ](./docs/p2p_shell_win_linux_demo.gif)
+![Linux から Windows への PQC P2P シェルのデモ](./docs/demos/p2p_shell_win_linux_demo.gif)
 
 Linux クライアントから実 Windows ホストへ、**踏み台なし・ポート開放なし・相互 ML-DSA-65
 認証**でシェル接続する様子（bazzite x86_64 → DESKTOP-UCP2T48、Wi-Fi ↔ 有線の実機
@@ -51,23 +51,23 @@ Linux クライアントから実 Windows ホストへ、**踏み台なし・ポ
 同一コードが openpty (Unix) と ConPTY (Windows) を `portable-pty` で吸収し、プロセス起動
 ユーザの権限で動作する（Tier-1 同一ユーザ）。
 
-同一ホスト内 Linux ↔ Linux 版（ループバック iroh）: [`docs/p2p_shell_linux_demo.gif`](./docs/p2p_shell_linux_demo.gif)。
+同一ホスト内 Linux ↔ Linux 版（ループバック iroh）: [`docs/demos/p2p_shell_linux_demo.gif`](./docs/demos/p2p_shell_linux_demo.gif)。
 
 ## **デモ: 踏み台レス PQC P2P シェル + ファイル転送 (scp)**
 
-![PQC P2P の ssh + scp デモ](./docs/p2p_ssh_scp_demo.gif)
+![PQC P2P の ssh + scp デモ](./docs/demos/p2p_ssh_scp_demo.gif)
 
 同じ PQC 認証 P2P トランスポート上で、**対話リモートシェル**（`p2p ssh` で `remote:~$`
 プロンプトに入り ls / cat / id / uname を実行）と**ファイル転送**（`p2p scp`）を行う様子。
 各接続が `Server authenticated successfully (auth: ML-DSA-65)` を示し、scp は fingerprint
 単位の read/write ポリシーとパス confinement 付き。put→ローカル削除→get で往復を実証している。
 
-- scp 設計: [`P2P_SCP_DESIGN.md`](./P2P_SCP_DESIGN.md)
+- scp 設計: [`P2P_SCP_DESIGN.md`](./docs/design/P2P_SCP_DESIGN.md)
 - 他ファイル転送との比較: [`P2P_SCP_COMPARISON.md`](./P2P_SCP_COMPARISON.md)
 
 ## **デモ: PQC P2P scp — 1 GiB 転送のライブ進捗バー**
 
-![PQC P2P scp の 1 GiB 転送とライブ進捗バー](./docs/p2p_scp_demo.gif)
+![PQC P2P scp の 1 GiB 転送とライブ進捗バー](./docs/demos/p2p_scp_demo.gif)
 
 `--serve-scp` サーバへ 1 GiB のファイルを put / get する様子。転送中に
 `[scp] send/recv NN%  X/Y MiB  Z MiB/s` の進捗行がライブ更新される（stderr が TTY の
@@ -76,7 +76,7 @@ read/write ポリシーと mutual ML-DSA-65 認証の上で、1 GiB が往復し
 
 ## **デモ: 入れ子 / チェーン PQC P2P（シェルの中で scp サーバを起動）**
 
-![入れ子 PQC P2P: シェルに入り、その中で scp サーバを起動して外から取得](./docs/p2p_nested_demo.gif)
+![入れ子 PQC P2P: シェルに入り、その中で scp サーバを起動して外から取得](./docs/demos/p2p_nested_demo.gif)
 
 p2p シェルで「ホスト A」に入り、**その A のシェルの中で `nkct --serve-scp` を起動**すると、
 A が新たな scp エンドポイントになる。外側の scp クライアントはその ticket で A のファイルを
@@ -86,7 +86,7 @@ scp は別プロセスなので両立する。
 
 ## **デモ: 署名付き recipient bundle + One-Time Prekey inbox で非同期 PQC 配送（PQ-FS）**
 
-![署名付き recipient bundle と One-Time Prekey inbox による非同期 PQC 配送](./docs/p2p_bundle_demo.gif)
+![署名付き recipient bundle と One-Time Prekey inbox による非同期 PQC 配送](./docs/demos/p2p_bundle_demo.gif)
 
 送信者と受信者が**一度も同時にオンラインにならない**非同期配送。信頼しない
 store-and-forward inbox がエンベロープを中継するだけで、**inbox は平文も鍵も一切見ない**。
@@ -103,11 +103,11 @@ store-and-forward inbox がエンベロープを中継するだけで、**inbox 
 
 最後に、untrusted な inbox 越しに**バイト単位で一致**した平文が復号されて表示される。
 bundle 署名は native ctx `nkct-recipient-bundle-v1` で file / prekey / handshake 署名と
-ドメイン分離される（[KEY_EXCHANGE_DESIGN.md](./KEY_EXCHANGE_DESIGN.md) 参照）。
+ドメイン分離される（[KEY_EXCHANGE_DESIGN.md](./docs/design/KEY_EXCHANGE_DESIGN.md) 参照）。
 
 ## **デモ: ペアリング（KeyBundle 自動登録 = `ssh-copy-id` 相当）→ 認可付き shell / scp**
 
-![ワンタイムトークンでペアリングし、確定した指紋で confined shell と path-jail scp を張るデモ](./docs/pairing_demo.gif)
+![ワンタイムトークンでペアリングし、確定した指紋で confined shell と path-jail scp を張るデモ](./docs/demos/pairing_demo.gif)
 
 未登録クライアントが**ワンタイムトークン**で自分を登録し、そのまま同じ ML-DSA-65 指紋で
 confined shell と path-jail された scp を張るまでを 4 ステップで示す（loopback iroh・相互 ML-DSA-65 認証）:
@@ -129,7 +129,7 @@ confined shell と path-jail された scp を張るまでを 4 ステップで�
 
 ## **デモ: keyring ワークフロー（copy-bundle → handle 宛て暗号化 → scp → 復号）**
 
-![ペアリングで登録した handle に宛てて暗号化し、ciphertext を scp で取得して受信者だけが復号するデモ](./docs/copy_encrypt_scp_demo.gif)
+![ペアリングで登録した handle に宛てて暗号化し、ciphertext を scp で取得して受信者だけが復号するデモ](./docs/demos/copy_encrypt_scp_demo.gif)
 
 ペアリングで登録した KeyBundle が**そのまま暗号化の宛先**になることを、単一の ML-DSA-65 identity を
 全段に通して示す（loopback iroh・ポート開放なし）:
@@ -142,7 +142,7 @@ confined shell と path-jail された scp を張るまでを 4 ステップで�
 
 ## **チケットを端末に QR 表示（外部ツール不要）**
 
-![端末に QR を表示するデモ](./docs/qr_demo.gif)
+![端末に QR を表示するデモ](./docs/demos/qr_demo.gif)
 
 `nkct --qr '<ticket>'`（または `… | nkct --qr -` で stdin）で、接続チケットを**その場で
 端末に QR 描画**する。同梱の `qrcode` クレートを使うので `qrencode` などの外部ツールは不要・
@@ -591,7 +591,7 @@ Members / Messages / 入力欄 / Add Member サブフォーム。すべての操
 > (RFC 9420 標準スイートのみ実装) とは通信できない。Plan §1 「PQC mandatory」が
 > 意図された制約。
 
-詳細仕様は [`MLS_GROUP_CHAT_PLAN.md`](./MLS_GROUP_CHAT_PLAN.md) と
+詳細仕様は [`docs/design/MLS_GROUP_CHAT_PLAN.md`](./docs/design/MLS_GROUP_CHAT_PLAN.md) と
 [`MLS_GROUP_CHAT_REPORT.md`](./MLS_GROUP_CHAT_REPORT.md) を参照。
 
 ## **処理フロー**

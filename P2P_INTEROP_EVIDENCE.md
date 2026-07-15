@@ -90,7 +90,7 @@ cargo test --test interop   # クロスバックエンド相互運用のみ
 ### 1.7 実機・踏み台レス P2P シェル（手動確認）
 
 NAT 配下ホストへ踏み台・ポート開放なしで対話シェル接続を、複数アーキテクチャ間で
-手動確認済み（`P2P_SHELL_DESIGN.md` §12 の実機計画に対応）。
+手動確認済み（`docs/design/P2P_SHELL_DESIGN.md` §12 の実機計画に対応）。
 
 | 項目 | 結果 |
 |---|---|
@@ -266,6 +266,6 @@ x86_64）の `--serve-shell` へ接続した。両端 `--discovery n0`、`--mode
 ## 関連ドキュメント
 
 - `P2P_SHELL_COMPARISON.md` — 設計・到達手段の比較表（本ドキュメントが実証面を補う）
-- `P2P_SHELL_DESIGN.md` — P2P シェルの設計メモ（§12 テスト計画）
+- `docs/design/P2P_SHELL_DESIGN.md` — P2P シェルの設計メモ（§12 テスト計画）
 - `P2P_SSH_USAGE_GUIDE.md` — 利用ガイド
 - `ZTNA_AVAILABILITY.md` — ZTNA / egress 制御下の可用性（実測 + 運用指針）

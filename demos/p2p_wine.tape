@@ -2,7 +2,7 @@
 # Linux host. Runs the self-pacing demos/p2p_wine_demo.sh inside the winbuild
 # distrobox (where wine64 lives).
 # Render:  vhs demos/p2p_wine.tape
-Output docs/p2p_wine_demo.gif
+Output docs/demos/p2p_wine_demo.gif
 
 Set Shell "bash"
 Set FontSize 14

@@ -2,7 +2,7 @@
 # Prekey inbox (PQ forward secret) — loopback iroh, sender & recipient never
 # online together. Runs the self-pacing demos/p2p_bundle_demo.sh.
 # Render:  vhs demos/p2p_bundle.tape
-Output docs/p2p_bundle_demo.gif
+Output docs/demos/p2p_bundle_demo.gif
 
 Set Shell "bash"
 Set FontSize 14

@@ -109,9 +109,9 @@ i+1 以降のエントリは既にワイヤ上にある。この在庫の運命�
 - **サーバ側コミットの並列化**（複数ファイルを同時に受信・fsync）は別物で、QUIC 複数ストリーム
   （`file_id` 多重化）が要る。nonce 分割（per-stream 鍵/nonce-prefix）が必須で中規模かつ
   慎重を要するため、実利（高速 LAN の bulk-many-files）が具体化するまで保留。詳細は
-  `P2P_SCP_DESIGN.md`。
+  `docs/design/P2P_SCP_DESIGN.md`。
 
 ## 関連
 
-- `P2P_SCP_DESIGN.md` — scp プロトコル設計、`-r` と並列化の方針。
+- `docs/design/P2P_SCP_DESIGN.md` — scp プロトコル設計、`-r` と並列化の方針。
 - `P2P_INTEROP_EVIDENCE.md` §2.4 — scp オーバーヘッドの切り分け（本レポートの前提となる性能分析）。

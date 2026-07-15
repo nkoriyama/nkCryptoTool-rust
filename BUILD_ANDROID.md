@@ -1,6 +1,6 @@
 # Android クロスコンパイル手順（aarch64-linux-android）
 
-`mls` ストレージを SQLCipher から純 Rust の redb へ移行した結果（`DB_PURERUST_DESIGN.md`）、
+`mls` ストレージを SQLCipher から純 Rust の redb へ移行した結果（`docs/design/DB_PURERUST_DESIGN.md`）、
 `mls` ビルドは **system libcrypto / SQLCipher に依存しなくなり、Android へクロスコンパイル可能**
 になった。本書は実機ターゲットで検証済みの手順を記録する。
 

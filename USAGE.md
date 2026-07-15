@@ -1,6 +1,6 @@
 # USAGE — ユースケース別クックブック
 
-やりたいこと別に「こう打てばできる」をまとめた実用ガイド。設計背景は各 DESIGN ドキュメント、
+やりたいこと別に「こう打てばできる」をまとめた実用ガイド。設計背景は各 DESIGN ドキュメント（[docs/design/](./docs/design/)）、
 機能一覧・性能・アーキテクチャは [README](./README.md) を参照。ここはコマンドだけ。
 
 - コマンドは `nk-crypto-tool`（ビルド後は `target/release/nk-crypto-tool`）。
