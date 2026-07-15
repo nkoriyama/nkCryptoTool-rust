@@ -100,6 +100,30 @@ done
 > 手順 3 と 4 の順序を守ること。**再封緘の完了と検証を確認してから旧秘密鍵を破棄** する。
 > 逆順では、再封緘に失敗したファイルが復号不能（恒久的データ損失）になる。
 
+### 3.1 鍵リング運用（my-identities）でのローテーション
+
+鍵を `keyring.db` に置いている場合（USAGE §0.1/§2.1）も、**新世代はいったんファイルで
+生成して再封緘し、検証後に keyring を入れ替える**。my-identities のスロット
+（`me:enc:ML-KEM-768` 等）は**単一占有**（クロバー防御）なので、旧鍵が入ったまま
+新鍵を同じスロットへ生成・取り込みはできない — これは identity の暗黙置換を防ぐ意図的な設計。
+
+```bash
+# 手順 1〜2 は従来どおりファイルで（$NEW に生成・KeyBundle 発行）。
+# 手順 3 の復号側は keyring 自動マッチが使える（--user-privkey 省略可）。
+
+# 4'. 再封緘の検証後、keyring のスロットを新世代に入れ替える
+nk-crypto-tool --keyring-cmd remove-my-key --key-role enc --key-algo ML-KEM-768
+nk-crypto-tool --keyring-cmd import-my-key \
+    --user-privkey "$NEW/private_enc_pqc.key" --shred-original
+#   （--shred-original で新世代のファイル原本も抹消 → 以後は keyring のみ）
+```
+
+- `remove-my-key` は DB からレコードを削除するが、redb のファイル自体に旧ページが
+  残留し得る（§4 の媒体特性と同種の caveat）。恒久的な保護は「格納されている秘密鍵が
+  常にパスフレーズ暗号化済みである」ことにある。
+- 署名鍵（identity）のローテーションは指紋＝identity そのものが変わるため、この
+  ガイドの範囲外（全ピアとの再ピン留め・再ペアリングが必要）。
+
 ---
 
 ## 4. 旧秘密鍵の安全な破棄

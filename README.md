@@ -179,6 +179,13 @@ confined shell と path-jail された scp を張るまでを 4 ステップで�
   (`--pairing-grant`)。接続本人が鍵所持を証明した identity だけを登録 (handshake 指紋 == bundle owner
   指紋を照合)、default-deny は維持 (grants はトランスポート認可のみ・実行 policy は別)。
   使い方は [USAGE.md §7](./USAGE.md)。
+* **GPG 風鍵リング (my-identities) — 鍵ファイルレス運用**: 自分の鍵ペアを物理ファイルではなく
+  **redb keyring (`keyring.db`) にカプセル化**して管理。`--keyring-cmd gen-my-key` で鍵を DB 内に
+  直接生成でき（秘密鍵は暗号化 PKCS#8 のまま格納・**ファイルとして一度もディスクに書かれない**）、
+  既存の鍵ファイルは `import-my-key`（`--shred-original` で原本抹消）で取り込める。以後、
+  **復号・署名・KeyBundle 生成・P2P 認証 (shell / scp / pairing) まで全て鍵パス指定なし**で動作
+  — 必要なスロットを自動解決し、使うたびに秘密鍵から公開鍵を再導出して DB レコードと照合する
+  （差し替えは使用前に fail closed）。使い方は [USAGE.md §0.1 / §2.1 / §3.1 / §5.1](./USAGE.md)。
 * **GUI**: Slint を用いた直感的な GUI を搭載。`--gui` オプションで起動可能で、QR コードのスキャンやチャット機能、ファイル転送をグラフィカルに実行できます。
 * **MLS (RFC 9420) グループチャット (オプション機能)**: `--features mls` で有効化。
   Ed25519 ‖ ML-DSA-65 + X25519 ‖ ML-KEM-768 (X-Wing) のハイブリッド PQC ciphersuite
@@ -325,6 +332,7 @@ flowchart TD
     Strategy --> KeyProvider
     KeyProvider -->|wrap/unwrap| TPM
     KeyProvider -->|file load| FS[File System]
+    KeyProvider -->|auto-match| Keyring[keyring my-identities]
 
     CryptoProcessor --> Network[Network Mode]
     Network --> Allowlist[keyring allowlist]
@@ -332,6 +340,9 @@ flowchart TD
 ```
 
 - **KeyProvider による抽象化**: 暗号操作を鍵ストレージの実装から分離。メインロジックは具体的な保護メカニズム (TPM, ファイル, etc.) に依存しません。
+- **keyring my-identities (GPG 風)**: 自分の鍵は `keyring.db` にカプセル化でき、復号・署名・
+  KeyBundle 生成・P2P 認証が該当スロットを自動解決する。秘密鍵は常に暗号化 PKCS#8 のまま
+  格納され、unlock のたびに公開鍵を再導出してレコードと照合する (改ざんは使用前に fail closed)。
 - **セキュアな TPM バックエンド**: TPM 2.0 HMAC セッションと `posix_spawn` ベースの安全なプロセス実行 (シェル排除) を活用。
 - **ネットワーク層の DoS 防御**: keyring allowlist + PeerId-based cooldown による多層防御 (詳細は SECURITY.md / SPEC.md)。
 
@@ -385,6 +396,10 @@ Linux 環境では、TPM デバイス (`/dev/tpmrm0` 等) へのアクセス権�
 * **暗号化鍵ペア (Hybrid)**: `nk-crypto-tool --mode hybrid --gen-enc-key`
     * これにより、ML-KEM と ECDH の鍵ペアがそれぞれ生成されます (例: `public_enc_hybrid_mlkem.key`, `private_enc_hybrid_mlkem.key`, `public_enc_hybrid_ecdh.key`, `private_enc_hybrid_ecdh.key`)
 * **受信者向け KeyBundle の発行 (`--gen-keybundle`)**: 生成済みの暗号化公開鍵を自分の ML-DSA-65 identity で署名して束ね、送信者に配布する署名付きユニット (`.nkkb`) を出力する。送信者はこれを暗号化に使う（下記「暗号化 — 署名付き KeyBundle 経由」参照）。鍵ペアではなく配布物なので、先に暗号化鍵ペアと署名鍵ペアの両方が必要。
+* **鍵ファイルを作らない生成 (`--keyring-cmd gen-my-key`)**: 鍵ペアを keyring.db 内に直接生成する
+  (例: `--keyring-cmd gen-my-key --key-algo ML-DSA-65`)。秘密鍵はファイルとして一度もディスクに
+  書かれない。以後の復号・署名・KeyBundle 生成・P2P 認証は鍵パス指定なしで動く
+  ([USAGE.md §0.1](./USAGE.md) 参照)。
 * **TPM 保護を有効化**: `--use-tpm` を追加
 * **アルゴリズム選択**: `--kem-algo ML-KEM-768` (デフォルト) / `--dsa-algo ML-DSA-65` (デフォルト)
 * **保存先指定**: `--key-dir <path>`
@@ -439,6 +454,8 @@ NKKB KeyBundle** に暗号化します。KeyBundle は受信者の ML-DSA-65 ide
         --user-ecdh-privkey <ecdh_priv.key> \
         --output-file <decrypted.txt> <encrypted.bin>
     ```
+* **鍵リング自動マッチング**: 鍵を keyring に取り込み済みなら `--user-*-privkey` は不要
+  — 暗号文ヘッダから必要スロットを自動解決する ([USAGE.md §2.1](./USAGE.md))。
 
 ### **署名・検証**
 
@@ -446,7 +463,8 @@ NKKB KeyBundle** に暗号化します。KeyBundle は受信者の ML-DSA-65 ide
     ```bash
     nk-crypto-tool --mode ecc --sign --signing-privkey <priv.key> --signature <file.sig> <input.txt>
     ```
-    オプション: `--digest-algo SHA3-512` (default), `SHA3-256`, `SHA-256` 等
+    オプション: `--digest-algo SHA3-512` (default), `SHA3-256`, `SHA-256` 等。
+    keyring 取り込み済みなら `--signing-privkey` は省略可 ([USAGE.md §3.1](./USAGE.md))。
 * **検証**:
     ```bash
     nk-crypto-tool --mode ecc --verify --signing-pubkey <pub.key> --signature <file.sig> <input.txt>

@@ -39,6 +39,46 @@ This document provides a detailed technical specification of the `nkCryptoTool` 
 - **Public Keys**: SubjectPublicKeyInfo (SPKI) encoded.
 - **TPM Blobs**: Custom PEM format (`-----BEGIN TPM WRAPPED BLOB-----`) containing the public and private parts of a TPM-wrapped key.
 
+### 2.4 Keyring My-Identities Store (GPG-style own-key encapsulation)
+
+The user's OWN key pairs can be encapsulated in the redb keyring
+(`<key-dir>/keyring.db`) instead of key files, in the
+`keyring_my_identities_v1` table:
+
+- **Slot key**: `{handle}:{role}:{algo}` (e.g. `me:enc:ML-KEM-768`,
+  `me:sign:ML-DSA-65`). `handle` must not contain `:`; `role` is `enc` or
+  `sign`; `algo` is the keyring algo vocabulary (`ML-KEM-512/768/1024`,
+  `ML-DSA-44/65/87`, `P-256`).
+- **Record value**: fingerprint (SHA3-256 of the RAW public key — for a sign
+  key this equals the KeyBundle owner fingerprint peers pin), `added_at`
+  (unix seconds), the public half as plaintext SPKI DER (enables
+  passphrase-less listing and KeyBundle generation), and the private key
+  **strictly as its passphrase-encrypted PKCS#8 PEM** — plaintext private
+  keys are refused at entry, so the table never holds an unprotected key.
+- **Entry paths**: `--keyring-cmd import-my-key` (validates an existing
+  encrypted PEM file; optional `--shred-original`) and `--keyring-cmd
+  gen-my-key` (generates the pair in memory; no key file is ever written).
+  Both run one validation pipeline: decrypt under the passphrase, classify
+  the PKCS#8 OID (EC keys are checked down to the named-curve parameter),
+  re-derive the public half from the private key and bind it, and
+  encap/decap self-test ML-KEM keys.
+- **Clobber protection**: re-storing a slot under a DIFFERENT fingerprint is
+  refused (`remove-my-key` first); the same fingerprint is an idempotent
+  update. Check-and-insert happens inside one write transaction.
+- **Unlock invariant**: every use re-decrypts the record, re-derives the
+  public half and requires it to match the stored SPKI + fingerprint. A
+  tampered or swapped record fails closed before any decryption output,
+  signature, or handshake message exists.
+- **Auto-match consumers** (all engage only when no explicit key path is
+  given): `--decrypt` peeks the v3 ciphertext header and resolves the needed
+  `enc` slot(s); `--sign` resolves the `sign` slot for the mode (`P-256` for
+  ecc, `--dsa-algo` for pqc/hybrid); `--gen-keybundle` / `--copy-bundle`
+  resolve the owner identity AND the bundled encryption public keys,
+  unlocking every slot before signing so a tampered record cannot enter a
+  signed bundle; listen/connect resolve the handshake identity
+  **opportunistically** (a missing keyring or slot leaves the node anonymous
+  — never a hard error; `--allow-unauth` skips the lookup).
+
 ---
 
 ## 3. Network Protocol Specification (NKCT)
@@ -49,6 +89,11 @@ The NKCT protocol provides a secure, authenticated, and quantum-resistant tunnel
 - **AEAD Algorithm**: Both peers must be configured with the same AEAD algorithm (`--aead-algo`, default `AES-256-GCM`). Mismatch results in an authentication failure during the first encrypted exchange.
 - **PQC Algorithms**: KEM (`--kem-algo`, default `ML-KEM-768`) and DSA (`--dsa-algo`, default `ML-DSA-65`) must match.
 - **Authentication Mode**: `--allow-unauth` defaults to `false` (mutual authentication required).
+- **Signing Identity Source**: the handshake signing key comes from
+  `--signing-privkey`, or — when that flag is absent — from the keyring
+  my-identities `sign:<--dsa-algo>` slot (§2.4), resolved opportunistically.
+  SELF_AUTH flags, transcript signatures, and the ticket fingerprint all
+  derive from the same resolved source.
 
 ### 3.2 Handshake Sequence
 The handshake follows a strict order to establish a secure session:
