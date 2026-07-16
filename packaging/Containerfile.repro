@@ -23,7 +23,14 @@ RUN apk add --no-cache build-base
 # Determinism knobs. SOURCE_DATE_EPOCH is honoured by any dep that timestamps;
 # Rust itself embeds no build time. CARGO_HOME is already /usr/local/cargo.
 ARG SOURCE_DATE_EPOCH=0
+# Variant hook: when non-empty, EXTRA_RUSTFLAGS REPLACES the
+# [target.x86_64-unknown-linux-musl] rustflags from .cargo/config.toml for this
+# build (env beats config in cargo), so a variant MUST restate the full flag
+# set including the --remap-path-prefix pair, or reproducibility breaks.
+# Empty (the default/portable variant) leaves config.toml in charge.
+ARG EXTRA_RUSTFLAGS=""
 ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    EXTRA_RUSTFLAGS=${EXTRA_RUSTFLAGS} \
     CARGO_INCREMENTAL=0 \
     CARGO_HOME=/usr/local/cargo \
     TZ=UTC \
@@ -36,7 +43,10 @@ COPY . .
 # from crates.io, whose published tarballs are immutable, so the lock fully
 # determines inputs). Not --frozen: that implies --offline and the fresh image
 # has no cached registry.
-RUN cargo build --release --locked \
-        --target x86_64-unknown-linux-musl \
+# NOTE: RUSTFLAGS is exported only when EXTRA_RUSTFLAGS is non-empty — an
+# empty-but-set RUSTFLAGS would also override config.toml (to nothing).
+RUN sh -c 'if [ -n "$EXTRA_RUSTFLAGS" ]; then export RUSTFLAGS="$EXTRA_RUSTFLAGS"; fi; \
+        cargo build --release --locked \
+            --target x86_64-unknown-linux-musl' \
     && cp target/x86_64-unknown-linux-musl/release/nk-crypto-tool /nk-crypto-tool \
     && sha256sum /nk-crypto-tool

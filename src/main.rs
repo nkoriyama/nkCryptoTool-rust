@@ -519,6 +519,26 @@ fn private_key_file_is_encrypted(path: &Option<String>) -> bool {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // VAES release variant: the avx512 aes backend is fixed at compile time
+    // (no runtime fallback), so on a CPU without VAES/AVX-512 this binary
+    // would die with an opaque SIGILL somewhere inside the first AES call.
+    // Check up front and fail with an actionable message instead. This MUST
+    // stay the first statement so no vectorizable code runs before it.
+    #[cfg(all(target_arch = "x86_64", aes_backend = "avx512"))]
+    {
+        if !(std::arch::is_x86_feature_detected!("vaes")
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("vpclmulqdq"))
+        {
+            eprintln!(
+                "error: this is the VAES build of nk-crypto-tool (requires AVX-512 + VAES: \
+                 AMD Zen 4+, Intel Ice Lake+ server). This CPU does not support it.\n\
+                 Use the portable `nk-crypto-tool` binary instead."
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Internal exec trampoline for confined shell sessions (`__nnp-exec`):
     // sets NO_NEW_PRIVS and execs the real command, or returns immediately
     // for every normal invocation. Must run before any CLI parsing.

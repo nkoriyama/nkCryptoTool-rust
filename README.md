@@ -979,6 +979,7 @@ v3 `ChunkedAead` 形式 + バッファ再利用最適化を適用した現行コ
 | **RustCrypto (Rust)** | ECC (P-256) | ~1.8 GiB/s | ~1.1 GiB/s |
 | **RustCrypto (Rust)** | PQC (ML-KEM-768) | ~1.8 GiB/s | ~1.1 GiB/s |
 | **RustCrypto (Rust)** | Hybrid | ~1.8 GiB/s | ~1.1 GiB/s |
+| **RustCrypto VAES 変種** ※2 | 全モード | ~2.2 GiB/s | ~1.5 GiB/s |
 
 * **※ 復号は2パス構成**: v3 `ChunkedAead` の復号は「全チャンク認証 (Pass 1) → 平文書き出し (Pass 2)」の2パス (THREAT 37-1: 未認証平文をディスクに書かない) のため、暗号文を2回読む。復号スループットが暗号化より構造的に低いのはこのため (RustCrypto は純 Rust AEAD のため特に顕著)。チャンク毎タグ化に伴うバッファ確保・ゼロ化のオーバーヘッドはバッファ再利用最適化で解消済み (OpenSSL は v2 単一タグ方式と同等)。
 * **大規模ファイル対応**: チャンク単位のストリーミング設計のため、原理的に性能・メモリとも入力サイズに依存しない (常時 **10 MiB 以下** の RSS で動作。本表の実測は 4.0 GiB — 10 GiB 級での劣化なしは旧計測に基づく設計特性)。
@@ -986,10 +987,13 @@ v3 `ChunkedAead` 形式 + バッファ再利用最適化を適用した現行コ
 * **RustCrypto は aes-gcm 0.11 世代 (2026-07 移行)**: `aes` 0.9 + `polyval` 0.7 への移行で
   旧 0.10 世代 (enc ~1.2 / dec ~0.67) から **+5〜6割** — 表の 1.8 / 1.1 はポータブルな
   AES-NI 経路の値。生 AEAD 単体の実測 (1 MiB チャンク) は 0.10 世代 1.59 → 0.11 世代
-  2.95 GiB/s。さらに `aes` 0.9 は **VAES-512 バックエンド**を持ち、opt-in
-  (`RUSTFLAGS='--cfg aes_backend="avx512" -C target-feature=+vaes,+avx512f'`) で生 AEAD
-  ~6.0 GiB/s (実測) まで伸びる — ただしコンパイル時固定で **非対応 CPU (Zen3 以前 /
-  AVX-512 なし Intel) では SIGILL** するため配布ビルドには不可、ローカル専用の選択肢。
+  2.95 GiB/s。
+* **※2 VAES 変種 (`nk-crypto-tool-vaes`)**: `aes` 0.9 の **VAES-512 バックエンド有効ビルド**
+  (`--cfg aes_backend="avx512"` + AVX-512/VAES target-feature、生 AEAD 実測 ~6.0 GiB/s)。
+  再現ビルド行列の第2変種として配布物に並ぶ (`packaging/reproducible-build.sh`)。
+  バックエンド選択はコンパイル時固定のため **AMD Zen 4+ / Intel Ice Lake+ (サーバ系) 専用** —
+  非対応 CPU では起動時 CPUID ガードが明快なエラーで即終了する (SIGILL にはならない)。
+  対応 CPU を持つならローカルビルドでも同フラグで有効化できる。
 * **検証注記 (2026-07 再検証, 0.10 世代当時)**: RustCrypto の値がハードウェア経路の欠落
   (GHASH の PCLMULQDQ 不使用等) によるものでないことを、強制ソフトウェア実装ビルド
   (`--cfg polyval_force_soft` / `--cfg aes_force_soft`) との比較で確認済み —

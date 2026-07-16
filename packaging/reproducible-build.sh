@@ -20,11 +20,19 @@ mkdir -p "$OUT"
 export SOURCE_DATE_EPOCH
 echo "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
 
+# The VAES variant restates the FULL musl rustflags (EXTRA_RUSTFLAGS replaces
+# the config.toml section — see Containerfile.repro), swapping the portable
+# x86-64-v2 floor for x86-64-v3 + the AVX-512/VAES features the aes crate's
+# `aes_backend="avx512"` backend requires. main() carries a startup CPUID
+# guard so a VAES-less machine gets a clear error instead of a SIGILL.
+VAES_RUSTFLAGS='-C target-cpu=x86-64-v3 -C target-feature=+aes,+pclmulqdq,+vaes,+vpclmulqdq,+avx512f --cfg aes_backend="avx512" --remap-path-prefix=/build=nkct --remap-path-prefix=/usr/local/cargo=cargo'
+
 build_once() {
-  local tag="$1" dest="$2"
+  local tag="$1" dest="$2" extra="${3:-}"
   echo "== building $tag (--no-cache) =="
   podman build --no-cache \
     --build-arg "SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH" \
+    --build-arg "EXTRA_RUSTFLAGS=$extra" \
     -f "$CF" -t "$tag" .
   # Extract the artifact from the image (no run, no mounts → no host variance).
   local cid; cid=$(podman create "$tag")
@@ -32,22 +40,36 @@ build_once() {
   podman rm "$cid" >/dev/null
 }
 
-build_once nkct-repro-a "$OUT/nk-crypto-tool.a"
-build_once nkct-repro-b "$OUT/nk-crypto-tool.b"
+# Build each variant twice from independent images and require byte-identity.
+# name:extra-rustflags pairs; the portable variant keeps config.toml in charge.
+build_variant() {
+  local name="$1" extra="${2:-}"
+  build_once "nkct-repro-$name-a" "$OUT/$name.a" "$extra"
+  build_once "nkct-repro-$name-b" "$OUT/$name.b" "$extra"
+  local ha hb
+  ha=$(sha256sum "$OUT/$name.a" | cut -d' ' -f1)
+  hb=$(sha256sum "$OUT/$name.b" | cut -d' ' -f1)
+  echo "$name build A: $ha"
+  echo "$name build B: $hb"
+  if [ "$ha" != "$hb" ]; then
+    echo "MISMATCH ($name): the two builds differ — not reproducible." >&2
+    ls -l "$OUT/$name.a" "$OUT/$name.b" >&2
+    exit 1
+  fi
+  mv "$OUT/$name.a" "$OUT/$name"
+  rm -f "$OUT/$name.b"
+}
 
-HA=$(sha256sum "$OUT/nk-crypto-tool.a" | cut -d' ' -f1)
-HB=$(sha256sum "$OUT/nk-crypto-tool.b" | cut -d' ' -f1)
-echo "build A: $HA"
-echo "build B: $HB"
+# VARIANTS=nk-crypto-tool packaging/reproducible-build.sh  → portable only
+: "${VARIANTS:=nk-crypto-tool nk-crypto-tool-vaes}"
+for v in $VARIANTS; do
+  case "$v" in
+    nk-crypto-tool)      build_variant "$v" "" ;;
+    nk-crypto-tool-vaes) build_variant "$v" "$VAES_RUSTFLAGS" ;;
+    *) echo "unknown variant $v" >&2; exit 1 ;;
+  esac
+done
 
-if [ "$HA" != "$HB" ]; then
-  echo "MISMATCH: the two builds differ — not reproducible. Diffing sizes:" >&2
-  ls -l "$OUT/nk-crypto-tool.a" "$OUT/nk-crypto-tool.b" >&2
-  exit 1
-fi
-
-cp "$OUT/nk-crypto-tool.a" "$OUT/nk-crypto-tool"
-rm -f "$OUT/nk-crypto-tool.a" "$OUT/nk-crypto-tool.b"
-( cd "$OUT" && sha256sum nk-crypto-tool > SHA256SUMS )
-echo "OK: reproducible. artifact + hash in $OUT/"
+( cd "$OUT" && sha256sum $VARIANTS > SHA256SUMS )
+echo "OK: reproducible. artifacts + hashes in $OUT/"
 cat "$OUT/SHA256SUMS"
