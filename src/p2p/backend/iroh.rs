@@ -334,6 +334,34 @@ impl IrohEndpoint {
             crate::network::ALPN_PAIRING.to_vec(),
         ]);
 
+        // QUIC per-stream flow control. iroh's default stream receive window
+        // (1.25 MB) is tuned for ~100 Mbit/s at 100 ms RTT; a higher-bandwidth or
+        // higher-latency (high-BDP) link throttles a single stream to window/RTT.
+        // Raising it (with a matching send window) lets one scp stream fill a
+        // fat/far pipe. Pure flow control — no crypto / nonce impact. The window
+        // is a ceiling on in-flight data, not a reservation, so a small transfer
+        // (chat/shell) pays nothing; only a bulk transfer buffers up to it.
+        //
+        // Default 8 MiB (measured: on an emulated RTT-50ms / 800-Mbit link, a
+        // single scp stream went from 20 MB/s at the 1.25 MB default to ~62 MB/s
+        // at 8 MiB — ~3x; a sweep peaked ~16 MiB and regressed by 64 MiB via
+        // buffer-bloat, so 8 MiB is the conservative sweet spot). Loopback / LAN
+        // (BDP≈0) is unaffected — the window is never the limiter there.
+        // Override with NKCT_QUIC_STREAM_WINDOW_MB (0 = keep iroh's default).
+        {
+            let mb: u32 = std::env::var("NKCT_QUIC_STREAM_WINDOW_MB")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(8);
+            if mb > 0 {
+                let bytes = mb.saturating_mul(1024 * 1024);
+                let mut tc = iroh::endpoint::QuicTransportConfig::builder();
+                tc = tc.stream_receive_window(bytes.into());
+                tc = tc.send_window(bytes as u64 * 2);
+                builder = builder.transport_config(tc.build());
+            }
+        }
+
         // A persistent node key gives us a stable NodeId across runs, which
         // the asynchronous inbox/prekey flow needs (PUBLISH in one run, POLL
         // in another, both addressing the same recipient slot). Without it
