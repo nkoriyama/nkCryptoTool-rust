@@ -1003,8 +1003,9 @@ fn aes256gcm_encrypt(
     // tag so the envelope layout (ciphertext, then 16-byte tag) is unchanged.
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| GroupError::Storage(format!("at-rest aes init: {e}")))?;
+    let nonce = Nonce::from(*nonce);
     let mut buf = cipher
-        .encrypt(Nonce::from_slice(nonce), Payload { msg: plaintext, aad })
+        .encrypt(&nonce, Payload { msg: plaintext, aad })
         .map_err(|_| GroupError::Storage("at-rest aes encrypt failed".into()))?;
     if buf.len() < ATREST_TAG_LEN {
         return Err(GroupError::Storage("at-rest aes output too short".into()));
@@ -1042,8 +1043,9 @@ fn aes256gcm_decrypt(
     combined.extend_from_slice(tag);
     // A bad passphrase, tampered ciphertext, or tampered AAD all fail at GCM
     // tag verification. Don't reveal which it was.
+    let nonce = Nonce::from(*nonce);
     let pt = cipher
-        .decrypt(Nonce::from_slice(nonce), Payload { msg: &combined, aad })
+        .decrypt(&nonce, Payload { msg: &combined, aad })
         .map_err(|_| {
             GroupError::Storage(
                 "at-rest decrypt failed (bad passphrase or corrupted file)".into(),
