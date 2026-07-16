@@ -937,6 +937,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+ "zeroize",
 ]
 
 [[package]]
@@ -2012,7 +2013,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
  "block-buffer 0.12.1",
+ "const-oid 0.10.2",
  "crypto-common 0.2.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -2477,7 +2480,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8bdb6454f692ca2a2b45cd554c6828c639d7f9c968cf83a678899ec4443a280"
 dependencies = [
  "rand_core 0.6.4",
- "sha3",
+ "sha3 0.10.9",
  "subtle",
  "zeroize",
 ]
@@ -2490,7 +2493,7 @@ checksum = "c9fb5a367b9846933e271a3c2a992930743f82ae5e8cb7faa780715a80fa0b15"
 dependencies = [
  "rand_core 0.6.4",
  "sha2 0.10.9",
- "sha3",
+ "sha3 0.10.9",
  "zeroize",
 ]
 
@@ -4408,6 +4411,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "keccak"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e24a010dd405bd7ed803e5253182815b41bf2e6a80cc3bfc066658e03a198aa"
+dependencies = [
+ "cfg-if 1.0.4",
+ "cpufeatures 0.3.0",
+]
+
+[[package]]
 name = "keyboard-types"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5339,7 +5352,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2 0.10.9",
- "sha3",
+ "sha3 0.12.0",
  "slint",
  "slint-build",
  "spki 0.8.0",
@@ -7792,8 +7805,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77fd7028345d415a4034cf8777cd4f8ab1851274233b45f84e3d955502d93874"
 dependencies = [
  "digest 0.10.7",
- "keccak",
- "zeroize",
+ "keccak 0.1.6",
+]
+
+[[package]]
+name = "sha3"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bc9bad02c26382724b2d2692c6f179285e4b54eeecd7968f52a50059c3c11759"
+dependencies = [
+ "digest 0.11.3",
+ "keccak 0.2.0",
+ "sponge-cursor",
 ]
 
 [[package]]
@@ -8225,6 +8248,15 @@ checksum = "1d9efca8738c78ee9484207732f728b1ef517bbb1833d6fc0879ca898a522f6f"
 dependencies = [
  "base64ct",
  "der 0.8.0",
+]
+
+[[package]]
+name = "sponge-cursor"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
+dependencies = [
+ "zeroize",
 ]
 
 [[package]]
