@@ -1039,6 +1039,10 @@ v3 `ChunkedAead` 形式 + バッファ再利用最適化を適用した現行コ
   KeyBundle 生成できることを実機確認済み。
 * **署名 (NKCS detached) — 双方向互換**: C++ 版の署名を Rust 版が検証、Rust 版の署名を
   C++ 版が検証 — 両方向とも実機確認済み。
+* **KeyBundle (NKKB) — 双方向互換 (2026-07-16)**: C++ 版に `--gen-keybundle` と
+  `--encrypt --recipient-keybundle` を実装。C++ 生成 bundle を Rust が指紋 pin + self-sig +
+  keybind まで検証、逆に Rust 生成 bundle を C++ が検証して暗号化 — 全モードで往復確認済み
+  (誤 pin・改ざん・期限切れは双方向で拒否)。ML-DSA の FIPS 204 context-string まで一致。
 * **Rust 版内のクロスバックエンド復号 — 互換**: OpenSSL バックエンドで暗号化したファイルを
   RustCrypto バックエンドで復号 (およびその逆) 可能。CI の interop テストで常時検証。
 * **暗号文 (NKCT v3) の C++ ↔ Rust — 双方向互換 (2026-07-16 復旧)**: C++ 版に v3 ChunkedAead
