@@ -31,10 +31,26 @@ libraries, so the run host contributes nothing to the bytes.
 packaging/reproducible-build.sh
 ```
 
-This runs two independent `--no-cache` container builds and asserts their
-binaries are byte-identical, then writes `packaging/out/nk-crypto-tool` and
+This runs two independent `--no-cache` container builds **per variant** and
+asserts each pair is byte-identical, then writes the artifacts and
 `packaging/out/SHA256SUMS`. Set `SOURCE_DATE_EPOCH` to override the timestamp
 (defaults to the HEAD commit time).
+
+Two variants are built by default (`VARIANTS=... ` narrows the set):
+
+| artifact | CPU floor | AES backend |
+|---|---|---|
+| `nk-crypto-tool` | x86-64-v2 (Nehalem+/Bulldozer+) | AES-NI (runtime detected) |
+| `nk-crypto-tool-vaes` | x86-64-v3 + AVX-512/VAES (Zen 4+ / Ice Lake+ server) | VAES-512 (`aes_backend="avx512"`, compile-time) |
+
+The VAES variant is ~20% faster at encrypt and ~37% faster at decrypt on the
+rustcrypto backend (see README「パフォーマンス」). Its backend is fixed at
+compile time; on a CPU without AVX-512/VAES it exits at startup with a clear
+error (a CPUID guard in `main()` — not a SIGILL) telling the user to take the
+portable binary. Its `EXTRA_RUSTFLAGS` restate the full musl flag set
+including the `--remap-path-prefix` pair, because a RUSTFLAGS override
+replaces `.cargo/config.toml`'s target section entirely — dropping the remaps
+would silently break reproducibility.
 
 ## Verify a published release (third party)
 

@@ -4,6 +4,14 @@ version = "2.1.0"
 edition = "2021"
 license = "MIT"
 
+[lints.rust]
+# `aes_backend` is the aes crate's backend-selection cfg (avx256/avx512 VAES);
+# our main() reads it for the VAES-variant startup CPU guard. Declare it so
+# check-cfg does not flag the guard as an unknown cfg.
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(aes_backend, values("avx256", "avx512"))',
+] }
+
 # `rlib` keeps the normal Rust library (used by the bin and integration tests);
 # `cdylib` additionally emits a C-ABI shared library (`libnk_crypto_tool.so`) so
 # the chat/crypto core can be loaded from a mobile app via JNI/UniFFI. See
