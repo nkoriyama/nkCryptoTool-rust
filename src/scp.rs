@@ -18,10 +18,13 @@
 //! counter nonce, so truncation / reorder / tamper surfaces as an
 //! authentication failure. Bulk bytes are chunked to [`CHUNK`].
 //!
-//! Security posture (this increment): single-file get/put only; `user=` in the
-//! policy is parsed and audited but **not enforced** (no per-request privilege
-//! drop yet), so `--serve-scp` refuses to run as root and every file operation
-//! runs as the server's own user, confined to the policy's read/write roots.
+//! Security posture: every file operation runs as the server's own user
+//! (`--serve-scp` refuses to run as root), confined to the policy's read/write
+//! roots. A policy `user=NAME` is enforced under the **per-user-instance model**
+//! (`enforce_scp_user`): with no in-process privilege drop, it is honored only
+//! when NAME is the server's own user — to serve another user's files, run a
+//! separate `--serve-scp` as that user. A `user=` naming anyone else refuses the
+//! session (fail closed) rather than silently running as the wrong user.
 //! Directory recursion (`-r`) is implemented: serial tree put/get with
 //! per-entry confinement (see `walk_tree` / `safe_join`).
 //!
@@ -64,6 +67,8 @@ const T_FAIL: u8 = 0x06;
 const T_GET: u8 = 0x07;
 const T_DONE: u8 = 0x08;
 const T_ERR: u8 = 0x09;
+const T_RESUME: u8 = 0x0a;
+const T_RESUMEFROM: u8 = 0x0b;
 
 /// One control/data frame over `ALPN_SCP`. The protocol is a *sender → receiver*
 /// stream of files: the sender emits `MkDir` / `Put`+`Data`*+`Eof` per entry and
@@ -89,6 +94,17 @@ pub enum ScpFrame {
     Fail { file_id: u32, msg: String },
     /// Client → server: request a download; `recursive` walks a directory tree.
     Get { path: String, recursive: bool },
+    /// Client → server: resume a single-file download from `offset`. The client
+    /// proves its partial matches the server's current file by sending the
+    /// SHA-256 of its first `offset` bytes; the server re-hashes and replies with
+    /// [`ScpFrame::ResumeFrom`].
+    Resume { path: String, offset: u64, prefix_sha256: [u8; 32] },
+    /// Server → client: response to `Resume`. `size` is the file's full size; the
+    /// `Data` stream that follows covers `[offset, size)`. `offset` equals the
+    /// client's offset when the partial verified (true resume), or `0` when it did
+    /// not (stale / shrunk / changed) — the client then truncates its partial and
+    /// takes the full file. One connection handles both without a re-run.
+    ResumeFrom { file_id: u32, mode: u32, size: u64, offset: u64 },
     /// Sender → receiver: no more entries — the batch is complete.
     Done,
     /// Either direction: a fatal / connection-level error (authz denied, protocol).
@@ -145,6 +161,20 @@ impl ScpFrame {
                 v.push(if *recursive { 1 } else { 0 });
                 put_u32(&mut v, path.len() as u32);
                 v.extend_from_slice(path.as_bytes());
+            }
+            ScpFrame::Resume { path, offset, prefix_sha256 } => {
+                v.push(T_RESUME);
+                v.extend_from_slice(&offset.to_be_bytes());
+                v.extend_from_slice(prefix_sha256);
+                put_u32(&mut v, path.len() as u32);
+                v.extend_from_slice(path.as_bytes());
+            }
+            ScpFrame::ResumeFrom { file_id, mode, size, offset } => {
+                v.push(T_RESUMEFROM);
+                put_u32(&mut v, *file_id);
+                put_u32(&mut v, *mode);
+                v.extend_from_slice(&size.to_be_bytes());
+                v.extend_from_slice(&offset.to_be_bytes());
             }
             ScpFrame::Done => v.push(T_DONE),
             ScpFrame::Err(m) => {
@@ -213,6 +243,33 @@ impl ScpFrame {
                 let path = std::str::from_utf8(&body[..plen]).map_err(|_| bad())?.to_string();
                 Ok(ScpFrame::Get { path, recursive })
             }
+            T_RESUME => {
+                // offset(8) ‖ prefix_sha256(32) ‖ plen(4) ‖ path
+                if rest.len() < 44 {
+                    return Err(bad());
+                }
+                let offset = u64::from_be_bytes(rest[0..8].try_into().map_err(|_| bad())?);
+                let mut prefix_sha256 = [0u8; 32];
+                prefix_sha256.copy_from_slice(&rest[8..40]);
+                let plen = get_u32(rest, 40).ok_or_else(bad)? as usize;
+                let body = &rest[44..];
+                if body.len() < plen {
+                    return Err(bad());
+                }
+                let path = std::str::from_utf8(&body[..plen]).map_err(|_| bad())?.to_string();
+                Ok(ScpFrame::Resume { path, offset, prefix_sha256 })
+            }
+            T_RESUMEFROM => {
+                // file_id(4) ‖ mode(4) ‖ size(8) ‖ offset(8)
+                if rest.len() < 24 {
+                    return Err(bad());
+                }
+                let file_id = get_u32(rest, 0).ok_or_else(bad)?;
+                let mode = get_u32(rest, 4).ok_or_else(bad)?;
+                let size = u64::from_be_bytes(rest[8..16].try_into().map_err(|_| bad())?);
+                let offset = u64::from_be_bytes(rest[16..24].try_into().map_err(|_| bad())?);
+                Ok(ScpFrame::ResumeFrom { file_id, mode, size, offset })
+            }
             T_DONE => Ok(ScpFrame::Done),
             T_ERR => Ok(ScpFrame::Err(String::from_utf8_lossy(rest).into_owned())),
             _ => Err(CryptoError::Parameter(format!("unknown scp frame type {ty}"))),
@@ -262,10 +319,9 @@ pub(crate) async fn drain_until_close(reader: &mut (impl AsyncReadExt + Unpin)) 
 pub struct ScpPolicy {
     read: HashMap<[u8; 32], Vec<PathBuf>>,
     write: HashMap<[u8; 32], Vec<PathBuf>>,
-    // allow(dead_code): the per-fingerprint `user=` map is parsed and audited at
-    // policy-load time but not yet consumed by a code path.
-    // Future: wire it into the shell per-user privilege-drop path.
-    #[allow(dead_code)]
+    // The per-fingerprint `user=` mapping, enforced under the per-user-instance
+    // model: honored only when it names the server's OWN user (see
+    // `enforce_scp_user`), since there is no in-process privilege drop.
     user: HashMap<[u8; 32], String>,
 }
 
@@ -316,6 +372,57 @@ impl ScpPolicy {
     fn roots(&self, fp: &[u8; 32], write: bool) -> &[PathBuf] {
         let map = if write { &self.write } else { &self.read };
         map.get(fp).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The `user=` mapping for a fingerprint, if any.
+    fn user_for(&self, fp: &[u8; 32]) -> Option<&str> {
+        self.user.get(fp).map(String::as_str)
+    }
+}
+
+/// Enforce a policy `user=` mapping under the **per-user-instance model**. The
+/// scp server has no in-process privilege drop — every file operation runs as
+/// the server's own user (root is refused at startup) — so a `user=NAME` is
+/// honored only when NAME is the server's own user. To serve a different user's
+/// files, run a separate `--serve-scp` logged in as that user. Mirrors the
+/// shell's Tier-1 `enforce_same_user`. `None` (no mapping) always passes.
+#[cfg(unix)]
+fn enforce_scp_user(policy_user: Option<&str>) -> std::result::Result<(), String> {
+    let Some(name) = policy_user else { return Ok(()) };
+    let euid = unsafe { libc::geteuid() };
+    match crate::utils::uid_by_name(name) {
+        Some(uid) if uid == euid => Ok(()),
+        Some(_) => Err(format!(
+            "policy maps this fingerprint to user {name:?}, but --serve-scp cannot switch \
+             users (running as uid {euid}); map to the server's own user or run a per-user \
+             --serve-scp instance"
+        )),
+        None => Err(format!("policy maps this fingerprint to unknown user {name:?}")),
+    }
+}
+
+/// Windows has no setuid drop, so a `user=` mapping to any account cannot be
+/// honored; the transfer always runs as the server's own account. Refuse rather
+/// than silently run as the wrong user (mirrors the shell).
+#[cfg(windows)]
+fn enforce_scp_user(policy_user: Option<&str>) -> std::result::Result<(), String> {
+    match policy_user {
+        None => Ok(()),
+        Some(name) => Err(format!(
+            "policy maps this fingerprint to user {name:?}, but --serve-scp on Windows runs \
+             as the server's own account (no user switching); remove user= or run a per-user \
+             --serve-scp instance"
+        )),
+    }
+}
+
+/// Fallback for platforms with neither setuid nor a Windows token model: a
+/// `user=` mapping cannot be honored, so refuse it.
+#[cfg(not(any(unix, windows)))]
+fn enforce_scp_user(policy_user: Option<&str>) -> std::result::Result<(), String> {
+    match policy_user {
+        None => Ok(()),
+        Some(name) => Err(format!("policy user= ({name:?}) is unsupported on this platform")),
     }
 }
 
@@ -619,10 +726,87 @@ fn safe_join(base: &Path, rel: &str) -> std::result::Result<PathBuf, String> {
 // interrupted / unauthenticated transfer never leaves bytes at the final path.
 // ===========================================================================
 
+/// Blocking: verify the client's resume prefix and position `file` for the send.
+/// Returns `(from_offset, file)` = `(offset, file@offset)` when the first
+/// `offset` bytes of `file` hash to `expect` (and `offset <= size`), else
+/// `(0, file@0)` — a shrink / change / stale partial falls back to a full send,
+/// and the client truncates its partial. The comparison is over an integrity
+/// hash (no secret), so plain equality is fine.
+fn verify_resume(
+    mut file: std::fs::File,
+    size: u64,
+    offset: u64,
+    expect: &[u8; 32],
+) -> std::io::Result<(u64, std::fs::File)> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+    fn rewind(mut f: std::fs::File) -> std::io::Result<(u64, std::fs::File)> {
+        f.seek(SeekFrom::Start(0))?;
+        Ok((0, f))
+    }
+    if offset == 0 || offset > size {
+        return rewind(file);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let mut hasher = Sha256::new();
+    let mut remaining = offset;
+    let mut buf = vec![0u8; 128 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..want])?;
+        if n == 0 {
+            return rewind(file); // file is now shorter than offset → restart
+        }
+        hasher.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    let got: [u8; 32] = hasher.finalize().into();
+    if &got == expect {
+        Ok((offset, file)) // position is exactly at `offset` after the read
+    } else {
+        rewind(file)
+    }
+}
+
+/// Blocking: SHA-256 of the first `len` bytes of `path` (the client's resume
+/// partial). Matches `verify_resume` on the server so a prefix compare succeeds.
+fn hash_prefix_blocking(path: &Path, len: u64) -> std::io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = crate::secure_fs::open_existing_no_follow(path, false)?;
+    let mut hasher = Sha256::new();
+    let mut remaining = len;
+    let mut buf = vec![0u8; 128 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = f.read(&mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    Ok(hasher.finalize().into())
+}
+
 struct Staged {
     temp: PathBuf,
     final_path: PathBuf,
     file: Option<tokio::fs::File>,
+    /// When true (a `--scp-resume` partial), Drop keeps the staging file so an
+    /// interrupted download can continue next time; commit still renames it away.
+    keep_partial: bool,
+}
+
+/// Stable staging name for a resumable get: `.<name>.nkct-partial` next to the
+/// final path, so a re-run finds the partial to continue from.
+fn partial_path(final_path: &Path) -> PathBuf {
+    let fname = final_path.file_name().and_then(|s| s.to_str()).unwrap_or("recv");
+    let name = format!(".{fname}.nkct-partial");
+    match final_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir.join(name),
+        _ => PathBuf::from(name),
+    }
 }
 
 impl Staged {
@@ -648,7 +832,33 @@ impl Staged {
             temp,
             final_path,
             file: Some(tokio::fs::File::from_std(std_file)),
+            keep_partial: false,
         })
+    }
+
+    /// Open the stable resume partial for `final_path`. `from == 0` truncates a
+    /// fresh partial; `from > 0` opens the existing partial for append. Returns
+    /// `(staged, actual_len)` — the caller checks `actual_len == from` for append.
+    /// The partial is owner-only + link-refusing, and (unlike `create`) is kept on
+    /// Drop so an interrupted transfer can resume.
+    fn open_partial(final_path: PathBuf, from: u64) -> std::io::Result<(Self, u64)> {
+        let temp = partial_path(&final_path);
+        let (std_file, actual_len) = if from > 0 {
+            let f = crate::secure_fs::open_append_owner_only(&temp)?;
+            let len = f.metadata()?.len();
+            (f, len)
+        } else {
+            (crate::secure_fs::create_owner_only(&temp, true)?, 0)
+        };
+        Ok((
+            Self {
+                temp,
+                final_path,
+                file: Some(tokio::fs::File::from_std(std_file)),
+                keep_partial: true,
+            },
+            actual_len,
+        ))
     }
 
     async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
@@ -719,10 +929,13 @@ impl Staged {
 
 impl Drop for Staged {
     fn drop(&mut self) {
-        // Any staging file still present at drop was never committed: discard it
-        // so unauthenticated / partial bytes are not left behind.
+        // A committed transfer already renamed the temp away. An interrupted one:
+        // for a resume partial (`keep_partial`) keep the bytes so the next run can
+        // continue; otherwise discard them (no partial/unauthenticated bytes left).
         let _ = self.file.take();
-        let _ = std::fs::remove_file(&self.temp);
+        if !self.keep_partial {
+            let _ = std::fs::remove_file(&self.temp);
+        }
     }
 }
 
@@ -942,8 +1155,9 @@ pub enum ScpOp {
     /// directory tree copied under the remote path.
     Put { local: PathBuf, remote: String, recursive: bool },
     /// Download remote `remote` to `local`. With `recursive`, `remote` is a
-    /// directory tree copied under the local path.
-    Get { remote: String, local: PathBuf, recursive: bool },
+    /// directory tree copied under the local path. `resume` (single file only)
+    /// continues from a kept `.<name>.nkct-partial`.
+    Get { remote: String, local: PathBuf, recursive: bool, resume: bool },
 }
 
 /// Run the scp client: perform a single `Put` or `Get` against the peer's
@@ -1051,7 +1265,58 @@ where
             }
             Ok(())
         }
-        ScpOp::Get { remote, local, recursive } => {
+        ScpOp::Get { remote, local, recursive, resume } => {
+            if *resume && !*recursive {
+                // --- resumable single-file get -------------------------------
+                // If a partial exists, ask the server to continue from its end
+                // (proving the prefix by hash); else start fresh. The server's
+                // ResumeFrom.offset is our offset (true resume) or 0 (restart —
+                // the partial was stale, take the whole file).
+                let partial = partial_path(local);
+                let have = std::fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
+                if have > 0 {
+                    let p = partial.clone();
+                    let prefix = tokio::task::spawn_blocking(move || hash_prefix_blocking(&p, have))
+                        .await
+                        .map_err(|e| CryptoError::Parameter(format!("hash partial: {e}")))?
+                        .map_err(|e| CryptoError::Parameter(format!("hash partial {}: {e}", partial.display())))?;
+                    send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Resume { path: remote.clone(), offset: have, prefix_sha256: prefix }).await?;
+                } else {
+                    send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Get { path: remote.clone(), recursive: false }).await?;
+                }
+                let (file_id, mode, size, from) = match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
+                    Some(ScpFrame::ResumeFrom { file_id, mode, size, offset }) => (file_id, mode, size, offset),
+                    Some(ScpFrame::Put { file_id, mode, size, .. }) => (file_id, mode, size, 0),
+                    Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp get refused: {m}"))),
+                    other => return Err(CryptoError::Parameter(format!("scp get: unexpected reply {other:?}"))),
+                };
+                if from > size {
+                    return Err(CryptoError::Parameter("scp resume: server offset past size".into()));
+                }
+                let (mut staged, actual) = Staged::open_partial(local.clone(), from)
+                    .map_err(|e| CryptoError::Parameter(format!("stage {}: {e}", partial.display())))?;
+                if from > 0 && actual != from {
+                    return Err(CryptoError::Parameter(format!(
+                        "scp resume: partial changed under us (have {actual}, expected {from})"
+                    )));
+                }
+                if from > 0 {
+                    eprintln!("[nkct] resuming {remote} from {from}/{size} bytes");
+                }
+                // The Data stream covers [from, size): recv_into_staged is bounded
+                // by that remainder and appends (the partial is positioned at `from`).
+                recv_into_staged(&mut reader, aead_name, rx_key, &mut rx, file_id, size - from, &mut staged).await?;
+                staged.commit(mode).await.map_err(|e| CryptoError::Parameter(format!("commit {}: {e}", local.display())))?;
+                send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ack { file_id }).await?;
+                match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
+                    Some(ScpFrame::Done) | None => {}
+                    Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp get failed: {m}"))),
+                    other => return Err(CryptoError::Parameter(format!("scp get: expected Done, got {other:?}"))),
+                }
+                let _ = writer.shutdown().await;
+                eprintln!("[nkct] downloaded {remote} ({size} bytes) → {}", local.display());
+                return Ok(());
+            }
             send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Get { path: remote.clone(), recursive: *recursive }).await?;
 
             if !*recursive {
@@ -1180,6 +1445,13 @@ where
             drain_until_close(&mut reader).await;
             return Err(CryptoError::Parameter(format!("scp denied: {reason}")));
         }};
+    }
+
+    // Session-level `user=` gate (per-user-instance model): if the policy maps
+    // this fingerprint to a user we are not, refuse the whole session before any
+    // file operation. Uniform "denied" on the wire; reason to the audit log.
+    if let Err(reason) = enforce_scp_user(policy.user_for(&peer_fp)) {
+        deny!(reason);
     }
 
     // A `put` batch is a stream of MkDir / (Put + body) entries ended by Done; a
@@ -1449,6 +1721,38 @@ where
                 drain_until_close(&mut reader).await;
                 return Ok(());
             }
+            // ---- resume: single-file download continued from a verified offset ----
+            Some(ScpFrame::Resume { path, offset, prefix_sha256 }) => {
+                let read_roots = policy.roots(&peer_fp, false);
+                let src = match confine_read(&path, read_roots) {
+                    Ok(s) => s,
+                    Err(e) => deny!(format!("resume {path}: {e}")),
+                };
+                let (file, mode, size) = match open_confined_read(&src, read_roots) {
+                    Ok(t) => t,
+                    Err(e) => deny!(format!("resume {path}: {e}")),
+                };
+                if let Err(e) = audit(audit_path, &peer_fp, &format!("scp allow resume path={} off={offset} bytes={size}", src.display())).await {
+                    let _ = send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Err("audit unavailable; refusing".into())).await;
+                    return Err(CryptoError::Parameter(format!("scp refused: audit write failed: {e}")));
+                }
+                // Verify the client's partial prefix off the executor; on any
+                // mismatch / shrink, fall back to a full send from 0 (the client
+                // truncates its partial). Same connection, no re-run.
+                let (from_offset, positioned) = tokio::task::spawn_blocking(move || verify_resume(file, size, offset, &prefix_sha256))
+                    .await
+                    .map_err(|e| CryptoError::Parameter(format!("resume verify join: {e}")))?
+                    .map_err(|e| CryptoError::Parameter(format!("resume verify: {e}")))?;
+                next_id += 1;
+                send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::ResumeFrom { file_id: next_id, mode, size, offset: from_offset }).await?;
+                let mut f = tokio::fs::File::from_std(positioned);
+                let sent = stream_bytes(&mut writer, aead_name, tx_key, &mut tx, next_id, &mut f).await?;
+                let _ = recv(&mut reader, aead_name, rx_key, &mut rx).await?;
+                send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Done).await?;
+                audit_best_effort(audit_path, &peer_fp, &format!("scp resume ok path={} from={from_offset} sent={sent}", src.display())).await;
+                drain_until_close(&mut reader).await;
+                return Ok(());
+            }
             // ---- end of a put batch ----
             Some(ScpFrame::Done) | None => {
                 audit_best_effort(audit_path, &peer_fp, &format!("scp batch end ok={n_ok} fail={n_fail}")).await;
@@ -1479,6 +1783,9 @@ mod tests {
             ScpFrame::Fail { file_id: 7, msg: "nope".into() },
             ScpFrame::Get { path: "/srv/pub/x".into(), recursive: false },
             ScpFrame::Get { path: "/srv/pub".into(), recursive: true },
+            ScpFrame::Resume { path: "/srv/pub/big.bin".into(), offset: 1 << 33, prefix_sha256: [0x5a; 32] },
+            ScpFrame::ResumeFrom { file_id: 3, mode: 0o644, size: 1 << 40, offset: 1 << 33 },
+            ScpFrame::ResumeFrom { file_id: 4, mode: 0o600, size: 100, offset: 0 },
             ScpFrame::Done,
             ScpFrame::Err("nope".into()),
         ];
@@ -1487,6 +1794,33 @@ mod tests {
             let dec = ScpFrame::decode(&enc).expect("decode");
             assert_eq!(f, dec);
         }
+    }
+
+    #[test]
+    fn resume_verify_prefix() {
+        use sha2::{Digest, Sha256};
+        use std::io::{Seek, SeekFrom};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        let data = vec![7u8; 1000];
+        std::fs::write(&path, &data).unwrap();
+        let good: [u8; 32] = { let mut h = Sha256::new(); h.update(&data[..500]); h.finalize().into() };
+
+        // Correct prefix at offset 500 → resume from 500, positioned at 500.
+        let f = std::fs::File::open(&path).unwrap();
+        let (off, mut fp) = verify_resume(f, 1000, 500, &good).unwrap();
+        assert_eq!(off, 500);
+        assert_eq!(fp.stream_position().unwrap(), 500);
+
+        // Wrong prefix → restart from 0, rewound.
+        let f = std::fs::File::open(&path).unwrap();
+        let (off, mut fp) = verify_resume(f, 1000, 500, &[0u8; 32]).unwrap();
+        assert_eq!(off, 0);
+        assert_eq!(fp.seek(SeekFrom::Current(0)).unwrap(), 0);
+
+        // Offset past current size → restart from 0.
+        let f = std::fs::File::open(&path).unwrap();
+        assert_eq!(verify_resume(f, 1000, 2000, &good).unwrap().0, 0);
     }
 
     #[test]

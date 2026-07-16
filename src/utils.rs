@@ -48,6 +48,25 @@ pub fn private_key_file_is_encrypted(path: &str) -> bool {
     pkcs8::EncryptedPrivateKeyInfo::from_der(&der).is_ok()
 }
 
+/// Resolve a user's uid by name via `getpwnam_r`. `None` = unknown user (or a
+/// name containing a NUL). Used by the shell / scp Tier-1 same-user checks (no
+/// supplementary-group lookup — the setuid drop that needed it was removed).
+#[cfg(unix)]
+pub(crate) fn uid_by_name(name: &str) -> Option<libc::uid_t> {
+    use std::ffi::CString;
+    let cname = CString::new(name).ok()?;
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buf = vec![0 as libc::c_char; 8192];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwnam_r(cname.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
+    };
+    if rc != 0 || result.is_null() {
+        return None;
+    }
+    Some(pwd.pw_uid)
+}
+
 pub fn extract_raw_private_key(
     priv_der: &[u8],
     passphrase: Option<&str>,

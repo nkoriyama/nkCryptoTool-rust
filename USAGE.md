@@ -284,6 +284,10 @@ nk-crypto-tool --scp-get /srv/remote.tar local.tar --connect <ticket> --mode pqc
 ```
 - 引数順: `--scp-put <ローカル> <リモート>` / `--scp-get <リモート> <ローカル>`。
 - `--serve-scp` と `--serve-shell` は 1 プロセスでは排他（役割は 1 プロセス 1 つ）。
+- **中断再開**: `--scp-get` に `--scp-resume` を付けると、中断した単一ファイルの
+  ダウンロードを続きから再開できる（`wget -c` 相当）。中断時に `.<名前>.nkct-partial` が
+  残り、再実行で先頭部分のハッシュ照合を経て残りだけ転送する。リモートが変わって
+  いれば自動でフル再取得に切り替わる。`-r`（ディレクトリ）は非対応。
 
 ---
 

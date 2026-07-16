@@ -683,7 +683,7 @@ fn enforce_same_user(policy_user: Option<&str>) -> std::result::Result<(), Strin
     }
     match policy_user {
         None => Ok(()),
-        Some(u) => match user_uid(u) {
+        Some(u) => match crate::utils::uid_by_name(u) {
             Some(uid) if uid == euid => Ok(()),
             Some(_) => Err(format!(
                 "policy maps this fingerprint to user {u:?}, but Tier 1 cannot switch \
@@ -693,25 +693,6 @@ fn enforce_same_user(policy_user: Option<&str>) -> std::result::Result<(), Strin
             None => Err(format!("policy maps this fingerprint to unknown user {u:?}")),
         },
     }
-}
-
-/// Resolve just a user's uid by name (no supplementary groups — the removal of
-/// the privilege drop also removed the `getgrouplist` call, which additionally
-/// avoids that syscall's non-portable signature across unixes). `None` = unknown.
-#[cfg(all(shell_desktop, unix))]
-fn user_uid(name: &str) -> Option<libc::uid_t> {
-    use std::ffi::CString;
-    let cname = CString::new(name).ok()?;
-    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut buf = vec![0 as libc::c_char; 8192];
-    let mut result: *mut libc::passwd = std::ptr::null_mut();
-    let rc = unsafe {
-        libc::getpwnam_r(cname.as_ptr(), &mut pwd, buf.as_mut_ptr(), buf.len(), &mut result)
-    };
-    if rc != 0 || result.is_null() {
-        return None;
-    }
-    Some(pwd.pw_uid)
 }
 
 /// Best-effort check whether this process holds an elevated (Administrator)

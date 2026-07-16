@@ -11,10 +11,21 @@
 - **やること**: 単一ファイル＋**ディレクトリツリー（`-r`）**の put / get、`--scp-policy`
   による read/write ルート認可、パス traversal / symlink escape の封じ込め（エントリ毎）、
   認証付きアトミックコミット（ファイル毎独立）、監査ログ。
-- **やらないこと（次段）**: 並列ストリーム転送（`file_id` 多重化）、`user=` による
-  per-request 権限降格、`Resume{offset}` 中断再開。フレーム集合はこれらを足せる形に
-  予約済み。`--serve-scp` は root 実行を拒否し、ファイル I/O は常にサーバ起動ユーザ権限で
-  行う（＝権限境界は「起動ユーザ ∧ policy ルート」）。
+- **やらないこと（次段）**: 並列ストリーム転送（`file_id` 多重化）。nonce 分割
+  （per-stream 鍵/nonce-prefix）が必須＋WAN 網律速で見返り薄いため保留（`EVIDENCE 2.4.1`）。
+  `--serve-scp` は root 実行を拒否し、ファイル I/O は常にサーバ起動ユーザ権限で行う
+  （＝権限境界は「起動ユーザ ∧ policy ルート」）。
+- **`Resume`（中断再開）は実装済**（2026-07-16, `nkct/scp/3`）。単一ファイル get の
+  `--scp-resume`。クライアントは中断時に `.<name>.nkct-partial` を残し、再 get で
+  `Resume{path, offset, prefix_sha256}` を送る。サーバは `verify_resume` で「現 size ≥ offset
+  ∧ 先頭 offset バイトの SHA-256 一致」を検証し、`ResumeFrom{offset}` を返す（一致=offset、
+  不一致/縮小=0）＝同一接続で自動フルダウンロードに落ちる。「認証されるまで final にしない」
+  不変条件は staging(.partial→rename)で維持。
+- **`user=` は per-user インスタンスモデルで強制済**（`enforce_scp_user`）。in-process の
+  権限降格は持たないので、`user=NAME` はそれが**サーバ自身のユーザ**を指す時のみ許可し、
+  別ユーザ／未知ユーザを指す場合はセッションを拒否（fail closed）。別ユーザのファイルを
+  配るにはそのユーザで別 `--serve-scp` を起動する。shell の Tier-1 `enforce_same_user` と同型。
+  per-request setuid 降格は採らない（root 起動が前提になり root 拒否姿勢と矛盾するため）。
 
 ## トランスポート再利用
 
@@ -40,10 +51,11 @@
 | `Ok` | 応答側 | 成功終端 |
 | `Err(String)` | いずれか | 認可拒否・I/O 失敗など |
 
-（予約・未実装: `List{path}` / `Entry{...}` / `ListEnd` / `MkDir{path,mode}` — `-r` 用。
-`Resume{path, offset:u64}` — 中断再開用。v3 の File Session ID＋チャンクカウンタ資産を
-使い staging temp への追記再開を許す拡張の席だけ予約する。「認証されるまで final に
-出さない」不変条件と部分受信 temp の再検証の両立設計が要るため本増分では未実装。）
+`Resume{path, offset, prefix_sha256}` / `ResumeFrom{file_id, mode, size, offset}` は
+**実装済**（`--scp-resume`、上記「やらないこと」節参照）。部分受信 temp の再検証は
+サーバ側 `verify_resume`（先頭 offset バイトの SHA-256 照合）で担保。
+
+（予約・未実装: `List{path}` / `Entry{...}` / `ListEnd` — 将来の一覧用。）
 
 ### `-r`（ディレクトリ再帰）の方針 — 直列先行・並列は席だけ予約
 
@@ -152,15 +164,16 @@ Get 側 staging も **Put 側と対称に、最終ローカルパスと同一デ
 `extract_quoted_span` / `extract_kv`）で組む。1 行 = 1 fingerprint:
 
 ```
-# <sha3-256-hex>  read="root1, root2"  write="root3"   [user=NAME(予約)]
+# <sha3-256-hex>  read="root1, root2"  write="root3"   [user=NAME]
 a6fc484e...  read="/srv/pub, /home/opc/out"  write="/home/opc/incoming"
 ```
 
 - `read=` / `write=` は**許可ルート（ディレクトリ）**のカンマ区切り。最低 1 つ必須。
 - fingerprint が policy に無ければ全拒否。read ルートに無いパスの Get、write ルートに
   無いパスの Put は Err。
-- `user=` は本増分では**パースするが未強制・未記録**（予約のみ。権限降格と監査への
-  記録はどちらも次段）。
+- `user=` は**サーバ自身のユーザを指す時のみ許可**（per-user インスタンスモデル、
+  `enforce_scp_user`）。別ユーザ／未知ユーザを指す行は、そのピアのセッションを拒否
+  （ワイヤ上は一様に "denied"、理由は監査ログにのみ記録）。上記「やらないこと」参照。
 - `mode` は**開いている fd に対して** `fchmod(mode & 0o0777)` で適用する。パスベースの
   `set_permissions(temp)` をクローズ後に呼ぶと、temp を symlink にすり替える TOCTOU で
   無関係ファイルを chmod されうるため、fd 経由にして封じる。マスクは `0o0777`＝

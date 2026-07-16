@@ -218,6 +218,8 @@ pub struct CryptoConfig {
     /// scp client recursive mode (`-r`/`--recursive`): `--scp-put`/`--scp-get`
     /// operate on a directory tree instead of a single file.
     pub scp_recursive: bool,
+    /// `--scp-resume`: continue an interrupted single-file get from a kept partial.
+    pub scp_resume: bool,
 
     // Pairing / KeyBundle auto-registration (ALPN_PAIRING, ssh-copy-id equivalent).
     /// This node serves pairing (`--serve-pairing`): accepts a self-authenticating
@@ -345,6 +347,7 @@ impl Default for CryptoConfig {
             scp_get: None,
             scp_policy_path: None,
             scp_recursive: false,
+            scp_resume: false,
             allow_unauth: false,
             force: false,
             handshake_timeout: 15,
