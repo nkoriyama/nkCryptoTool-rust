@@ -130,7 +130,7 @@ qrcode = "0.12"
 crc = "3.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.52", optional = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_SystemInformation"] }
+windows = { version = "0.62", optional = true, features = ["Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_System_SystemInformation"] }
 # Console raw-mode + size for the interactive shell *client* on Windows (the
 # counterpart to termios on unix). Always-on on Windows (the shell client is
 # desktop-only). See src/shell.rs (RawModeGuard / term_size, cfg(windows)).
