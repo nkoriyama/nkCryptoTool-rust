@@ -45,7 +45,7 @@ pub const ALPN_FWD: &[u8] = b"nkct/fwd/2";
 /// P2P scp (bastion-less file transfer; see `P2P_SCP_DESIGN.md`). Carries a
 /// single get/put request per connection, policy-gated and path-confined; see
 /// [`crate::scp`].
-pub const ALPN_SCP: &[u8] = b"nkct/scp/2";
+pub const ALPN_SCP: &[u8] = b"nkct/scp/3";
 /// Pairing / KeyBundle auto-registration ALPN (`ssh-copy-id` equivalent). A
 /// not-yet-registered client self-authenticates, proves it holds the OTP, and
 /// sends its signed KeyBundle; the server verifies (incl. handshake fingerprint
@@ -1268,7 +1268,7 @@ mod tests {
         assert_eq!(ALPN_FILE, b"nkct/file/3", "file ALPN reverted (flag-day break)");
         assert_eq!(ALPN_SHELL, b"nkct/shell/2", "shell ALPN reverted (flag-day break)");
         assert_eq!(ALPN_FWD, b"nkct/fwd/2", "fwd ALPN reverted (flag-day break)");
-        assert_eq!(ALPN_SCP, b"nkct/scp/2", "scp ALPN reverted (flag-day break)");
+        assert_eq!(ALPN_SCP, b"nkct/scp/3", "scp ALPN reverted (flag-day break)");
         // MLS / inbox do NOT run the NetworkProcessor handshake (separate
         // subsystems), so they are intentionally NOT bumped by this flag-day.
         assert_eq!(ALPN_MLS, b"nkct/mls/1", "MLS ALPN is intentionally unbumped");

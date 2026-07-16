@@ -209,6 +209,13 @@ struct Args {
     #[arg(long = "scp-get", num_args = 2, value_names = ["REMOTE", "LOCAL"])]
     scp_get: Option<Vec<String>>,
 
+    /// scp client: resume an interrupted `--scp-get` (single file). Keeps a
+    /// `.<name>.nkct-partial` next to LOCAL across interruptions and, on re-run,
+    /// asks the server to continue from where it stopped (verified by a prefix
+    /// hash; a changed/shrunk remote falls back to a full download automatically).
+    #[arg(long = "scp-resume")]
+    scp_resume: bool,
+
     /// scp server authorization policy file: lines of
     /// `<sha3-256-hex>  read="r1, r2"  write="w1"  [user=NAME]`. Default deny.
     #[arg(long)]
@@ -900,6 +907,7 @@ async fn main() -> anyhow::Result<()> {
     config.serve_scp = args.serve_scp;
     config.scp_policy_path = args.scp_policy;
     config.scp_recursive = args.recursive;
+    config.scp_resume = args.scp_resume;
     config.scp_mode = args.serve_scp || config.scp_put.is_some() || config.scp_get.is_some();
     if config.scp_put.is_some() && config.scp_get.is_some() {
         anyhow::bail!("--scp-put and --scp-get are mutually exclusive");
