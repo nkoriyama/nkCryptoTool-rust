@@ -254,7 +254,7 @@ Iroh トランスポート + V3.1 PQC ハンドシェイクによるチャット
 
 > 注: system OpenSSL が 3.5 未満の環境（Ubuntu 24.04 / Debian 12 / RHEL 9 等）で OpenSSL を使う場合は、PQC keygen が失敗するため `backend-openssl-vendored` を選んでください。
 >
-> 性能注: バルクファイル暗号化のスループットは OpenSSL が大きく上回ります。2026-07 の実測（4 GiB, tmpfs, AES-256-GCM — 下記「パフォーマンス」節）で OpenSSL は暗号化で約 2.6 倍・復号で約 3.7 倍高速でした。数十 GB 規模を日常的に扱う用途では OpenSSL 系を推奨します。デフォルトの RustCrypto は依存ゼロ・移植性を優先した選択です。
+> 性能注: バルクファイル暗号化のスループットは OpenSSL が上回ります。2026-07 の実測（4 GiB, tmpfs, AES-256-GCM — 下記「パフォーマンス」節）で OpenSSL は暗号化で約 1.8 倍・復号で約 2.3 倍高速でした（RustCrypto 側は aes-gcm 0.11 世代への移行で以前の約 2.6 倍・3.7 倍差から縮小）。数十 GB 規模を日常的に扱う用途では引き続き OpenSSL 系を推奨します。デフォルトの RustCrypto は依存ゼロ・移植性を優先した選択です。
 
 ## **ビルド方法**
 
@@ -976,32 +976,41 @@ v3 `ChunkedAead` 形式 + バッファ再利用最適化を適用した現行コ
 | **OpenSSL (Rust)** | ECC (P-256) | ~3.1 GiB/s | ~2.5 GiB/s |
 | **OpenSSL (Rust)** | PQC (ML-KEM-768) | ~3.2 GiB/s | ~2.5 GiB/s |
 | **OpenSSL (Rust)** | Hybrid (ML-KEM + P-256) | ~3.1 GiB/s | ~2.4 GiB/s |
-| **RustCrypto (Rust)** | ECC (P-256) | ~1.2 GiB/s | ~0.7 GiB/s |
-| **RustCrypto (Rust)** | PQC (ML-KEM-768) | ~1.2 GiB/s | ~0.7 GiB/s |
-| **RustCrypto (Rust)** | Hybrid | ~1.2 GiB/s | ~0.7 GiB/s |
+| **RustCrypto (Rust)** | ECC (P-256) | ~1.8 GiB/s | ~1.1 GiB/s |
+| **RustCrypto (Rust)** | PQC (ML-KEM-768) | ~1.8 GiB/s | ~1.1 GiB/s |
+| **RustCrypto (Rust)** | Hybrid | ~1.8 GiB/s | ~1.1 GiB/s |
 
 * **※ 復号は2パス構成**: v3 `ChunkedAead` の復号は「全チャンク認証 (Pass 1) → 平文書き出し (Pass 2)」の2パス (THREAT 37-1: 未認証平文をディスクに書かない) のため、暗号文を2回読む。復号スループットが暗号化より構造的に低いのはこのため (RustCrypto は純 Rust AEAD のため特に顕著)。チャンク毎タグ化に伴うバッファ確保・ゼロ化のオーバーヘッドはバッファ再利用最適化で解消済み (OpenSSL は v2 単一タグ方式と同等)。
 * **大規模ファイル対応**: チャンク単位のストリーミング設計のため、原理的に性能・メモリとも入力サイズに依存しない (常時 **10 MiB 以下** の RSS で動作。本表の実測は 4.0 GiB — 10 GiB 級での劣化なしは旧計測に基づく設計特性)。
 * **計測法**: `--encrypt` / `--decrypt` の wall-clock を各3反復・中央値。読み書きとも tmpfs (RAM)。この条件で **RustCrypto は CPU (AEAD) 律速、OpenSSL は tmpfs でもなお I/O 律速**である (根拠は下記「実用上の帰結」)。実ディスク (NVMe 以下) では書き込み帯域がさらに強く律速になり値は下がる。
-* **検証注記 (2026-07 再検証)**: RustCrypto の値がハードウェア経路の欠落 (GHASH の
-  PCLMULQDQ 不使用等) によるものでないことを、強制ソフトウェア実装ビルド
+* **RustCrypto は aes-gcm 0.11 世代 (2026-07 移行)**: `aes` 0.9 + `polyval` 0.7 への移行で
+  旧 0.10 世代 (enc ~1.2 / dec ~0.67) から **+5〜6割** — 表の 1.8 / 1.1 はポータブルな
+  AES-NI 経路の値。生 AEAD 単体の実測 (1 MiB チャンク) は 0.10 世代 1.59 → 0.11 世代
+  2.95 GiB/s。さらに `aes` 0.9 は **VAES-512 バックエンド**を持ち、opt-in
+  (`RUSTFLAGS='--cfg aes_backend="avx512" -C target-feature=+vaes,+avx512f'`) で生 AEAD
+  ~6.0 GiB/s (実測) まで伸びる — ただしコンパイル時固定で **非対応 CPU (Zen3 以前 /
+  AVX-512 なし Intel) では SIGILL** するため配布ビルドには不可、ローカル専用の選択肢。
+* **検証注記 (2026-07 再検証, 0.10 世代当時)**: RustCrypto の値がハードウェア経路の欠落
+  (GHASH の PCLMULQDQ 不使用等) によるものでないことを、強制ソフトウェア実装ビルド
   (`--cfg polyval_force_soft` / `--cfg aes_force_soft`) との比較で確認済み —
   GHASH をソフトに落とすと enc ~0.75 / dec ~0.40、AES まで落とすと 0.15 / 0.08 まで低下する
-  (現行値 1.2 / 0.67 は CLMUL + AES-NI 経路)。`aes` / `polyval` クレートはコンパイルフラグに
-  依らず実行時 CPU 検出でハードウェア経路を選ぶ。復号/暗号化比 ~0.55 は 2 パス構成の帰結
+  (当時値 1.2 / 0.67 は CLMUL + AES-NI 経路)。`aes` / `polyval` クレートはコンパイルフラグに
+  依らず実行時 CPU 検出でハードウェア経路を選ぶ。復号/暗号化比 ~0.55–0.6 は 2 パス構成の帰結
   (Pass 1 も AES-CTR 込みの**フル復号**を実行し書き込みのみ省く) で、ソフト実装ビルドでも
   比は ~0.54 と不変 — 特定プリミティブの異常ではなく構造由来。バルク速度は (RustCrypto では)
-  AEAD 律速のためモード (ecc/pqc/hybrid) 間の差は誤差範囲 (無負荷実測で復号 0.66–0.67 GiB/s
-  に収束。OpenSSL でもモード差は出ないが、そちらは I/O 収束による — 下記帰結)。
-  OpenSSL との残差は同クレートが VAES/VPCLMULQDQ の stitched 実装を持たないことに由来し、
-  クレート性能として妥当。
+  AEAD 律速のためモード (ecc/pqc/hybrid) 間の差は誤差範囲
+  (OpenSSL でもモード差は出ないが、そちらは I/O 収束による — 下記帰結)。
+  OpenSSL との残差は、デフォルト経路に VAES が乗らないこと (opt-in のみ)・GHASH が
+  128-bit CLMUL のままなこと・AES と GHASH を同一ループに編み込む stitching を
+  持たないことに由来し、クレート性能として妥当。
 * **復号/暗号化比がバックエンドで異なる理由**: 両バックエンドとも**同一の 2 パス実装**を通る
   (処理系は共通で AEAD プリミティブのみ差し替え) が、比は RustCrypto ~0.55・OpenSSL ~0.78 と
   異なる。これは 2 パスの追加コスト = 「書き込みなしのフルパス 1 回分」であり、その相対コストが
-  律速点で変わるため。各パスの**直接計測** (進捗 50% 境界のタイムスタンプ、3反復):
+  律速点で変わるため。各パスの**直接計測** (進捗 50% 境界のタイムスタンプ、3反復。RustCrypto は
+  0.10 世代時点の計測で、0.11 でも構図は同じ):
   OpenSSL は Pass 1 (read+open のみ) **~8.0 GiB/s** / Pass 2 (write あり) **~3.3 GiB/s**
   — 書き込みを持つパスが支配して比 ~0.78。RustCrypto は Pass 1 ~1.5 / Pass 2 ~1.2 と
-  両パスとも暗号計算律速で等価に効き、合成 1/(1/1.5+1/1.2)=0.66 が実測復号 0.67 と一致。
+  両パスとも暗号計算律速で等価に効き、合成 1/(1/1.5+1/1.2)=0.66 が当時の実測復号 0.67 と一致。
   裏付け: 生の AES-256-GCM 単体は `openssl speed -evp aes-256-gcm` (1 MiB ブロック =
   本ツールのチャンクサイズ) で **~21 GiB/s** (9800X3D 単スレッド)、暗号なしの tmpfs
   read+write コピーは ~4.2 GiB/s — 暗号化 3.2 は書き込み律速側、Pass 1 の 8.0 は

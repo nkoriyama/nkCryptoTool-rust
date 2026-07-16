@@ -28,8 +28,8 @@ use chacha20poly1305::aead::{Aead as ChaChaAead, KeyInit as ChaChaKeyInit};
 use chacha20poly1305::{aead::Payload as ChaChaPayload, ChaCha20Poly1305};
 
 #[cfg(feature = "backend-rustcrypto")]
-use aes_gcm::aead::generic_array::GenericArray as AesGenericArray;
-use chacha20poly1305::aead::generic_array::GenericArray as ChaChaGenericArray;
+use aes_gcm::Nonce as AesNonce;
+use chacha20poly1305::Nonce as ChaChaNonce;
 
 pub const V3_NONCE_PREFIX_LEN: usize = 8;
 pub const V3_COUNTER_LEN: usize = 4;
@@ -63,9 +63,10 @@ pub fn aead_encrypt_chunk(
         "chacha20-poly1305" => {
             let cipher = ChaCha20Poly1305::new_from_slice(key)
                 .map_err(|e| CryptoError::OpenSSL(format!("ChaCha20-Poly1305 key: {}", e)))?;
-            let nonce_arr = ChaChaGenericArray::from_slice(nonce);
+            let nonce_arr = ChaChaNonce::try_from(nonce)
+                .map_err(|_| CryptoError::Parameter("ChaCha20-Poly1305 nonce length".to_string()))?;
             cipher
-                .encrypt(nonce_arr, ChaChaPayload { msg: plaintext, aad })
+                .encrypt(&nonce_arr, ChaChaPayload { msg: plaintext, aad })
                 .map_err(|_| CryptoError::OpenSSL("ChaCha20-Poly1305 encrypt failed".to_string()))
         }
         other => Err(CryptoError::Parameter(format!(
@@ -100,10 +101,11 @@ pub fn aead_decrypt_chunk(
         "chacha20-poly1305" => {
             let cipher = ChaCha20Poly1305::new_from_slice(key)
                 .map_err(|e| CryptoError::OpenSSL(format!("ChaCha20-Poly1305 key: {}", e)))?;
-            let nonce_arr = ChaChaGenericArray::from_slice(nonce);
+            let nonce_arr = ChaChaNonce::try_from(nonce)
+                .map_err(|_| CryptoError::Parameter("ChaCha20-Poly1305 nonce length".to_string()))?;
             cipher
                 .decrypt(
-                    nonce_arr,
+                    &nonce_arr,
                     ChaChaPayload {
                         msg: ciphertext_and_tag,
                         aad,
@@ -206,9 +208,10 @@ pub fn decrypt_chunk_v3_into(
 fn aes_gcm_encrypt(key: &[u8], nonce: &[u8], aad: &[u8], pt: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| CryptoError::OpenSSL(format!("AES-256-GCM key: {}", e)))?;
-    let nonce_arr = AesGenericArray::from_slice(nonce);
+    let nonce_arr = AesNonce::try_from(nonce)
+        .map_err(|_| CryptoError::Parameter("AES-256-GCM nonce length".to_string()))?;
     cipher
-        .encrypt(nonce_arr, AesPayload { msg: pt, aad })
+        .encrypt(&nonce_arr, AesPayload { msg: pt, aad })
         .map_err(|_| CryptoError::OpenSSL("AES-256-GCM encrypt failed".to_string()))
 }
 
@@ -216,9 +219,10 @@ fn aes_gcm_encrypt(key: &[u8], nonce: &[u8], aad: &[u8], pt: &[u8]) -> Result<Ve
 fn aes_gcm_decrypt(key: &[u8], nonce: &[u8], aad: &[u8], ct_tag: &[u8]) -> Result<Vec<u8>> {
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| CryptoError::OpenSSL(format!("AES-256-GCM key: {}", e)))?;
-    let nonce_arr = AesGenericArray::from_slice(nonce);
+    let nonce_arr = AesNonce::try_from(nonce)
+        .map_err(|_| CryptoError::Parameter("AES-256-GCM nonce length".to_string()))?;
     cipher
-        .decrypt(nonce_arr, AesPayload { msg: ct_tag, aad })
+        .decrypt(&nonce_arr, AesPayload { msg: ct_tag, aad })
         .map_err(|_| CryptoError::SignatureVerification)
 }
 
@@ -235,14 +239,15 @@ fn aes_gcm_decrypt_into(
     ct_tag: &[u8],
     out: &mut Vec<u8>,
 ) -> Result<()> {
-    use aes_gcm::aead::AeadInPlace;
+    use aes_gcm::aead::AeadInOut;
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|e| CryptoError::OpenSSL(format!("AES-256-GCM key: {}", e)))?;
-    let nonce_arr = AesGenericArray::from_slice(nonce);
+    let nonce_arr = AesNonce::try_from(nonce)
+        .map_err(|_| CryptoError::Parameter("AES-256-GCM nonce length".to_string()))?;
     out.clear();
     out.extend_from_slice(ct_tag);
     cipher
-        .decrypt_in_place(nonce_arr, aad, out)
+        .decrypt_in_place(&nonce_arr, aad, out)
         .map_err(|_| CryptoError::SignatureVerification)?;
     Ok(())
 }

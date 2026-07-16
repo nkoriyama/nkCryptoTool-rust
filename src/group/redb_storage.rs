@@ -53,7 +53,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use chacha20poly1305::aead::{Aead, AeadCore, KeyInit, OsRng, Payload};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+use rand_core::{OsRng, RngCore};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -826,7 +827,8 @@ fn seal_value(
     plaintext: &[u8],
 ) -> Result<Vec<u8>, RedbStorageError> {
     let cipher = XChaCha20Poly1305::new_from_slice(k_value).map_err(|_| RedbStorageError::Encrypt)?;
-    let nonce = XChaCha20Poly1305::generate_nonce(&mut OsRng);
+    let mut nonce = XNonce::default();
+    OsRng.fill_bytes(&mut nonce);
     let aad = aad_bytes(db_binding, table_id, redb_key);
     let ct = cipher
         .encrypt(&nonce, Payload { msg: plaintext, aad: &aad })
@@ -872,12 +874,13 @@ fn open_value(
             record[0]
         )));
     }
-    let nonce = XNonce::from_slice(&record[1..1 + NONCE_LEN]);
+    let nonce = XNonce::try_from(&record[1..1 + NONCE_LEN])
+        .map_err(|_| RedbStorageError::Malformed("bad nonce length".into()))?;
     let ct = &record[1 + NONCE_LEN..];
     let cipher = XChaCha20Poly1305::new_from_slice(k_value).map_err(|_| RedbStorageError::Decrypt)?;
     let aad = aad_bytes(db_binding, table_id, redb_key);
     let pt = cipher
-        .decrypt(nonce, Payload { msg: ct, aad: &aad })
+        .decrypt(&nonce, Payload { msg: ct, aad: &aad })
         .map_err(|_| RedbStorageError::Decrypt)?;
     Ok(Zeroizing::new(pt))
 }

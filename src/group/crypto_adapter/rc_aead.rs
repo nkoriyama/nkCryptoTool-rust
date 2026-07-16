@@ -49,10 +49,8 @@ impl RcAead {
         }
     }
 
-    fn check_nonce(nonce: &[u8]) -> Result<&Nonce<aes_gcm::aes::cipher::consts::U12>, RcAeadError> {
-        (nonce.len() == 12)
-            .then(|| Nonce::from_slice(nonce))
-            .ok_or(RcAeadError::InvalidNonceLen(nonce.len()))
+    fn check_nonce(nonce: &[u8]) -> Result<Nonce<aes_gcm::aes::cipher::consts::U12>, RcAeadError> {
+        Nonce::try_from(nonce).map_err(|_| RcAeadError::InvalidNonceLen(nonce.len()))
     }
 }
 
@@ -84,11 +82,11 @@ impl AeadType for RcAead {
         match self.aead_id {
             AeadId::Aes128Gcm => Aes128Gcm::new_from_slice(key)
                 .map_err(|_| RcAeadError::InvalidKeyLen(key.len()))?
-                .encrypt(nonce, payload)
+                .encrypt(&nonce, payload)
                 .map_err(|_| RcAeadError::CryptoError),
             AeadId::Aes256Gcm => Aes256Gcm::new_from_slice(key)
                 .map_err(|_| RcAeadError::InvalidKeyLen(key.len()))?
-                .encrypt(nonce, payload)
+                .encrypt(&nonce, payload)
                 .map_err(|_| RcAeadError::CryptoError),
             _ => Err(RcAeadError::UnsupportedCipherSuite),
         }
@@ -114,11 +112,11 @@ impl AeadType for RcAead {
         match self.aead_id {
             AeadId::Aes128Gcm => Aes128Gcm::new_from_slice(key)
                 .map_err(|_| RcAeadError::InvalidKeyLen(key.len()))?
-                .decrypt(nonce, payload)
+                .decrypt(&nonce, payload)
                 .map_err(|_| RcAeadError::CryptoError),
             AeadId::Aes256Gcm => Aes256Gcm::new_from_slice(key)
                 .map_err(|_| RcAeadError::InvalidKeyLen(key.len()))?
-                .decrypt(nonce, payload)
+                .decrypt(&nonce, payload)
                 .map_err(|_| RcAeadError::CryptoError),
             _ => Err(RcAeadError::UnsupportedCipherSuite),
         }
