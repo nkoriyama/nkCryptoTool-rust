@@ -999,13 +999,29 @@ impl NetworkProcessor {
                 // `local_addr`) lets the very first connect use the relay, usually
                 // removing the retry entirely.
                 let _ = self.endpoint.local_addr().await;
-                const CONNECT_ATTEMPTS: u32 = 5;
-                const PER_ATTEMPT: Duration = Duration::from_secs(12);
+                // Per-attempt connect timeout, escalating. A server can advertise
+                // direct addresses a given client cannot reach — multi-homed hosts,
+                // VPN/overlay addresses, or an interface firewalled off from this
+                // peer — and iroh may race onto such a dead path and block on it.
+                // A short FIRST timeout fast-fails that dead path so the next
+                // attempt re-races and usually lands on a working address within a
+                // few seconds, instead of burning a flat 12 s five times (~64 s
+                // before it finally errors). Later attempts keep the full 12 s so a
+                // genuinely slow-but-live path — a WAN relay / hole-punch still
+                // coming up — is not cut off prematurely. Total worst case is
+                // 3+5+8+12+12 + 4×1 s backoff = 44 s.
+                const CONNECT_TIMEOUTS: [Duration; 5] = [
+                    Duration::from_secs(3),
+                    Duration::from_secs(5),
+                    Duration::from_secs(8),
+                    Duration::from_secs(12),
+                    Duration::from_secs(12),
+                ];
                 let stream = {
-                    let mut attempt = 1;
+                    let mut attempt = 1usize;
                     loop {
                         let res = tokio::time::timeout(
-                            PER_ATTEMPT,
+                            CONNECT_TIMEOUTS[attempt - 1],
                             self.endpoint.connect(&remote_peer_addr, protocol),
                         )
                         .await;
@@ -1017,10 +1033,11 @@ impl NetworkProcessor {
                         };
                         match outcome {
                             Ok(s) => break s,
-                            Err(e) if attempt < CONNECT_ATTEMPTS => {
+                            Err(e) if attempt < CONNECT_TIMEOUTS.len() => {
                                 eprintln!(
-                                    "[nkct] connect attempt {attempt}/{CONNECT_ATTEMPTS} failed \
-                                     ({e}); retrying…"
+                                    "[nkct] connect attempt {attempt}/{} failed \
+                                     ({e}); retrying…",
+                                    CONNECT_TIMEOUTS.len()
                                 );
                                 attempt += 1;
                                 tokio::time::sleep(Duration::from_secs(1)).await;
