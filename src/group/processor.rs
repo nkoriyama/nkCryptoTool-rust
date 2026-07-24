@@ -764,7 +764,10 @@ impl GroupChatProcessor {
         let inc = pending
             .establish(crate::p2p::P2P_SETUP_TIMEOUT)
             .await
-            .map_err(GroupError::Transport)?;
+            // `establish` reports the peer's identity alongside the error when
+            // setup got far enough to prove one; this path has no throttle to
+            // feed it to, so keep the transport error and drop the attribution.
+            .map_err(|e| GroupError::Transport(e.into()))?;
         if inc.protocol != crate::group::transport::ALPN_MLS_PROTOCOL {
             return Err(GroupError::Transport(crate::p2p::P2pError::Accept(format!(
                 "accept_welcome: unexpected ALPN {:?}",
@@ -941,7 +944,10 @@ impl GroupChatProcessor {
         let mut inc = pending
             .establish(crate::p2p::P2P_SETUP_TIMEOUT)
             .await
-            .map_err(GroupError::Transport)?;
+            // `establish` reports the peer's identity alongside the error when
+            // setup got far enough to prove one; this path has no throttle to
+            // feed it to, so keep the transport error and drop the attribution.
+            .map_err(|e| GroupError::Transport(e.into()))?;
         if inc.protocol != crate::group::transport::ALPN_MLS_PROTOCOL {
             return Err(GroupError::Transport(crate::p2p::P2pError::Accept(format!(
                 "accept_next: unexpected ALPN {:?}",
