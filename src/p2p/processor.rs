@@ -111,7 +111,7 @@ fn signing_pem_bytes(config: &CryptoConfig) -> Result<Option<Zeroizing<Vec<u8>>>
 /// Concurrency budget for connections whose peer is **not yet authenticated**:
 /// transport setup plus the nkct handshake.
 ///
-/// Sized separately from [`MAX_SESSIONS`] on purpose. A single pool covering
+/// Sized separately from [`DEFAULT_MAX_SESSIONS`] on purpose. A single pool covering
 /// both is exhaustible by peers that connect and stall: nothing about them is
 /// verified yet, but each holds a slot for up to `P2P_SETUP_TIMEOUT +
 /// handshake_timeout` — and because the accept throttle keys on the transport
@@ -124,32 +124,116 @@ fn signing_pem_bytes(config: &CryptoConfig) -> Result<Option<Zeroizing<Vec<u8>>>
 /// (a few round trips and one signature verify, all bounded by timeouts) and a
 /// bigger pool directly raises the number of concurrent connections an attacker
 /// must sustain to deny service.
-const MAX_UNAUTHENTICATED: usize = 32;
+const DEFAULT_MAX_UNAUTHENTICATED: usize = 32;
 
 /// Concurrency budget for **authenticated** sessions (chat / file / shell /
-/// forward / scp / pairing). Much smaller than [`MAX_UNAUTHENTICATED`] because a
-/// slot is held for the session's whole lifetime, which for an interactive shell
-/// or a large transfer is unbounded. Only peers that passed the handshake — and
-/// the allowlist / grant checks, when configured — reach this pool.
-const MAX_SESSIONS: usize = 10;
+/// forward / scp / pairing). Much smaller than [`DEFAULT_MAX_UNAUTHENTICATED`]
+/// because a slot is held for the session's whole lifetime, which for an
+/// interactive shell or a large transfer is unbounded. Only peers that passed
+/// the handshake — and the allowlist / grant checks, when configured — reach
+/// this pool.
+const DEFAULT_MAX_SESSIONS: usize = 10;
 
 /// How long a freshly-authenticated connection may wait for a session slot
 /// before the server refuses it as at-capacity.
 ///
 /// Bounded on purpose, and short. The connection is still holding its pre-auth
 /// permit while it waits (the handover takes the session permit first — see
-/// [`Admission`]), so an unbounded wait would let `MAX_UNAUTHENTICATED`
-/// post-handshake connections pin the entire pre-auth pool for as long as the
-/// session pool stays full, halting the accept loop. A short grace absorbs the
-/// normal case — a session ending moments later — while keeping the worst-case
-/// pre-auth hold bounded at `P2P_SETUP_TIMEOUT + handshake_timeout + this`.
-const SESSION_ADMISSION_GRACE: Duration = Duration::from_secs(5);
+/// [`Admission`]), so an unbounded wait would let the whole pre-auth pool be
+/// pinned by post-handshake connections for as long as the session pool stays
+/// full, halting the accept loop. A short grace absorbs the normal case — a
+/// session ending moments later — while keeping the worst-case pre-auth hold
+/// bounded at `P2P_SETUP_TIMEOUT + handshake_timeout + this`. Zero is a valid
+/// setting: refuse immediately rather than wait at all.
+const DEFAULT_SESSION_ADMISSION_GRACE_SECS: u64 = 5;
 
-/// The pre-auth pool must stay the larger of the two: its slots are cheap and
-/// timeout-bounded, so a bigger pool directly raises the concurrent-connection
-/// count an attacker has to sustain, while session slots are held indefinitely.
-/// Inverting them would make the scarce resource the one anyone can take.
-const _: () = assert!(MAX_UNAUTHENTICATED > MAX_SESSIONS);
+/// The shipped pre-auth pool must be the larger of the two: its slots are cheap
+/// and timeout-bounded, so a bigger pool directly raises the concurrent-
+/// connection count an attacker has to sustain, while session slots are held
+/// indefinitely. Inverting them would make the scarce resource the one anyone
+/// can take. (An operator can still invert them via the environment; that path
+/// warns rather than refuses — see [`AdmissionLimits::from_env`].)
+const _: () = assert!(DEFAULT_MAX_UNAUTHENTICATED > DEFAULT_MAX_SESSIONS);
+
+/// Read a `usize` tuning override, falling back to `default` when the variable
+/// is unset or unparseable. A bad value is reported rather than silently
+/// ignored: a typo in a systemd unit should not quietly leave the server on
+/// defaults the operator believes they changed.
+fn env_usize(var: &str, default: usize) -> usize {
+    parse_limit(var, std::env::var(var).ok().as_deref(), default)
+}
+
+/// The parsing half of [`env_usize`], split out so it is testable without
+/// mutating process-global environment state from a threaded test runner.
+fn parse_limit(var: &str, raw: Option<&str>, default: usize) -> usize {
+    match raw {
+        None => default,
+        Some(s) => s.trim().parse::<usize>().unwrap_or_else(|_| {
+            eprintln!("[nkct] ignoring {var}={s:?}: not a non-negative integer; using {default}");
+            default
+        }),
+    }
+}
+
+/// Resolved admission-control limits.
+///
+/// Overrides are environment variables rather than CLI flags because they tune a
+/// long-running server process (a systemd unit, a container) rather than express
+/// a per-invocation choice — the same reasoning as `NKCT_QUIC_STREAM_WINDOW_MB`.
+struct AdmissionLimits {
+    unauthenticated: usize,
+    sessions: usize,
+    grace: Duration,
+}
+
+impl AdmissionLimits {
+    /// Resolve once per process, so the environment is read (and any complaint
+    /// about it printed) a single time no matter how many processors are built.
+    fn get() -> &'static Self {
+        static LIMITS: std::sync::OnceLock<AdmissionLimits> = std::sync::OnceLock::new();
+        LIMITS.get_or_init(Self::from_env)
+    }
+
+    fn from_env() -> Self {
+        Self::resolve(
+            env_usize("NKCT_MAX_UNAUTHENTICATED", DEFAULT_MAX_UNAUTHENTICATED),
+            env_usize("NKCT_MAX_SESSIONS", DEFAULT_MAX_SESSIONS),
+            env_usize(
+                "NKCT_SESSION_ADMISSION_GRACE_SECS",
+                DEFAULT_SESSION_ADMISSION_GRACE_SECS as usize,
+            ),
+        )
+    }
+
+    /// Apply the floors and the sanity warning to already-parsed values. Split
+    /// from [`Self::from_env`] so the policy is testable without the
+    /// environment.
+    fn resolve(unauthenticated: usize, sessions: usize, grace_secs: usize) -> Self {
+        // Both pools are floored at 1: zero would refuse every connection, which
+        // is a typo rather than a policy (a server that should accept nothing
+        // simply should not be started). The grace has no floor — see its doc.
+        let unauthenticated = unauthenticated.max(1);
+        let sessions = sessions.max(1);
+        let grace = Duration::from_secs(grace_secs as u64);
+
+        // Warn, but honour it. This is a "you probably did not mean this" guard,
+        // not a correctness invariant: an inverted split still runs, it just
+        // makes the pre-auth pool — the one any unauthenticated peer can spend —
+        // the binding constraint, which is the starvation the split exists to
+        // avoid. Refusing to start would be a worse trade for an explicit
+        // operator setting.
+        if unauthenticated <= sessions {
+            eprintln!(
+                "[nkct] warning: pre-auth admission pool ({unauthenticated}) <= session pool \
+                 ({sessions}). Unauthenticated peers can then exhaust admission before the \
+                 session pool is even full, which is what separating the pools avoids. \
+                 Raise NKCT_MAX_UNAUTHENTICATED unless this is deliberate."
+            );
+        }
+
+        Self { unauthenticated, sessions, grace }
+    }
+}
 
 /// The pre-auth permit plus the session pool to move into, carried across the
 /// handshake boundary.
@@ -161,19 +245,24 @@ const _: () = assert!(MAX_UNAUTHENTICATED > MAX_SESSIONS);
 struct Admission {
     preauth: tokio::sync::OwnedSemaphorePermit,
     sessions: Arc<Semaphore>,
+    /// Bound on the wait below — carried rather than read from a const so the
+    /// limit stays configurable and testable.
+    grace: Duration,
+    /// The session cap, for the at-capacity message only.
+    session_cap: usize,
 }
 
 impl Admission {
     /// Swap the pre-auth permit for a session permit once the peer is
-    /// authenticated, bounded by [`SESSION_ADMISSION_GRACE`].
+    /// authenticated, bounded by `grace`.
     ///
     /// The pre-auth permit is released only on the success path, after the
     /// session permit is in hand, so the connection is never unaccounted. On
     /// either failure path it is dropped as this call returns, freeing the slot
     /// for the next peer instead of pinning it while the session pool is full.
     async fn into_session_permit(self) -> Result<tokio::sync::OwnedSemaphorePermit> {
-        let Admission { preauth, sessions } = self;
-        match tokio::time::timeout(SESSION_ADMISSION_GRACE, sessions.acquire_owned()).await {
+        let Admission { preauth, sessions, grace, session_cap } = self;
+        match tokio::time::timeout(grace, sessions.acquire_owned()).await {
             Ok(Ok(permit)) => {
                 drop(preauth);
                 Ok(permit)
@@ -182,7 +271,7 @@ impl Admission {
                 "Session semaphore closed".to_string(),
             )),
             Err(_) => Err(CryptoError::Parameter(format!(
-                "server is at session capacity ({MAX_SESSIONS} active); refusing this connection"
+                "server is at session capacity ({session_cap} active); refusing this connection"
             ))),
         }
     }
@@ -191,9 +280,9 @@ impl Admission {
 pub struct NetworkProcessor {
     config: CryptoConfig,
     endpoint: Arc<dyn P2pEndpoint>,
-    /// Pre-authentication admission — see [`MAX_UNAUTHENTICATED`].
+    /// Pre-authentication admission — see [`AdmissionLimits`].
     handshake_semaphore: Arc<Semaphore>,
-    /// Post-authentication admission — see [`MAX_SESSIONS`].
+    /// Post-authentication admission — see [`AdmissionLimits`].
     session_semaphore: Arc<Semaphore>,
     cached_allowlist: Option<Arc<std::collections::HashMap<[u8; 32], u8>>>,
     io_provider: Arc<dyn IOProvider>,
@@ -208,8 +297,8 @@ impl NetworkProcessor {
         Self {
             config,
             endpoint,
-            handshake_semaphore: Arc::new(Semaphore::new(MAX_UNAUTHENTICATED)),
-            session_semaphore: Arc::new(Semaphore::new(MAX_SESSIONS)),
+            handshake_semaphore: Arc::new(Semaphore::new(AdmissionLimits::get().unauthenticated)),
+            session_semaphore: Arc::new(Semaphore::new(AdmissionLimits::get().sessions)),
             cached_allowlist: None,
             io_provider,
         }
@@ -375,7 +464,7 @@ impl NetworkProcessor {
             // A stalling peer's `establish` times out within P2P_SETUP_TIMEOUT,
             // freeing its slot, so the accept loop is never permanently starved.
             // This budget is separate from the session budget (see
-            // `MAX_UNAUTHENTICATED`), so unauthenticated peers can never take a
+            // `AdmissionLimits::unauthenticated`), so unauthenticated peers can never take a
             // slot away from an authenticated session — and vice versa: a
             // long-running shell or transfer no longer blocks new handshakes.
             let permit = match self.handshake_semaphore.clone().acquire_owned().await {
@@ -395,6 +484,8 @@ impl NetworkProcessor {
                 let admission = Admission {
                     preauth: permit,
                     sessions: session_semaphore,
+                    grace: AdmissionLimits::get().grace,
+                    session_cap: AdmissionLimits::get().sessions,
                 };
 
                 // Protocol negotiation + stream open run HERE, off the accept loop,
@@ -912,7 +1003,7 @@ impl NetworkProcessor {
         // handshake-done callback fires, so the UI does not report a live session
         // while it is still queued for a slot.
         //
-        // The wait inside is bounded — see `SESSION_ADMISSION_GRACE`. An at-capacity
+        // The wait inside is bounded — see `AdmissionLimits::grace`. An at-capacity
         // refusal is deliberately NOT recorded against the auth-failure throttle:
         // that runs above, on the handshake path, and this connection's handshake
         // succeeded. The fault is the server's, not the peer's.
@@ -1643,6 +1734,51 @@ mod tests {
     use crate::p2p::backend::mock::MockNetwork;
     use crate::network::TestIOProvider;
 
+    // Tuning overrides: a bad value must fall back to the shipped default rather
+    // than disable admission control, and the floors must hold.
+
+    #[test]
+    fn limit_override_parsing_falls_back_on_junk() {
+        assert_eq!(parse_limit("V", None, 32), 32, "unset → default");
+        assert_eq!(parse_limit("V", Some("64"), 32), 64);
+        assert_eq!(parse_limit("V", Some("  64  "), 32), 64, "whitespace tolerated");
+        assert_eq!(parse_limit("V", Some("0"), 32), 0, "zero parses; floors applied later");
+        // Junk must not silently become 0 (which the floor would then turn into
+        // 1) or panic — it falls back to the shipped default.
+        for junk in ["", "abc", "-1", "3.5", "64k", "99999999999999999999999"] {
+            assert_eq!(parse_limit("V", Some(junk), 32), 32, "junk {junk:?} → default");
+        }
+    }
+
+    #[test]
+    fn resolved_limits_floor_the_pools_but_not_the_grace() {
+        let l = AdmissionLimits::resolve(0, 0, 0);
+        assert_eq!(l.unauthenticated, 1, "a zero pool would accept nothing");
+        assert_eq!(l.sessions, 1);
+        assert_eq!(l.grace, Duration::ZERO, "zero grace is a valid 'never wait'");
+
+        // An inverted split is honoured (it only warns) — pinning that the guard
+        // is advisory, so an explicit operator setting is never silently altered.
+        let l = AdmissionLimits::resolve(2, 50, 7);
+        assert_eq!((l.unauthenticated, l.sessions), (2, 50));
+        assert_eq!(l.grace, Duration::from_secs(7));
+
+        let l = AdmissionLimits::resolve(
+            DEFAULT_MAX_UNAUTHENTICATED,
+            DEFAULT_MAX_SESSIONS,
+            DEFAULT_SESSION_ADMISSION_GRACE_SECS as usize,
+        );
+        assert_eq!(l.unauthenticated, DEFAULT_MAX_UNAUTHENTICATED);
+        assert_eq!(l.sessions, DEFAULT_MAX_SESSIONS);
+    }
+
+    /// The shipped grace, used directly rather than via `AdmissionLimits::get()`
+    /// so these tests pin the *design* and stay deterministic regardless of what
+    /// `NKCT_*` happens to be set to in the environment running them.
+    fn test_grace() -> Duration {
+        Duration::from_secs(DEFAULT_SESSION_ADMISSION_GRACE_SECS)
+    }
+
     // Admission control: the pre-auth and session budgets must stay independent.
     // A single shared pool was exhaustible from either side — unauthenticated
     // peers that connect and stall could consume every slot (holding each for up
@@ -1655,17 +1791,19 @@ mod tests {
     /// new handshakes.
     #[tokio::test]
     async fn full_session_pool_leaves_every_preauth_slot_free() {
-        let preauth = Arc::new(Semaphore::new(MAX_UNAUTHENTICATED));
-        let sessions = Arc::new(Semaphore::new(MAX_SESSIONS));
+        let preauth = Arc::new(Semaphore::new(DEFAULT_MAX_UNAUTHENTICATED));
+        let sessions = Arc::new(Semaphore::new(DEFAULT_MAX_SESSIONS));
 
         let mut established = Vec::new();
-        for _ in 0..MAX_SESSIONS {
+        for _ in 0..DEFAULT_MAX_SESSIONS {
             // The handover `handle_server_connection` performs once the handshake
             // authenticates the peer: take the session permit, THEN release the
             // pre-auth one, so the connection is never in neither pool.
             let admission = Admission {
                 preauth: preauth.clone().acquire_owned().await.unwrap(),
                 sessions: sessions.clone(),
+                grace: test_grace(),
+                session_cap: DEFAULT_MAX_SESSIONS,
             };
             established.push(admission.into_session_permit().await.unwrap());
         }
@@ -1673,7 +1811,7 @@ mod tests {
         assert_eq!(sessions.available_permits(), 0, "session pool should be full");
         assert_eq!(
             preauth.available_permits(),
-            MAX_UNAUTHENTICATED,
+            DEFAULT_MAX_UNAUTHENTICATED,
             "a saturated session pool must leave the pre-auth pool untouched, \
              otherwise long-lived shells/transfers starve new handshakes"
         );
@@ -1683,21 +1821,23 @@ mod tests {
     /// so it can only ever spend the pre-auth budget — never a session slot.
     #[tokio::test]
     async fn unauthenticated_flood_cannot_reach_the_session_pool() {
-        let preauth = Arc::new(Semaphore::new(MAX_UNAUTHENTICATED));
-        let sessions = Arc::new(Semaphore::new(MAX_SESSIONS));
+        let preauth = Arc::new(Semaphore::new(DEFAULT_MAX_UNAUTHENTICATED));
+        let sessions = Arc::new(Semaphore::new(DEFAULT_MAX_SESSIONS));
 
         let mut stalled = Vec::new();
-        for _ in 0..MAX_UNAUTHENTICATED {
+        for _ in 0..DEFAULT_MAX_UNAUTHENTICATED {
             stalled.push(Admission {
                 preauth: preauth.clone().acquire_owned().await.unwrap(),
                 sessions: sessions.clone(),
+                grace: test_grace(),
+                session_cap: DEFAULT_MAX_SESSIONS,
             });
         }
 
         assert_eq!(preauth.available_permits(), 0, "pre-auth pool should be full");
         assert_eq!(
             sessions.available_permits(),
-            MAX_SESSIONS,
+            DEFAULT_MAX_SESSIONS,
             "unauthenticated peers must not be able to consume session slots"
         );
         // Timing out / erroring drops the Admission, which frees the slot.
@@ -1710,19 +1850,19 @@ mod tests {
     ///
     /// This is the case the two tests above do not reach — they only ever hand
     /// over while a session permit is free. An unbounded wait here is worse than
-    /// the single-pool design this replaced: `MAX_UNAUTHENTICATED` connections
+    /// the single-pool design this replaced: `DEFAULT_MAX_UNAUTHENTICATED` connections
     /// that finished their handshake would pin every pre-auth slot for as long as
     /// the session pool stayed full, halting the accept loop with no timeout to
     /// break it.
     #[tokio::test]
     async fn full_session_pool_refuses_instead_of_pinning_a_preauth_slot() {
-        tokio::time::pause(); // auto-advances over SESSION_ADMISSION_GRACE
+        tokio::time::pause(); // auto-advances over the grace
 
-        let preauth = Arc::new(Semaphore::new(MAX_UNAUTHENTICATED));
-        let sessions = Arc::new(Semaphore::new(MAX_SESSIONS));
+        let preauth = Arc::new(Semaphore::new(DEFAULT_MAX_UNAUTHENTICATED));
+        let sessions = Arc::new(Semaphore::new(DEFAULT_MAX_SESSIONS));
 
         // Saturate the session pool and keep it that way.
-        let _held: Vec<_> = (0..MAX_SESSIONS)
+        let _held: Vec<_> = (0..DEFAULT_MAX_SESSIONS)
             .map(|_| sessions.clone().try_acquire_owned().unwrap())
             .collect();
         assert_eq!(sessions.available_permits(), 0);
@@ -1730,8 +1870,10 @@ mod tests {
         let admission = Admission {
             preauth: preauth.clone().acquire_owned().await.unwrap(),
             sessions: sessions.clone(),
+            grace: test_grace(),
+            session_cap: DEFAULT_MAX_SESSIONS,
         };
-        assert_eq!(preauth.available_permits(), MAX_UNAUTHENTICATED - 1);
+        assert_eq!(preauth.available_permits(), DEFAULT_MAX_UNAUTHENTICATED - 1);
 
         // The outer bound is far longer than the inner one, so on a paused clock
         // the inner timer always fires first. It exists only so that *removing*
@@ -1746,7 +1888,7 @@ mod tests {
         );
         assert_eq!(
             preauth.available_permits(),
-            MAX_UNAUTHENTICATED,
+            DEFAULT_MAX_UNAUTHENTICATED,
             "a refused connection must release its pre-auth slot"
         );
     }

@@ -541,7 +541,7 @@ pub(crate) fn fp_hex(fp: &[u8; 32]) -> String {
 /// process-per-transfer CLI attacker mints a fresh NodeId each time and slips
 /// past. Each attempt is still rejected cheaply by the pinned key / allowlist,
 /// and the damage such a flood can do is capped by admission control: it can
-/// only spend the *pre-auth* budget (`p2p::processor::MAX_UNAUTHENTICATED`),
+/// only spend the *pre-auth* budget (`p2p::processor::AdmissionLimits`, NKCT_MAX_UNAUTHENTICATED),
 /// which is held separately from the session budget, so established sessions
 /// and their successors cannot be starved by it. It is **not** claimed that a
 /// NodeId-rotating flood is prevented — only that it is confined.
