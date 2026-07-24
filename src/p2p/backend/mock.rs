@@ -27,7 +27,8 @@
 //! ```
 
 use crate::p2p::{
-    P2pEndpoint, P2pError, P2pIncoming, P2pPending, P2pProtocol, P2pStream, PeerAddr, PeerId,
+    EstablishError, P2pEndpoint, P2pError, P2pIncoming, P2pPending, P2pProtocol, P2pStream,
+    PeerAddr, PeerId,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -97,7 +98,7 @@ impl P2pPending for MockPending {
     async fn establish(
         self: Box<Self>,
         _timeout: std::time::Duration,
-    ) -> Result<P2pIncoming, P2pError> {
+    ) -> Result<P2pIncoming, EstablishError> {
         Ok(self.incoming)
     }
 }

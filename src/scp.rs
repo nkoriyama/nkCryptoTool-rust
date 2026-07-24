@@ -1412,7 +1412,9 @@ where
     // No per-operation throttle: an authenticated, policy-allowed client copying
     // several files in a row is normal use. Brute-force is limited on the
     // handshake failure path (see `crate::shell::auth_failure_blocked`);
-    // concurrency is bounded by the accept semaphore.
+    // concurrency is bounded by the session admission pool
+    // (`crate::p2p::processor::MAX_SESSIONS`), which unauthenticated peers
+    // cannot spend from.
 
     // A policy is mandatory for the server (enforced at startup); default deny.
     let policy = match policy_path {

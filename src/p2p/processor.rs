@@ -108,10 +108,93 @@ fn signing_pem_bytes(config: &CryptoConfig) -> Result<Option<Zeroizing<Vec<u8>>>
     }
 }
 
+/// Concurrency budget for connections whose peer is **not yet authenticated**:
+/// transport setup plus the nkct handshake.
+///
+/// Sized separately from [`MAX_SESSIONS`] on purpose. A single pool covering
+/// both is exhaustible by peers that connect and stall: nothing about them is
+/// verified yet, but each holds a slot for up to `P2P_SETUP_TIMEOUT +
+/// handshake_timeout` — and because the accept throttle keys on the transport
+/// NodeId, which is free to mint, rotating identities evades it. With one pool
+/// that starves *everything*, including established sessions' successors; with
+/// two, an unauthenticated flood is confined to this budget and cannot take a
+/// session slot.
+///
+/// It is much larger than the session cap because the per-slot cost is small
+/// (a few round trips and one signature verify, all bounded by timeouts) and a
+/// bigger pool directly raises the number of concurrent connections an attacker
+/// must sustain to deny service.
+const MAX_UNAUTHENTICATED: usize = 32;
+
+/// Concurrency budget for **authenticated** sessions (chat / file / shell /
+/// forward / scp / pairing). Much smaller than [`MAX_UNAUTHENTICATED`] because a
+/// slot is held for the session's whole lifetime, which for an interactive shell
+/// or a large transfer is unbounded. Only peers that passed the handshake — and
+/// the allowlist / grant checks, when configured — reach this pool.
+const MAX_SESSIONS: usize = 10;
+
+/// How long a freshly-authenticated connection may wait for a session slot
+/// before the server refuses it as at-capacity.
+///
+/// Bounded on purpose, and short. The connection is still holding its pre-auth
+/// permit while it waits (the handover takes the session permit first — see
+/// [`Admission`]), so an unbounded wait would let `MAX_UNAUTHENTICATED`
+/// post-handshake connections pin the entire pre-auth pool for as long as the
+/// session pool stays full, halting the accept loop. A short grace absorbs the
+/// normal case — a session ending moments later — while keeping the worst-case
+/// pre-auth hold bounded at `P2P_SETUP_TIMEOUT + handshake_timeout + this`.
+const SESSION_ADMISSION_GRACE: Duration = Duration::from_secs(5);
+
+/// The pre-auth pool must stay the larger of the two: its slots are cheap and
+/// timeout-bounded, so a bigger pool directly raises the concurrent-connection
+/// count an attacker has to sustain, while session slots are held indefinitely.
+/// Inverting them would make the scarce resource the one anyone can take.
+const _: () = assert!(MAX_UNAUTHENTICATED > MAX_SESSIONS);
+
+/// The pre-auth permit plus the session pool to move into, carried across the
+/// handshake boundary.
+///
+/// The handover in [`NetworkProcessor::handle_server_connection`] takes the
+/// session permit **before** releasing the pre-auth one, so a connection is
+/// always accounted to exactly one pool. Releasing first would open a window in
+/// which arbitrarily many connections belong to neither.
+struct Admission {
+    preauth: tokio::sync::OwnedSemaphorePermit,
+    sessions: Arc<Semaphore>,
+}
+
+impl Admission {
+    /// Swap the pre-auth permit for a session permit once the peer is
+    /// authenticated, bounded by [`SESSION_ADMISSION_GRACE`].
+    ///
+    /// The pre-auth permit is released only on the success path, after the
+    /// session permit is in hand, so the connection is never unaccounted. On
+    /// either failure path it is dropped as this call returns, freeing the slot
+    /// for the next peer instead of pinning it while the session pool is full.
+    async fn into_session_permit(self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let Admission { preauth, sessions } = self;
+        match tokio::time::timeout(SESSION_ADMISSION_GRACE, sessions.acquire_owned()).await {
+            Ok(Ok(permit)) => {
+                drop(preauth);
+                Ok(permit)
+            }
+            Ok(Err(_)) => Err(CryptoError::Parameter(
+                "Session semaphore closed".to_string(),
+            )),
+            Err(_) => Err(CryptoError::Parameter(format!(
+                "server is at session capacity ({MAX_SESSIONS} active); refusing this connection"
+            ))),
+        }
+    }
+}
+
 pub struct NetworkProcessor {
     config: CryptoConfig,
     endpoint: Arc<dyn P2pEndpoint>,
-    semaphore: Arc<Semaphore>,
+    /// Pre-authentication admission — see [`MAX_UNAUTHENTICATED`].
+    handshake_semaphore: Arc<Semaphore>,
+    /// Post-authentication admission — see [`MAX_SESSIONS`].
+    session_semaphore: Arc<Semaphore>,
     cached_allowlist: Option<Arc<std::collections::HashMap<[u8; 32], u8>>>,
     io_provider: Arc<dyn IOProvider>,
 }
@@ -125,7 +208,8 @@ impl NetworkProcessor {
         Self {
             config,
             endpoint,
-            semaphore: Arc::new(Semaphore::new(10)),
+            handshake_semaphore: Arc::new(Semaphore::new(MAX_UNAUTHENTICATED)),
+            session_semaphore: Arc::new(Semaphore::new(MAX_SESSIONS)),
             cached_allowlist: None,
             io_provider,
         }
@@ -286,11 +370,15 @@ impl NetworkProcessor {
                     continue;
                 }
             };
-            // Reserve a concurrency slot BEFORE spawning the per-connection setup:
-            // a flood of half-open peers then cannot spawn unbounded setup tasks.
+            // Reserve a PRE-AUTH slot BEFORE spawning the per-connection setup: a
+            // flood of half-open peers then cannot spawn unbounded setup tasks.
             // A stalling peer's `establish` times out within P2P_SETUP_TIMEOUT,
             // freeing its slot, so the accept loop is never permanently starved.
-            let permit = match self.semaphore.clone().acquire_owned().await {
+            // This budget is separate from the session budget (see
+            // `MAX_UNAUTHENTICATED`), so unauthenticated peers can never take a
+            // slot away from an authenticated session — and vice versa: a
+            // long-running shell or transfer no longer blocks new handshakes.
+            let permit = match self.handshake_semaphore.clone().acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => break, // semaphore closed → endpoint shutting down
             };
@@ -298,9 +386,16 @@ impl NetworkProcessor {
             let cached_allowlist = self.cached_allowlist.clone();
             let local_peer_id = self.endpoint.local_id();
             let io_provider = self.io_provider.clone();
+            let session_semaphore = self.session_semaphore.clone();
 
             tokio::spawn(async move {
-                let _permit = permit; // held for the connection's lifetime
+                // Held until the handshake authenticates the peer, at which point
+                // `handle_server_connection` swaps it for a session permit. Every
+                // early return below drops it, freeing the slot immediately.
+                let admission = Admission {
+                    preauth: permit,
+                    sessions: session_semaphore,
+                };
 
                 // Protocol negotiation + stream open run HERE, off the accept loop,
                 // bounded by the timeout — a peer that stalls this cannot block
@@ -308,6 +403,17 @@ impl NetworkProcessor {
                 let incoming = match pending.establish(crate::p2p::P2P_SETUP_TIMEOUT).await {
                     Ok(inc) => inc,
                     Err(e) => {
+                        // Attribute the stall when the transport got far enough to
+                        // prove who the peer is: completing the QUIC handshake and
+                        // then never opening a stream costs the peer nothing but
+                        // holds a pre-auth slot for the full timeout, so it must
+                        // count toward the throttle like any other failed attempt.
+                        // Before that point the identity is merely claimed — see
+                        // `EstablishError` — and recording it would let anyone get
+                        // a third party throttled.
+                        if let Some(node) = e.peer_id {
+                            crate::shell::note_auth_failure(node.as_bytes());
+                        }
                         eprintln!(
                             "[nkct] connection setup failed (continuing to serve): {}",
                             Self::sanitize_for_terminal(&e.to_string())
@@ -374,6 +480,7 @@ impl NetworkProcessor {
                     io_provider,
                     None,
                     None,
+                    Some(admission),
                 )
                 .await
                 {
@@ -443,6 +550,9 @@ impl NetworkProcessor {
         // Single-shot: run the per-connection setup inline, but still bound it so
         // a peer that completes the QUIC handshake then never opens a stream
         // cannot hang the listener forever.
+        // Single-shot serves exactly one connection and then returns, so a failure
+        // here ends the listener anyway — there is no next accept for a throttle
+        // entry to protect, unlike the long-running loop above.
         let incoming = pending.establish(crate::p2p::P2P_SETUP_TIMEOUT).await
             .map_err(|e| CryptoError::Parameter(format!("Connection setup failed: {}", e)))?;
 
@@ -494,7 +604,10 @@ impl NetworkProcessor {
             )));
         }
 
-        let _permit = self.semaphore.clone().acquire_owned().await
+        // One connection for the lifetime of this call, so the two-pool handover
+        // has nothing to arbitrate: take a session permit directly and pass no
+        // `Admission`.
+        let _permit = self.session_semaphore.clone().acquire_owned().await
             .map_err(|_| CryptoError::Parameter("Semaphore closed".to_string()))?;
 
         let local_peer_id = self.endpoint.local_id();
@@ -509,6 +622,7 @@ impl NetworkProcessor {
             self.io_provider.clone(),
             Some(Box::new(on_handshake_done)),
             on_progress,
+            None,
         ).await
     }
 
@@ -526,6 +640,7 @@ impl NetworkProcessor {
         io_provider: Arc<dyn IOProvider>,
         on_handshake_done: Option<Box<dyn FnOnce() + Send>>,
         on_progress: Option<crate::network::ProgressCallback>,
+        admission: Option<Admission>,
     ) -> Result<()> {
         let (mut reader, mut writer) = tokio::io::split(stream);
         let mut peer_id_opt: Option<PeerId> = None;
@@ -790,6 +905,21 @@ impl NetworkProcessor {
         };
 
         let (s2c_key, _s2c_iv, c2s_key, c2s_iv, peer_id) = handshake_result;
+
+        // Admission handover: the handshake is done, so this connection stops
+        // spending the pre-auth budget and starts spending the session budget.
+        // Acquire before releasing — see `Admission` — and do it before the
+        // handshake-done callback fires, so the UI does not report a live session
+        // while it is still queued for a slot.
+        //
+        // The wait inside is bounded — see `SESSION_ADMISSION_GRACE`. An at-capacity
+        // refusal is deliberately NOT recorded against the auth-failure throttle:
+        // that runs above, on the handshake path, and this connection's handshake
+        // succeeded. The fault is the server's, not the peer's.
+        let _session_permit = match admission {
+            Some(a) => Some(a.into_session_permit().await?),
+            None => None,
+        };
 
         // For a shell session the peer must be cryptographically authenticated
         // (PeerId::Pubkey = SHA3-256 of its ML-DSA key); that fingerprint keys
@@ -1512,6 +1642,114 @@ mod tests {
     use super::*;
     use crate::p2p::backend::mock::MockNetwork;
     use crate::network::TestIOProvider;
+
+    // Admission control: the pre-auth and session budgets must stay independent.
+    // A single shared pool was exhaustible from either side — unauthenticated
+    // peers that connect and stall could consume every slot (holding each for up
+    // to P2P_SETUP_TIMEOUT + handshake_timeout, and evading the NodeId-keyed
+    // throttle by rotating identities), and conversely a full set of long-lived
+    // sessions blocked all new handshakes. These two tests pin each direction.
+
+    /// Session side: the handover must give the pre-auth slot back. If it ever
+    /// regresses to holding both, saturating the session pool would again starve
+    /// new handshakes.
+    #[tokio::test]
+    async fn full_session_pool_leaves_every_preauth_slot_free() {
+        let preauth = Arc::new(Semaphore::new(MAX_UNAUTHENTICATED));
+        let sessions = Arc::new(Semaphore::new(MAX_SESSIONS));
+
+        let mut established = Vec::new();
+        for _ in 0..MAX_SESSIONS {
+            // The handover `handle_server_connection` performs once the handshake
+            // authenticates the peer: take the session permit, THEN release the
+            // pre-auth one, so the connection is never in neither pool.
+            let admission = Admission {
+                preauth: preauth.clone().acquire_owned().await.unwrap(),
+                sessions: sessions.clone(),
+            };
+            established.push(admission.into_session_permit().await.unwrap());
+        }
+
+        assert_eq!(sessions.available_permits(), 0, "session pool should be full");
+        assert_eq!(
+            preauth.available_permits(),
+            MAX_UNAUTHENTICATED,
+            "a saturated session pool must leave the pre-auth pool untouched, \
+             otherwise long-lived shells/transfers starve new handshakes"
+        );
+    }
+
+    /// Pre-auth side: a peer that connects and stalls never reaches the handover,
+    /// so it can only ever spend the pre-auth budget — never a session slot.
+    #[tokio::test]
+    async fn unauthenticated_flood_cannot_reach_the_session_pool() {
+        let preauth = Arc::new(Semaphore::new(MAX_UNAUTHENTICATED));
+        let sessions = Arc::new(Semaphore::new(MAX_SESSIONS));
+
+        let mut stalled = Vec::new();
+        for _ in 0..MAX_UNAUTHENTICATED {
+            stalled.push(Admission {
+                preauth: preauth.clone().acquire_owned().await.unwrap(),
+                sessions: sessions.clone(),
+            });
+        }
+
+        assert_eq!(preauth.available_permits(), 0, "pre-auth pool should be full");
+        assert_eq!(
+            sessions.available_permits(),
+            MAX_SESSIONS,
+            "unauthenticated peers must not be able to consume session slots"
+        );
+        // Timing out / erroring drops the Admission, which frees the slot.
+        stalled.pop();
+        assert_eq!(preauth.available_permits(), 1);
+    }
+
+    /// Contended handover: with the session pool full, waiting for a slot must be
+    /// bounded AND must give the pre-auth slot back.
+    ///
+    /// This is the case the two tests above do not reach — they only ever hand
+    /// over while a session permit is free. An unbounded wait here is worse than
+    /// the single-pool design this replaced: `MAX_UNAUTHENTICATED` connections
+    /// that finished their handshake would pin every pre-auth slot for as long as
+    /// the session pool stayed full, halting the accept loop with no timeout to
+    /// break it.
+    #[tokio::test]
+    async fn full_session_pool_refuses_instead_of_pinning_a_preauth_slot() {
+        tokio::time::pause(); // auto-advances over SESSION_ADMISSION_GRACE
+
+        let preauth = Arc::new(Semaphore::new(MAX_UNAUTHENTICATED));
+        let sessions = Arc::new(Semaphore::new(MAX_SESSIONS));
+
+        // Saturate the session pool and keep it that way.
+        let _held: Vec<_> = (0..MAX_SESSIONS)
+            .map(|_| sessions.clone().try_acquire_owned().unwrap())
+            .collect();
+        assert_eq!(sessions.available_permits(), 0);
+
+        let admission = Admission {
+            preauth: preauth.clone().acquire_owned().await.unwrap(),
+            sessions: sessions.clone(),
+        };
+        assert_eq!(preauth.available_permits(), MAX_UNAUTHENTICATED - 1);
+
+        // The outer bound is far longer than the inner one, so on a paused clock
+        // the inner timer always fires first. It exists only so that *removing*
+        // the inner bound fails this test with a diagnostic instead of hanging.
+        let err = tokio::time::timeout(Duration::from_secs(600), admission.into_session_permit())
+            .await
+            .expect("the handover must be bounded — it waited on a full session pool")
+            .expect_err("a full session pool must refuse, not wait forever");
+        assert!(
+            err.to_string().contains("session capacity"),
+            "expected an at-capacity refusal, got: {err}"
+        );
+        assert_eq!(
+            preauth.available_permits(),
+            MAX_UNAUTHENTICATED,
+            "a refused connection must release its pre-auth slot"
+        );
+    }
 
     // Parser robustness (§10(B)): the fixed-length gate must REJECT a wrong length
     // via Result — never panic — and must not fire on a match or an unknown algo.

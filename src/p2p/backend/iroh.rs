@@ -182,43 +182,72 @@ impl crate::p2p::P2pPending for IrohPending {
     async fn establish(
         self: Box<Self>,
         timeout: std::time::Duration,
-    ) -> std::result::Result<crate::p2p::P2pIncoming, crate::p2p::P2pError> {
+    ) -> std::result::Result<crate::p2p::P2pIncoming, crate::p2p::EstablishError> {
+        use crate::p2p::{EstablishError, P2pError};
         let IrohPending {
             mut accepting,
             protocols,
         } = *self;
-        tokio::time::timeout(timeout, async move {
+        // A single deadline spans both phases, so the overall bound is exactly
+        // the `timeout` the caller asked for. The split is purely about
+        // attribution: iroh authenticates the remote's NodeId as part of the
+        // QUIC/TLS handshake, so only failures *after* that point can be blamed
+        // on a specific peer (see `EstablishError`).
+        let deadline = tokio::time::Instant::now() + timeout;
+
+        // Phase 1 — negotiate the ALPN and complete the transport handshake.
+        // No authenticated identity exists yet, so failures here are anonymous.
+        let phase1 = tokio::time::timeout_at(deadline, async move {
             let alpn_bytes = accepting
                 .alpn()
                 .await
-                .map_err(|e| crate::p2p::P2pError::Accept(format!("ALPN detection: {}", e)))?;
+                .map_err(|e| P2pError::Accept(format!("ALPN detection: {}", e)))?;
             let protocol = protocols
                 .iter()
                 .find(|p| p.0 == alpn_bytes.as_slice())
                 .copied()
                 .ok_or_else(|| {
-                    crate::p2p::P2pError::Accept(format!(
+                    P2pError::Accept(format!(
                         "Unknown ALPN: {:?}",
                         String::from_utf8_lossy(alpn_bytes.as_slice())
                     ))
                 })?;
             let connection = accepting
                 .await
-                .map_err(|e| crate::p2p::P2pError::Accept(e.to_string()))?;
-            let remote_node_id = connection.remote_id();
-            let peer_id = crate::p2p::PeerId::new(*remote_node_id.as_bytes());
-            let (send, recv) = connection
-                .accept_bi()
-                .await
-                .map_err(|e| crate::p2p::P2pError::Accept(format!("accept_bi: {}", e)))?;
-            Ok::<_, crate::p2p::P2pError>(crate::p2p::P2pIncoming {
+                .map_err(|e| P2pError::Accept(e.to_string()))?;
+            Ok::<_, P2pError>((protocol, connection))
+        })
+        .await;
+        let (protocol, connection) = match phase1 {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => return Err(EstablishError::anonymous(e)),
+            Err(_) => {
+                return Err(EstablishError::anonymous(P2pError::Accept(
+                    "connection setup timed out".to_string(),
+                )))
+            }
+        };
+
+        // Phase 2 — open the bidirectional stream. The NodeId is proven now, so
+        // a peer that completes the handshake and then never opens a stream (it
+        // would otherwise hold an accept slot for the full timeout, for free) is
+        // attributable and gets recorded against the accept throttle.
+        let peer_id = crate::p2p::PeerId::new(*connection.remote_id().as_bytes());
+        match tokio::time::timeout_at(deadline, connection.accept_bi()).await {
+            Ok(Ok((send, recv))) => Ok(crate::p2p::P2pIncoming {
                 peer_id,
                 protocol,
                 stream: Box::new(IrohBiStream { send, recv }),
-            })
-        })
-        .await
-        .map_err(|_| crate::p2p::P2pError::Accept("connection setup timed out".to_string()))?
+            }),
+            Ok(Err(e)) => Err(EstablishError::attributed(
+                peer_id,
+                P2pError::Accept(format!("accept_bi: {}", e)),
+            )),
+            Err(_) => Err(EstablishError::attributed(
+                peer_id,
+                P2pError::Accept("connection setup timed out".to_string()),
+            )),
+        }
     }
 }
 

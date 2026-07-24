@@ -524,14 +524,27 @@ pub(crate) fn fp_hex(fp: &[u8; 32]) -> String {
 /// window applied *post*-auth) throttled legitimate use, e.g. a client copying
 /// several files in a row over scp.
 ///
+/// Counted failures include a peer that completes the transport handshake and
+/// then stalls connection setup without ever opening a stream (`establish`
+/// timing out after the NodeId is proven — see `p2p::EstablishError`). That
+/// costs the peer nothing but holds an accept slot for the full setup timeout,
+/// so it is exactly the resource flood this dampener exists for. A failure
+/// *before* the transport proves the NodeId is not counted: the identity is
+/// merely claimed at that point, and recording it would let anyone get a third
+/// party throttled.
+///
 /// Scope, honestly: unlike password SSH there is **no secret to brute-force** —
 /// authentication is a public-key match, so a wrong key is rejected
 /// deterministically and cheaply. This throttle therefore targets *resource
 /// floods*, not credential guessing, and it only bites a peer that **reuses its
 /// NodeId** (a long-lived process reconnecting, the prekey/inbox flow). A
 /// process-per-transfer CLI attacker mints a fresh NodeId each time and slips
-/// past — but each attempt is still rejected cheaply by the pinned key /
-/// allowlist, and total concurrency is bounded by the accept semaphore.
+/// past. Each attempt is still rejected cheaply by the pinned key / allowlist,
+/// and the damage such a flood can do is capped by admission control: it can
+/// only spend the *pre-auth* budget (`p2p::processor::MAX_UNAUTHENTICATED`),
+/// which is held separately from the session budget, so established sessions
+/// and their successors cannot be starved by it. It is **not** claimed that a
+/// NodeId-rotating flood is prevented — only that it is confined.
 const AUTH_FAIL_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
 /// Failed handshakes allowed from one NodeId within the window before it is
 /// temporarily blocked.
@@ -539,7 +552,8 @@ const AUTH_FAIL_MAX: u32 = 8;
 /// Hard cap on tracked NodeIds. A flood of *distinct* NodeIds must not grow the
 /// map without bound or make cleanup expensive, so we only scan when over this
 /// cap and, if a live flood keeps it over cap, drop tracking entirely (fail-open
-/// — this is a dampener; the accept semaphore is the real concurrency bound).
+/// — this is a dampener; the pre-auth admission pool is the real concurrency
+/// bound).
 const AUTH_FAIL_MAX_TRACKED: usize = 4096;
 
 /// `NodeId -> (failure_count, window_start)`, shared by [`note_auth_failure`] and

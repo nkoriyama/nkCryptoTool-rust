@@ -29,6 +29,58 @@ pub struct P2pIncoming {
 /// then never opens a stream (a Slowloris-style accept-loop stall).
 pub const P2P_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Why [`P2pPending::establish`] failed, plus the remote's identity when setup
+/// got far enough to have one.
+///
+/// The split exists so the listener can throttle a peer that stalls connection
+/// setup. Setup has two phases with different attribution:
+///
+/// * **Before** the transport handshake completes there is no *authenticated*
+///   identity — only a claimed one. Attributing a failure to it would let any
+///   peer get a third party throttled, so `peer_id` is `None` and the failure
+///   goes unrecorded.
+/// * **After** it completes, the identity is proven. A peer that finishes the
+///   handshake and then never opens a stream — the Slowloris shape, which holds
+///   an accept slot for the whole `timeout` — is attributable, and the caller
+///   records it so a repeat offender is refused at the next accept.
+#[derive(Debug)]
+pub struct EstablishError {
+    /// The remote's proven transport identity, or `None` when the failure
+    /// predates authentication (see the type docs).
+    pub peer_id: Option<PeerId>,
+    pub error: P2pError,
+}
+
+impl EstablishError {
+    /// A failure with no authenticated peer to attribute it to.
+    pub fn anonymous(error: P2pError) -> Self {
+        Self { peer_id: None, error }
+    }
+
+    /// A failure attributable to an already-authenticated peer.
+    pub fn attributed(peer_id: PeerId, error: P2pError) -> Self {
+        Self { peer_id: Some(peer_id), error }
+    }
+}
+
+impl std::fmt::Display for EstablishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for EstablishError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl From<EstablishError> for P2pError {
+    fn from(e: EstablishError) -> Self {
+        e.error
+    }
+}
+
 /// A half-open incoming connection whose per-peer setup — protocol negotiation
 /// and opening the bidirectional stream — has **not** run yet. Accepting one is
 /// cheap and cannot be stalled by the peer, so the listener can accept the next
@@ -39,11 +91,13 @@ pub const P2P_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 pub trait P2pPending: Send {
     /// Negotiate the protocol and open the bidirectional stream, bounded by
     /// `timeout`. A peer that stalls this (e.g. never opens the stream) yields a
-    /// timeout error rather than blocking forever.
+    /// timeout error rather than blocking forever. On failure the error carries
+    /// the peer's identity when setup got far enough to prove one, so the caller
+    /// can throttle a peer that repeatedly stalls — see [`EstablishError`].
     async fn establish(
         self: Box<Self>,
         timeout: std::time::Duration,
-    ) -> Result<P2pIncoming, P2pError>;
+    ) -> Result<P2pIncoming, EstablishError>;
 }
 
 /// A local P2P node — the origin of outgoing connections and the

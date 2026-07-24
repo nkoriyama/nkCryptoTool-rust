@@ -55,6 +55,18 @@ trade-off is explicit rather than forgotten.
    monotonicity cover this; see `docs/design/ATREST_ANTIROLLBACK_DESIGN.md`.
 6. **redb create→chmod window** (`group/redb_storage.rs`): only AEAD ciphertext
    exists in the brief window before the file is tightened to 0600.
+7. **Unauthenticated connection flood with rotating NodeIds** (`p2p/processor.rs`,
+   2026-07): a peer that connects and stalls holds a pre-auth admission slot for
+   up to `P2P_SETUP_TIMEOUT` + `handshake_timeout` (10 s + 15 s by default), and
+   the accept throttle keys on the transport NodeId, which is free to mint — so
+   rotating identities evades it. Availability only; nothing is disclosed or
+   forged. **Confined, not prevented**: the pre-auth budget
+   (`MAX_UNAUTHENTICATED`) is now a separate pool from the session budget
+   (`MAX_SESSIONS`), so such a flood cannot take a slot from an authenticated
+   session, and a stall after the transport proves the NodeId (the free
+   Slowloris shape) is recorded against the throttle. Fully preventing it needs
+   something the transport does not offer here — proof-of-work, or an
+   address-level rate limit below the overlay. Accepted at this level.
 
 (Several other audit findings — the ECDSA verify bug, network-receive release
 of unverified plaintext, the `Ticket::from_str` DoS, plaintext ECC keys, and
