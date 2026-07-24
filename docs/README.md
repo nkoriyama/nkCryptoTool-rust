@@ -6,7 +6,7 @@ CHANGELOG）。それ以外は用途別に本フォルダへ分類する。
 
 | フォルダ | 中身 | 性質 |
 |---|---|---|
-| [guides/](./guides/) | P2P ssh・チャット・鍵ローテーション・Android ビルド・再現ビルドの運用ガイド | 生きた文書（機能に追従して更新） |
+| [guides/](./guides/) | P2P ssh・チャット・鍵ローテーション・rsync 連携デプロイ・Android ビルド・再現ビルドの運用ガイド | 生きた文書（機能に追従して更新） |
 | [security/](./security/) | セキュリティ評価（SECURITY_PROFILE / GUI 版） | 生きた文書 |
 | [reports/](./reports/) | 実装後の検証レポート・比較・エビデンス | 記録（時点スナップショット） |
 | [design/](./design/) | 実装済み設計文書のアーカイブ（[索引](./design/README.md)） | 歴史（root の仕様文書が正） |

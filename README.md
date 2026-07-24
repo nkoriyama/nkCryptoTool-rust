@@ -172,7 +172,8 @@ confined shell と path-jail された scp を張るまでを 4 ステップで�
   なしで対話シェル (`--shell`)・ローカル/リモートフォワード (`-L`/`-R`) を張る。ハイブリッド
   P-256‖ML-KEM-768 KEM + ML-DSA-65 認証 (指紋ピンニング)、`--tui` でライブ接続バー、
   MLS グループ連動の認可 (Phase 6)、監査ログ・レート制限を備える。
-  詳細は [`P2P_SSH_USAGE_GUIDE.md`](./docs/guides/P2P_SSH_USAGE_GUIDE.md)。
+  詳細は [`P2P_SSH_USAGE_GUIDE.md`](./docs/guides/P2P_SSH_USAGE_GUIDE.md)。フォワード越しに
+  rsync を載せてデプロイする構成は [`RSYNC_DEPLOY_GUIDE.md`](./docs/guides/RSYNC_DEPLOY_GUIDE.md)。
 * **ペアリング (KeyBundle 自動登録 = `ssh-copy-id` 相当)**: 未登録クライアントを**ワンタイム
   トークン**で初回だけ登録 (`--serve-pairing` / `--copy-bundle`)。クライアントの指紋と KeyBundle を
   **redb keyring (`<key-dir>/keyring.db`) の allowlist テーブルに per-service grants 付き**で保存する
@@ -1060,7 +1061,7 @@ root は一次文書のみ。ガイド・検証記録・実装済み設計文書
 * [`SPEC.md`](./SPEC.md): プロトコル仕様、PQC アルゴリズム詳細、ネットワーク (NKCT) プロトコル、DoS 防御設計、不変性 (invariants) 定義
 * [`SECURITY.md`](./SECURITY.md): セキュリティポリシー、脅威モデル、メモリ保護モデル、運用ベストプラクティス
 * [`KNOWN_ISSUES.md`](./KNOWN_ISSUES.md): 既知の制限事項
-* [`docs/guides/`](./docs/guides/): 運用ガイド（P2P ssh / チャット / 鍵ローテーション / Android ビルド / 再現ビルド）
+* [`docs/guides/`](./docs/guides/): 運用ガイド（P2P ssh / チャット / 鍵ローテーション / [rsync 連携デプロイ](./docs/guides/RSYNC_DEPLOY_GUIDE.md) / Android ビルド / 再現ビルド）
 * [`docs/security/`](./docs/security/): セキュリティ評価（[SECURITY_PROFILE.md](./docs/security/SECURITY_PROFILE.md) / GUI 版）
 * [`docs/reports/`](./docs/reports/): 実装後の検証レポート・比較・エビデンス
 * [`docs/design/`](./docs/design/): 実装済み設計文書のアーカイブ（現行仕様は root が正）
