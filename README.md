@@ -137,7 +137,7 @@ confined shell と path-jail された scp を張るまでを 4 ステップで�
 1. **PAIR** — クライアントが `--copy-bundle` で KeyBundle を登録（`--pairing-grant scp` で scp grant のみ付与）。
 2. **ENCRYPT** — サーバは `--encrypt --recipient laptop` と **handle 指定**で暗号化。束と固定指紋は
    keyring から引くので、別途の鍵交換・鍵ファイル受け渡しは不要。
-3. **SCP** — クライアントが `nkct/scp/1` で ciphertext を取得（path-jail + keyring grants で認可）。
+3. **SCP** — クライアントが `nkct/scp/3` で ciphertext を取得（path-jail + keyring grants で認可）。
 4. **DECRYPT** — ML-KEM 秘密鍵を持つ登録クライアントだけが復号できる。
 
 ## **チケットを端末に QR 表示（外部ツール不要）**

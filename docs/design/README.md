@@ -10,7 +10,7 @@
 | [KEY_EXCHANGE_DESIGN.md](./KEY_EXCHANGE_DESIGN.md) | 公開鍵授受 — ML-DSA 単一アンカーの KeyBundle (NKKB) | 実装済み（最終仕様に改稿済み） |
 | [TRUST_BOOTSTRAP_DESIGN.md](./TRUST_BOOTSTRAP_DESIGN.md) | ペアリング（ssh-copy-id 相当）と二層信頼モデル | 実装済み |
 | [P2P_SHELL_DESIGN.md](./P2P_SHELL_DESIGN.md) | 踏み台レス PQC P2P シェル / ポートフォワード | 実装済み |
-| [P2P_SCP_DESIGN.md](./P2P_SCP_DESIGN.md) | P2P scp（nkct/scp/1、path confinement） | 実装済み |
+| [P2P_SCP_DESIGN.md](./P2P_SCP_DESIGN.md) | P2P scp（nkct/scp/3、path confinement） | 実装済み |
 | [PQFS_DESIGN.md](./PQFS_DESIGN.md) | Post-Quantum Forward Secrecy（One-Time Prekey） | 実装済み |
 | [ATREST_ANTIROLLBACK_DESIGN.md](./ATREST_ANTIROLLBACK_DESIGN.md) | at-rest 暗号化とアンチロールバック | 実装済み |
 | [DB_PURERUST_DESIGN.md](./DB_PURERUST_DESIGN.md) | SQLCipher → redb 純 Rust 化 | 実装済み |

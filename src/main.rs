@@ -191,7 +191,7 @@ struct Args {
     #[arg(long)]
     forward_policy: Option<String>,
 
-    /// Run a P2P scp (file-transfer) server on ALPN `nkct/scp/2`. Prints a ticket;
+    /// Run a P2P scp (file-transfer) server on ALPN `nkct/scp/3`. Prints a ticket;
     /// pair with a client's `--scp-put`/`--scp-get --connect <ticket>`. Requires
     /// `--scp-policy` (default deny) and refuses to run as root.
     #[arg(long)]

@@ -546,7 +546,7 @@ impl NetworkProcessor {
                     config.forward_mode = true;
                 } else if incoming.protocol.0 == crate::network::ALPN_SCP {
                     if !scp_allowed {
-                        eprintln!("Rejecting nkct/scp/2: this node is not an scp server");
+                        eprintln!("Rejecting nkct/scp/3: this node is not an scp server");
                         return;
                     }
                     config.scp_mode = true;
@@ -678,7 +678,7 @@ impl NetworkProcessor {
         } else if incoming.protocol.0 == crate::network::ALPN_SCP {
             if !scp_allowed {
                 return Err(CryptoError::Parameter(
-                    "scp (nkct/scp/2) is not enabled on this node".to_string(),
+                    "scp (nkct/scp/3) is not enabled on this node".to_string(),
                 ));
             }
             config.scp_mode = true;

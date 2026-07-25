@@ -4,7 +4,7 @@
  * This file is part of nkCryptoTool.
  */
 
-//! P2P scp (`nkct/scp/2`) — bastion-less PQC file transfer. See `P2P_SCP_DESIGN.md`.
+//! P2P scp (`nkct/scp/3`) — bastion-less PQC file transfer. See `P2P_SCP_DESIGN.md`.
 //!
 //! A third service ALPN alongside the PTY shell (`nkct/shell/2`) and the
 //! port-forward (`nkct/fwd/2`). Where the legacy `ALPN_FILE` stream was a raw

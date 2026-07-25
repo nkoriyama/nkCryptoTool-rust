@@ -19,7 +19,8 @@ The underlying `fips203` library may perform internal copies of sensitive seeds 
 ## Usability Issues
 
 ### 1. Stdin/Stdout only File Transfer
-Iroh file transfer currently only supports redirection via stdin/stdout. Direct file path arguments for network transfer are not yet implemented.
+Resolved: Direct file path arguments for network transfer are now implemented.
+
 
 ## GUI Features (deferred)
 
