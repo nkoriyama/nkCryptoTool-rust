@@ -818,6 +818,11 @@ impl Staged {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("recv");
+        // SECURITY-CRITICAL: this 64-bit `OsRng` draw is not a uniquifier for
+        // debugging — it is what makes `commit`'s rename safe against a parent
+        // swap (see `commit`). An attacker who could predict the temp name could
+        // pre-place a file under it in a directory they swap in, and win the
+        // race. Never replace it with a pid, a counter, or a timestamp.
         let temp_name = format!(".{}.tmp.{:016x}", fname, rand_core::OsRng.next_u64());
         let temp = match final_path.parent() {
             Some(dir) if !dir.as_os_str().is_empty() => dir.join(temp_name),
@@ -917,12 +922,30 @@ impl Staged {
         // Close the handle before the rename (Windows requires it); on unix the
         // fchmod above already landed on this same inode.
         let _ = self.file.take();
-        // The rename is path-based, but temp and final share the SAME parent
-        // directory: an attacker swapping an intermediate directory for a link
-        // here redirects source and destination alike, so the temp is simply
-        // not found (ENOENT) — the content is never published elsewhere. A
-        // swap of the root's own ancestry is outside the threat model (roots
-        // are server-user-owned, untrusted writers excluded by policy doc).
+        // The rename is path-based — the one operation on this path that is not
+        // anchored to an already-verified fd. Its safety rests on two properties,
+        // and on nothing else; both hold at every call site (client get, get -r,
+        // resume, and server put):
+        //
+        //   1. `temp` and `final_path` share the SAME parent directory, so an
+        //      attacker who swaps an intermediate directory has BOTH names
+        //      resolve under the swapped-in directory. Source and destination
+        //      move together, never apart.
+        //   2. `temp`'s name carries 64 unpredictable bits (see `create`), and
+        //      the staged file is owner-only, so that name cannot be observed
+        //      from outside this process.
+        //
+        // To publish content of their choosing at `final_path`, an attacker
+        // would have to pre-place a file under that unguessed name inside the
+        // directory they swap in — a 2^-64 shot. Not an impossibility: it is the
+        // margin this design is built on, which is why (2) must not be weakened.
+        // Losing that race means `rename` finds no source and fails with ENOENT,
+        // so the transfer fails and nothing is published anywhere.
+        //
+        // Note the scope: server-side `put` additionally re-verifies the staging
+        // fd against the policy roots before reaching here (`recheck_confined`),
+        // but the three client-side paths have no policy roots and rest on (1)
+        // and (2) alone. Any claim stronger than that does not hold for them.
         std::fs::rename(&self.temp, &self.final_path)
     }
 }
