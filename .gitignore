@@ -12,6 +12,13 @@ issue/
 .agents/
 CLAUDE.md
 .claude/
+AGENTS.md
+.opencode/
+
+# graphify knowledge graph (generated). Rebuild with `/graphify .`; the AST and
+# semantic caches under graphify-out/cache/ make a rebuild cheap, and graph.json
+# alone is several MB of derived data.
+graphify-out/
 
 # Test/runtime artifacts
 test_keys/
