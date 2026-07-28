@@ -904,35 +904,48 @@ impl GroupChatProcessor {
         body: &[u8],
         recipients: &[crate::p2p::PeerAddr],
     ) -> Result<Zeroizing<Vec<u8>>, GroupError> {
-        // Held until the state is written back below: the load and the write
-        // must not straddle another task's cycle for this group.
-        let _guard = self.lock_group(gid.as_bytes()).await;
-        let mut group = self.client.load_group(gid.as_bytes()).map_err(|e| {
-            let msg = format!("{e}");
-            if msg.contains("GroupNotFound") || msg.contains("group not found") {
-                GroupError::NotFound
-            } else {
-                GroupError::Backend(format!("load_group for send: {e}"))
-            }
-        })?;
+        // The group guard covers load → encrypt → persist → encode and
+        // NOTHING beyond it. It is a state-consistency lock, not a delivery
+        // lock: `fanout_send` below awaits QUIC connects, writes and a
+        // per-recipient linger against peer-controlled endpoints, and holding
+        // a group's mutation lock across that lets any one recipient freeze
+        // every other task that needs this group — including the inbound
+        // `process_mls_bytes` that would apply the Commit evicting it. Keep
+        // the fan-out outside this block.
+        //
+        // The key schedule is persisted inside the block, before any bytes
+        // leave the host: if a recipient receives the encrypted message but
+        // our state was never written, a subsequent re-encrypt could reuse a
+        // nonce. That ordering also fixes the failure semantics — once we are
+        // past this block the epoch has advanced durably, so a fan-out error
+        // is a *delivery* failure and must never roll the MLS state back.
+        let (msg, wire_bytes) = {
+            let _guard = self.lock_group(gid.as_bytes()).await;
+            let mut group = self.client.load_group(gid.as_bytes()).map_err(|e| {
+                let msg = format!("{e}");
+                if msg.contains("GroupNotFound") || msg.contains("group not found") {
+                    GroupError::NotFound
+                } else {
+                    GroupError::Backend(format!("load_group for send: {e}"))
+                }
+            })?;
 
-        let msg = group
-            .encrypt_application_message(body, Vec::new())
-            .map_err(|e| GroupError::Backend(format!("encrypt_application_message: {e}")))?;
-        // Persist the advanced key schedule before fanning out — if a
-        // recipient receives the encrypted message but our state was
-        // never written, a subsequent re-encrypt could reuse a nonce.
-        // sqlite WAL + busy_timeout makes this a single quick write.
-        group
-            .write_to_storage()
-            .map_err(|e| GroupError::Storage(format!("write_to_storage after encrypt: {e}")))?;
+            let msg = group
+                .encrypt_application_message(body, Vec::new())
+                .map_err(|e| GroupError::Backend(format!("encrypt_application_message: {e}")))?;
+            group
+                .write_to_storage()
+                .map_err(|e| GroupError::Storage(format!("write_to_storage after encrypt: {e}")))?;
 
-        let wire_bytes = msg
-            .to_bytes()
-            .map_err(|e| GroupError::Backend(format!("PrivateMessage encode: {e}")))?;
+            let wire_bytes = msg
+                .to_bytes()
+                .map_err(|e| GroupError::Backend(format!("PrivateMessage encode: {e}")))?;
+            (msg, wire_bytes)
+        };
 
-        // Fan-out in parallel. One QUIC stream per recipient (1 frame =
-        // 1 MlsMessage per the §5.4 contract). We wait for all sends to
+        // Fan-out in parallel, with the group guard released. One QUIC
+        // stream per recipient (1 frame = 1 MlsMessage per the §5.4
+        // contract). We wait for all sends to
         // settle and surface the first error encountered — that way a
         // mid-list failure doesn't abandon downstream recipients (the
         // earlier sequential `?` would skip recipients after the first
@@ -1973,6 +1986,95 @@ mod tests {
         );
         drop(other);
         drop(held);
+    }
+
+    // ---- F4: the group lock must NOT span the fan-out --------------------
+
+    /// `send_application_message` must release the group guard before it
+    /// starts talking to recipients. Otherwise one silent member holds the
+    /// group's mutation lock for the whole linger window, and every other
+    /// task that needs the group — including the inbound path that would
+    /// apply the Commit evicting that very member — is stuck behind it.
+    ///
+    /// The synchronisation here is an ordering, not a sleep: Bob's `accept()`
+    /// resolves only once Alice has dialled him, which happens *after* the
+    /// load → encrypt → persist section. So when it returns we know Alice is
+    /// inside the fan-out, and the lock must be free at that instant. Bob
+    /// then never reads the frame and never ACKs, which is exactly the
+    /// hostile behaviour the finding describes.
+    #[tokio::test]
+    async fn send_releases_group_lock_before_fanout() {
+        let net = MockNetwork::new();
+        let (alice, _da) = build_proc_on_net(&net, "alice", 1);
+        let bob_id = PeerId::new([2u8; 32]);
+        // Registered so the dial succeeds — but we never service his inbox.
+        let bob_ep = net.register(bob_id, vec![PROTO_MLS]);
+
+        let alice = Arc::new(alice);
+        let gid = alice.create_group().await.expect("create_group");
+
+        let sender = {
+            let (a, gid) = (alice.clone(), gid.clone());
+            tokio::spawn(async move {
+                a.send_application_message(&gid, b"hello", &[PeerAddr::new(bob_id)])
+                    .await
+            })
+        };
+
+        // Proof that Alice is past the critical section and inside the fan-out.
+        let _pending = tokio::time::timeout(Duration::from_secs(10), bob_ep.accept())
+            .await
+            .expect("Alice never dialled the recipient")
+            .expect("accept failed");
+
+        // The whole point: with Bob stalled, this must not wait on him.
+        let guard = tokio::time::timeout(
+            Duration::from_secs(2),
+            alice.lock_group(gid.as_bytes()),
+        )
+        .await
+        .expect("send_application_message held the group lock across the fan-out");
+        drop(guard);
+
+        // And the send itself still finishes once the linger expires.
+        let _ = tokio::time::timeout(Duration::from_secs(60), sender)
+            .await
+            .expect("send never completed");
+    }
+
+    /// The narrowed scope must not lose F8: the critical section itself is
+    /// still serialized, so a send cannot interleave with another task's
+    /// load → mutate → persist cycle for the same group.
+    #[tokio::test]
+    async fn send_still_waits_for_the_group_lock() {
+        let net = MockNetwork::new();
+        let (alice, _da) = build_proc_on_net(&net, "alice", 1);
+        let bob_id = PeerId::new([2u8; 32]);
+        let _bob_ep = net.register(bob_id, vec![PROTO_MLS]);
+
+        let alice = Arc::new(alice);
+        let gid = alice.create_group().await.expect("create_group");
+
+        let held = alice.lock_group(gid.as_bytes()).await;
+
+        let sender = {
+            let (a, gid) = (alice.clone(), gid.clone());
+            tokio::spawn(async move {
+                a.send_application_message(&gid, b"hello", &[PeerAddr::new(bob_id)])
+                    .await
+            })
+        };
+
+        tokio::task::yield_now().await;
+        assert!(
+            !sender.is_finished(),
+            "a send entered the critical section while the group was locked"
+        );
+
+        drop(held);
+        let _ = tokio::time::timeout(Duration::from_secs(60), sender)
+            .await
+            .expect("send never completed after the lock was released");
     }
 
     /// Concurrent first-acquisition must converge on ONE mutex per group —

@@ -238,9 +238,10 @@ impl ScpFrame {
             T_FAIL => {
                 let file_id = get_u32(rest, 0).ok_or_else(bad)?;
                 // Peer-authored text that the client prints per skipped file.
-                // Sanitized here so every consumer is covered by one gate — the
-                // scp client renders no other remote bytes, so this frame and
-                // `Err` below are the peer's only channel to the display.
+                // Sanitized here so every consumer is covered by one gate.
+                // Note this is not the peer's *only* channel to the display:
+                // `path` on `MkDir`/`Put` reaches operator-visible errors too,
+                // and is sanitized at those sinks via `show_path`.
                 let msg = crate::utils::sanitize_for_terminal_bounded(
                     &String::from_utf8_lossy(&rest[4..]),
                     256,
@@ -735,13 +736,46 @@ fn safe_join(base: &Path, rel: &str) -> std::result::Result<PathBuf, String> {
     if relp.is_absolute() {
         return Err(format!("relative path expected, got absolute {rel:?}"));
     }
+    // An empty (or `.`-only) relative path joins to `base` itself, which would
+    // let a peer name the operator's destination root as if it were an entry
+    // inside the tree — and then have its mode applied to it. Every legitimate
+    // entry in a recursive batch names at least one component.
+    let mut components = 0usize;
     for comp in relp.components() {
         match comp {
-            Component::Normal(_) => {}
+            Component::Normal(_) => components += 1,
             _ => return Err(format!("unsafe path component in {rel:?}")),
         }
     }
+    if components == 0 {
+        return Err(format!("empty relative path {rel:?}"));
+    }
     Ok(base.join(relp))
+}
+
+/// Render a filesystem path for an operator-visible message.
+///
+/// On the receiving side of a recursive `get`, the trailing components of a
+/// destination path are named by the peer, and `Path::display()` writes them
+/// through byte for byte — ESC and CR included. That is enough for a hostile
+/// server to erase our `Error:` line and paint a forged success line in its
+/// place. Route every path that can reach the operator through the same gate
+/// the frame decoder uses. `safe_join`'s own errors already render the raw
+/// string with `{:?}` (Debug escapes control characters), so they are safe.
+fn show_path(p: &Path) -> String {
+    crate::utils::sanitize_for_terminal_bounded(&p.to_string_lossy(), 256)
+}
+
+/// Ceiling applied to a peer-supplied directory mode.
+///
+/// The sender chooses these bits, so they are an attacker-controlled value on
+/// the receiving side. We honour the owner bits and the readable/traversable
+/// group and other bits, but never let a peer create a group- or
+/// world-*writable* directory under the operator's destination. OpenSSH scp
+/// makes the same trade the other way round — it ignores the remote mode
+/// entirely unless `-p` is given.
+fn clamp_dir_mode(mode: u32) -> u32 {
+    (mode & 0o0777) & !0o022
 }
 
 // ===========================================================================
@@ -1184,18 +1218,41 @@ async fn recv_tree<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
         match recv(reader, aead_name, rx_key, rx).await? {
             Some(ScpFrame::MkDir { file_id, path, mode }) => {
                 let d = safe_join(local, &path).map_err(CryptoError::Parameter)?;
-                std::fs::create_dir_all(&d)
-                    .map_err(|e| CryptoError::Parameter(format!("mkdir {}: {e}", d.display())))?;
-                // fchmod via the dir fd (O_NOFOLLOW), not a path-based
-                // set_permissions a local symlink swap could redirect.
-                set_dir_mode_nofollow(&d, mode);
+                // Any missing ancestors are created with the process default
+                // permissions: the peer's mode belongs to the directory it
+                // named, never to a parent it merely implied.
+                if let Some(parent) = d.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| {
+                        CryptoError::Parameter(format!("mkdir {}: {e}", show_path(parent)))
+                    })?;
+                }
+                // `create_dir` — not `create_dir_all` — so that "already there"
+                // is distinguishable from "we made it". A peer must not be able
+                // to re-mode directories that existed before this transfer:
+                // pointing a recursive get at $HOME would otherwise hand it
+                // ~/.ssh and friends.
+                let created = match std::fs::create_dir(&d) {
+                    Ok(()) => true,
+                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(e) => {
+                        return Err(CryptoError::Parameter(format!(
+                            "mkdir {}: {e}",
+                            show_path(&d)
+                        )))
+                    }
+                };
+                if created {
+                    // fchmod via the dir fd (O_NOFOLLOW), not a path-based
+                    // set_permissions a local symlink swap could redirect.
+                    set_dir_mode_nofollow(&d, clamp_dir_mode(mode));
+                }
                 send(writer, aead_name, tx_key, tx, &ScpFrame::Ack { file_id }).await?;
                 dirs += 1;
             }
             Some(ScpFrame::Put { file_id, path, mode, size }) => {
                 let dest = safe_join(local, &path).map_err(CryptoError::Parameter)?;
                 let mut staged = Staged::create(dest.clone())
-                    .map_err(|e| CryptoError::Parameter(format!("stage {}: {e}", dest.display())))?;
+                    .map_err(|e| CryptoError::Parameter(format!("stage {}: {e}", show_path(&dest))))?;
                 // Errors here propagate with the file still staged — a
                 // partially received file is never committed to its
                 // destination.
@@ -1203,7 +1260,7 @@ async fn recv_tree<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
                 staged
                     .commit(mode)
                     .await
-                    .map_err(|e| CryptoError::Parameter(format!("commit {}: {e}", dest.display())))?;
+                    .map_err(|e| CryptoError::Parameter(format!("commit {}: {e}", show_path(&dest))))?;
                 send(writer, aead_name, tx_key, tx, &ScpFrame::Ack { file_id }).await?;
                 files += 1;
             }
@@ -1911,11 +1968,18 @@ mod tests {
         frames: &[ScpFrame],
     ) -> (Result<(usize, usize)>, tempfile::TempDir) {
         let dir = tempfile::tempdir().expect("tempdir");
+        let res = run_recv_tree_in(dir.path(), frames).await;
+        (res, dir)
+    }
+
+    /// As `run_recv_tree`, but into a destination the caller has already
+    /// populated — the shape the "pre-existing directory" tests need.
+    async fn run_recv_tree_in(local: &Path, frames: &[ScpFrame]) -> Result<(usize, usize)> {
         let bytes = wire(frames).await;
         let mut reader = &bytes[..];
         let mut sink: Vec<u8> = Vec::new();
         let (mut rx, mut tx) = (0u64, 0u64);
-        let res = recv_tree(
+        recv_tree(
             &mut reader,
             &mut sink,
             T_AEAD,
@@ -1923,10 +1987,23 @@ mod tests {
             &mut rx,
             &T_KEY,
             &mut tx,
-            dir.path(),
+            local,
         )
-        .await;
-        (res, dir)
+        .await
+    }
+
+    /// Permission bits of `p`, unix-only.
+    #[cfg(unix)]
+    fn mode_of(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).expect("stat").permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    fn make_dir_with_mode(p: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(p).expect("mkdir");
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).expect("chmod");
     }
 
     /// One complete file: Put ‖ Data ‖ Eof.
@@ -1944,6 +2021,185 @@ mod tests {
             },
             ScpFrame::Eof { file_id: id },
         ]
+    }
+
+    // ---- F2/F6: a peer must not re-mode directories it did not create -------
+
+    /// An empty relative path resolves to the destination root itself. Left
+    /// unchecked, `MkDir { path: "", mode: 0o777 }` chmods the operator's own
+    /// download directory — `$HOME`, if that is where they pointed the get.
+    #[tokio::test]
+    async fn mkdir_rejects_empty_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        #[cfg(unix)]
+        let before = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("chmod");
+            mode_of(dir.path())
+        };
+
+        let res = run_recv_tree_in(
+            dir.path(),
+            &[
+                ScpFrame::MkDir {
+                    file_id: 1,
+                    path: "".into(),
+                    mode: 0o777,
+                },
+                ScpFrame::Done,
+            ],
+        )
+        .await;
+
+        let err = res.expect_err("an empty MkDir path must be rejected");
+        assert!(
+            format!("{err}").contains("empty relative path"),
+            "unexpected error: {err}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            mode_of(dir.path()),
+            before,
+            "the destination root's mode was changed by the peer"
+        );
+    }
+
+    /// The `~/.ssh` case from the finding: a directory that existed before the
+    /// transfer keeps its mode, no matter what the peer asks for.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mkdir_leaves_pre_existing_directory_mode_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret = dir.path().join(".ssh");
+        make_dir_with_mode(&secret, 0o700);
+
+        let res = run_recv_tree_in(
+            dir.path(),
+            &[
+                ScpFrame::MkDir {
+                    file_id: 1,
+                    path: ".ssh".into(),
+                    mode: 0o777,
+                },
+                ScpFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(res.expect("batch"), (0, 1));
+        assert_eq!(
+            mode_of(&secret),
+            0o700,
+            "a pre-existing directory was re-moded by the peer"
+        );
+    }
+
+    /// A nested `MkDir` must not re-mode the intermediate directory it implies
+    /// either — the peer's mode belongs to the directory it actually named.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mkdir_does_not_mode_implied_parents() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = dir.path().join("keep");
+        make_dir_with_mode(&parent, 0o700);
+
+        let res = run_recv_tree_in(
+            dir.path(),
+            &[
+                ScpFrame::MkDir {
+                    file_id: 1,
+                    path: "keep/child".into(),
+                    mode: 0o755,
+                },
+                ScpFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(res.expect("batch"), (0, 1));
+        assert_eq!(mode_of(&parent), 0o700, "an implied parent was re-moded");
+        assert_eq!(mode_of(&parent.join("child")), 0o755);
+    }
+
+    /// The mode still applies where it legitimately should: a directory this
+    /// transfer created.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mkdir_applies_mode_to_newly_created_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let res = run_recv_tree_in(
+            dir.path(),
+            &[
+                ScpFrame::MkDir {
+                    file_id: 1,
+                    path: "fresh".into(),
+                    mode: 0o750,
+                },
+                ScpFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(res.expect("batch"), (0, 1));
+        assert_eq!(mode_of(&dir.path().join("fresh")), 0o750);
+    }
+
+    /// Even on a directory we did create, a peer cannot ask for group- or
+    /// world-writable.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mkdir_clamps_group_and_other_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let res = run_recv_tree_in(
+            dir.path(),
+            &[
+                ScpFrame::MkDir {
+                    file_id: 1,
+                    path: "fresh".into(),
+                    mode: 0o777,
+                },
+                ScpFrame::Done,
+            ],
+        )
+        .await;
+
+        assert_eq!(res.expect("batch"), (0, 1));
+        assert_eq!(
+            mode_of(&dir.path().join("fresh")),
+            0o755,
+            "0o777 from the peer was honoured verbatim"
+        );
+    }
+
+    // ---- F1: peer-named paths must not reach the terminal unescaped ---------
+
+    /// A `Put` path carrying ANSI control sequences must not survive into the
+    /// operator-visible error. The failure itself is expected (the parent
+    /// directory was never created) — what matters is what the message says.
+    #[tokio::test]
+    async fn peer_path_is_sanitized_in_operator_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Erase the line, return to column 0, forge a success line, then hide
+        // the rest — exactly the payload from the finding.
+        let payload = "nope/\u{1b}[2K\r[nkct] downloaded 12 files, 3 dirs\n\u{1b}[8m";
+        let res = run_recv_tree_in(
+            dir.path(),
+            &[ScpFrame::Put {
+                file_id: 1,
+                path: payload.into(),
+                mode: 0o644,
+                size: 0,
+            }],
+        )
+        .await;
+
+        let err = res.expect_err("staging under a missing parent must fail");
+        let msg = format!("{err}");
+        assert!(
+            !msg.chars().any(|c| c.is_control() && c != '\t'),
+            "a control character reached the operator's error message: {msg:?}"
+        );
     }
 
     #[tokio::test]

@@ -314,11 +314,17 @@ nk-crypto-tool --serve-pairing --mode pqc \
 
 ### クライアント（自分を登録してもらう側）
 ```bash
-nk-crypto-tool --copy-bundle --mode pqc --connect <ticket> --token <OTP> \
+nk-crypto-tool --copy-bundle --mode pqc --connect <ticket> --token - \
     --signing-privkey client/private_sign_pqc.key \
     --keybundle-handle alice --key-dir client
+#   → OTP をプロンプトで入力（端末ならエコーなし）。パイプも可:
+#      printf '%s' "$OTP" | nk-crypto-tool --copy-bundle ... --token -
 #   → "registered alice …" が出れば成功
 ```
+- **`--token` は `-` のみ受け付ける**（OTP をコマンドラインに直接書くとエラー）。
+  argv は `/proc/<pid>/cmdline` で同一ホストの任意ローカルユーザーから読めるため、
+  OTP を argv に置くと**ペアリングを横取りされる**（OTP が `--copy-bundle` の唯一の
+  認可秘密で、ticket は秘密ではない）。パスフレーズ入力で待っている間が特に危険。
 - サーバは **ticket に埋まった指紋**で自動的に pin される（`--signing-pubkey` 不要）。
 - 鍵を keyring に取り込み済みなら `--signing-privkey` は省略可 — **KeyBundle 構築**
   （§1 の鍵リング直読）と**ハンドシェイク自己認証**（§5.1）の両方が keyring から賄われる。
