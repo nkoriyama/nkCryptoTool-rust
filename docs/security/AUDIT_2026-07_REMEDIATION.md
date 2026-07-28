@@ -314,4 +314,131 @@ Beyond confirming the 21 do not reappear:
 - Whether the Privacy Mode warning can be suppressed through another path.
 - The three coverage gaps in §5.
 
-**Re-scan status: not run.** `/claude-security` is user-triggered and billed.
+**Re-scan status: run.** See §7.
+
+---
+
+## 7. Re-scan of the remediation commit (2026-07-28)
+
+A second scan was run in `changes` mode over the remediation commit itself
+(`4de865a52306c1bf9e80014f7208aaf5239dcddd`, 29 files / 2686 lines) at **medium**
+effort. Sixteen raw candidates deduplicated to fifteen; all fifteen reached a
+three-lens adversarial panel (45 votes, every round complete at three voters)
+and **6 survived**. No HIGH. Nine were refuted — F8/F9/F10/F11/F12/F14 at 0/3
+and F7/F13/F15 at 1/3.
+
+Report: `CLAUDE-SECURITY-20260728-023318/CLAUDE-SECURITY-RESULTS.md`
+(`verification.status: verified`).
+
+Four of the six were gaps in the §1 remediation rather than new defects: two
+sinks the new sanitizer and the new algorithm-name validator do not reach, one
+denial-of-service introduced by the new per-group lock, and one exposure the
+first pass mitigated but did not close.
+
+### Findings and where they were fixed
+
+`R6` is the same sink as `R2`, found independently through a second lens; the
+`R2` fix closes both, so five changes cover six findings.
+
+| ID | Sev | Votes | Summary | Fixed in | Tests |
+|----|-----|-------|---------|----------|-------|
+| R4 | MED | 3/3 | Per-group MLS lock held across `fanout_send`, so one silent member freezes all inbound processing for the group | `group/processor.rs`, `group/transport.rs` | `send_releases_group_lock_before_fanout`, `send_still_waits_for_the_group_lock` |
+| R2/R6 | MED | 3/3 | `MkDir` chmods pre-existing client directories, and an empty path reaches the destination root itself | `scp.rs` — `safe_join`, `recv_tree`, new `clamp_dir_mode` | `mkdir_rejects_empty_path`, `mkdir_leaves_pre_existing_directory_mode_alone`, `mkdir_does_not_mode_implied_parents`, `mkdir_applies_mode_to_newly_created_directory`, `mkdir_clamps_group_and_other_write` |
+| R3 | MED | 2/3 | Pairing OTP still accepted on argv (warned only), leaving the `/proc/<pid>/cmdline` hijack path documented | `main.rs`, `USAGE.md` | `pairing_token_cli.rs` (2 tests) |
+| R1 | MED | 3/3 | Peer-supplied path bypasses the decode-time terminal sanitizer via `dest.display()` | `scp.rs` — new `show_path` at three sinks | `peer_path_is_sanitized_in_operator_errors` |
+| R5 | LOW | 3/3 | NKCS signature-header algorithm names skip `validate_algo_name` | `strategy/pqc.rs`, `strategy/ecc.rs` | 5 tests across both parsers |
+
+**R4.** The group guard now covers `load → encrypt → persist → encode` and
+stops there; `fanout_send` runs with it released. The ordering is deliberate:
+the key schedule is persisted before any bytes leave the host (a recipient must
+never hold a message our state does not know we sent), which also fixes the
+failure semantics — past the critical section the epoch has advanced durably, so
+a fan-out error is a *delivery* failure and never rolls MLS state back. Delivery
+ordering is not serialized by this lock and never was: `broadcast_commit` has
+always fanned out unlocked, and MLS application messages carry their own
+generation, so recipients tolerate reordering. Separately, the sender's trailing
+ACK read and stream shutdown moved from `IDLE_TIMEOUT` (300 s each) to a new
+`ACK_LINGER` of 10 s — both outcomes are discarded, so the longer wait bought
+nothing and cost a 10-minute stall per message that any recipient could trigger.
+
+The regression test was confirmed to have teeth: restoring the old lock scope
+makes `send_releases_group_lock_before_fanout` fail with
+`held the group lock across the fan-out`.
+
+**R2/R6.** Three changes. `safe_join` rejects a relative path with no
+components, so a peer can no longer name the destination root. `MkDir` uses
+`create_dir` instead of `create_dir_all` for the directory the peer named, so
+`AlreadyExists` is distinguishable from "we made it" and the mode is applied
+only to directories this transfer created; missing ancestors are still created,
+but with default permissions. Finally `clamp_dir_mode` masks off group and other
+write even on directories we did create, so a peer cannot leave a
+world-writable directory behind. OpenSSH scp makes the same trade the other way
+round — it ignores the remote mode entirely without `-p`.
+
+**R3.** A warning was not enough: the in-tree help and `USAGE.md` still showed
+the argv form, so the exposure survived in practice. `--token` now accepts only
+`-`; a literal value is an error naming the `/proc` exposure and the piping
+alternative. This is a **breaking CLI change** — see §8.
+
+**R1.** `show_path` routes peer-derived paths through the same
+`sanitize_for_terminal_bounded` gate the frame decoder uses, at the `mkdir`,
+`stage` and `commit` sinks in `recv_tree`. The decoder's comment claiming
+`Fail`/`Err` were "the peer's only channel to the display" was wrong and has
+been corrected in place.
+
+**R5.** `validate_algo_name` is now called immediately after each `read_string`
+in both `deserialize_signature_header` implementations, matching what the
+encryption header already did. Rejection is at the parse boundary, not at the
+point of use. The real algorithm names (`ML-KEM-768`, `ML-DSA-65`, `SHA3-512`,
+`prime256v1`) all pass the charset, so no existing signature stops verifying;
+there is an explicit test for that.
+
+### Verification
+
+```
+cargo test                                    219 passed, 1 ignored
+cargo test --features mls --lib group::       126 passed
+cargo clippy --all-targets                    no issues
+scripts/mandate_check.sh                      PASS=21 FAIL=0 WARN=1
+```
+
+The `WARN` is the pre-existing `clippy has continue-on-error: true` check.
+`.security-baseline.sha256` needed no rebaseline: none of the nine baselined
+files changed in this round.
+
+### Coverage limits of the re-scan
+
+**The "6 findings" figure is not a complete re-evaluation of the remediation
+commit.** The componentizer inferred the commit's scope from the preceding
+`docs(scp)` / `chore` commits and concluded it was scp-scoped, so it excluded
+`src/group`, `src/utils.rs`, `src/processor.rs`, `src/pairing.rs`,
+`src/keyring.rs`, `src/forward.rs` and `src/gui` from the researcher matrix —
+all of which the commit in fact modifies. R4 was found in
+`src/group/processor.rs` only because a researcher followed a lead across that
+boundary, which is evidence that the excluded areas were not empty. The nine
+refutations bound nothing outside the scanned components.
+
+The correct next step is a scan that explicitly covers the changed components,
+or a whole-repository run — not another `changes` pass.
+
+### Observed but not changed
+
+`scp.rs` interpolates peer-supplied paths into **server-side audit records**
+without sanitizing: `scp mkdir ok path={}` (`dir.display()`),
+`scp deny: mkdir {path}` (the raw frame string), `scp put ok path={}`, and the
+`put {path}: …` reasons. This is the same class as R1 with a different sink — an
+audit file rather than a terminal — and the panel did not raise it. Left for a
+scan pass that covers the server side deliberately, rather than folded into this
+round.
+
+---
+
+## 8. Breaking changes in this round
+
+- **`--token <OTP>` is rejected.** Only `--token -` is accepted; the OTP is read
+  from the terminal without echo, or from stdin so it can be piped. Any script
+  passing the OTP literally must change to
+  `printf '%s' "$OTP" | nk-crypto-tool … --token -`.
+- **`MkDir` modes are no longer honoured on pre-existing directories**, and are
+  masked to drop group/other write on new ones. A `get -r` that previously
+  reproduced a `0o775` or `0o777` directory now yields `0o755`.

@@ -228,29 +228,31 @@ struct Args {
 
     /// Run a P2P pairing server on ALPN `nkct/pairing/1` (ssh-copy-id equivalent).
     /// Prints a one-time token, ticket, and this node's fingerprint; a client runs
-    /// `--copy-bundle --connect <ticket> --token <OTP>` to register its KeyBundle.
+    /// `--copy-bundle --connect <ticket> --token -` to register its KeyBundle.
     /// Registration (authz grants + bundle) is written to the redb keyring at
     /// `<key-dir>/keyring.db` (or `--keyring-db`); refuses to run as root.
     #[arg(long)]
     serve_pairing: bool,
 
     /// Pairing client: send our signed KeyBundle to a pairing server for
-    /// auto-registration. Use with `--connect <ticket>`, `--token <OTP>`,
+    /// auto-registration. Use with `--connect <ticket>`, `--token -`,
     /// `--signing-privkey` (our identity), `--signing-pubkey` (pin the server),
     /// and `--keybundle-handle` (the name the server saves us under).
     #[arg(long)]
     copy_bundle: bool,
 
     /// One-time token for `--copy-bundle`, as printed by the pairing server.
+    /// The only accepted value is `-`, which reads the OTP from stdin.
     ///
-    /// Use `--token -` to read it from stdin instead. Unlike `--qr`, this is not
-    /// a courtesy: the OTP is the *sole* authorization secret for enrolling an
-    /// identity into the server's keyring, and a value passed on the command
-    /// line is world-readable on Linux via `/proc/<pid>/cmdline` for as long as
-    /// the process runs — which includes the passphrase prompt that happens
-    /// before any network connection is made. Any local user can read it there
-    /// and race the legitimate client to the single-shot pairing server. If
-    /// stdin is a terminal, `--token -` prompts without echoing.
+    /// Unlike `--qr`, this is not a courtesy: the OTP is the *sole*
+    /// authorization secret for enrolling an identity into the server's
+    /// keyring, and a value passed on the command line is world-readable on
+    /// Linux via `/proc/<pid>/cmdline` for as long as the process runs — which
+    /// includes the passphrase prompt that happens before any network
+    /// connection is made. Any local user can read it there and race the
+    /// legitimate client to the single-shot pairing server. Passing the OTP
+    /// literally is therefore rejected, not warned about. If stdin is a
+    /// terminal, `--token -` prompts without echoing.
     #[arg(long)]
     token: Option<String>,
 
@@ -931,19 +933,26 @@ async fn main() -> anyhow::Result<()> {
     // role (`copy_bundle`), and the token.
     config.serve_pairing = args.serve_pairing;
     config.copy_bundle = args.copy_bundle;
-    // `--token -` keeps the OTP off argv, where any local user can read it from
-    // /proc and race us to the single-shot pairing server. From a terminal we
-    // prompt without echo; otherwise we take one line from stdin so it can be
-    // piped. A token given directly on the command line still works, but warns.
+    // The OTP is the sole authorization secret for `--copy-bundle`: whoever
+    // holds it (plus the ticket, which is not secret) can enrol their own
+    // identity into the server's keyring with the operator's configured grants.
+    // On Linux argv is world-readable via /proc/<pid>/cmdline for the whole
+    // process lifetime — including the passphrase prompt that follows — so a
+    // literal `--token <OTP>` hands any local user a window to read it and race
+    // us to the single-shot pairing server.
+    //
+    // A warning was not enough: the documented workflow still put it on the
+    // command line, so the exposure survived in practice. Only `-` is accepted
+    // now. From a terminal we prompt without echo; otherwise we take one line
+    // from stdin, so it can still be piped from a secret store.
     config.pairing_token = match args.token.as_deref() {
         Some("-") => Some(read_pairing_token_from_stdin()?),
-        Some(_) => {
-            eprintln!(
-                "[nkct] warning: --token on the command line is visible to other local users \
-                 via /proc/<pid>/cmdline; prefer `--token -` to read it from stdin"
-            );
-            args.token
-        }
+        Some(_) => anyhow::bail!(
+            "--token no longer accepts the OTP on the command line: argv is readable by \
+             any local user via /proc/<pid>/cmdline, which is enough to hijack the \
+             pairing. Use `--token -` to be prompted, or pipe it: \
+             `printf '%s' \"$OTP\" | nk-crypto-tool --copy-bundle ... --token -`"
+        ),
         None => None,
     };
     config.keybundle_handle = args.keybundle_handle.clone();
@@ -1106,7 +1115,7 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("--copy-bundle requires --connect <ticket> (the pairing server's ticket)");
         }
         if config.pairing_token.is_none() {
-            anyhow::bail!("--copy-bundle requires --token <OTP> (as printed by the pairing server)");
+            anyhow::bail!("--copy-bundle requires `--token -` (the OTP is read from stdin)");
         }
         // No --signing-privkey needed: build_keybundle_bytes falls back to the
         // keyring my-identities table (keyring_bundle_keys), which errors with

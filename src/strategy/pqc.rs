@@ -477,9 +477,19 @@ impl CryptoStrategy for PqcStrategy {
             Ok(s)
         };
 
+        // Same gate as the NKCT v3 encryption header: reject at the parse
+        // boundary, not at the point of use. These strings come from an
+        // attacker-supplied `.sig` and `dsa_algo` in particular is interpolated
+        // verbatim into the "Unsupported PQC algorithm for OID" error, which is
+        // printed on the operator's terminal at the exact moment they are
+        // reading a verification result — enough to clear the screen and paint
+        // a forged "Signature verified successfully."
         self.kem_algo = read_string(&mut pos)?;
+        v3::validate_algo_name("kem_algo", &self.kem_algo)?;
         self.dsa_algo = read_string(&mut pos)?;
+        v3::validate_algo_name("dsa_algo", &self.dsa_algo)?;
         self.digest_algo = read_string(&mut pos)?;
+        v3::validate_algo_name("digest_algo", &self.digest_algo)?;
         Ok(pos)
     }
 
@@ -783,4 +793,76 @@ fn v3_decrypt_chunk(
     let pt = v3::aead_decrypt_chunk(aead_algo, key, &nonce, &aad, ciphertext_and_tag)?;
     *counter = counter.checked_add(1).ok_or(CryptoError::CounterOverflow)?;
     Ok(pt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic NKCS PQC signature header: magic ‖ version ‖ type ‖
+    /// len-prefixed kem_algo, dsa_algo, digest_algo.
+    fn nkcs(kem: &str, dsa: &str, digest: &str) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(b"NKCS");
+        h.extend_from_slice(&NKCS_VERSION_DOMAIN_SEP.to_le_bytes());
+        h.push(StrategyType::PQC as u8);
+        for s in [kem, dsa, digest] {
+            h.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            h.extend_from_slice(s.as_bytes());
+        }
+        h
+    }
+
+    /// The real algorithm names still round-trip — the gate must not break
+    /// every signature this tool has ever written.
+    #[test]
+    fn signature_header_accepts_real_algorithm_names() {
+        let mut s = PqcStrategy::new();
+        let h = nkcs("ML-KEM-768", "ML-DSA-65", "SHA3-512");
+        assert!(s.deserialize_signature_header(&h).is_ok());
+        assert_eq!(s.dsa_algo, "ML-DSA-65");
+    }
+
+    /// A hostile `.sig` cannot smuggle terminal control sequences through the
+    /// algorithm-name fields. `dsa_algo` is the one interpolated verbatim into
+    /// "Unsupported PQC algorithm for OID: …", which the operator reads at the
+    /// exact moment they are looking at a verification result.
+    #[test]
+    fn signature_header_rejects_control_characters() {
+        for payload in [
+            "\u{1b}[2J\u{1b}[HSignature verified successfully.",
+            "ML-DSA-65\r\nverified",
+            "ML-DSA-65\u{7}",
+        ] {
+            let mut s = PqcStrategy::new();
+            let h = nkcs("ML-KEM-768", payload, "SHA3-512");
+            assert!(
+                s.deserialize_signature_header(&h).is_err(),
+                "accepted a dsa_algo carrying control characters: {payload:?}"
+            );
+        }
+    }
+
+    /// Every string field is gated, not just the one with a known sink.
+    #[test]
+    fn signature_header_rejects_empty_and_overlong_names() {
+        let esc = "\u{1b}[2J";
+        let long = "A".repeat(65);
+        let cases: [(&str, &str, &str); 6] = [
+            ("", "ML-DSA-65", "SHA3-512"),
+            ("ML-KEM-768", "", "SHA3-512"),
+            ("ML-KEM-768", "ML-DSA-65", ""),
+            (&long, "ML-DSA-65", "SHA3-512"),
+            ("ML-KEM-768", &long, "SHA3-512"),
+            ("ML-KEM-768", "ML-DSA-65", esc),
+        ];
+        for (kem, dsa, digest) in cases {
+            let mut s = PqcStrategy::new();
+            assert!(
+                s.deserialize_signature_header(&nkcs(kem, dsa, digest))
+                    .is_err(),
+                "accepted {kem:?}/{dsa:?}/{digest:?}"
+            );
+        }
+    }
 }

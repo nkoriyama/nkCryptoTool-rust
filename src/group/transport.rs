@@ -35,12 +35,27 @@
 //! [`crate::network::IDLE_TIMEOUT`] (5 minutes), matching the 1:1 chat
 //! conventions. A stalled peer therefore fails fast rather than
 //! blocking the processor indefinitely.
+//!
+//! The sender's trailing ACK read and stream shutdown are the exception:
+//! their outcome is discarded (see `send_one`), so a peer that simply
+//! never answers must not be able to buy 5 minutes of our time twice
+//! over. Those two waits use [`ACK_LINGER`] instead.
 
 use mls_rs::MlsMessage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::network::IDLE_TIMEOUT;
 use crate::p2p::{P2pEndpoint, P2pError, P2pProtocol, P2pStream, PeerAddr};
+
+/// How long the sender lingers for the receiver's ACK byte and for the
+/// stream shutdown.
+///
+/// Both outcomes are deliberately ignored — the ACK exists to keep the
+/// QUIC connection alive past the receiver's body read, not to confirm
+/// delivery — so this is a politeness window, not a correctness one.
+/// It must stay short: it is time an unresponsive or hostile recipient
+/// can make the sender spend, once per recipient per message.
+const ACK_LINGER: std::time::Duration = crate::network::HANDSHAKE_TIMEOUT;
 
 /// Maximum acceptable encoded MLS frame size (16 MiB).
 ///
@@ -142,10 +157,16 @@ pub async fn send_mls_message<S: P2pStream>(
     // or a `--verbose` switch) to re-expose these for debugging.
     //
     // Body-write failures *above* this point still surface as errors.
+    //
+    // Bounded by ACK_LINGER, not IDLE_TIMEOUT: because the result is
+    // discarded, a recipient that stays silent gains nothing by our
+    // waiting longer, while every second we do wait is a second it can
+    // charge us. At IDLE_TIMEOUT this pair was a 10-minute stall any
+    // group member could trigger on demand.
     let mut ack = [0u8; 1];
-    let _ = tokio::time::timeout(IDLE_TIMEOUT, stream.read_exact(&mut ack)).await;
+    let _ = tokio::time::timeout(ACK_LINGER, stream.read_exact(&mut ack)).await;
     // Best-effort shutdown — same rationale, swallow errors.
-    let _ = tokio::time::timeout(IDLE_TIMEOUT, stream.shutdown()).await;
+    let _ = tokio::time::timeout(ACK_LINGER, stream.shutdown()).await;
     Ok(())
 }
 

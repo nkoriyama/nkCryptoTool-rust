@@ -518,8 +518,13 @@ impl CryptoStrategy for EccStrategy {
             Ok(s)
         };
 
+        // Same gate as the NKCT v3 encryption header — see the PQC counterpart:
+        // these come from an attacker-supplied `.sig` and reach operator-visible
+        // errors, so they are rejected at the parse boundary.
         self.curve_name = read_string(&mut pos)?;
+        v3::validate_algo_name("curve_name", &self.curve_name)?;
         self.digest_algo = read_string(&mut pos)?;
+        v3::validate_algo_name("digest_algo", &self.digest_algo)?;
         Ok(pos)
     }
 
@@ -839,4 +844,54 @@ fn decrypt_chunk_inner(
     let pt = v3::aead_decrypt_chunk(aead_algo, key, &nonce, &aad, ciphertext_and_tag)?;
     *counter = counter.checked_add(1).ok_or(CryptoError::CounterOverflow)?;
     Ok(pt)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a synthetic NKCS ECC signature header: magic ‖ version ‖ type ‖
+    /// len-prefixed curve_name, digest_algo.
+    fn nkcs(curve: &str, digest: &str) -> Vec<u8> {
+        let mut h = Vec::new();
+        h.extend_from_slice(b"NKCS");
+        h.extend_from_slice(&1u16.to_le_bytes());
+        h.push(StrategyType::ECC as u8);
+        for s in [curve, digest] {
+            h.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            h.extend_from_slice(s.as_bytes());
+        }
+        h
+    }
+
+    #[test]
+    fn signature_header_accepts_real_algorithm_names() {
+        let mut s = EccStrategy::new();
+        assert!(s
+            .deserialize_signature_header(&nkcs("prime256v1", "SHA3-512"))
+            .is_ok());
+        assert_eq!(s.curve_name, "prime256v1");
+    }
+
+    /// The PQC counterpart's gate, applied to the ECC container's fields:
+    /// both reach operator-visible errors the same way.
+    #[test]
+    fn signature_header_rejects_control_characters_and_bad_lengths() {
+        let long = "A".repeat(65);
+        let cases: [(&str, &str); 6] = [
+            ("\u{1b}[2J\u{1b}[HSignature verified successfully.", "SHA3-512"),
+            ("prime256v1", "\u{1b}[2JOK"),
+            ("prime256v1\r\n", "SHA3-512"),
+            ("", "SHA3-512"),
+            ("prime256v1", ""),
+            (&long, "SHA3-512"),
+        ];
+        for (curve, digest) in cases {
+            let mut s = EccStrategy::new();
+            assert!(
+                s.deserialize_signature_header(&nkcs(curve, digest)).is_err(),
+                "accepted {curve:?}/{digest:?}"
+            );
+        }
+    }
 }
