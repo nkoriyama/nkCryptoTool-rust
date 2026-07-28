@@ -61,7 +61,7 @@ slint = { version = "1.16", optional = true }
 arboard = { version = "3.4", optional = true }
 nokhwa = { version = "0.10", optional = true, features = ["input-native", "output-threaded"] }
 rqrr = { version = "0.6", optional = true }
-image = { version = "0.24", optional = true }
+image = { version = "0.25", optional = true }
 
 # MLS group chat (opt-in via `--features mls`). See MLS_GROUP_CHAT_PLAN.md.
 mls-rs = { version = "0.55", optional = true }
