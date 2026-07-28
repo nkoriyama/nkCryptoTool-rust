@@ -37,6 +37,15 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "hkdf"
         update-types: ["version-update:semver-major"]
+      # foreign-types is not ours to choose: `backend/openssl_impl.rs` calls
+      # `ForeignType::as_ptr()` on types owned by the `openssl` crate, so our
+      # version has to be the one `openssl` links against (0.3 for openssl
+      # 0.10.x). Bumping it alone gives two `foreign-types-shared` copies and
+      # the trait no longer applies — 24 compile errors, recorded on #76.
+      # This unpins itself when `openssl` moves; there is nothing to do here
+      # until then.
+      - dependency-name: "foreign-types"
+        update-types: ["version-update:semver-major"]
 
   # GitHub Actions used by our workflows (keeps actions/checkout, cache, etc.
   # current — this is what the Node 20 deprecation bump would have surfaced).
