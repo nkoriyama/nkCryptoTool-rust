@@ -60,8 +60,13 @@ hex = "0.4"
 slint = { version = "1.16", optional = true }
 arboard = { version = "3.4", optional = true }
 nokhwa = { version = "0.10", optional = true, features = ["input-native", "output-threaded"] }
-rqrr = { version = "0.6", optional = true }
-image = { version = "0.24", optional = true }
+rqrr = { version = "0.10", optional = true }
+# NOTE: no direct `image` dependency. `gui/camera.rs` never names the crate —
+# it feeds raw greyscale bytes to `rqrr::PreparedImage::prepare_from_greyscale`
+# and calls inherent methods on the buffer nokhwa hands back. Declaring `image`
+# separately only pinned a second copy of whatever version `rqrr` already
+# chose; with rqrr 0.10 and qrcode 0.14 the tree converges on a single
+# image 0.25.
 
 # MLS group chat (opt-in via `--features mls`). See MLS_GROUP_CHAT_PLAN.md.
 mls-rs = { version = "0.55", optional = true }
@@ -129,7 +134,7 @@ iroh = { version = "1.0" }
 iroh-base = { version = "1.0", features = ["key", "relay"] }
 iroh-relay = "1.0"
 data-encoding = "2.4"
-qrcode = "0.12"
+qrcode = "0.14"
 crc = "3.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
@@ -164,7 +169,7 @@ slint-build = { version = "1.16", optional = true }
 default = ["backend-rustcrypto"]
 gui = ["slint", "slint-build", "arboard"]
 testing = []
-gui-camera = ["gui", "nokhwa", "rqrr", "image"]
+gui-camera = ["gui", "nokhwa", "rqrr"]
 gui-notifications = ["gui", "notify-rust"]
 # Gates the ScreenProtectionApi impls. Since #71 (F6) every impl is a stub that
 # returns Err and reports is_supported() == false, so the feature no longer
