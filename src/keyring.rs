@@ -30,6 +30,37 @@ type Result<T> = std::result::Result<T, CryptoError>;
 /// `handle -> fingerprint(32) ‖ added_at(8 LE) ‖ keybundle_bytes`.
 const CONTACTS: TableDefinition<&str, &[u8]> = TableDefinition::new("keyring_contacts_v1");
 
+/// Reject a contact handle that is unsafe as a filename or as terminal output.
+///
+/// A handle is frequently authored by the peer whose bundle is being stored, and
+/// it is displayed by `keyring list` — the table an operator reads to decide
+/// which fingerprint owns which name before selecting one with `--recipient`.
+/// Restricting it to `[A-Za-z0-9._-]` keeps a contact from embedding escape
+/// sequences that repaint that table, and keeps the handle usable as a path
+/// component. This is the single definition; `pairing` re-exports it so the
+/// pairing path and the `add`/`import` paths cannot drift apart.
+pub fn validate_handle(handle: &str) -> Result<()> {
+    if handle.is_empty() || handle.len() > 128 {
+        return Err(CryptoError::Parameter(
+            "handle empty or too long".into(),
+        ));
+    }
+    if handle == "." || handle == ".." || handle.starts_with('.') {
+        return Err(CryptoError::Parameter(
+            "handle must not start with a dot".into(),
+        ));
+    }
+    if !handle
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(CryptoError::Parameter(
+            "handle may only contain [A-Za-z0-9._-]".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// `fingerprint(32) -> grants(u8)` — per-service transport authorization. Keyed
 /// by fingerprint (the value the handshake proves), distinct from the
 /// handle-keyed contacts table.
@@ -138,7 +169,14 @@ impl KeyringStore {
     /// handle already holds a bundle for a **different** fingerprint, the write is
     /// refused (a different identity must not hijack the handle). Re-storing under
     /// the same fingerprint is an idempotent update.
+    ///
+    /// The handle is validated here rather than at each caller: it is often
+    /// chosen by the bundle's author, not by the operator, and `keyring list`
+    /// renders it as the audit view that `--recipient <handle>` then selects
+    /// from. Verifying the bundle's signature proves who wrote the handle, not
+    /// that the handle is well-formed.
     pub fn add(&self, handle: &str, fp: &[u8; 32], bundle: &[u8], added_at: u64) -> Result<AddOutcome> {
+        validate_handle(handle)?;
         let outcome = match self.get(handle)? {
             Some(e) if &e.fingerprint != fp => {
                 return Err(CryptoError::Parameter(format!(
@@ -652,8 +690,15 @@ pub fn peek_v3_header(bytes: &[u8]) -> Result<PeekedHeader> {
             .get(*p..*p + len)
             .ok_or_else(|| CryptoError::FileRead("truncated header".into()))?;
         *p += len;
-        String::from_utf8(v.to_vec())
-            .map_err(|_| CryptoError::FileRead("non-UTF-8 header string".into()))
+        let s = String::from_utf8(v.to_vec())
+            .map_err(|_| CryptoError::FileRead("non-UTF-8 header string".into()))?;
+        // These are protocol constants, and the caller interpolates them into
+        // errors that reach the operator's terminal (main.rs's keyring
+        // auto-match path bails with the algorithm name in the message). The
+        // length check above does not constrain the charset, so an ESC-laden
+        // name would otherwise repaint the failure the operator is reading.
+        crate::strategy::streaming_aead::validate_algo_name("header algorithm", &s)?;
+        Ok(s)
     }
 
     if bytes.len() < 7 || &bytes[0..4] != b"NKCT" {
@@ -724,6 +769,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join("keyring.db")
+    }
+
+    #[test]
+    fn add_rejects_a_handle_that_could_repaint_keyring_list() {
+        // The handle is usually authored by the bundle's owner, and `keyring
+        // list` is the table an operator reads before `--recipient <handle>`.
+        // Signature verification proves who wrote the handle, not that it is
+        // well-formed, so the charset gate has to live in `add` itself.
+        let path = tmp("handle");
+        let ks = KeyringStore::open(&path).unwrap();
+        let fp = [3u8; 32];
+        let hostile = "mallory\u{1b}[1A\u{1b}[2K0000  alice";
+        assert!(ks.add(hostile, &fp, b"bundle", 1).is_err());
+        assert!(ks.get(hostile).unwrap().is_none(), "hostile handle was stored");
+
+        // Sibling rejections and the shapes that must keep working.
+        assert!(ks.add("with space", &fp, b"b", 1).is_err());
+        assert!(ks.add(".hidden", &fp, b"b", 1).is_err());
+        assert!(ks.add("", &fp, b"b", 1).is_err());
+        assert!(ks.add("alice", &fp, b"b", 1).is_ok());
+        assert!(ks.add("alice.laptop-2_v3", &fp, b"b", 1).is_ok());
     }
 
     #[test]

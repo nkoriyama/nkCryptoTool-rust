@@ -160,6 +160,17 @@ pub struct CryptoConfig {
 
     pub connect_addr: Option<String>,
     pub chat_mode: bool,
+    /// Inbound file-receive mode (ALPN_FILE). Set per-connection by the ALPN
+    /// dispatch, like `chat_mode`; exists so authorization can name the service
+    /// rather than inferring it from "every other mode is false".
+    pub file_mode: bool,
+    /// This node will *serve* chat and file-receive (`--serve-chat`). Only when
+    /// true does an inbound chat/file-ALPN connection get served — so a node
+    /// started as a shell, scp, forward or pairing server does not additionally
+    /// hand a peer an interactive chat session against its own stdin, nor write
+    /// peer-chosen bytes to its stdout. The peer picks the ALPN, so without this
+    /// gate the operator's choice of service is advisory.
+    pub serve_chat: bool,
     /// P2P shell mode (ALPN_SHELL). Mutually exclusive with chat/file; when set,
     /// the post-handshake path runs the shell session instead of chat/file.
     /// True for both the shell client and server.
@@ -321,6 +332,8 @@ impl Default for CryptoConfig {
             is_recursive: false,
             connect_addr: None,
             chat_mode: false,
+            file_mode: false,
+            serve_chat: false,
             shell_mode: false,
             serve_shell: false,
             shell_command: None,

@@ -40,9 +40,78 @@ pub const V3_FLAG_INTERMEDIATE: u8 = 0x00;
 pub const V3_FLAG_FINAL: u8 = 0x01;
 pub const V3_DEFAULT_CHUNK_SIZE: u32 = 1024 * 1024;
 
+/// Largest chunk size a v3 header may declare (64 MiB, 64x the default).
+///
+/// On decrypt this field is entirely attacker-controlled and is read before a
+/// single AEAD tag has been verified, yet it sizes both the wire buffer and the
+/// plaintext buffer. Because the plaintext buffer is a `Zeroizing<Vec<u8>>`
+/// whose drop volatile-writes its *whole capacity*, an unbounded value does not
+/// merely reserve address space — it commits that much physical memory even on
+/// the error path. Bounding it at parse time keeps the worst case proportional
+/// to a legitimate producer's choice instead of to `u32::MAX`.
+pub const V3_MAX_CHUNK_SIZE: u32 = 64 * 1024 * 1024;
+
+/// Longest algorithm-name string accepted from a v3 header.
+const V3_MAX_ALGO_NAME_LEN: usize = 64;
+
 /// HKDF info labels for v3 derivation.
 pub const V3_INFO_ENC_KEY: &[u8] = b"nkct-v3-enc-key";
 pub const V3_INFO_NONCE_PREFIX: &[u8] = b"nkct-v3-nonce-prefix";
+
+/// Reject a header-declared chunk size that is zero or implausibly large.
+///
+/// Callers must apply this in `deserialize_header` — i.e. before the value is
+/// used to size any buffer — since everything downstream of the parser treats
+/// it as trusted.
+pub fn validate_chunk_size(chunk_size: u32) -> Result<()> {
+    if chunk_size == 0 {
+        return Err(CryptoError::FileRead(
+            "v3 chunk_size must be > 0".to_string(),
+        ));
+    }
+    if chunk_size > V3_MAX_CHUNK_SIZE {
+        return Err(CryptoError::FileRead(format!(
+            "v3 chunk_size {} exceeds the {} byte maximum",
+            chunk_size, V3_MAX_CHUNK_SIZE
+        )));
+    }
+    Ok(())
+}
+
+/// Reject an algorithm-name string from a v3 header that is not a plausible
+/// identifier.
+///
+/// These fields are protocol constants ("ML-KEM-768", "AES-256-GCM", ...), not
+/// free text, but they arrive via `String::from_utf8_lossy`, which preserves
+/// ESC and other C0 bytes. Several error paths interpolate the value into a
+/// message that reaches the operator's terminal, so an unconstrained name lets
+/// a hostile file paint arbitrary escape sequences at the exact moment the
+/// operator is reading a failure. Restricting the charset at parse time closes
+/// every such sink at once; `field` names the header field for the error.
+pub fn validate_algo_name(field: &str, name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(CryptoError::FileRead(format!("v3 {} is empty", field)));
+    }
+    if name.len() > V3_MAX_ALGO_NAME_LEN {
+        return Err(CryptoError::FileRead(format!(
+            "v3 {} exceeds {} bytes",
+            field, V3_MAX_ALGO_NAME_LEN
+        )));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '+')))
+    {
+        // Render the offending character escaped: it is exactly the byte we are
+        // refusing to let reach a terminal unfiltered.
+        return Err(CryptoError::FileRead(format!(
+            "v3 {} contains an invalid character {}",
+            field,
+            bad.escape_debug()
+        )));
+    }
+    Ok(())
+}
 
 /// One-shot AEAD encryption with AAD for v3 chunks. Returns ciphertext || tag.
 pub fn aead_encrypt_chunk(
@@ -69,9 +138,11 @@ pub fn aead_encrypt_chunk(
                 .encrypt(&nonce_arr, ChaChaPayload { msg: plaintext, aad })
                 .map_err(|_| CryptoError::OpenSSL("ChaCha20-Poly1305 encrypt failed".to_string()))
         }
+        // `other` may be a header-derived string; escape it so a hostile
+        // ciphertext cannot paint escape sequences via this error message.
         other => Err(CryptoError::Parameter(format!(
             "Unsupported v3 cipher: {}",
-            other
+            other.escape_debug()
         ))),
     }
 }
@@ -113,10 +184,12 @@ pub fn aead_decrypt_chunk(
                 )
                 .map_err(|_| CryptoError::SignatureVerification)?
         }
+        // Escaped for the same reason as in `aead_encrypt_chunk`: this string
+        // originates in the untrusted v3 header and this error is printed.
         other => {
             return Err(CryptoError::Parameter(format!(
                 "Unsupported v3 cipher: {}",
-                other
+                other.escape_debug()
             )))
         }
     };
@@ -416,6 +489,38 @@ pub fn hkdf_expand(prk_secret: &[u8], salt: &[u8], info: &[u8], out_len: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_size_bounds_reject_zero_and_the_amplifying_range() {
+        assert!(validate_chunk_size(0).is_err());
+        assert!(validate_chunk_size(u32::MAX).is_err(), "0xFFFFFFFF accepted");
+        assert!(validate_chunk_size(V3_MAX_CHUNK_SIZE + 1).is_err());
+        // The boundary itself, the default, and a small test-sized chunk are all
+        // legitimate.
+        assert!(validate_chunk_size(V3_MAX_CHUNK_SIZE).is_ok());
+        assert!(validate_chunk_size(V3_DEFAULT_CHUNK_SIZE).is_ok());
+        assert!(validate_chunk_size(1).is_ok());
+    }
+
+    #[test]
+    fn algo_names_reject_escape_sequences_and_padding() {
+        // The exact shape a hostile header would use to repaint a failure.
+        assert!(validate_algo_name("aead_algo", "\u{1b}[2J\u{1b}[HOK").is_err());
+        assert!(validate_algo_name("aead_algo", "AES-256-GCM\r\n").is_err());
+        assert!(validate_algo_name("aead_algo", "").is_err());
+        assert!(validate_algo_name("aead_algo", &"A".repeat(65)).is_err());
+        // Real protocol constants must keep parsing.
+        for ok in [
+            "AES-256-GCM",
+            "chacha20-poly1305",
+            "ML-KEM-768",
+            "ML-DSA-65",
+            "SHA3-512",
+            "prime256v1",
+        ] {
+            assert!(validate_algo_name("field", ok).is_ok(), "{ok} rejected");
+        }
+    }
 
     #[test]
     fn session_id_is_first_16_bytes_of_sha256() {

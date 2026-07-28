@@ -252,9 +252,63 @@ pub struct GroupChatProcessor {
     /// / unreachable). When `None`, behaviour matches the original
     /// direct-only path.
     inbox: Option<PeerAddr>,
+    /// Per-group serialization of the `load → mutate → write` cycle.
+    ///
+    /// `listen`/`chat-group` share one `Arc<GroupChatProcessor>` across an
+    /// inbound `accept_next` task, an optional inbox-poll task and the stdin
+    /// REPL, all on the multi-threaded runtime. Each of those reloads the group
+    /// from storage, mutates it and writes it back; interleave two and the
+    /// later writer persists a snapshot built from a state it read *before* the
+    /// earlier one landed, silently discarding it. When the discarded change is
+    /// a Commit that removed a member, the member is back on the roster and the
+    /// old epoch secrets stay live.
+    ///
+    /// Keyed by group id so unrelated groups still proceed in parallel. The map
+    /// holds `Weak` references, so an entry costs nothing once no task holds
+    /// that group's lock and is reclaimed on the next acquisition — the table
+    /// cannot grow without bound across a long-running session.
+    group_locks: std::sync::Mutex<
+        std::collections::HashMap<Vec<u8>, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
 }
 
 impl GroupChatProcessor {
+    /// Acquire the per-group lock, creating it if this is the first waiter.
+    ///
+    /// The returned guard must be held across the whole `load → mutate →
+    /// write` sequence — releasing it after the load defeats the point.
+    async fn lock_group(&self, group_id: &[u8]) -> tokio::sync::OwnedMutexGuard<()> {
+        // The strong reference is kept alive across the await below; the table
+        // holds only a `Weak`, so dropping it here would let a second caller
+        // mint a *different* mutex for the same group and defeat the exclusion.
+        let lock = self.group_lock_arc(group_id);
+        lock.lock_owned().await
+    }
+
+    /// The `Arc<Mutex>` for `group_id`, creating it on first use.
+    ///
+    /// Split out from [`lock_group`](Self::lock_group) so the table's own
+    /// (synchronous) lock is released before anyone awaits the group lock —
+    /// awaiting while holding it would serialize every group behind one.
+    fn group_lock_arc(&self, group_id: &[u8]) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self
+            .group_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Reclaim entries whose lock nobody holds any more. Done here rather
+        // than on release so it costs one pass per acquisition and needs no
+        // drop guard.
+        map.retain(|_, weak| weak.strong_count() > 0);
+        match map.get(group_id).and_then(|w| w.upgrade()) {
+            Some(existing) => existing,
+            None => {
+                let fresh = Arc::new(tokio::sync::Mutex::new(()));
+                map.insert(group_id.to_vec(), Arc::downgrade(&fresh));
+                fresh
+            }
+        }
+    }
+
     /// Build a processor backed by `storage`. The signing identity is
     /// **loaded from the sqlite db** when present, otherwise generated
     /// fresh and stored — so multiple invocations against the same db
@@ -401,6 +455,7 @@ impl GroupChatProcessor {
             storage,
             endpoint,
             inbox: None,
+            group_locks: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -572,6 +627,8 @@ impl GroupChatProcessor {
             )));
         }
 
+        // Held across load → commit → write, like every other mutation path.
+        let _guard = self.lock_group(gid.as_bytes()).await;
         let mut group = self.client.load_group(gid.as_bytes()).map_err(|e| {
             let msg = format!("{e}");
             if msg.contains("GroupNotFound") || msg.contains("group not found") {
@@ -672,10 +729,12 @@ impl GroupChatProcessor {
                 GroupError::Backend(format!("join_group: {e}"))
             })?;
 
-        group
-            .write_to_storage()
-            .map_err(|e| GroupError::Storage(format!("write_to_storage after join: {e}")))?;
-
+        // Everything below runs BEFORE `write_to_storage`. The group id is
+        // chosen by whoever authored the Welcome — reachable unauthenticated
+        // over `nkct/mls/1` — and mls-rs puts no constraint on it, so it must
+        // be checked while rejecting still costs nothing. Persisting first and
+        // validating afterwards left the bad row committed with no way to
+        // remove it.
         let id_bytes = group.group_id().to_vec();
         if id_bytes.len() != 32 {
             return Err(GroupError::Backend(format!(
@@ -683,10 +742,31 @@ impl GroupChatProcessor {
                 id_bytes.len()
             )));
         }
+
+        // A Welcome must not silently take over a group we are already in.
+        // The id travels in cleartext in every PrivateMessage header, so any
+        // past or present member of a group knows it; without this check one
+        // accepted Welcome replaces that group's stored MLS state, after which
+        // inbound messages no longer decrypt and outbound ones are encrypted
+        // under the attacker's key schedule. Mirrors the clobber protection
+        // already applied to commits and to keyring handles.
+        let existing = self.storage.list_group_ids_raw()?;
+        if existing.iter().any(|k| k.as_slice() == id_bytes.as_slice()) {
+            return Err(GroupError::InvalidWelcome(
+                "Welcome is for a group id that already exists locally; refusing to overwrite \
+                 its state (leave the existing group first if this is intentional)"
+                    .to_string(),
+            ));
+        }
+
+        group
+            .write_to_storage()
+            .map_err(|e| GroupError::Storage(format!("write_to_storage after join: {e}")))?;
+
         let mut id = [0u8; 32];
         id.copy_from_slice(&id_bytes);
         // Drop `group` to zeroize its in-memory keys via ZeroizeOnDrop;
-        // the state lives on in sqlite.
+        // the state lives on in storage.
         drop(group);
 
         Ok(GroupId::new(id))
@@ -824,6 +904,9 @@ impl GroupChatProcessor {
         body: &[u8],
         recipients: &[crate::p2p::PeerAddr],
     ) -> Result<Zeroizing<Vec<u8>>, GroupError> {
+        // Held until the state is written back below: the load and the write
+        // must not straddle another task's cycle for this group.
+        let _guard = self.lock_group(gid.as_bytes()).await;
         let mut group = self.client.load_group(gid.as_bytes()).map_err(|e| {
             let msg = format!("{e}");
             if msg.contains("GroupNotFound") || msg.contains("group not found") {
@@ -1237,6 +1320,11 @@ impl GroupChatProcessor {
                 GroupError::InvalidWelcome(format!("SYNC commit decode: {e}"))
             })?;
 
+            // Locked per applied commit rather than for the whole resync: each
+            // load → process → write must be atomic, but a resync streams over
+            // the network and holding the group for its full duration would
+            // stall the REPL and the inbound task for as long as the peer takes.
+            let _guard = self.lock_group(gid.as_bytes()).await;
             let mut group = self.client.load_group(gid.as_bytes()).map_err(|e| {
                 GroupError::Backend(format!("load_group during SYNC: {e}"))
             })?;
@@ -1324,6 +1412,10 @@ impl GroupChatProcessor {
                 gid_arr.copy_from_slice(gid_bytes);
                 let group_id = GroupId::new(gid_arr);
 
+                // Held across load → process → write. This is the side that
+                // carries Commits, including the Remove that a concurrent
+                // REPL/inbox write would otherwise roll back.
+                let _guard = self.lock_group(gid_bytes).await;
                 let mut group = self.client.load_group(gid_bytes).map_err(|e| {
                     let m = format!("{e}");
                     if m.contains("GroupNotFound") || m.contains("group not found") {
@@ -1629,6 +1721,10 @@ impl GroupChatProcessor {
         gid: &GroupId,
         index: u32,
     ) -> Result<Zeroizing<Vec<u8>>, GroupError> {
+        // Held across load → commit → write. This is the path whose loss the
+        // whole finding is about: a discarded Remove leaves the evicted member
+        // on the roster with the old epoch secrets still live.
+        let _guard = self.lock_group(gid.as_bytes()).await;
         let mut group = self.client.load_group(gid.as_bytes()).map_err(|e| {
             let m = format!("{e}");
             if m.contains("GroupNotFound") || m.contains("group not found") {
@@ -1821,9 +1917,138 @@ mod tests {
     use crate::p2p::backend::mock::MockNetwork;
     use crate::p2p::{P2pProtocol, PeerId};
     use mls_rs::ExtensionList;
+    use std::time::Duration;
     use tempfile::tempdir;
 
     const PROTO_MLS: P2pProtocol = P2pProtocol(b"nkct/mls/1");
+
+    // ---- F8: per-group serialization of load → mutate → persist ----------
+
+    /// A second waiter on the SAME group cannot enter the critical section
+    /// while the first holds it, and enters as soon as it is released.
+    /// Ordering is fixed with a `Notify`, not with sleeps.
+    #[tokio::test]
+    async fn same_group_waiters_are_serialized() {
+        let (proc, _dir) = build_proc("alice", 1);
+        let proc = Arc::new(proc);
+        let gid = [1u8; 32];
+
+        let held = proc.lock_group(&gid).await;
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let waiter = {
+            let (p, entered) = (proc.clone(), entered.clone());
+            tokio::spawn(async move {
+                let _g = p.lock_group(&gid).await;
+                entered.notify_one();
+            })
+        };
+
+        // With the lock held, the waiter must not get in. `notified()` is
+        // polled once; a ready notification here would mean it did.
+        tokio::task::yield_now().await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), entered.notified())
+                .await
+                .is_err(),
+            "a second task entered the critical section while the group was locked"
+        );
+
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("waiter never acquired the lock after it was released");
+        waiter.await.unwrap();
+    }
+
+    /// Holding one group's lock must not stall an unrelated group.
+    #[tokio::test]
+    async fn different_groups_stay_parallel() {
+        let (proc, _dir) = build_proc("alice", 1);
+        let held = proc.lock_group(&[1u8; 32]).await;
+        let other = tokio::time::timeout(Duration::from_secs(5), proc.lock_group(&[2u8; 32])).await;
+        assert!(
+            other.is_ok(),
+            "an unrelated group blocked on another group's lock"
+        );
+        drop(other);
+        drop(held);
+    }
+
+    /// Concurrent first-acquisition must converge on ONE mutex per group —
+    /// otherwise each caller would lock a private mutex and exclude nothing.
+    #[tokio::test]
+    async fn concurrent_first_acquisition_shares_one_mutex() {
+        let (proc, _dir) = build_proc("alice", 1);
+        let proc = Arc::new(proc);
+        let gid = [7u8; 32];
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(16));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let (p, barrier) = (proc.clone(), barrier.clone());
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await; // fix the race point
+                p.group_lock_arc(&gid)
+            }));
+        }
+        let mut arcs = Vec::new();
+        for h in handles {
+            arcs.push(h.await.unwrap());
+        }
+        for a in &arcs[1..] {
+            assert!(
+                Arc::ptr_eq(&arcs[0], a),
+                "the table handed out more than one mutex for the same group"
+            );
+        }
+        assert_eq!(proc.group_locks.lock().unwrap().len(), 1);
+    }
+
+    /// The table holds only `Weak`s, so a released lock becomes unupgradable
+    /// and its entry is swept — it cannot grow without bound over a session.
+    #[tokio::test]
+    async fn released_locks_are_reclaimed() {
+        let (proc, _dir) = build_proc("alice", 1);
+        let gid = [9u8; 32];
+
+        // (1) While a strong reference lives, the same group yields the same Arc.
+        let a = proc.group_lock_arc(&gid);
+        let b = proc.group_lock_arc(&gid);
+        assert!(Arc::ptr_eq(&a, &b));
+
+        // (2) Once every strong reference is dropped, the table's Weak expires.
+        let weak = Arc::downgrade(&a);
+        drop(a);
+        drop(b);
+        assert!(
+            weak.upgrade().is_none(),
+            "the table kept a strong reference to a released lock"
+        );
+
+        // (3) A later acquisition mints a fresh Arc — and concurrent callers at
+        //     that point again converge on it.
+        let c = proc.group_lock_arc(&gid);
+        assert!(
+            weak.upgrade().is_none(),
+            "the expired lock must not come back"
+        );
+        let d = proc.group_lock_arc(&gid);
+        assert!(Arc::ptr_eq(&c, &d));
+        drop(c);
+        drop(d);
+
+        for i in 0..200u8 {
+            let _g = proc.lock_group(&[i; 32]).await;
+        }
+        // The next acquisition's retain() sweeps every dangling Weak.
+        let _g = proc.lock_group(&[255u8; 32]).await;
+        let live = proc.group_locks.lock().unwrap().len();
+        assert!(
+            live <= 2,
+            "lock table retained {live} entries for released locks"
+        );
+    }
 
     /// Test helper: build a `GroupChatProcessor` with a freshly
     /// registered mock endpoint and a sqlite database backed by a

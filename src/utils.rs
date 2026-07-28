@@ -14,6 +14,49 @@ use std::ops::{Deref, DerefMut};
 
 use std::path::Path;
 
+/// Neutralize terminal-spoofing characters in a string that may embed
+/// remote-supplied bytes (a peer's chat body, an error string a peer
+/// influenced, a filename or handle a peer chose).
+///
+/// Control characters and the bidi/zero-width marks are replaced with a space.
+/// Everything printable is preserved, so this is safe to apply to text the
+/// operator is meant to read; it only removes the characters that let a peer
+/// erase, overwrite or reorder lines the operator relies on to make trust
+/// decisions.
+///
+/// Note this replaces `\n` and `\t` as well: every call site here prints a
+/// single-line status or event, so an embedded newline is itself a forged-line
+/// primitive. Callers that intend to render multi-line text need a variant that
+/// keeps `\n`, not this one.
+pub fn sanitize_for_terminal(msg: &str) -> String {
+    let unsafe_char = |c: char| {
+        c.is_control()
+            || ('\u{200B}'..='\u{200F}').contains(&c) // zero-width + bidi marks
+            || ('\u{202A}'..='\u{202E}').contains(&c) // bidi embed/override
+            || ('\u{2066}'..='\u{2069}').contains(&c) // bidi isolates
+    };
+    msg.chars()
+        .map(|c| if unsafe_char(c) { ' ' } else { c })
+        .collect()
+}
+
+/// `sanitize_for_terminal` plus a hard length bound.
+///
+/// Peer-supplied strings are length-bounded by their wire format, not by
+/// anything the display can absorb — a pairing response carries up to 4 KiB and
+/// a forward rejection reason up to the 128 KiB packet cap. Truncating keeps a
+/// hostile peer from flooding the operator's scrollback. The marker makes the
+/// truncation visible rather than silent.
+pub fn sanitize_for_terminal_bounded(msg: &str, max_chars: usize) -> String {
+    let clean = sanitize_for_terminal(msg);
+    if clean.chars().count() <= max_chars {
+        return clean;
+    }
+    let mut out: String = clean.chars().take(max_chars).collect();
+    out.push_str("…[truncated]");
+    out
+}
+
 /// Render `text` as a terminal-friendly QR code (unicode half-blocks), or
 /// `None` if `text` is too large to fit in a QR symbol. Colors are inverted
 /// (modules light / background dark) so the code scans on a dark terminal.
@@ -758,6 +801,69 @@ pub fn get_passphrase_if_needed(
         return Ok(Some(pass));
     }
     Ok(None)
+}
+
+// Backend-independent, so not gated on a backend feature like the tests below.
+#[cfg(test)]
+mod terminal_sanitizer_tests {
+    use super::*;
+
+    #[test]
+    fn strips_the_sequences_used_to_repaint_a_transcript() {
+        // Erase-line + CR + a forged event line: the primitive every
+        // log-injection finding in this tree relied on.
+        let hostile = "\u{1b}[2K\r[joined] deadbeef";
+        let clean = sanitize_for_terminal(hostile);
+        assert!(!clean.contains('\u{1b}'), "ESC survived: {clean:?}");
+        assert!(!clean.contains('\r'), "CR survived: {clean:?}");
+        // Printable text is preserved, only the control bytes become spaces.
+        assert!(clean.ends_with("[joined] deadbeef"));
+        assert_eq!(clean.chars().count(), hostile.chars().count());
+    }
+
+    #[test]
+    fn strips_bidi_and_zero_width_marks() {
+        for c in ['\u{200B}', '\u{200E}', '\u{202E}', '\u{2066}'] {
+            let clean = sanitize_for_terminal(&format!("a{c}b"));
+            assert_eq!(clean, "a b", "{c:?} survived");
+        }
+    }
+
+    #[test]
+    fn newline_and_tab_are_also_neutralized() {
+        // These call sites all print one line; an embedded newline is itself a
+        // forged-line primitive, so it must not survive either.
+        assert_eq!(sanitize_for_terminal("a\nb\tc"), "a b c");
+    }
+
+    #[test]
+    fn ordinary_text_is_untouched() {
+        for s in ["plain ascii", "日本語のメッセージ", "emoji 🎉 ok", ""] {
+            assert_eq!(sanitize_for_terminal(s), s);
+        }
+    }
+
+    #[test]
+    fn bounded_truncates_and_marks() {
+        let long = "x".repeat(1000);
+        let out = sanitize_for_terminal_bounded(&long, 16);
+        assert!(out.starts_with(&"x".repeat(16)));
+        assert!(out.ends_with("…[truncated]"));
+
+        // Under the bound, nothing is appended.
+        assert_eq!(sanitize_for_terminal_bounded("short", 16), "short");
+        // Exactly at the bound is not truncated (boundary, counted in chars).
+        let exact = "y".repeat(16);
+        assert_eq!(sanitize_for_terminal_bounded(&exact, 16), exact);
+    }
+
+    #[test]
+    fn bounded_counts_chars_not_bytes() {
+        // A multi-byte string must not be cut mid-character.
+        let s = "あ".repeat(100);
+        let out = sanitize_for_terminal_bounded(&s, 10);
+        assert_eq!(out, format!("{}…[truncated]", "あ".repeat(10)));
+    }
 }
 
 #[cfg(all(test, feature = "backend-rustcrypto"))]

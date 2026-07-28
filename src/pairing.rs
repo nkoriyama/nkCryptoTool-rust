@@ -105,7 +105,16 @@ impl PairingResponse {
         if off != buf.len() {
             return Err(CryptoError::Parameter("pairing: trailing bytes in response".into()));
         }
-        let msg = String::from_utf8_lossy(&msg_bytes).into_owned();
+        // The server chooses this string and both the success path (printed by
+        // the pairing client) and the failure path (`pairing rejected by
+        // server: {msg}`, surfaced through anyhow) put it on the operator's
+        // terminal — at the moment they are deciding whether the enrollment
+        // bound the identity they expected. Sanitizing here, in the decoder,
+        // covers every consumer rather than relying on each print site.
+        let msg = crate::utils::sanitize_for_terminal_bounded(
+            &String::from_utf8_lossy(&msg_bytes),
+            512,
+        );
         Ok(Self { ok, msg })
     }
 }
@@ -142,21 +151,9 @@ pub fn generate_token() -> String {
 /// could escape the received-bundles directory. Only `[A-Za-z0-9._-]`, non-empty,
 /// not `.`/`..`, no leading dot.
 fn validate_handle(handle: &str) -> Result<()> {
-    if handle.is_empty() || handle.len() > 128 {
-        return Err(CryptoError::Parameter("pairing: handle empty or too long".into()));
-    }
-    if handle == "." || handle == ".." || handle.starts_with('.') {
-        return Err(CryptoError::Parameter("pairing: handle must not start with a dot".into()));
-    }
-    if !handle
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
-    {
-        return Err(CryptoError::Parameter(
-            "pairing: handle may only contain [A-Za-z0-9._-]".into(),
-        ));
-    }
-    Ok(())
+    // Single definition in `keyring`, which also applies it inside
+    // `KeyringStore::add` so the `add`/`import` paths get the same check.
+    crate::keyring::validate_handle(handle)
 }
 
 

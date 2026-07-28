@@ -584,6 +584,21 @@ mod tests {
         config: CryptoConfig,
         io_provider: Arc<dyn crate::network::IOProvider>,
     ) -> NetworkProcessor {
+        // These tests drive the handshake over the chat/file ALPNs, which are
+        // gated on `serve_chat` exactly like shell/scp/forward are gated on
+        // their own flags. Declare the role the tests are exercising; the gate
+        // itself is covered by `chat_and_file_alpns_are_refused_without_serve_chat`.
+        let mut config = config;
+        config.serve_chat = true;
+        let endpoint = Arc::new(IrohEndpoint::new(&config, true).await.unwrap());
+        NetworkProcessor::new(config, endpoint, io_provider)
+    }
+
+    /// Same helper without the chat/file role, for testing the gate.
+    async fn new_iroh_without_chat_role(
+        config: CryptoConfig,
+        io_provider: Arc<dyn crate::network::IOProvider>,
+    ) -> NetworkProcessor {
         let endpoint = Arc::new(IrohEndpoint::new(&config, true).await.unwrap());
         NetworkProcessor::new(config, endpoint, io_provider)
     }
@@ -698,6 +713,60 @@ mod tests {
         }).await;
         server_task.abort();
         assert!(client_res.unwrap().is_ok());
+    }
+
+    /// A node that was not started as a chat/file server must refuse those
+    /// ALPNs, exactly as it refuses shell/scp/forward/pairing without their
+    /// flags. Otherwise the peer, which picks the ALPN, decides which service a
+    /// listener runs: a `--serve-shell` node would additionally hand out an
+    /// interactive chat session reading the server's own stdin.
+    #[tokio::test]
+    #[serial]
+    async fn chat_and_file_alpns_are_refused_without_serve_chat() {
+        reset_state();
+        let (ticket_tx, ticket_rx) = tokio::sync::oneshot::channel();
+        let mut server_config = CryptoConfig::default();
+        server_config.transport = crate::config::TransportKind::Iroh;
+        server_config.chat_mode = false;
+        server_config.allow_unauth = true;
+        server_config.handshake_timeout = 30;
+        // Deliberately NOT a chat/file server.
+        assert!(!server_config.serve_chat);
+        let server_task = tokio::spawn(async move {
+            let mut processor =
+                new_iroh_without_chat_role(server_config, Arc::new(TestIOProvider)).await;
+            processor.preload_allowlist().await.unwrap();
+            let _ = processor
+                .start_with_ticket_callback(|ticket| {
+                    let _ = ticket_tx.send(ticket.to_string());
+                })
+                .await;
+        });
+        let ticket_str = tokio::time::timeout(Duration::from_secs(60), ticket_rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut client_config = CryptoConfig::default();
+        client_config.transport = crate::config::TransportKind::Iroh;
+        client_config.connect_addr = Some(modify_ticket(&ticket_str, None, None));
+        client_config.chat_mode = false;
+        client_config.allow_unauth = true;
+        client_config.handshake_timeout = 30;
+        let client_res = tokio::time::timeout(Duration::from_secs(60), async {
+            let processor =
+                new_iroh_without_chat_role(client_config, Arc::new(TestIOProvider)).await;
+            processor.run_connect().await
+        })
+        .await;
+        server_task.abort();
+
+        // The server drops the connection at the ALPN gate, before the
+        // handshake, so the client cannot complete it.
+        assert!(
+            client_res.is_err() || client_res.unwrap().is_err(),
+            "chat/file ALPN was served by a node that is not a chat/file server"
+        );
     }
 
     #[tokio::test]

@@ -390,11 +390,9 @@ impl CryptoStrategy for HybridStrategy {
                 .map_err(|_| CryptoError::FileRead("Invalid chunk_size".to_string()))?,
         );
         pos += 4;
-        if self.chunk_size == 0 {
-            return Err(CryptoError::FileRead(
-                "v3 chunk_size must be > 0".to_string(),
-            ));
-        }
+        // Bound before anything sizes a buffer from it: this field is
+        // attacker-controlled and is read before any AEAD tag is verified.
+        v3::validate_chunk_size(self.chunk_size)?;
 
         self.salt = self.ecc.get_salt();
         self.iv = self.ecc.get_iv();

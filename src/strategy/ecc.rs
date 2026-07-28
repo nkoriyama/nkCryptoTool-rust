@@ -647,12 +647,15 @@ impl CryptoStrategy for EccStrategy {
 
         self.curve_name = read_string(&mut pos)?;
         self.digest_algo = read_string(&mut pos)?;
+        v3::validate_algo_name("curve_name", &self.curve_name)?;
+        v3::validate_algo_name("digest_algo", &self.digest_algo)?;
         self.ephemeral_pubkey = read_vec(&mut pos)?;
         self.salt = read_vec(&mut pos)?;
         self.iv = read_vec(&mut pos)?;
 
         // v3 always carries the AEAD algorithm string.
         self.aead_algo = read_string(&mut pos)?;
+        v3::validate_algo_name("aead_algo", &self.aead_algo)?;
 
         // v3 trailer: chunk_size (u32).
         if data.len() < pos + 4 {
@@ -666,11 +669,9 @@ impl CryptoStrategy for EccStrategy {
                 .map_err(|_| CryptoError::FileRead("Invalid chunk_size".to_string()))?,
         );
         pos += 4;
-        if self.chunk_size == 0 {
-            return Err(CryptoError::FileRead(
-                "v3 chunk_size must be > 0".to_string(),
-            ));
-        }
+        // Bound before anything sizes a buffer from it: this field is
+        // attacker-controlled and is read before any AEAD tag is verified.
+        v3::validate_chunk_size(self.chunk_size)?;
 
         Ok(pos)
     }

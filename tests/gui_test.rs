@@ -91,7 +91,10 @@ mod tests {
         });
         let manager = NotificationManager::new(sink.clone());
 
-        manager.notify_message("peer8888", false).unwrap();
+        // `peer8888` stands for an *authenticated* identity (fingerprint
+        // prefix). A label parsed out of the peer's own message is no longer
+        // accepted here at all — see `notify_message`'s contract.
+        manager.notify_message(Some("peer8888"), false).unwrap();
 
         let history = sink.history.lock().unwrap();
         assert_eq!(history.len(), 1);
@@ -109,7 +112,7 @@ mod tests {
         });
         let manager = NotificationManager::new(sink.clone());
 
-        manager.notify_message("peer8888", true).unwrap();
+        manager.notify_message(Some("peer8888"), true).unwrap();
 
         let history = sink.history.lock().unwrap();
         assert_eq!(history.len(), 0);
@@ -125,7 +128,7 @@ mod tests {
         let manager = NotificationManager::new(sink.clone());
 
         for _ in 0..5 {
-            manager.notify_message("peer8888", false).unwrap();
+            manager.notify_message(Some("peer8888"), false).unwrap();
         }
 
         let history = sink.history.lock().unwrap();
@@ -179,13 +182,39 @@ mod tests {
         assert!(!*state.lock().unwrap());
     }
 
+    /// The real Privacy Mode contract: while no platform implements capture
+    /// exclusion, the API must SAY so rather than returning `Ok(())`.
+    ///
+    /// This replaces a test that only grepped `screen_protection.rs` for
+    /// placeholder phrases like "TODO" — which the stub passed while every
+    /// `set_protection` returned `Ok(())` without calling any OS API, so the
+    /// UI reported protection the user did not have.
+    ///
+    /// When a platform is actually implemented, this test should be narrowed to
+    /// the platforms that still are not, not deleted.
     #[test]
-    fn test_placeholder_check_screen_protection() {
-        let screen_protection_rs = include_str!("../src/gui/screen_protection.rs");
-        assert!(!screen_protection_rs.contains("In a real implementation"));
-        assert!(!screen_protection_rs.contains("we would start"));
-        assert!(!screen_protection_rs.contains("simulate with"));
-        assert!(!screen_protection_rs.contains("TODO"));
+    fn privacy_mode_reports_unavailability_instead_of_pretending() {
+        use nk_crypto_tool::gui::screen_protection::{
+            OsScreenProtectionApi, ScreenProtectionApi,
+        };
+        let ui = ui();
+        let api = OsScreenProtectionApi;
+
+        assert!(
+            !api.is_supported(),
+            "is_supported() must be false while no OS capture-exclusion call is wired up"
+        );
+        assert!(
+            api.set_protection(ui.window(), true).is_err(),
+            "enabling protection that is not implemented must return Err, not Ok(())"
+        );
+        let warning = api
+            .get_warning_message()
+            .expect("an unsupported platform must explain itself");
+        assert!(
+            warning.contains("NOT excluded"),
+            "the warning must state plainly that the window is still capturable: {warning}"
+        );
     }
 
     // ===== F1: Transfer mode toggle + file picker =====

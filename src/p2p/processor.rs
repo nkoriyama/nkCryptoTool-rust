@@ -80,6 +80,15 @@ fn required_grant_bit(config: &CryptoConfig) -> Option<u8> {
         Some(crate::keyring::GRANT_SCP)
     } else if config.forward_mode {
         Some(crate::keyring::GRANT_FORWARD)
+    } else if config.chat_mode || config.file_mode {
+        // Chat and file-receive have no bit of their own: adding one would
+        // deny both services to every peer already stored under the current
+        // GRANT_ALL, since a legacy row cannot be told apart from a deliberate
+        // narrow grant. Requiring the full grant set instead keeps existing
+        // fully-trusted peers working while ensuring a peer paired for exactly
+        // one service (`--pairing-grant scp`) cannot reach the operator's
+        // stdin/stdout through the chat or file ALPN.
+        Some(crate::keyring::GRANT_ALL)
     } else {
         None
     }
@@ -277,6 +286,134 @@ impl Admission {
     }
 }
 
+/// The authorization map (`fingerprint -> grants`) as a **live view** of the
+/// keyring, not a snapshot taken at startup.
+///
+/// A long-running server is the deployment the keyring is for, and
+/// `--keyring-cmd revoke` runs in a *separate* process against the same file.
+/// A startup snapshot therefore kept admitting a fingerprint whose grants had
+/// been revoked or narrowed, for the process's lifetime, while the CLI printed
+/// success — a revocation that silently failed open. The shell/scp/forward
+/// policy files are already re-read on every connection; this brings the
+/// keyring in line with them.
+///
+/// Re-reading redb on *every* connection would be wasteful and would contend
+/// with the operator's own `keyring` commands for the file lock, so the map is
+/// cached and invalidated on the file's (mtime, len) — a keyring write is
+/// exactly what changes those, and a connection arriving after the write sees
+/// the new grants.
+pub(crate) struct AllowlistSource {
+    db_path: std::path::PathBuf,
+    cached: tokio::sync::Mutex<CachedAllowlist>,
+}
+
+struct CachedAllowlist {
+    map: Arc<std::collections::HashMap<[u8; 32], u8>>,
+    /// `(mtime, len)` of the keyring file the cached map was read from; `None`
+    /// forces a reload.
+    stamp: Option<(std::time::SystemTime, u64)>,
+    /// When the cached map was read. Bounds staleness independently of the
+    /// stamp — see [`AllowlistSource::MAX_CACHE_AGE`].
+    loaded_at: std::time::Instant,
+}
+
+impl AllowlistSource {
+    /// Ceiling on how long a cached map is trusted even if `(mtime, len)` looks
+    /// unchanged.
+    ///
+    /// The stamp is the primary signal and catches a revocation immediately,
+    /// but it is only as good as the filesystem's timestamp granularity: a
+    /// revoke landing in the same mtime tick as the previous read, with the
+    /// file length unchanged, would otherwise go unnoticed indefinitely. This
+    /// bounds that window to seconds instead of to the process's lifetime,
+    /// at the cost of at most one redb read every few seconds on a node that
+    /// is actually receiving connections.
+    const MAX_CACHE_AGE: Duration = Duration::from_secs(5);
+    fn stamp_of(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+        let md = std::fs::metadata(path).ok()?;
+        Some((md.modified().ok()?, md.len()))
+    }
+
+    fn load(path: &std::path::Path) -> Result<std::collections::HashMap<[u8; 32], u8>> {
+        let store = crate::keyring::KeyringStore::open(path).map_err(|e| {
+            CryptoError::Parameter(format!("open keyring {}: {e}", path.display()))
+        })?;
+        Ok(store
+            .load_authz()
+            .map_err(|e| CryptoError::Parameter(format!("load keyring authz: {e}")))?
+            .into_iter()
+            .collect())
+    }
+
+    pub(crate) fn open(path: &std::path::Path) -> Result<Self> {
+        // Load once up front so a misconfigured `--keyring-db` fails at startup
+        // rather than on the first inbound connection.
+        let map = Self::load(path)?;
+        Ok(Self {
+            db_path: path.to_path_buf(),
+            cached: tokio::sync::Mutex::new(CachedAllowlist {
+                map: Arc::new(map),
+                stamp: Self::stamp_of(path),
+                loaded_at: std::time::Instant::now(),
+            }),
+        })
+    }
+
+    /// The authorization map as of now. Reloads if the keyring file changed.
+    ///
+    /// Fails **closed**: if the keyring changed but cannot be re-read, this
+    /// returns an error and the caller refuses the connection rather than
+    /// falling back to the superseded map — falling back is precisely the
+    /// revoked-but-still-admitted behaviour being fixed here. One retry absorbs
+    /// the brief lock contention of a concurrent `keyring` command; a reload is
+    /// rare in the first place, since an unchanged file skips it entirely.
+    pub(crate) async fn current(&self) -> Result<Arc<std::collections::HashMap<[u8; 32], u8>>> {
+        let mut guard = self.cached.lock().await;
+        let path = self.db_path.clone();
+        let stamp = tokio::task::spawn_blocking(move || Self::stamp_of(&path))
+            .await
+            .map_err(|e| CryptoError::Parameter(format!("keyring stat task: {e}")))?;
+
+        // Unchanged file (and a stamp we could actually read), still inside the
+        // freshness ceiling — serve the cache.
+        if stamp.is_some()
+            && stamp == guard.stamp
+            && guard.loaded_at.elapsed() < Self::MAX_CACHE_AGE
+        {
+            return Ok(guard.map.clone());
+        }
+
+        let mut last_err = None;
+        for attempt in 0..2 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            let path = self.db_path.clone();
+            let loaded = tokio::task::spawn_blocking(move || Self::load(&path))
+                .await
+                .map_err(|e| CryptoError::Parameter(format!("keyring load task: {e}")))?;
+            match loaded {
+                Ok(map) => {
+                    guard.map = Arc::new(map);
+                    // Re-stat after the read: if the file changed *during* it,
+                    // this stamp will differ from the next connection's and we
+                    // reload again rather than pinning a torn view.
+                    let path = self.db_path.clone();
+                    guard.stamp = tokio::task::spawn_blocking(move || Self::stamp_of(&path))
+                        .await
+                        .map_err(|e| CryptoError::Parameter(format!("keyring stat task: {e}")))?;
+                    guard.loaded_at = std::time::Instant::now();
+                    return Ok(guard.map.clone());
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| {
+            CryptoError::Parameter("keyring authorization unavailable".to_string())
+        }))
+    }
+}
+
 pub struct NetworkProcessor {
     config: CryptoConfig,
     endpoint: Arc<dyn P2pEndpoint>,
@@ -284,7 +421,7 @@ pub struct NetworkProcessor {
     handshake_semaphore: Arc<Semaphore>,
     /// Post-authentication admission — see [`AdmissionLimits`].
     session_semaphore: Arc<Semaphore>,
-    cached_allowlist: Option<Arc<std::collections::HashMap<[u8; 32], u8>>>,
+    cached_allowlist: Option<Arc<AllowlistSource>>,
     io_provider: Arc<dyn IOProvider>,
 }
 
@@ -311,16 +448,18 @@ impl NetworkProcessor {
     /// Enforcement is activated only when a keyring is configured; without one,
     /// `cached_allowlist` stays `None` and authorization falls to
     /// `--signing-pubkey` pinning alone (unchanged behaviour).
+    ///
+    /// Despite the name this no longer freezes the map: it opens the keyring
+    /// (so a bad path fails at startup) and hands ownership to an
+    /// [`AllowlistSource`], which re-reads the file whenever it changes. See
+    /// that type for why a startup snapshot was wrong.
     pub async fn preload_allowlist(&mut self) -> Result<()> {
         if let Some(ref db) = self.config.keyring_db {
-            let store = crate::keyring::KeyringStore::open(std::path::Path::new(db))
-                .map_err(|e| CryptoError::Parameter(format!("open keyring {db}: {e}")))?;
-            let map: std::collections::HashMap<[u8; 32], u8> = store
-                .load_authz()
-                .map_err(|e| CryptoError::Parameter(format!("load keyring authz: {e}")))?
-                .into_iter()
-                .collect();
-            self.cached_allowlist = Some(Arc::new(map));
+            let path = std::path::PathBuf::from(db);
+            let source = tokio::task::spawn_blocking(move || AllowlistSource::open(&path))
+                .await
+                .map_err(|e| CryptoError::Parameter(format!("keyring open task: {e}")))??;
+            self.cached_allowlist = Some(Arc::new(source));
         }
         Ok(())
     }
@@ -413,16 +552,11 @@ impl NetworkProcessor {
     /// remote-supplied bytes (an unknown ALPN, a peer-influenced error string):
     /// strips control chars and bidi/zero-width marks that would otherwise inject
     /// escape sequences or reorder an operator's terminal / log display.
-    fn sanitize_for_terminal(msg: &str) -> String {
-        let unsafe_char = |c: char| {
-            c.is_control()
-                || ('\u{200B}'..='\u{200F}').contains(&c) // zero-width + bidi marks
-                || ('\u{202A}'..='\u{202E}').contains(&c) // bidi embed/override
-                || ('\u{2066}'..='\u{2069}').contains(&c) // bidi isolates
-        };
-        msg.chars()
-            .map(|c| if unsafe_char(c) { ' ' } else { c })
-            .collect()
+    /// The implementation now lives in `crate::utils` so every peer-string
+    /// print site in the tree shares one filter; this stays as the name the
+    /// P2P code already calls.
+    pub fn sanitize_for_terminal(msg: &str) -> String {
+        crate::utils::sanitize_for_terminal(msg)
     }
 
     async fn run_listen_loop(&self) -> Result<()> {
@@ -523,15 +657,32 @@ impl NetworkProcessor {
                 let forward_allowed = config.serve_forward;
                 let scp_allowed = config.serve_scp;
                 let pairing_allowed = config.serve_pairing;
+                let chat_allowed = config.serve_chat;
                 config.shell_mode = false;
                 config.chat_mode = false;
+                config.file_mode = false;
                 config.forward_mode = false;
                 config.scp_mode = false;
                 config.pairing_mode = false;
                 if incoming.protocol.0 == ALPN_CHAT {
+                    // Gated like every other service. Chat is the most
+                    // sensitive of them to leave open by default: the server
+                    // half of `chat_loop` reads this process's real stdin and
+                    // streams it to the peer, so an ungated chat ALPN turns any
+                    // listener into a keystroke feed for whoever dials it.
+                    if !chat_allowed {
+                        eprintln!("Rejecting nkct/chat/2: this node is not a chat server");
+                        return;
+                    }
                     config.chat_mode = true;
                 } else if incoming.protocol.0 == ALPN_FILE {
-                    // file receive: both modes false
+                    // Same gate: the file-receive arm writes up to MAX_FILE_SIZE
+                    // of peer-chosen bytes to this process's stdout.
+                    if !chat_allowed {
+                        eprintln!("Rejecting nkct/file/1: this node is not a chat/file server");
+                        return;
+                    }
+                    config.file_mode = true;
                 } else if incoming.protocol.0 == crate::network::ALPN_SHELL {
                     if !shell_allowed {
                         eprintln!("Rejecting nkct/shell/2: this node is not a shell server");
@@ -652,15 +803,32 @@ impl NetworkProcessor {
         let forward_allowed = config.serve_forward;
         let scp_allowed = config.serve_scp;
         let pairing_allowed = config.serve_pairing;
+        let chat_allowed = config.serve_chat;
         config.shell_mode = false;
         config.chat_mode = false;
+        config.file_mode = false;
         config.forward_mode = false;
         config.scp_mode = false;
         config.pairing_mode = false;
+        // Same gate as `run_listen_loop`. This dispatch is duplicated, so both
+        // copies must carry it: without the gate here a `--serve-pairing` node
+        // (which serves exactly one connection through this path) would hand a
+        // peer that dials `nkct/chat/2` an interactive session against the
+        // server's own stdin instead of the pairing exchange it advertises.
         if incoming.protocol.0 == ALPN_CHAT {
+            if !chat_allowed {
+                return Err(CryptoError::Parameter(
+                    "chat (nkct/chat/2) is not enabled on this node".to_string(),
+                ));
+            }
             config.chat_mode = true;
         } else if incoming.protocol.0 == ALPN_FILE {
-            // file receive: both modes false
+            if !chat_allowed {
+                return Err(CryptoError::Parameter(
+                    "file receive (nkct/file/1) is not enabled on this node".to_string(),
+                ));
+            }
+            config.file_mode = true;
         } else if incoming.protocol.0 == crate::network::ALPN_SHELL {
             if !shell_allowed {
                 return Err(CryptoError::Parameter(
@@ -727,7 +895,7 @@ impl NetworkProcessor {
         config: &CryptoConfig,
         local_peer_id: P2pPeerId,
         remote_peer_id: P2pPeerId,
-        cached_allowlist: Option<Arc<std::collections::HashMap<[u8; 32], u8>>>,
+        cached_allowlist: Option<Arc<AllowlistSource>>,
         io_provider: Arc<dyn IOProvider>,
         on_handshake_done: Option<Box<dyn FnOnce() + Send>>,
         on_progress: Option<crate::network::ProgressCallback>,
@@ -840,7 +1008,10 @@ impl NetworkProcessor {
                         "pairing requires a self-authenticating client".to_string(),
                     ));
                 }
-            } else if let Some(ref allowlist) = cached_allowlist {
+            } else if let Some(ref source) = cached_allowlist {
+                // Read the keyring as of *now*, not as of startup, so a
+                // revocation between then and this connection is honoured.
+                let allowlist = source.current().await?;
                 match peer_id {
                     PeerId::Pubkey(hash) => {
                         let granted = match allowlist.get(&hash) {
@@ -849,11 +1020,13 @@ impl NetworkProcessor {
                                 return Err(CryptoError::Parameter("Peer not in allowlist".to_string()))
                             }
                         };
-                        // Per-service grant for shell/scp/forward; services without
-                        // a grant bit (chat, file receive) authorize on keyring
-                        // membership alone.
-                        if let Some(bit) = required_grant_bit(config) {
-                            if granted & bit == 0 {
+                        // Per-service grant. `required_grant_bit` returns a
+                        // *mask*: a single bit for shell/scp/forward, and the
+                        // full set for chat/file-receive, so the peer must hold
+                        // every bit in it. (`& mask != 0` would have accepted a
+                        // peer holding any one bit of a multi-bit mask.)
+                        if let Some(mask) = required_grant_bit(config) {
+                            if granted & mask != mask {
                                 return Err(CryptoError::Parameter(format!(
                                     "Peer is in the allowlist but not authorized for this service (grants=0b{granted:03b})"
                                 )));
@@ -1446,10 +1619,11 @@ impl NetworkProcessor {
                         }
                         eprintln!("Server authenticated successfully (auth: {}).", config.pqc_dsa_algo);
                         
-                        if let Some(ref allowlist) = self.cached_allowlist {
+                        if let Some(ref source) = self.cached_allowlist {
                             // Client side: we are pinning which SERVER we will talk
                             // to, so membership (any grant) is what matters — grants
                             // gate a server authorizing a client, not the reverse.
+                            let allowlist = source.current().await?;
                             let hash: [u8; 32] = Sha3_256::digest(&server_dsa_pub).into();
                             if !allowlist.contains_key(&hash) {
                                 return Err(CryptoError::Parameter("Server not in allowlist".to_string()));
@@ -2042,6 +2216,9 @@ mod tests {
 
         let mut server_config = CryptoConfig::default();
         server_config.chat_mode = false;
+        // The test drives the handshake over ALPN_FILE, which is gated on this
+        // like shell/scp/forward are on theirs — declare the role being tested.
+        server_config.serve_chat = true;
         server_config.allow_unauth = true;
         server_config.handshake_timeout = 2;
 
@@ -2064,6 +2241,60 @@ mod tests {
 
         assert!(client_res.is_ok(), "Client connection failed: {:?}", client_res.err());
         assert!(server_task.await.unwrap().is_ok(), "Server listening failed");
+    }
+
+    /// The ALPN dispatch is duplicated between `run_listen_loop` and the
+    /// single-shot `run_listen_once`, so the chat/file gate has to be tested on
+    /// both. The single-shot path is what `--serve-pairing` and the GUI use: a
+    /// node serving pairing must not additionally hand out a chat session
+    /// against its own stdin to a peer that simply dials `nkct/chat/2`.
+    #[tokio::test]
+    async fn single_shot_listener_refuses_chat_file_without_serve_chat() {
+        let net = MockNetwork::new();
+        let server_id = P2pPeerId::new([3; 32]);
+        let client_id = P2pPeerId::new([4; 32]);
+
+        let proto_chat = P2pProtocol(ALPN_CHAT);
+        let proto_file = P2pProtocol(ALPN_FILE);
+        let server_ep = Arc::new(net.register(server_id, vec![proto_chat, proto_file]));
+        let client_ep = Arc::new(net.register(client_id, vec![proto_chat, proto_file]));
+
+        let mut server_config = CryptoConfig::default();
+        server_config.chat_mode = false;
+        server_config.allow_unauth = true;
+        server_config.handshake_timeout = 2;
+        // Deliberately NOT a chat/file server.
+        assert!(!server_config.serve_chat);
+
+        let mut client_config = CryptoConfig::default();
+        client_config.chat_mode = false;
+        client_config.allow_unauth = true;
+        client_config.handshake_timeout = 2;
+
+        let server_addr = server_ep.local_addr().await.unwrap();
+        client_config.connect_addr = Some(Ticket::new(server_addr, None, None).to_string());
+
+        let server_proc = NetworkProcessor::new(server_config, server_ep, Arc::new(TestIOProvider));
+        let client_proc = NetworkProcessor::new(client_config, client_ep, Arc::new(TestIOProvider));
+
+        let server_task = tokio::spawn(async move {
+            server_proc.run_listen_once_with_progress(|_| {}, || {}, None).await
+        });
+        let client_res = client_proc.run_connect().await;
+
+        let server_res = server_task.await.unwrap();
+        assert!(
+            server_res.is_err(),
+            "the single-shot listener served a chat/file ALPN it never enabled"
+        );
+        assert!(
+            format!("{:?}", server_res.unwrap_err()).contains("not enabled on this node"),
+            "the refusal must name the missing role"
+        );
+        assert!(
+            client_res.is_err(),
+            "the client must not complete a session the server refused"
+        );
     }
 
     // ------------------------------------------------------------------

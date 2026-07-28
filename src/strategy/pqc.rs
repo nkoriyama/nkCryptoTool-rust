@@ -17,6 +17,27 @@ use std::fs;
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
+/// FIPS 204 context string for detached **file** signatures (`--sign`).
+///
+/// Without it, `sign_hash` signs attacker-supplied file bytes under the empty
+/// context — the same context `group::binding` verifies MLS↔transport binding
+/// signatures under, with the same ML-DSA key (`--signing-privkey` is loaded as
+/// `transport_dsa_priv`). One "please sign this attestation" request would then
+/// yield a valid `transport_sig` for a `MemberBinding` of the requester's
+/// choosing, defeating the proof-of-possession `verify_binding` rests on.
+/// Domain-separating the file-signing path is what makes a file signature
+/// unusable as a binding signature; every other ML-DSA producer in the tree
+/// already carries a distinct context (`HANDSHAKE_CTX_IROH`, `PREKEY_CTX`,
+/// `BUNDLE_CTX`, `KEYBIND_CTX`), leaving `binding` as the only remaining user
+/// of the empty context and therefore no longer a collision.
+pub const FILE_SIGN_CTX: &[u8] = b"nkct-file-sign-v1";
+
+/// NKCS container version that signed under the empty context. Still *verified*
+/// so signatures produced before this change keep validating; never produced.
+const NKCS_VERSION_CTX_FREE: u16 = 1;
+/// NKCS container version that signs under [`FILE_SIGN_CTX`]. What we produce.
+const NKCS_VERSION_DOMAIN_SEP: u16 = 2;
+
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct PqcStrategy {
     #[zeroize(skip)]
@@ -53,6 +74,11 @@ pub struct PqcStrategy {
     dsa_privkey: Zeroizing<Vec<u8>>,
     sign_buffer: Zeroizing<Vec<u8>>,
     signature: Vec<u8>,
+    /// NKCS container version in play. Signing always uses
+    /// `NKCS_VERSION_DOMAIN_SEP`; verification adopts whatever the file
+    /// declares, so that decides which FIPS 204 context to verify under.
+    #[zeroize(skip)]
+    sig_version: u16,
 
     // ---- v3 chunked-AEAD state ----
     #[zeroize(skip)]
@@ -85,6 +111,7 @@ impl PqcStrategy {
             dsa_privkey: Zeroizing::new(Vec::new()),
             sign_buffer: Zeroizing::new(Vec::new()),
             signature: Vec::new(),
+            sig_version: NKCS_VERSION_DOMAIN_SEP,
             chunk_size: V3_DEFAULT_CHUNK_SIZE,
             nonce_prefix: Zeroizing::new(Vec::new()),
             file_session_id: None,
@@ -369,7 +396,14 @@ impl CryptoStrategy for PqcStrategy {
     }
 
     fn sign_hash(&mut self) -> Result<Vec<u8>> {
-        backend::pqc_sign(&self.dsa_algo, &self.dsa_privkey, &self.sign_buffer, &[])
+        // Always the domain-separated context: a signature we produce must not
+        // be reusable as a `MemberBinding.transport_sig`.
+        backend::pqc_sign(
+            &self.dsa_algo,
+            &self.dsa_privkey,
+            &self.sign_buffer,
+            FILE_SIGN_CTX,
+        )
     }
 
     fn verify_hash(&mut self, signature: &[u8]) -> Result<bool> {
@@ -377,13 +411,22 @@ impl CryptoStrategy for PqcStrategy {
             .peer_public_key
             .as_ref()
             .ok_or(CryptoError::Parameter("No pubkey".to_string()))?;
-        backend::pqc_verify(&self.dsa_algo, raw_pub, &self.sign_buffer, signature, &[])
+        // Verify under the context the container declares, so signatures made
+        // by an older build (NKCS v1, empty context) still validate. This does
+        // not reopen the cross-protocol reuse: that attack needs a *freshly
+        // produced* victim signature, and nothing produces v1 any more.
+        let ctx: &[u8] = if self.sig_version >= NKCS_VERSION_DOMAIN_SEP {
+            FILE_SIGN_CTX
+        } else {
+            &[]
+        };
+        backend::pqc_verify(&self.dsa_algo, raw_pub, &self.sign_buffer, signature, ctx)
     }
 
     fn serialize_signature_header(&self) -> Vec<u8> {
         let mut header = Vec::new();
         header.extend_from_slice(b"NKCS");
-        header.extend_from_slice(&1u16.to_le_bytes());
+        header.extend_from_slice(&NKCS_VERSION_DOMAIN_SEP.to_le_bytes());
         header.push(self.get_strategy_type() as u8);
 
         let add_string = |h: &mut Vec<u8>, s: &str| {
@@ -401,6 +444,17 @@ impl CryptoStrategy for PqcStrategy {
         if data.len() < 7 || &data[0..4] != b"NKCS" {
             return Err(CryptoError::FileRead("Invalid signature magic".to_string()));
         }
+        // The version selects the FIPS 204 context `verify_hash` uses, so it
+        // has to be read rather than skipped. Reject anything we do not know:
+        // guessing a context on an unknown container would be exactly the
+        // ambiguity this version exists to remove.
+        let version = u16::from_le_bytes(data[4..6].try_into().unwrap());
+        if version != NKCS_VERSION_CTX_FREE && version != NKCS_VERSION_DOMAIN_SEP {
+            return Err(CryptoError::FileRead(format!(
+                "unsupported NKCS signature version {version}"
+            )));
+        }
+        self.sig_version = version;
         let mut pos = 7;
 
         let read_string = |p: &mut usize| -> Result<String> {
@@ -540,12 +594,15 @@ impl CryptoStrategy for PqcStrategy {
 
         self.kem_algo = read_string(&mut pos)?;
         self.dsa_algo = read_string(&mut pos)?;
+        v3::validate_algo_name("kem_algo", &self.kem_algo)?;
+        v3::validate_algo_name("dsa_algo", &self.dsa_algo)?;
         self.kem_ciphertext = Zeroizing::new(read_vec(&mut pos)?);
         self.salt = read_vec(&mut pos)?;
         self.iv = read_vec(&mut pos)?;
 
         // v3 always carries the AEAD algorithm string.
         self.aead_algo = read_string(&mut pos)?;
+        v3::validate_algo_name("aead_algo", &self.aead_algo)?;
 
         // v3 trailer: chunk_size (u32).
         if data.len() < pos + 4 {
@@ -559,11 +616,9 @@ impl CryptoStrategy for PqcStrategy {
                 .map_err(|_| CryptoError::FileRead("Invalid chunk_size".to_string()))?,
         );
         pos += 4;
-        if self.chunk_size == 0 {
-            return Err(CryptoError::FileRead(
-                "v3 chunk_size must be > 0".to_string(),
-            ));
-        }
+        // Bound before anything sizes a buffer from it: this field is
+        // attacker-controlled and is read before any AEAD tag is verified.
+        v3::validate_chunk_size(self.chunk_size)?;
 
         Ok(pos)
     }

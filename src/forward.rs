@@ -214,7 +214,16 @@ impl FwdFrame {
             }
             F_CONNECTED => Ok(FwdFrame::Connected { chan: id }),
             F_REJECTED => {
-                Ok(FwdFrame::Rejected { chan: id, reason: String::from_utf8_lossy(rest).into_owned() })
+                // Peer-authored and printed by `open_from_tcp`, which runs on
+                // BOTH roles — so on the `-R` path an authenticated forward
+                // client drives this onto the server operator's console or
+                // audit log. Sanitized and bounded at decode (the frame body
+                // may be up to the 128 KiB packet cap).
+                let reason = crate::utils::sanitize_for_terminal_bounded(
+                    &String::from_utf8_lossy(rest),
+                    256,
+                );
+                Ok(FwdFrame::Rejected { chan: id, reason })
             }
             F_DATA => {
                 if rest.len() > MAX_FWD_DATA {
@@ -241,7 +250,12 @@ impl FwdFrame {
             }
             F_BINDOK => Ok(FwdFrame::BindOk { req: id }),
             F_BINDERR => {
-                Ok(FwdFrame::BindErr { req: id, reason: String::from_utf8_lossy(rest).into_owned() })
+                // Same treatment as `Rejected`: printed at forward.rs:708.
+                let reason = crate::utils::sanitize_for_terminal_bounded(
+                    &String::from_utf8_lossy(rest),
+                    256,
+                );
+                Ok(FwdFrame::BindErr { req: id, reason })
             }
             _ => Err(CryptoError::Parameter(format!("unknown forward frame type {ty}"))),
         }

@@ -41,6 +41,25 @@ use sha3::{Digest, Sha3_256};
 /// uses RFC 9420's own labels) or a transport-handshake signature.
 pub const BINDING_CONTEXT: &[u8] = b"nkct-mls-transport-binding-v1";
 
+/// FIPS 204 context for the **transport half** of a binding.
+///
+/// `BINDING_CONTEXT` above is a prefix inside the signed message; this is the
+/// separate `ctx` parameter ML-DSA itself takes. The transport half previously
+/// passed an empty `ctx`, which meant its domain separation rested entirely on
+/// the message prefix — and any other protocol persuaded to sign chosen bytes
+/// with the same key under the empty context could produce a valid
+/// `transport_sig`. Carrying an explicit context here removes that dependence,
+/// so the guarantee holds at the signature primitive rather than only at the
+/// message format.
+///
+/// Every ML-DSA producer in this tree now uses a distinct, non-empty context
+/// (`HANDSHAKE_CTX_IROH`, `PREKEY_CTX`, `BUNDLE_CTX`, `KEYBIND_CTX`,
+/// `FILE_SIGN_CTX`, and this one).
+///
+/// **Wire break**: a binding produced by an older build signed with `ctx = ""`
+/// and will no longer verify, and vice versa. Peers must upgrade together.
+pub const BINDING_SIG_CTX: &[u8] = b"nkct-mls-transport-binding-sig-v1";
+
 /// Signature scheme of the transport identity key.
 pub const TRANSPORT_DSA_ALGO: &str = "ML-DSA-65";
 
@@ -94,8 +113,9 @@ pub fn create_binding<P: CipherSuiteProvider>(
     let mls_sig = suite
         .sign(mls_sk, &msg)
         .map_err(|e| BindingError::MlsSign(format!("{e:?}")))?;
-    let transport_sig = crate::backend::pqc_sign(transport_algo, transport_dsa_priv, &msg, &[])
-        .map_err(|e| BindingError::TransportSign(e.to_string()))?;
+    let transport_sig =
+        crate::backend::pqc_sign(transport_algo, transport_dsa_priv, &msg, BINDING_SIG_CTX)
+            .map_err(|e| BindingError::TransportSign(e.to_string()))?;
     Ok(MemberBinding {
         mls_sig,
         transport_sig,
@@ -116,7 +136,13 @@ pub fn verify_binding<P: CipherSuiteProvider>(
     let msg = binding_message(epoch, mls_pub.as_bytes(), transport_dsa_pub, peer_id);
     let mls_ok = suite.verify(mls_pub, &binding.mls_sig, &msg).is_ok();
     let transport_ok = matches!(
-        crate::backend::pqc_verify(transport_algo, transport_dsa_pub, &msg, &binding.transport_sig, &[]),
+        crate::backend::pqc_verify(
+            transport_algo,
+            transport_dsa_pub,
+            &msg,
+            &binding.transport_sig,
+            BINDING_SIG_CTX
+        ),
         Ok(true)
     );
     mls_ok && transport_ok
@@ -204,13 +230,80 @@ mod tests {
         // the attacker's own transport key (the best they can do).
         let msg = binding_message(1, mpk.as_bytes(), &victim_tpk, &pid);
         let mls_sig = s.sign(&msk, &msg).unwrap();
+        // Signed under the binding's own context, so the only thing being
+        // tested is the wrong *key* — not a context mismatch.
         let transport_sig =
-            crate::backend::pqc_sign(TRANSPORT_DSA_ALGO, &attacker_tsk, &msg, &[]).unwrap();
+            crate::backend::pqc_sign(TRANSPORT_DSA_ALGO, &attacker_tsk, &msg, BINDING_SIG_CTX)
+                .unwrap();
         let forged = MemberBinding { mls_sig, transport_sig };
         assert!(
             !verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &victim_tpk, 1, &pid, &forged),
             "binding a transport key without its private key must not verify"
         );
+    }
+
+    #[test]
+    fn file_signature_is_not_usable_as_a_transport_binding_signature() {
+        // The `--sign` path and this module share one ML-DSA key (main.rs loads
+        // `--signing-privkey` as `transport_dsa_priv`). If both signed under the
+        // same FIPS 204 context, getting the victim to sign one crafted file
+        // would hand the attacker a valid `transport_sig` for a binding of their
+        // choosing. `PqcStrategy::FILE_SIGN_CTX` is what separates them, so the
+        // exact bytes `binding_message` produces, signed the way `--sign` signs,
+        // must NOT verify here.
+        let s = suite();
+        let (msk, mpk, victim_tsk, victim_tpk) = member(&s);
+        let pid = [7u8; 32];
+
+        // The attacker hands the victim `msg` as an ordinary file to sign.
+        let msg = binding_message(1, mpk.as_bytes(), &victim_tpk, &pid);
+        let file_sig = crate::backend::pqc_sign(
+            TRANSPORT_DSA_ALGO,
+            &victim_tsk,
+            &msg,
+            crate::strategy::pqc::FILE_SIGN_CTX,
+        )
+        .unwrap();
+
+        let forged = MemberBinding {
+            mls_sig: s.sign(&msk, &msg).unwrap(),
+            transport_sig: file_sig,
+        };
+        assert!(
+            !verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &victim_tpk, 1, &pid, &forged),
+            "a file signature must not verify as a transport binding signature"
+        );
+
+        // The empty context is likewise no longer accepted here: nothing in the
+        // tree signs under ctx="" any more, so a signature made that way — by an
+        // older build, or by some future caller that forgets a context — must
+        // not be usable as a binding either.
+        let empty_ctx_sig =
+            crate::backend::pqc_sign(TRANSPORT_DSA_ALGO, &victim_tsk, &msg, &[]).unwrap();
+        let forged_empty = MemberBinding {
+            mls_sig: s.sign(&msk, &msg).unwrap(),
+            transport_sig: empty_ctx_sig,
+        };
+        assert!(
+            !verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &victim_tpk, 1, &pid, &forged_empty),
+            "an empty-context signature must not verify as a transport binding signature"
+        );
+
+        // Control: the same key signing the same bytes under the binding's own
+        // context does verify, proving the rejection above is the context and
+        // not an unrelated mismatch.
+        let real = create_binding(
+            &s,
+            &msk,
+            &mpk,
+            TRANSPORT_DSA_ALGO,
+            &victim_tsk,
+            &victim_tpk,
+            1,
+            &pid,
+        )
+        .unwrap();
+        assert!(verify_binding(&s, &mpk, TRANSPORT_DSA_ALGO, &victim_tpk, 1, &pid, &real));
     }
 
     #[test]

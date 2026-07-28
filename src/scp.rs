@@ -15,8 +15,17 @@
 //! Wire framing reuses the shared AEAD packet primitive
 //! ([`crate::shell::send_packet`] / [`recv_packet`]): each [`ScpFrame`] is one
 //! AEAD packet sealed under the per-direction session key with a monotonic
-//! counter nonce, so truncation / reorder / tamper surfaces as an
-//! authentication failure. Bulk bytes are chunked to [`CHUNK`].
+//! counter nonce, so reorder / tamper surfaces as an authentication failure.
+//! Bulk bytes are chunked to [`CHUNK`].
+//!
+//! Truncation is **not** caught by the AEAD — cutting a stream between two
+//! sealed packets forges nothing, it just stops the transfer — so completion is
+//! a protocol question, not a cryptographic one. Every receive loop therefore
+//! ends only on an explicit terminator: a single-file get on the declared size
+//! plus `Eof`, a recursive get on `ScpFrame::Done`, and a put on its collected
+//! acks. A stream that closes before its terminator is an error, never a
+//! completed transfer, and a partially received file is left staged rather than
+//! committed to its destination.
 //!
 //! Security posture: every file operation runs as the server's own user
 //! (`--serve-scp` refuses to run as root), confined to the policy's read/write
@@ -228,7 +237,15 @@ impl ScpFrame {
             T_ACK => Ok(ScpFrame::Ack { file_id: get_u32(rest, 0).ok_or_else(bad)? }),
             T_FAIL => {
                 let file_id = get_u32(rest, 0).ok_or_else(bad)?;
-                Ok(ScpFrame::Fail { file_id, msg: String::from_utf8_lossy(&rest[4..]).into_owned() })
+                // Peer-authored text that the client prints per skipped file.
+                // Sanitized here so every consumer is covered by one gate — the
+                // scp client renders no other remote bytes, so this frame and
+                // `Err` below are the peer's only channel to the display.
+                let msg = crate::utils::sanitize_for_terminal_bounded(
+                    &String::from_utf8_lossy(&rest[4..]),
+                    256,
+                );
+                Ok(ScpFrame::Fail { file_id, msg })
             }
             T_GET => {
                 if rest.len() < 5 {
@@ -271,7 +288,13 @@ impl ScpFrame {
                 Ok(ScpFrame::ResumeFrom { file_id, mode, size, offset })
             }
             T_DONE => Ok(ScpFrame::Done),
-            T_ERR => Ok(ScpFrame::Err(String::from_utf8_lossy(rest).into_owned())),
+            // Sanitized at decode for the same reason as `Fail`: this string is
+            // interpolated into errors printed at scp.rs:1159/1276/1313/1336/
+            // 1350/1360/1393, and gating it here covers all of them.
+            T_ERR => Ok(ScpFrame::Err(crate::utils::sanitize_for_terminal_bounded(
+                &String::from_utf8_lossy(rest),
+                256,
+            ))),
             _ => Err(CryptoError::Parameter(format!("unknown scp frame type {ty}"))),
         }
     }
@@ -1133,6 +1156,77 @@ async fn stream_bytes<W: AsyncWriteExt + Unpin>(
 
 /// Receive `Data{file_id}`* / `Eof{file_id}` into `staged`, bounded by `size`.
 /// A frame for another `file_id`, an overshoot, or a short stream is an error.
+/// Receive one recursive-`get` batch: every `MkDir` / `Put` the server sends,
+/// terminated by its explicit `Done`. Returns `(files, dirs)`.
+///
+/// Completion is defined by the `Done` frame alone. A stream that ends without
+/// it is an error, because at the transport layer a close between two sealed
+/// packets is indistinguishable from the peer finishing — the AEAD authenticates
+/// each packet, not the fact that the batch ended. Reporting such a close as
+/// success delivered a partial tree with exit status 0, which any wrapping
+/// deploy script reads as "the tree is complete".
+///
+/// Split out of `run_scp_client` so this contract is testable directly against a
+/// synthesized stream.
+#[allow(clippy::too_many_arguments)]
+async fn recv_tree<R: AsyncReadExt + Unpin, W: AsyncWriteExt + Unpin>(
+    reader: &mut R,
+    writer: &mut W,
+    aead_name: &str,
+    rx_key: &[u8],
+    rx: &mut u64,
+    tx_key: &[u8],
+    tx: &mut u64,
+    local: &Path,
+) -> Result<(usize, usize)> {
+    let (mut files, mut dirs) = (0usize, 0usize);
+    loop {
+        match recv(reader, aead_name, rx_key, rx).await? {
+            Some(ScpFrame::MkDir { file_id, path, mode }) => {
+                let d = safe_join(local, &path).map_err(CryptoError::Parameter)?;
+                std::fs::create_dir_all(&d)
+                    .map_err(|e| CryptoError::Parameter(format!("mkdir {}: {e}", d.display())))?;
+                // fchmod via the dir fd (O_NOFOLLOW), not a path-based
+                // set_permissions a local symlink swap could redirect.
+                set_dir_mode_nofollow(&d, mode);
+                send(writer, aead_name, tx_key, tx, &ScpFrame::Ack { file_id }).await?;
+                dirs += 1;
+            }
+            Some(ScpFrame::Put { file_id, path, mode, size }) => {
+                let dest = safe_join(local, &path).map_err(CryptoError::Parameter)?;
+                let mut staged = Staged::create(dest.clone())
+                    .map_err(|e| CryptoError::Parameter(format!("stage {}: {e}", dest.display())))?;
+                // Errors here propagate with the file still staged — a
+                // partially received file is never committed to its
+                // destination.
+                recv_into_staged(reader, aead_name, rx_key, rx, file_id, size, &mut staged).await?;
+                staged
+                    .commit(mode)
+                    .await
+                    .map_err(|e| CryptoError::Parameter(format!("commit {}: {e}", dest.display())))?;
+                send(writer, aead_name, tx_key, tx, &ScpFrame::Ack { file_id }).await?;
+                files += 1;
+            }
+            // The server's own end-of-batch marker is the ONLY success exit.
+            Some(ScpFrame::Done) => break,
+            None => {
+                return Err(CryptoError::Parameter(
+                    "scp get: stream closed before Done — transfer is incomplete".to_string(),
+                ))
+            }
+            Some(ScpFrame::Err(m)) => {
+                return Err(CryptoError::Parameter(format!("scp get failed: {m}")))
+            }
+            other => {
+                return Err(CryptoError::Parameter(format!(
+                    "scp get: unexpected frame {other:?}"
+                )))
+            }
+        }
+    }
+    Ok((files, dirs))
+}
+
 async fn recv_into_staged<R: AsyncReadExt + Unpin>(
     r: &mut R,
     aead: &str,
@@ -1331,6 +1425,13 @@ where
                 recv_into_staged(&mut reader, aead_name, rx_key, &mut rx, file_id, size - from, &mut staged).await?;
                 staged.commit(mode).await.map_err(|e| CryptoError::Parameter(format!("commit {}: {e}", local.display())))?;
                 send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ack { file_id }).await?;
+                // `None` is tolerated *here only*: this file's completeness was
+                // already established by the declared size plus `Eof` inside
+                // `recv_into_staged`, and it is committed. The trailing `Done`
+                // is a formality, so a close after it would otherwise turn a
+                // verified, complete transfer into a failure. The recursive
+                // path has no such per-item proof of "that was all of them",
+                // which is why it insists on `Done`.
                 match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
                     Some(ScpFrame::Done) | None => {}
                     Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp get failed: {m}"))),
@@ -1355,6 +1456,13 @@ where
                 recv_into_staged(&mut reader, aead_name, rx_key, &mut rx, file_id, size, &mut staged).await?;
                 staged.commit(mode).await.map_err(|e| CryptoError::Parameter(format!("commit {}: {e}", local.display())))?;
                 send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ack { file_id }).await?;
+                // `None` is tolerated *here only*: this file's completeness was
+                // already established by the declared size plus `Eof` inside
+                // `recv_into_staged`, and it is committed. The trailing `Done`
+                // is a formality, so a close after it would otherwise turn a
+                // verified, complete transfer into a failure. The recursive
+                // path has no such per-item proof of "that was all of them",
+                // which is why it insists on `Done`.
                 match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
                     Some(ScpFrame::Done) | None => {}
                     Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp get failed: {m}"))),
@@ -1368,32 +1476,17 @@ where
                 // server sends under it (relative paths validated by safe_join).
                 std::fs::create_dir_all(local)
                     .map_err(|e| CryptoError::Parameter(format!("create {}: {e}", local.display())))?;
-                let (mut files, mut dirs) = (0usize, 0usize);
-                loop {
-                    match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
-                        Some(ScpFrame::MkDir { file_id, path, mode }) => {
-                            let d = safe_join(local, &path).map_err(CryptoError::Parameter)?;
-                            std::fs::create_dir_all(&d).map_err(|e| CryptoError::Parameter(format!("mkdir {}: {e}", d.display())))?;
-                            // fchmod via the dir fd (O_NOFOLLOW), not a path-based
-                            // set_permissions a local symlink swap could redirect.
-                            set_dir_mode_nofollow(&d, mode);
-                            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ack { file_id }).await?;
-                            dirs += 1;
-                        }
-                        Some(ScpFrame::Put { file_id, path, mode, size }) => {
-                            let dest = safe_join(local, &path).map_err(CryptoError::Parameter)?;
-                            let mut staged = Staged::create(dest.clone())
-                                .map_err(|e| CryptoError::Parameter(format!("stage {}: {e}", dest.display())))?;
-                            recv_into_staged(&mut reader, aead_name, rx_key, &mut rx, file_id, size, &mut staged).await?;
-                            staged.commit(mode).await.map_err(|e| CryptoError::Parameter(format!("commit {}: {e}", dest.display())))?;
-                            send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Ack { file_id }).await?;
-                            files += 1;
-                        }
-                        Some(ScpFrame::Done) | None => break,
-                        Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp get failed: {m}"))),
-                        other => return Err(CryptoError::Parameter(format!("scp get: unexpected frame {other:?}"))),
-                    }
-                }
+                let (files, dirs) = recv_tree(
+                    &mut reader,
+                    &mut writer,
+                    aead_name,
+                    rx_key,
+                    &mut rx,
+                    tx_key,
+                    &mut tx,
+                    local,
+                )
+                .await?;
                 let _ = writer.shutdown().await;
                 eprintln!("[nkct] downloaded {files} files, {dirs} dirs → {}", local.display());
                 Ok(())
@@ -1796,6 +1889,259 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- F16: completion is `Done`, never end-of-stream --------------------
+
+    const T_AEAD: &str = "AES-256-GCM";
+    const T_KEY: [u8; 32] = [0x5Au8; 32];
+
+    /// Seal `frames` into the byte stream a server would have written.
+    /// Ending the Vec is the peer closing the connection at that point.
+    async fn wire(frames: &[ScpFrame]) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut ctr = 0u64;
+        for f in frames {
+            send(&mut buf, T_AEAD, &T_KEY, &mut ctr, f).await.expect("seal");
+        }
+        buf
+    }
+
+    /// Drive `recv_tree` over a synthesized stream into a fresh directory.
+    async fn run_recv_tree(
+        frames: &[ScpFrame],
+    ) -> (Result<(usize, usize)>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bytes = wire(frames).await;
+        let mut reader = &bytes[..];
+        let mut sink: Vec<u8> = Vec::new();
+        let (mut rx, mut tx) = (0u64, 0u64);
+        let res = recv_tree(
+            &mut reader,
+            &mut sink,
+            T_AEAD,
+            &T_KEY,
+            &mut rx,
+            &T_KEY,
+            &mut tx,
+            dir.path(),
+        )
+        .await;
+        (res, dir)
+    }
+
+    /// One complete file: Put ‖ Data ‖ Eof.
+    fn file_frames(id: u32, path: &str, body: &[u8]) -> Vec<ScpFrame> {
+        vec![
+            ScpFrame::Put {
+                file_id: id,
+                path: path.into(),
+                mode: 0o644,
+                size: body.len() as u64,
+            },
+            ScpFrame::Data {
+                file_id: id,
+                bytes: body.to_vec(),
+            },
+            ScpFrame::Eof { file_id: id },
+        ]
+    }
+
+    #[tokio::test]
+    async fn recursive_get_accepts_explicit_done_for_empty_transfer() {
+        let (res, _dir) = run_recv_tree(&[ScpFrame::Done]).await;
+        assert_eq!(res.expect("empty batch with Done is a success"), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn recursive_get_accepts_explicit_done_after_entries() {
+        let mut frames = vec![ScpFrame::MkDir {
+            file_id: 1,
+            path: "sub".into(),
+            mode: 0o755,
+        }];
+        frames.extend(file_frames(2, "sub/a.bin", b"alpha"));
+        frames.extend(file_frames(3, "b.bin", b"beta"));
+        frames.push(ScpFrame::Done);
+
+        let (res, dir) = run_recv_tree(&frames).await;
+        assert_eq!(res.expect("complete batch"), (2, 1));
+        assert_eq!(
+            std::fs::read(dir.path().join("sub/a.bin")).unwrap(),
+            b"alpha"
+        );
+        assert_eq!(std::fs::read(dir.path().join("b.bin")).unwrap(), b"beta");
+    }
+
+    #[tokio::test]
+    async fn recursive_get_rejects_stream_end_before_done() {
+        // The regression: two files arrived intact, then the stream was cut.
+        // That used to break out of the loop and report success.
+        let mut frames = file_frames(1, "a.bin", b"alpha");
+        frames.extend(file_frames(2, "b.bin", b"beta"));
+        // No Done.
+        let (res, dir) = run_recv_tree(&frames).await;
+        let err = res.expect_err("truncated batch must not be reported as complete");
+        assert!(
+            format!("{err}").contains("before Done"),
+            "unexpected error: {err}"
+        );
+        // The files that did arrive are still there — the failure is about the
+        // batch being incomplete, not about discarding what was received.
+        assert!(dir.path().join("a.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn recursive_get_rejects_stream_end_mid_file_body() {
+        // Put announces 5 bytes, one Data of 2 arrives, then the stream ends.
+        let frames = vec![
+            ScpFrame::Put {
+                file_id: 1,
+                path: "a.bin".into(),
+                mode: 0o644,
+                size: 5,
+            },
+            ScpFrame::Data {
+                file_id: 1,
+                bytes: b"al".to_vec(),
+            },
+        ];
+        let (res, dir) = run_recv_tree(&frames).await;
+        let err = res.expect_err("a mid-body cut must fail");
+        assert!(
+            format!("{err}").contains("closed before Eof"),
+            "unexpected error: {err}"
+        );
+        // A partially received file is never committed to its destination.
+        assert!(
+            !dir.path().join("a.bin").exists(),
+            "a partial file was committed as if complete"
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_get_rejects_file_shorter_than_declared_size() {
+        // Protocol Eof arrives, but fewer bytes than declared.
+        let frames = vec![
+            ScpFrame::Put {
+                file_id: 1,
+                path: "a.bin".into(),
+                mode: 0o644,
+                size: 5,
+            },
+            ScpFrame::Data {
+                file_id: 1,
+                bytes: b"al".to_vec(),
+            },
+            ScpFrame::Eof { file_id: 1 },
+            ScpFrame::Done,
+        ];
+        let (res, dir) = run_recv_tree(&frames).await;
+        let err = res.expect_err("a short file must fail the declared-size check");
+        assert!(
+            format!("{err}").contains("size mismatch"),
+            "unexpected error: {err}"
+        );
+        assert!(!dir.path().join("a.bin").exists());
+    }
+
+    /// Drive `recv_into_staged` — the single-file completion check — over a
+    /// synthesized stream. Returns the result and the staged destination.
+    async fn run_recv_file(
+        declared: u64,
+        frames: &[ScpFrame],
+    ) -> (Result<()>, tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dest = dir.path().join("out.bin");
+        let bytes = wire(frames).await;
+        let mut reader = &bytes[..];
+        let mut rx = 0u64;
+        let mut staged = Staged::create(dest.clone()).expect("stage");
+        let res =
+            recv_into_staged(&mut reader, T_AEAD, &T_KEY, &mut rx, 1, declared, &mut staged).await;
+        if res.is_ok() {
+            staged.commit(0o644).await.expect("commit");
+        }
+        (res, dir, dest)
+    }
+
+    /// A single-file get is complete once the declared byte count and the
+    /// protocol `Eof` have both been validated. Whatever the stream does after
+    /// that — including closing — cannot make it incomplete. This is the
+    /// deliberate difference from the recursive path above, which has no
+    /// per-item proof that the batch ended and therefore requires `Done`.
+    #[tokio::test]
+    async fn single_file_accepts_stream_end_after_size_and_eof() {
+        let body = b"alpha";
+        let frames = vec![
+            ScpFrame::Data {
+                file_id: 1,
+                bytes: body.to_vec(),
+            },
+            ScpFrame::Eof { file_id: 1 },
+            // Stream ends here: no trailing Done.
+        ];
+        let (res, _dir, dest) = run_recv_file(body.len() as u64, &frames).await;
+        res.expect("size + Eof establish completeness on their own");
+        assert_eq!(std::fs::read(&dest).unwrap(), body);
+        assert_eq!(
+            std::fs::metadata(&dest).unwrap().len(),
+            body.len() as u64,
+            "committed file must match the declared size"
+        );
+    }
+
+    /// Distinct from the short-file case: every declared byte arrived, but the
+    /// protocol `Eof` never did. Byte count alone must not stand in for the
+    /// terminator — otherwise a cut that happens to land on the declared length
+    /// would read as a complete transfer.
+    #[tokio::test]
+    async fn single_file_rejects_stream_end_without_protocol_eof() {
+        let body = b"alpha";
+        let frames = vec![ScpFrame::Data {
+            file_id: 1,
+            bytes: body.to_vec(),
+        }];
+        let (res, _dir, dest) = run_recv_file(body.len() as u64, &frames).await;
+        let err = res.expect_err("a missing Eof must fail even at the declared size");
+        assert!(matches!(err, CryptoError::Parameter(_)));
+        assert!(
+            format!("{err}").contains("closed before Eof"),
+            "unexpected error: {err}"
+        );
+        assert!(!dest.exists());
+    }
+
+    #[tokio::test]
+    async fn single_file_rejects_stream_end_before_transfer_is_complete() {
+        // Declared 5, two bytes delivered, no Eof, stream closes.
+        let frames = vec![ScpFrame::Data {
+            file_id: 1,
+            bytes: b"al".to_vec(),
+        }];
+        let (res, dir, dest) = run_recv_file(5, &frames).await;
+        let err = res.expect_err("an incomplete single-file transfer must fail");
+        // `CryptoError` has no dedicated truncation variant, so the category is
+        // all that can be matched structurally; the message pins the case.
+        assert!(matches!(err, CryptoError::Parameter(_)));
+        assert!(
+            format!("{err}").contains("closed before Eof"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            !dest.exists(),
+            "a partial file was committed as if complete"
+        );
+        // Nothing is left behind at the destination directory either.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.iter().all(|n| n != "out.bin"),
+            "staged file surfaced at the destination name: {leftovers:?}"
+        );
+    }
 
     #[test]
     fn frame_roundtrip() {
