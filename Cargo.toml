@@ -42,7 +42,7 @@ fips204 = "0.4"
 sha3 = { version = "0.10", features = ["zeroize"] }
 sha2 = "0.10"
 hkdf = "0.12"
-base64 = "0.21"
+base64 = "0.22"
 pkcs8 = { version = "0.10", features = ["encryption"] }
 spki = "0.8"
 # NOTE: no direct `der` dependency. Every use in src/ goes through the
