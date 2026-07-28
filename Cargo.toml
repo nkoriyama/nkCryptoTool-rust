@@ -160,7 +160,7 @@ windows-sys = { version = "0.59", features = ["Win32_System_Console", "Win32_Fou
 # one API. Gated to the same target set as the `shell_desktop` cfg in build.rs so
 # mobile (android/ios) and other targets never pull it (they use an error stub).
 [target.'cfg(any(all(unix, not(target_os = "android"), not(target_os = "ios")), windows))'.dependencies]
-portable-pty = "0.8"
+portable-pty = "0.9"
 
 [build-dependencies]
 slint-build = { version = "1.16", optional = true }
