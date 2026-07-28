@@ -129,7 +129,7 @@ iroh = { version = "1.0" }
 iroh-base = { version = "1.0", features = ["key", "relay"] }
 iroh-relay = "1.0"
 data-encoding = "2.4"
-qrcode = "0.12"
+qrcode = "0.14"
 crc = "3.0"
 
 [target.'cfg(target_os = "windows")'.dependencies]
