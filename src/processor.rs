@@ -352,10 +352,12 @@ impl CryptoProcessor {
         // All encryptions use the v3 chunked-AEAD format.
         // NKCT_V3_CHUNK_SIZE lets tests pick a small chunk size so the
         // boundary cases (file size = chunk_size etc.) stay cheap.
+        // Bounded by the same maximum the v3 parser enforces, so we can never
+        // write a file this build would then refuse to read back.
         let chunk_size = std::env::var("NKCT_V3_CHUNK_SIZE")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .filter(|&n| n > 0)
+            .filter(|&n| n > 0 && n <= v3::V3_MAX_CHUNK_SIZE)
             .unwrap_or(v3::V3_DEFAULT_CHUNK_SIZE);
         strategy.set_chunk_size(chunk_size);
 
@@ -606,7 +608,18 @@ impl CryptoProcessor {
             }
             let chunk_size_usize = chunk_size as usize;
             let tag_len = v3::V3_TAG_LEN;
-            let max_chunk_wire = chunk_size_usize.saturating_add(tag_len);
+            // Clamp the header-declared chunk size by the body actually on
+            // disk. `deserialize_header` already caps it at V3_MAX_CHUNK_SIZE,
+            // but a chunk larger than the whole remaining body can never be
+            // legitimate, so sizing by the smaller of the two makes the header
+            // field non-amplifying no matter what the parser let through. This
+            // matters because `pt` below is a `Zeroizing` buffer whose drop
+            // volatile-writes its entire capacity — reserved-but-unused
+            // capacity is physically committed, including on the error path.
+            let body_size_usize = usize::try_from(body_size).unwrap_or(usize::MAX);
+            let max_chunk_wire = chunk_size_usize
+                .saturating_add(tag_len)
+                .min(body_size_usize);
             if body_size < tag_len as u64 {
                 return Err(CryptoError::FileRead(
                     "v3 body too small for even one tag".to_string(),
@@ -648,7 +661,7 @@ impl CryptoProcessor {
                 // drop-time zeroize per pass instead of per chunk. Holds the
                 // decrypted plaintext of the current chunk only.
                 let mut pt: Zeroizing<Vec<u8>> =
-                    Zeroizing::new(Vec::with_capacity(chunk_size_usize));
+                    Zeroizing::new(Vec::with_capacity(max_chunk_wire.saturating_sub(tag_len)));
                 let mut bytes_remaining = body_size;
                 let mut final_seen = false;
                 let mut total_read: u64 = 0;

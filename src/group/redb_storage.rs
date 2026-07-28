@@ -173,6 +173,11 @@ pub enum RedbStorageError {
     Codec(String),
     #[error("malformed record: {0}")]
     Malformed(String),
+    #[error(
+        "refusing to persist group state at epoch {incoming}: storage already holds epoch \
+         {stored} (a concurrent writer would have rolled the group back)"
+    )]
+    EpochRollback { stored: u64, incoming: u64 },
 }
 
 // `mls-rs-core` needs the storage error to be convertible into its erased
@@ -957,11 +962,52 @@ impl RedbGroupStateStorage {
         // random low-sensitivity ids, kept cleartext so DEK rotation re-seals
         // values without re-keying.
         let gkey = &state.id;
+        // Epoch this write is carrying. `write_to_storage` always ships the
+        // epoch records belonging to the snapshot, so the highest of them
+        // identifies how far along the state being persisted is.
+        let incoming_epoch = inserts.iter().chain(updates.iter()).map(|e| e.id).max();
 
         let wtx = b
             .db
             .begin_write()
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        {
+            // Compare-and-swap on the epoch, inside the same write transaction
+            // as the writes below so two writers cannot interleave here.
+            //
+            // The snapshot upsert is unconditional, so without this a task
+            // holding an older in-memory copy of the group could write it back
+            // over a newer one and silently undo whatever the newer state
+            // contained — including a Commit that removed a member, which would
+            // reinstate the removed member on the roster and keep the old epoch
+            // secrets live. Failing loudly is the point: a lost update here is
+            // a membership-revocation failure, not a cache miss.
+            if let Some(incoming) = incoming_epoch {
+                let etable = wtx
+                    .open_table(TBL_EPOCH)
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                let lo = group_epoch_key(gkey, 0);
+                let hi = group_epoch_key(gkey, u64::MAX);
+                let stored_max: Option<u64> = {
+                    let mut range = etable
+                        .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
+                        .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                    match range.next_back() {
+                        Some(entry) => {
+                            let (k, _v) =
+                                entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                            Some(epoch_from_group_key(k.value())?)
+                        }
+                        None => None,
+                    }
+                };
+                if let Some(stored) = stored_max {
+                    if incoming < stored {
+                        return Err(RedbStorageError::EpochRollback { stored, incoming });
+                    }
+                }
+            }
+        }
         {
             // Snapshot upsert. `list_group_ids` reads the key directly.
             let mut gtable = wtx
@@ -2062,6 +2108,79 @@ mod tests {
         let dek = [0x37u8; 32];
         let b = RedbBackend::open(dir.path().join("groups.redb"), &dek).expect("open");
         (dir, b)
+    }
+
+    /// The F8 scenario at the storage layer: two writers each loaded the group
+    /// at epoch N, one advanced it to N+1 and persisted, and the other then
+    /// writes its stale epoch-N snapshot back. That write must be REFUSED, not
+    /// silently accepted — accepting it is what reinstates a removed member and
+    /// rewinds the sender ratchet. The per-group async lock normally prevents
+    /// the interleave; this is the backstop for any path that bypasses it.
+    #[test]
+    fn stale_snapshot_write_is_refused() {
+        let (_d, b) = backend();
+        let gss = b.group_state_storage();
+        let gid = b"group-race".to_vec();
+
+        let state = |data: &[u8]| GroupState {
+            id: gid.clone(),
+            data: data.to_vec().into(),
+        };
+        let epoch = |id: u64, data: &[u8]| EpochRecord {
+            id,
+            data: data.to_vec().into(),
+        };
+
+        // Both tasks loaded epoch 5. The inbound task applies a Remove and
+        // persists epoch 6.
+        gss.write_inner(state(b"at-5"), vec![epoch(5, b"e5")], vec![])
+            .expect("initial write");
+        gss.write_inner(state(b"at-6-remove-applied"), vec![epoch(6, b"e6")], vec![])
+            .expect("advancing write");
+
+        // The REPL task, still holding its epoch-5 copy, writes back.
+        let err = gss
+            .write_inner(state(b"at-5-stale"), vec![], vec![epoch(5, b"e5")])
+            .expect_err("a stale snapshot must not be persisted");
+        match err {
+            RedbStorageError::EpochRollback { stored, incoming } => {
+                assert_eq!(stored, 6);
+                assert_eq!(incoming, 5);
+            }
+            other => panic!("expected EpochRollback, got {other:?}"),
+        }
+
+        // The advanced state survived the attempt.
+        let loaded = gss.state(&gid).expect("state").expect("present");
+        assert_eq!(loaded.to_vec(), b"at-6-remove-applied".to_vec());
+    }
+
+    /// Normal forward progress, and re-writing the *current* epoch (the sender
+    /// ratchet advancing within an epoch), must both still be accepted.
+    #[test]
+    fn same_and_advancing_epoch_writes_are_accepted() {
+        let (_d, b) = backend();
+        let gss = b.group_state_storage();
+        let gid = b"group-ok".to_vec();
+        let state = |data: &[u8]| GroupState {
+            id: gid.clone(),
+            data: data.to_vec().into(),
+        };
+        let epoch = |id: u64, data: &[u8]| EpochRecord {
+            id,
+            data: data.to_vec().into(),
+        };
+
+        for (n, payload) in [(1u64, &b"s1"[..]), (2, b"s2"), (3, b"s3")] {
+            gss.write_inner(state(payload), vec![epoch(n, b"e")], vec![])
+                .expect("advancing write must be accepted");
+        }
+        // Same epoch again (ratchet advanced, epoch unchanged).
+        gss.write_inner(state(b"s3-again"), vec![], vec![epoch(3, b"e")])
+            .expect("same-epoch write must be accepted");
+
+        let loaded = gss.state(&gid).expect("state").expect("present");
+        assert_eq!(loaded.to_vec(), b"s3-again".to_vec());
     }
 
     #[test]

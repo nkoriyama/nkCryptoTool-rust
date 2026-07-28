@@ -242,6 +242,15 @@ struct Args {
     copy_bundle: bool,
 
     /// One-time token for `--copy-bundle`, as printed by the pairing server.
+    ///
+    /// Use `--token -` to read it from stdin instead. Unlike `--qr`, this is not
+    /// a courtesy: the OTP is the *sole* authorization secret for enrolling an
+    /// identity into the server's keyring, and a value passed on the command
+    /// line is world-readable on Linux via `/proc/<pid>/cmdline` for as long as
+    /// the process runs — which includes the passphrase prompt that happens
+    /// before any network connection is made. Any local user can read it there
+    /// and race the legitimate client to the single-shot pairing server. If
+    /// stdin is a terminal, `--token -` prompts without echoing.
     #[arg(long)]
     token: Option<String>,
 
@@ -575,6 +584,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Standalone QR encoder: render any string (typically a ticket) as a
+    // (`read_pairing_token_from_stdin` is defined below, near the other helpers.)
     // terminal QR and exit. Self-contained (uses the bundled `qrcode` crate),
     // so `nkct --serve-… | grep Ticket` can be re-shown as a QR without any
     // external tool, and it works offline.
@@ -886,6 +896,10 @@ async fn main() -> anyhow::Result<()> {
     config.use_tpm = args.use_tpm;
     config.connect_addr = args.connect;
     config.chat_mode = args.chat;
+    // Server gate for chat/file-receive. `chat_mode`/`file_mode` are set
+    // per-connection by the ALPN dispatch; this is the operator's decision that
+    // this node serves those ALPNs at all.
+    config.serve_chat = args.serve_chat;
     config.shell_mode =
         args.serve_shell || args.shell || args.shell_cmd.is_some() || args.conn_metrics;
     config.serve_shell = args.serve_shell;
@@ -917,7 +931,21 @@ async fn main() -> anyhow::Result<()> {
     // role (`copy_bundle`), and the token.
     config.serve_pairing = args.serve_pairing;
     config.copy_bundle = args.copy_bundle;
-    config.pairing_token = args.token;
+    // `--token -` keeps the OTP off argv, where any local user can read it from
+    // /proc and race us to the single-shot pairing server. From a terminal we
+    // prompt without echo; otherwise we take one line from stdin so it can be
+    // piped. A token given directly on the command line still works, but warns.
+    config.pairing_token = match args.token.as_deref() {
+        Some("-") => Some(read_pairing_token_from_stdin()?),
+        Some(_) => {
+            eprintln!(
+                "[nkct] warning: --token on the command line is visible to other local users \
+                 via /proc/<pid>/cmdline; prefer `--token -` to read it from stdin"
+            );
+            args.token
+        }
+        None => None,
+    };
     config.keybundle_handle = args.keybundle_handle.clone();
     // Validate forward client specs early (fail fast on a bad spec) before any
     // network setup.
@@ -1227,6 +1255,36 @@ fn load_raw_dsa_priv(
 /// `parse_and_verify` in agreement and forecloses any signature-algorithm
 /// downgrade on the verify side.
 const KEYBUNDLE_IDENTITY_DSA: &str = "ML-DSA-65";
+
+/// Read the pairing one-time token for `--token -`.
+///
+/// From a terminal this prompts and reads without echo; otherwise it takes one
+/// line from stdin so the token can be piped in (`pass show … | nkct --token -`).
+/// Either way the secret never appears in `/proc/<pid>/cmdline`, which is what
+/// let any local user lift it and race the single-shot pairing server.
+///
+/// Deliberately *not* an environment variable: on Linux `/proc/<pid>/environ` is
+/// owner-readable rather than world-readable, so it is better than argv, but it
+/// is still inherited by every child process and visible to anything running as
+/// the same user — a weaker boundary than simply not persisting the value.
+fn read_pairing_token_from_stdin() -> anyhow::Result<String> {
+    use std::io::IsTerminal;
+
+    let token = if std::io::stdin().is_terminal() {
+        rpassword::prompt_password("Pairing token: ")
+            .map_err(|e| anyhow::anyhow!("read --token from terminal: {e}"))?
+    } else {
+        let mut line = String::new();
+        std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut line)
+            .map_err(|e| anyhow::anyhow!("read --token from stdin: {e}"))?;
+        line
+    };
+    let token = token.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("--token - was given but no token was supplied on stdin");
+    }
+    Ok(token)
+}
 
 /// Decode a 64-hex fingerprint (`SHA3-256` of a raw pubkey) into 32 bytes.
 fn parse_fingerprint_hex(s: &str) -> anyhow::Result<[u8; 32]> {
@@ -1791,7 +1849,11 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
                 println!("(keyring {} is empty)", db.display());
             } else {
                 for (handle, fp) in entries {
-                    println!("{}  {}", hex::encode(fp), handle);
+                    // `KeyringStore::add` now rejects handles outside
+                    // [A-Za-z0-9._-], so this is belt-and-braces for rows
+                    // written by an older build, whose handles were never
+                    // charset-checked on ingest.
+                    println!("{}  {handle:?}", hex::encode(fp));
                 }
             }
         }
@@ -2308,16 +2370,21 @@ async fn run_serve_pairing(mut config: CryptoConfig) -> anyhow::Result<()> {
     processor.preload_allowlist().await?;
 
     eprintln!("[pairing] one-time token: {token}   (valid 5 minutes — give it to the client out-of-band)");
-    let tok = token.clone();
     processor
         .run_listen_once(
             move |ticket| {
                 eprintln!("[pairing] server fingerprint: {}", hex::encode(ticket.pqc_sign_fp));
                 println!("[pairing] ticket: {ticket}");
+                // The suggested command uses `--token -`, not the literal OTP:
+                // a token on argv is readable by any local user on the client's
+                // host for the lifetime of the process, including while it sits
+                // at the passphrase prompt before connecting. The token itself
+                // was printed above for the operator to carry out-of-band.
                 eprintln!(
                     "[pairing] client runs: nk-crypto-tool --copy-bundle --connect <ticket> \
-                     --token {tok} --signing-privkey <priv> --keybundle-handle <name> --key-dir <dir>"
+                     --token - --signing-privkey <priv> --keybundle-handle <name> --key-dir <dir>"
                 );
+                eprintln!("[pairing]   (then paste the one-time token when prompted)");
             },
             || {},
         )

@@ -110,19 +110,38 @@ impl GroupStorage {
     /// a 32-byte random group_id per MLS convention); rows with other lengths
     /// are rejected with a `Storage` error so the caller can investigate
     /// corruption rather than silently truncate.
-    pub fn list_group_ids(&self) -> Result<Vec<GroupId>, GroupError> {
-        let raw = self
-            .backend
+    /// Every stored group key, exactly as it sits in the table — including any
+    /// that is not a well-formed 32-byte id.
+    ///
+    /// Used by the join path to detect a group id that already exists before
+    /// persisting over it, which must work regardless of whether some other
+    /// row is malformed.
+    pub fn list_group_ids_raw(&self) -> Result<Vec<Vec<u8>>, GroupError> {
+        self.backend
             .group_state_storage()
             .list_group_ids()
-            .map_err(|e| GroupError::Storage(format!("list_group_ids: {e}")))?;
+            .map_err(|e| GroupError::Storage(format!("list_group_ids: {e}")))
+    }
+
+    /// The well-formed group ids in storage.
+    ///
+    /// A row whose key is not 32 bytes is **skipped with a warning**, not
+    /// treated as a fatal error for the whole scan. It used to abort the
+    /// listing, which meant a single malformed key — one an attacker could
+    /// plant with a crafted Welcome — permanently broke `list_groups` for every
+    /// real group, with no CLI or FFI operation able to remove it. Skipping
+    /// keeps one bad row from denying access to the rest; the join path now
+    /// also refuses to create such a row in the first place.
+    pub fn list_group_ids(&self) -> Result<Vec<GroupId>, GroupError> {
+        let raw = self.list_group_ids_raw()?;
         let mut out = Vec::with_capacity(raw.len());
         for bytes in raw {
             if bytes.len() != 32 {
-                return Err(GroupError::Storage(format!(
-                    "stored group_id has length {} (expected 32)",
+                eprintln!(
+                    "[nkct] warning: skipping stored group with malformed id ({} bytes, expected 32)",
                     bytes.len()
-                )));
+                );
+                continue;
             }
             let mut id = [0u8; 32];
             id.copy_from_slice(&bytes);

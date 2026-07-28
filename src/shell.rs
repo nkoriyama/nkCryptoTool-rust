@@ -22,6 +22,14 @@
 //! are ephemeral (per connection, from the PQC handshake), so counters reset
 //! safely each connection. The plaintext inside one packet is a single
 //! [`Frame`].
+//!
+//! Truncation is a separate matter: cutting the stream between packets forges
+//! nothing, so the AEAD cannot flag it. [`recv_packet`] therefore reports a
+//! clean end of stream (`Ok(None)`) only when the close lands exactly on a
+//! packet boundary, and reports a transport failure or a close part-way through
+//! a packet as an error. Callers that need a *complete* exchange must still
+//! require their own explicit terminator rather than treating `Ok(None)` as
+//! "the peer said we are finished".
 
 use crate::error::{CryptoError, Result};
 use crate::strategy::streaming_aead::{aead_decrypt_chunk, aead_encrypt_chunk};
@@ -176,9 +184,17 @@ pub(crate) async fn send_packet<W: AsyncWriteExt + Unpin>(
 }
 
 /// Read one length-prefixed AEAD packet and decrypt it under `key` with the nonce
-/// derived from `ctr` (incremented on success). Returns `Ok(None)` on a clean
-/// stream close (zero-length packet or EOF). A replayed/reordered/tampered packet
-/// decrypts under the wrong counter-nonce and surfaces as an authentication error.
+/// derived from `ctr` (incremented on success).
+///
+/// Returns `Ok(None)` **only** on a clean end of stream: a zero-length packet, or
+/// a FIN arriving exactly at a packet boundary with nothing read. A transport
+/// failure, or a close partway through the length prefix, is an `Err`.
+///
+/// The distinction matters. This used to map every read failure to `Ok(None)`,
+/// which made a connection cut by an off-path attacker indistinguishable from
+/// the peer's own end-of-stream — so a caller that treats `None` as "the peer
+/// said we are done" would accept a truncated transfer as a complete one. A
+/// replayed/reordered/tampered packet still surfaces as an authentication error.
 pub(crate) async fn recv_packet<R: AsyncReadExt + Unpin>(
     r: &mut R,
     aead_name: &str,
@@ -186,9 +202,23 @@ pub(crate) async fn recv_packet<R: AsyncReadExt + Unpin>(
     ctr: &mut u64,
 ) -> Result<Option<Zeroizing<Vec<u8>>>> {
     let mut len_bytes = [0u8; 4];
-    match r.read_exact(&mut len_bytes).await {
-        Ok(_) => {}
-        Err(_) => return Ok(None), // EOF / peer closed
+    // Filled by hand rather than with `read_exact` because we need to know
+    // whether *anything* arrived: zero bytes then FIN is a clean close, while a
+    // partial prefix then FIN is a truncation.
+    let mut got = 0usize;
+    while got < 4 {
+        match r.read(&mut len_bytes[got..]).await {
+            Ok(0) => {
+                if got == 0 {
+                    return Ok(None); // clean FIN at a packet boundary
+                }
+                return Err(CryptoError::Parameter(
+                    "stream closed part-way through a packet length prefix".to_string(),
+                ));
+            }
+            Ok(n) => got += n,
+            Err(e) => return Err(io_err(e)),
+        }
     }
     let len = u32::from_le_bytes(len_bytes) as usize;
     if len == 0 {
@@ -1758,6 +1788,97 @@ pub async fn run_pty_client<R, W>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- F16: a truncated stream must not look like a clean end of stream ----
+
+    const TEST_AEAD: &str = "AES-256-GCM";
+
+    fn test_key() -> [u8; 32] {
+        [0x5Au8; 32]
+    }
+
+    /// Seal one frame the way the wire carries it, so the tests below can cut
+    /// the byte stream at chosen offsets.
+    async fn sealed_packet(payload: &[u8], ctr: &mut u64) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        send_packet(&mut buf, TEST_AEAD, &test_key(), ctr, payload)
+            .await
+            .expect("seal");
+        buf
+    }
+
+    #[tokio::test]
+    async fn clean_close_on_a_packet_boundary_is_end_of_stream() {
+        let mut ctr = 0u64;
+        let wire = sealed_packet(b"hello", &mut ctr).await;
+
+        let mut r = &wire[..];
+        let mut rx = 0u64;
+        let first = recv_packet(&mut r, TEST_AEAD, &test_key(), &mut rx)
+            .await
+            .expect("first packet");
+        assert_eq!(first.as_deref().map(|v| v.as_slice()), Some(&b"hello"[..]));
+
+        // Nothing left: this is the peer finishing, not a failure.
+        let end = recv_packet(&mut r, TEST_AEAD, &test_key(), &mut rx)
+            .await
+            .expect("clean end of stream must not be an error");
+        assert!(end.is_none());
+    }
+
+    #[tokio::test]
+    async fn close_part_way_through_the_length_prefix_is_an_error() {
+        let mut ctr = 0u64;
+        let wire = sealed_packet(b"hello", &mut ctr).await;
+
+        // Two of the four length bytes, then EOF.
+        let mut r = &wire[..2];
+        let mut rx = 0u64;
+        let res = recv_packet(&mut r, TEST_AEAD, &test_key(), &mut rx).await;
+        assert!(
+            res.is_err(),
+            "a truncated length prefix must not read as end-of-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_part_way_through_a_packet_body_is_an_error() {
+        let mut ctr = 0u64;
+        let wire = sealed_packet(b"a longer payload for truncation", &mut ctr).await;
+
+        // Full length prefix, then a body cut short.
+        let cut = 4 + (wire.len() - 4) / 2;
+        let mut r = &wire[..cut];
+        let mut rx = 0u64;
+        let res = recv_packet(&mut r, TEST_AEAD, &test_key(), &mut rx).await;
+        assert!(
+            res.is_err(),
+            "a truncated packet body must not read as end-of-stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncation_between_two_complete_packets_is_end_of_stream_for_the_reader() {
+        // The transport layer cannot tell this from a legitimate finish — which
+        // is exactly why completion has to be a protocol-level terminator. The
+        // reader reports `None`; it is the caller's job (e.g. scp's `get -r`
+        // requiring `ScpFrame::Done`) to refuse to call that a success.
+        let mut ctr = 0u64;
+        let mut wire = sealed_packet(b"one", &mut ctr).await;
+        wire.extend_from_slice(&sealed_packet(b"two", &mut ctr).await);
+        let first_len = 4 + u32::from_le_bytes(wire[..4].try_into().unwrap()) as usize;
+
+        let mut r = &wire[..first_len];
+        let mut rx = 0u64;
+        assert!(recv_packet(&mut r, TEST_AEAD, &test_key(), &mut rx)
+            .await
+            .expect("first")
+            .is_some());
+        assert!(recv_packet(&mut r, TEST_AEAD, &test_key(), &mut rx)
+            .await
+            .expect("boundary close")
+            .is_none());
+    }
 
     #[test]
     fn auth_failure_blocks_only_after_threshold() {

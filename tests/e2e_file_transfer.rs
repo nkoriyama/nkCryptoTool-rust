@@ -54,6 +54,11 @@ async fn make_processor_with_file_io(
 ) -> NetworkProcessor {
     let mut config = CryptoConfig::default();
     config.chat_mode = false;
+    // File receive runs over ALPN_FILE, which is gated on `serve_chat` the way
+    // shell/scp/forward are gated on their own flags. The listener half of this
+    // helper is a file server, so it declares the role; the connector half
+    // ignores the flag.
+    config.serve_chat = true;
     config.no_relay = true;
     config.allow_unauth = true;
     config.transport = TransportKind::Iroh;

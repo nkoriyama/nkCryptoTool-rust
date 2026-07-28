@@ -289,6 +289,19 @@ impl Reassembler {
         if base.contains('/') || base.contains('\\') || base.contains('\0') {
             return None;
         }
+        // The sender chooses this name and it becomes both a real filename and
+        // display text. Control characters (ESC/CSI, CR) and the bidi/zero-width
+        // marks let a sender repaint the receiving operator's transcript or
+        // disguise an extension, so refuse them outright rather than only
+        // escaping them at one print site.
+        if base.chars().any(|c| {
+            c.is_control()
+                || ('\u{200B}'..='\u{200F}').contains(&c)
+                || ('\u{202A}'..='\u{202E}').contains(&c)
+                || ('\u{2066}'..='\u{2069}').contains(&c)
+        }) {
+            return None;
+        }
         Some(base.to_string())
     }
 
@@ -501,6 +514,23 @@ fn exclusive_create(path: &Path) -> std::io::Result<std::fs::File> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn safe_name_rejects_control_and_bidi_characters() {
+        // The sender picks this name and it becomes both a real filename and
+        // the text of the completion line the receiving operator reads.
+        assert!(Reassembler::safe_name("\u{1b}[2K\rinvoice.pdf").is_none());
+        assert!(Reassembler::safe_name("report\u{202E}fdp.exe").is_none());
+        assert!(Reassembler::safe_name("a\u{200B}b").is_none());
+        assert!(Reassembler::safe_name("line\nbreak").is_none());
+        // Still rejected for the reasons it always was.
+        assert!(Reassembler::safe_name("").is_none());
+        assert!(Reassembler::safe_name("..").is_none());
+        assert!(Reassembler::safe_name("a\\b").is_none());
+        // Ordinary names, including non-ASCII ones, keep working.
+        assert_eq!(Reassembler::safe_name("hello.bin").as_deref(), Some("hello.bin"));
+        assert_eq!(Reassembler::safe_name("報告書 v2.pdf").as_deref(), Some("報告書 v2.pdf"));
+    }
 
     #[test]
     fn frame_and_reassemble_roundtrip() {

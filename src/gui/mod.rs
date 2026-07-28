@@ -69,22 +69,14 @@ fn chrono_like_timestamp() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
-/// Parse a sender label from a message of the form `[name] body`.
-/// Returns `None` if either bracket is missing or `]` precedes `[`,
-/// so callers can substitute a safe default.
-///
-/// Uses checked slicing (`str::get`) so malformed remote input cannot
-/// trigger a panic. The `]` is searched only in the substring after
-/// `[`, which guarantees the absolute end offset is >= start + 1.
-#[cfg(feature = "gui")]
-fn extract_peer_id(msg: &str) -> Option<String> {
-    let start = msg.find('[')?;
-    let after_start = start + 1;
-    let tail = msg.get(after_start..)?;
-    let rel_end = tail.find(']')?;
-    let end = after_start + rel_end;
-    msg.get(after_start..end).map(|s| s.to_string())
-}
+// `extract_peer_id` used to parse a sender label out of `[name] body` and hand
+// it to the desktop-notification body. But `[name]` is part of the *peer's own
+// message*, so the peer chose that label — it was never an identity, and a
+// notification attributed to "nkCryptoTool" carrying peer-authored text is a
+// phishing surface (markup-capable notification servers render `<a href=…>`).
+// The parser is gone along with its only caller; the authenticated handshake
+// fingerprint is the only thing that may ever label a notification, and until
+// it is plumbed into the GUI the notification stays generic.
 
 /// F3: format the transfer-status string from (sent, total). Public so the
 /// test suite can verify the canonical format without driving a real
@@ -259,12 +251,14 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             let clean_msg = msg.trim_start_matches("\r[Peer]: ").trim_end_matches("\n> ").trim_start_matches("> ").to_string();
             if clean_msg.is_empty() || clean_msg == ">" { continue; }
             
-            let peer_id = extract_peer_id(&msg).unwrap_or_else(|| "Peer".to_string());
-
             #[cfg(feature = "gui-notifications")]
             {
-                 // M4: Trigger notification
-                 let _ = nm.notify_message(&peer_id, false);
+                 // M4: Trigger notification. `None` because no authenticated
+                 // identity reaches this task — the only peer-derived string
+                 // here is the message body itself, which the peer authored and
+                 // which therefore must not label a notification. Pass the
+                 // handshake fingerprint here once it is plumbed through.
+                 let _ = nm.notify_message(None, false);
             }
 
             let ui_handle = ui_handle_out.clone();
@@ -323,8 +317,29 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     let ui_handle_privacy = ui_handle.clone();
     let pa = protection_api.clone();
     ui.on_privacy_mode_toggled(move |enabled| {
-        if let Some(ui) = ui_handle_privacy.upgrade() {
-            let _ = pa.set_protection(ui.window(), enabled);
+        let Some(ui) = ui_handle_privacy.upgrade() else {
+            return;
+        };
+        // The result is NOT discarded. `set_protection` returns Err on every
+        // platform where the OS capture-exclusion call is not wired up, and
+        // swallowing that left the switch reading "on" over a window that any
+        // screen-share or screenshot tool still captured in full — a control
+        // the user relies on precisely when secrets are on screen.
+        match pa.set_protection(ui.window(), enabled) {
+            Ok(()) => {
+                if enabled {
+                    ui.set_privacy_warning(slint::SharedString::from(""));
+                }
+            }
+            Err(e) => {
+                // Put the switch back where it actually is, and say why.
+                ui.set_privacy_mode(false);
+                let msg = pa
+                    .get_warning_message()
+                    .unwrap_or_else(|| format!("Privacy mode unavailable: {e}"));
+                eprintln!("[nkct-gui] {msg}");
+                ui.set_privacy_warning(slint::SharedString::from(msg));
+            }
         }
     });
 
@@ -684,6 +699,11 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             config.signing_privkey = if privkey.is_empty() { None } else { Some(privkey.clone()) };
             config.signing_pubkey = if pubkey.is_empty() { None } else { Some(pubkey.clone()) };
             config.chat_mode = false;
+            // This IS the chat/file server role — the GUI's receive button
+            // listens on ALPN_FILE. `serve_chat` is what the ALPN dispatch
+            // checks before serving that protocol, so a listener that does not
+            // declare the role is refused (as a `--serve-shell` node now is).
+            config.serve_chat = true;
             config.transport = crate::config::TransportKind::Iroh;
             config.allow_unauth = true;
 
@@ -864,44 +884,9 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "gui"))]
-mod tests {
-    use super::extract_peer_id;
-
-    #[test]
-    fn normal_label_is_extracted() {
-        assert_eq!(extract_peer_id("[admin] hello"), Some("admin".to_string()));
-    }
-
-    #[test]
-    fn multibyte_label_is_extracted() {
-        assert_eq!(extract_peer_id("[あ]"), Some("あ".to_string()));
-    }
-
-    #[test]
-    fn empty_brackets_yield_empty_string() {
-        assert_eq!(extract_peer_id("[]"), Some(String::new()));
-    }
-
-    #[test]
-    fn no_brackets_returns_none() {
-        assert_eq!(extract_peer_id("no brackets"), None);
-    }
-
-    #[test]
-    fn closing_before_opening_does_not_panic() {
-        // Previously msg.find(']') < msg.find('[') triggered an
-        // out-of-bounds slice. Must now return None and never panic.
-        assert_eq!(extract_peer_id("] ["), None);
-    }
-
-    #[test]
-    fn only_opening_bracket_returns_none() {
-        assert_eq!(extract_peer_id("[unterminated"), None);
-    }
-
-    #[test]
-    fn only_closing_bracket_returns_none() {
-        assert_eq!(extract_peer_id("trailing]"), None);
-    }
-}
+// The tests that lived here exercised `extract_peer_id`'s panic-safety on
+// malformed remote input (`"] ["`, `"[unterminated"`, …). They went with the
+// function: nothing parses a label out of a peer's message any more, so there
+// is no longer a parser to keep panic-safe. The property that replaced them —
+// that a notification body never carries peer-authored markup — is tested in
+// `gui::notifications`.

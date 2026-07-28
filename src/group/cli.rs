@@ -838,13 +838,18 @@ async fn event_to_line(
                     "[file ⇩ {sender_index}@{group_id}] receiving {name:?} ({size} bytes)…"
                 )),
                 Some(FileStatus::Progress { .. }) => None,
+                // The destination basename comes from the sender's START frame
+                // (`safe_name` rejects only separators, NUL, `.` and `..`), so
+                // ESC/CSI bytes reach the path. `{name:?}` is Debug-escaped
+                // already; `path.display()` is not, hence the explicit filter.
                 Some(FileStatus::Completed { name, path }) => Some(format!(
                     "[file ✓ {sender_index}@{group_id}] saved {name:?} → {}",
-                    path.display()
+                    crate::utils::sanitize_for_terminal(&path.display().to_string())
                 )),
-                Some(FileStatus::Error(e)) => {
-                    Some(format!("[file ✗ {sender_index}@{group_id}] {e}"))
-                }
+                Some(FileStatus::Error(e)) => Some(format!(
+                    "[file ✗ {sender_index}@{group_id}] {}",
+                    crate::utils::sanitize_for_terminal(&e.to_string())
+                )),
                 None => None,
             };
         }
@@ -861,8 +866,13 @@ fn render_event(evt: &IncomingGroupEvent) -> String {
             body,
         } => {
             // UTF-8 lossy so a peer sending malformed bytes can't
-            // crash our display; matches the 1:1 chat policy.
-            let text = String::from_utf8_lossy(body);
+            // crash our display; matches the 1:1 chat policy. Then strip the
+            // control/bidi characters that would let a group member erase or
+            // forge the event lines above their own — this REPL is where the
+            // operator reads group and identity events to make trust
+            // decisions, so spoofing it is not merely cosmetic. Applied here in
+            // `render_event` so all of its call sites are covered.
+            let text = crate::utils::sanitize_for_terminal(&String::from_utf8_lossy(body));
             format!("[{sender_index}@{group_id}] {text}")
         }
         IncomingGroupEvent::EpochAdvanced {
