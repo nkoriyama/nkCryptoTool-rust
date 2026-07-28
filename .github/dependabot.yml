@@ -18,6 +18,25 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    ignore:
+      # The RustCrypto digest 0.11 set. These four cannot move independently:
+      # sha3 0.12, hmac 0.13, sha2 0.11 and hkdf 0.13 are all built on
+      # digest 0.11, while anything left on digest 0.10 sees them as unrelated
+      # types. A single-crate bump therefore fails to compile — see #63 and #64,
+      # both closed with the errors recorded.
+      #
+      # The migration is blocked upstream, not on us: fips203/fips204 pin
+      # sha2 0.10, and ed25519-dalek 3.0 (the first digest-0.11 release) is
+      # still pre-release. Drop this block and bump all four together once both
+      # land; until then dependabot would reopen the same unmergeable PR weekly.
+      - dependency-name: "sha3"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "sha2"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "hmac"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "hkdf"
+        update-types: ["version-update:semver-major"]
 
   # GitHub Actions used by our workflows (keeps actions/checkout, cache, etc.
   # current — this is what the Node 20 deprecation bump would have surfaced).
