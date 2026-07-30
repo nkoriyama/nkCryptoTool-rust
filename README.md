@@ -596,6 +596,11 @@ Members / Messages / 入力欄 / Add Member サブフォーム。すべての操
 `crate::group::cli::*` ハンドラを呼ぶため、CLI と GUI で別永続化スキーマや別実装は
 存在しない。
 
+> **表示上の注**: Messages ペインは直近 1000 行のみ保持し (超過分は古い行から破棄)、
+> 1 メッセージの表示は 256 文字で `…[truncated]` に切られる。CLI 同様、本文中の
+> 制御文字・bidi 文字は空白に置換される。理由は
+> [`docs/security/SECURITY_PROFILE_GUI.md`](./docs/security/SECURITY_PROFILE_GUI.md) §1.12。
+
 > **設計上の注**: ハイブリッド suite (`0xF101`) のみを公開するため、クラシカルピア
 > (RFC 9420 標準スイートのみ実装) とは通信できない。Plan §1 「PQC mandatory」が
 > 意図された制約。

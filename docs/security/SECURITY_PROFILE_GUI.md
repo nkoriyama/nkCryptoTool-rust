@@ -43,3 +43,12 @@
 - **UI スレッドの計算量**: 追記は `VecModel` への in-place `push` / `remove(0)`。従来はメッセージ 1 通ごとに既存全行を新しい `VecModel` にコピーし直して `set_messages` していたため、N 通で O(N^2) の行コピーが UI スレッド上で発生し、event loop が停止した。
 - **event loop queue の深さ**: `slint::invoke_from_event_loop` のキューは無制限なので、パケット 1 個につき closure 1 個を投げない。行は `gui::ChatRowQueue` に staging し、**未処理の closure は同時に最大 1 個**とする (pending 中に届いた行はその closure がまとめて回収)。staging バッファ自体も `MAX_CHAT_ROWS` 上限を持つ。
 - **表示上の帰結**: 1000 行を超えると古いメッセージは画面から消える (GUI にスクロールバック保存は無い)。256 文字を超えるメッセージは末尾が `…[truncated]` になり、GUI 側で全文は復元できない。
+
+## 1.12 MLS グループチャット窓 (`gui-mls`) の Messages モデル
+`GroupChatWindow` の Messages ペインは `ChatWindow` と同じ `StandardListView` + `StandardListViewItem` であり、行の供給元も同じく peer が書いた平文 (`accept_next` → `render_event`) である。§1.11 の 4 つの上限をこの窓にもそのまま適用する。定数 (`gui::MAX_CHAT_ROWS` / `gui::MAX_CHAT_ROW_CHARS`) と staging 実装 (`gui::ChatRowQueue`) は 1:1 窓と共有し、Slint がコンポーネントごとに別の型を生成するため `append_chat_rows` の本体だけを `append_message` として再掲する。
+
+- **サニタイズ**: メンバ本文は `utils::sanitize_for_terminal_bounded(.., 256)` を `render_event` 内で通す (CLI 双子 `group::cli::render_event` と同じ位置 = 全呼出元をカバー)。Messages ペインには `[joined]` / `[epoch]` / `[removed]` という**信頼判断に使う行**が同居するため、本文に改行や bidi override を入れられると隣の行を偽造できる。なお `StandardListViewItem` は端末ではないので ESC / `\r` によるカーソル操作は無効 (Slint の `Text` は解釈せず描画するだけ) だが、bidi override / isolate による**行内の並べ替え**とゼロ幅文字による隠蔽は媒体が変わっても成立する。改行は行が固定高さ・非 wrap・`overflow: elide` の 1 行であるため、隣接行への描画か本文後半の黙殺かのいずれかになり、どちらも偽造プリミティブ。よって空白置換が正しい。
+- **行数上限**: `append_message` が `MAX_CHAT_ROWS = 1000` で最古行から破棄。`push_event_into_ui` (peer 由来) と `wire_send_message` のローカルエコーの**両方**がこの関数を通るため、上限を迂回する行の供給路は無い。
+- **UI スレッドの計算量**: `VecModel` への in-place `push` / `remove(0)`。従来は 1 通ごとに全行コピー + `set_messages` で O(N^2)。`row_data` は `unwrap` ではなく `filter_map` で受ける。
+- **event loop queue の深さ**: 受信イベントは `ChatRowQueue` に staging し、未処理 closure は同時に最大 1 個。
+- **表示上の帰結**: §1.11 と同じ。1000 行を超えた古い行は消え、256 文字を超えた本文は `…[truncated]` で切られる。`[leaf N @ <group-id>]` の接頭辞は自前の文字列なので上限の対象外。
