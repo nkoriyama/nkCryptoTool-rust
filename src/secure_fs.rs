@@ -100,6 +100,24 @@ pub fn open_existing_no_follow(path: &Path, write: bool) -> io::Result<File> {
     imp::open_existing_no_follow(path, write)
 }
 
+/// Open an *existing* file read-write through a link-free handle that stays
+/// shareable for as long as it is held. For handing a storage engine a file it
+/// must never re-resolve itself: the engine's own path open would follow a
+/// link the caller already refused, so it gets this handle instead.
+///
+/// Differs from [`open_existing_no_follow`] in two ways it needs to be a
+/// separate entry point for. It refuses a hard link as well as a symlink, on
+/// both platforms, because the engine writes through the handle immediately —
+/// [`harden_owner_only`]'s identical refusal only lands after that write. And
+/// on windows it keeps the sharing mode `std` puts on a plain `File`, because
+/// the engine used to open this path itself and got exactly that: the handle
+/// outlives the call, so the exclusive mode of [`open_existing_no_follow`]
+/// would newly deny opens of the database that used to succeed. Permissions
+/// are untouched — the caller tightens them once the engine has settled.
+pub fn open_existing_no_follow_shared(path: &Path) -> io::Result<File> {
+    imp::open_existing_no_follow_shared(path)
+}
+
 #[cfg(unix)]
 mod imp {
     use super::*;
@@ -188,6 +206,16 @@ mod imp {
         opts.read(true).write(write).custom_flags(libc::O_NOFOLLOW);
         opts.open(path)
     }
+
+    pub fn open_existing_no_follow_shared(path: &Path) -> io::Result<File> {
+        // Nothing to widen for sharing: unix has no share modes, so the
+        // O_NOFOLLOW open is the whole story. The hard-link refusal is spelled
+        // out because O_NOFOLLOW only covers a symlink at the final component;
+        // the windows twin gets it inside `open_secure` for free.
+        let f = open_existing_no_follow(path, true)?;
+        reject_multilink(&f)?;
+        Ok(f)
+    }
 }
 
 #[cfg(windows)]
@@ -213,8 +241,8 @@ mod imp {
     use windows_sys::Win32::Storage::FileSystem::{
         CreateDirectoryW, CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
         CREATE_NEW, FILE_APPEND_DATA, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
     };
 
     /// Protected (non-inheriting) DACL granting FILE_ALL_ACCESS to the file's
@@ -536,6 +564,29 @@ mod imp {
         };
         open_secure(path, access, 0, OPEN_EXISTING, 0, false)
     }
+
+    pub fn open_existing_no_follow_shared(path: &Path) -> io::Result<File> {
+        use windows_sys::Win32::Foundation::GENERIC_READ;
+        // The share flags `std`'s OpenOptions puts on a plain File. The engine
+        // used to open this path itself and got exactly these, so keeping them
+        // leaves its concurrency unchanged; narrowing them would newly deny
+        // opens that succeeded before, for as long as this handle is held.
+        // (An exclusive share would probably *not* also break the caller's
+        // later harden_owner_only — its WRITE_DAC|READ_CONTROL|
+        // FILE_READ_ATTRIBUTES touches none of the accesses NT's share check
+        // arbitrates — but that is unverified from here; the concurrency
+        // argument alone decides this.) `open_secure` supplies
+        // FILE_FLAG_OPEN_REPARSE_POINT and rejects both a reparse point and a
+        // hard-linked file.
+        open_secure(
+            path,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            OPEN_EXISTING,
+            0,
+            false,
+        )
+    }
 }
 
 // No silent degradation on exotic targets: a secret write that cannot be
@@ -564,6 +615,9 @@ mod imp {
         Err(unsupported())
     }
     pub fn open_existing_no_follow(_path: &Path, _write: bool) -> io::Result<File> {
+        Err(unsupported())
+    }
+    pub fn open_existing_no_follow_shared(_path: &Path) -> io::Result<File> {
         Err(unsupported())
     }
     pub fn create_dir_owner_only(_path: &Path) -> io::Result<()> {

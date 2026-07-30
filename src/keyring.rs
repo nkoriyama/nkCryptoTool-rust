@@ -114,7 +114,8 @@ pub struct KeyringStore {
 
 impl KeyringStore {
     /// Open (or create) the keyring at `path`. Creates both tables on first use
-    /// and tightens the file to `0600` on unix.
+    /// and tightens the file to `0600` on unix. A symlink at `path`, or a
+    /// keyring carrying a second hard link, is refused rather than opened.
     pub fn open(path: &Path) -> Result<Self> {
         // Pre-create the file owner-only (exclusive, no-follow) so a fresh
         // keyring is never readable by other users even for an instant —
@@ -131,7 +132,19 @@ impl KeyringStore {
                 )))
             }
         }
-        let db = Database::create(path)
+        // redb gets an already-resolved handle, never the path. The exclusive
+        // create above also reports `AlreadyExists` for a symlink planted at
+        // `path`, and a path-based `Database::create` then re-resolved and
+        // followed the very link the create had refused — initializing a fresh
+        // ~1 MiB database over whatever the link aimed at, since redb adopts
+        // any empty file as a new database. Silently, at that: the
+        // `harden_owner_only` below is best-effort, so `open` still returned
+        // `Ok`. Here the path is resolved once, under no-follow, and a link is
+        // refused before a byte is written.
+        let file = crate::secure_fs::open_existing_no_follow_shared(path)
+            .map_err(|e| CryptoError::Parameter(format!("keyring: open {path:?}: {e}")))?;
+        let db = Database::builder()
+            .create_file(file)
             .map_err(|e| CryptoError::Parameter(format!("keyring: open {path:?}: {e}")))?;
         // Ensure both tables exist so a read on a fresh DB does not error.
         {
@@ -769,6 +782,89 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d.join("keyring.db")
+    }
+
+    /// A symlink planted at the keyring path must not be followed. The
+    /// owner-only pre-create refuses the link with `AlreadyExists`, but handing
+    /// redb the *path* afterwards let it re-resolve and follow the very link
+    /// the create had refused, writing a fresh database over the target — and
+    /// `open` returned `Ok`, because the only check that would have caught it
+    /// (`harden_owner_only`) is best-effort here.
+    #[cfg(unix)]
+    #[test]
+    fn keyring_path_symlink_is_refused_leaving_target_intact() {
+        let path = tmp("symlink");
+        // Zero length on purpose: redb adopts an empty file as a brand-new
+        // database and initializes it in place, which is what turns a followed
+        // link into the destruction of the target. A non-empty victim would be
+        // rejected as a corrupt database and hide the defect entirely.
+        let victim = path.parent().expect("dir").join("victim");
+        std::fs::write(&victim, b"").expect("write victim");
+        std::os::unix::fs::symlink(&victim, &path).expect("plant symlink");
+
+        assert!(
+            KeyringStore::open(&path).is_err(),
+            "a symlink at the keyring path must not be opened"
+        );
+
+        assert_eq!(
+            std::fs::metadata(&victim).expect("victim still present").len(),
+            0,
+            "the symlink target must not be written through by the keyring open"
+        );
+        // Refused, not deleted: the link itself is left exactly as planted.
+        assert!(std::fs::symlink_metadata(&path)
+            .expect("link still present")
+            .file_type()
+            .is_symlink());
+    }
+
+    /// The other direction of the no-follow open: refusing links must not cost
+    /// the honest case. An existing keyring re-opens through the handle and
+    /// still reads back what a previous session stored.
+    #[test]
+    fn existing_keyring_reopens_with_entries_intact() {
+        // Distinct from `reopen_persists`'s tag: `tmp` wipes and recreates the
+        // directory it names, so two tests sharing a tag race for one redb file
+        // and collide on its exclusive lock when the suite runs in parallel.
+        let path = tmp("reopen-intact");
+        {
+            let ks = KeyringStore::open(&path).expect("create");
+            ks.add("alice", &[5u8; 32], b"bundle-a", 42).expect("add");
+        }
+        let ks = KeyringStore::open(&path).expect("reopen existing");
+        let e = ks.get("alice").expect("get").expect("present");
+        assert_eq!(e.fingerprint, [5u8; 32]);
+        assert_eq!(e.bundle, b"bundle-a");
+        assert_eq!(e.added_at, 42);
+    }
+
+    /// Deliberate behaviour change, pinned: `open` now refuses a keyring that
+    /// carries a second hard link, which it used to accept — the refusal lives
+    /// in `harden_owner_only`, whose result this call site discards. A second
+    /// name for a secret file is the aliasing primitive `secure_fs` exists to
+    /// refuse, and `nlink > 1` taints *both* names, so a keyring a
+    /// hard-linking backup has touched needs the extra name dropped (or a real
+    /// copy taken) before it opens again. Nothing is damaged by the refusal.
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_keyring_is_refused() {
+        let path = tmp("hardlink");
+        {
+            let ks = KeyringStore::open(&path).expect("create");
+            ks.add("alice", &[5u8; 32], b"bundle-a", 42).expect("add");
+        }
+        let alias = path.parent().expect("dir").join("alias.db");
+        std::fs::hard_link(&path, &alias).expect("hard link");
+
+        assert!(
+            KeyringStore::open(&path).is_err(),
+            "a multi-hard-linked keyring must be refused"
+        );
+
+        std::fs::remove_file(&alias).expect("unlink alias");
+        let ks = KeyringStore::open(&path).expect("reopen once the extra link is gone");
+        assert_eq!(ks.get("alice").expect("get").expect("present").bundle, b"bundle-a");
     }
 
     #[test]

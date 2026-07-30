@@ -890,11 +890,21 @@ fn seal_value(
 }
 
 /// Open (or create) a redb database, ensuring the file is owner-only from the
-/// moment it exists. `Database::create` alone would create the file under the
-/// default umask / inherited ACL and leave a brief window before
-/// `tighten_permissions` re-locks it; pre-creating exclusively with owner-only
-/// permissions (unix 0600 / windows owner-only DACL) closes that window. An
-/// already-present DB is opened as-is (then still tightened by the caller).
+/// moment it exists and that no link at `path` is ever followed.
+///
+/// Two properties, and both need redb to be kept away from the path.
+/// `Database::create` alone would create the file under the default umask /
+/// inherited ACL and leave a window before `tighten_permissions` re-locks it,
+/// so the file is pre-created exclusively at unix 0600 / a windows owner-only
+/// DACL. But the exclusive create *also* fails with `AlreadyExists` against a
+/// symlink planted at `path`, and handing redb the path after that let it
+/// re-resolve and follow the very link the create had refused — initializing a
+/// fresh ~1 MiB database over whatever the link aimed at, since redb adopts any
+/// empty file as a new database. So redb is given an already-validated handle
+/// via `create_file` instead: the path is resolved only by `secure_fs`, only
+/// under no-follow, and a link is refused before a byte is written rather than
+/// by the caller's `harden_owner_only` after the damage. Permissions on an
+/// already-present database are still the caller's to tighten.
 fn open_db_secure(path: &Path) -> Result<Database, RedbStorageError> {
     match crate::secure_fs::create_owner_only(path, false) {
         // Pre-created an empty owner-only file; redb initializes it as a new DB.
@@ -903,7 +913,15 @@ fn open_db_secure(path: &Path) -> Result<Database, RedbStorageError> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(RedbStorageError::Backend(format!("precreate db: {e}"))),
     }
-    Database::create(path).map_err(|e| RedbStorageError::Backend(e.to_string()))
+    // Reopened rather than kept from the create above, whose handle is
+    // write-only on both platforms while redb needs read+write. This open is
+    // no-follow too, so losing the race to a link swapped in behind the create
+    // costs an error, never the target file.
+    let file = crate::secure_fs::open_existing_no_follow_shared(path)
+        .map_err(|e| RedbStorageError::Backend(format!("open db: {e}")))?;
+    Database::builder()
+        .create_file(file)
+        .map_err(|e| RedbStorageError::Backend(e.to_string()))
 }
 
 /// Decrypt a record produced by [`seal_value`], verifying the slot binding.
@@ -2482,6 +2500,99 @@ mod tests {
         // world readable — not even in the window before tighten_permissions.
         let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o077, 0, "redb DB file must not be group/other accessible (mode {mode:o})");
+    }
+
+    /// A symlink planted at a database path must not be followed. Handing
+    /// `redb` the *path* let it re-resolve what the owner-only pre-create had
+    /// already refused, so a link aimed at any file the victim could write was
+    /// overwritten with a fresh database; the engine now only ever receives an
+    /// already-validated no-follow handle. Covers every `open_db_secure`
+    /// caller, the lazily-created `.seen` sidecar included.
+    #[cfg(unix)]
+    #[test]
+    fn db_path_symlink_is_refused_leaving_target_intact() {
+        let dir = tempdir().expect("tempdir");
+        // Zero length on purpose: redb treats an empty file as "no database
+        // yet" and initializes it in place, which is what turns a followed
+        // link into the destruction of the target. A non-empty target would be
+        // rejected as a corrupt database and hide the defect.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"").expect("write victim");
+        let path = dir.path().join("groups.redb");
+        std::os::unix::fs::symlink(&victim, &path).expect("plant symlink");
+
+        RedbBackend::open(&path, &[0x37u8; 32])
+            .expect_err("a symlink at the DB path must not be opened");
+
+        assert_eq!(
+            std::fs::metadata(&victim).expect("victim still present").len(),
+            0,
+            "the symlink target must not be written through by the DB open"
+        );
+        // Refused, not deleted: the link itself is left exactly as planted.
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("link still present")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// The other direction of the no-follow open: refusing links must not cost
+    /// the honest case. An existing database re-opens through the handle and
+    /// still reads back what a previous session committed.
+    #[test]
+    fn existing_db_reopens_with_records_intact() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("groups.redb");
+        let dek = [0x37u8; 32];
+        let state = GroupState {
+            id: vec![1, 2, 3, 4],
+            data: Zeroizing::new(vec![9u8; 512]),
+        };
+        {
+            let b = RedbBackend::open(&path, &dek).expect("create");
+            let mut gs = b.group_state_storage();
+            gs.write(state.clone(), vec![], vec![]).expect("write");
+        }
+        let b = RedbBackend::open(&path, &dek).expect("reopen existing");
+        let gs = b.group_state_storage();
+        let got = gs.state(&state.id).expect("state").expect("present");
+        assert_eq!(&*got, &*state.data);
+    }
+
+    /// Deliberate behaviour change, pinned: `dek_opens` and `rotate_group_dek`
+    /// now refuse a database carrying a second hard link, which they used to
+    /// accept — only `RedbBackend::open` refused it before, and only later, via
+    /// `tighten_permissions`. A second name for a secret database is the
+    /// aliasing primitive `secure_fs` exists to refuse, and `nlink > 1` taints
+    /// *both* names, so a database a hard-linking backup has touched needs the
+    /// extra name dropped (or a real copy taken) before it opens again.
+    /// Refusal costs nothing: the rotation in particular is turned away before
+    /// it rewrites a single record, which the re-probe under the *old* DEK
+    /// proves.
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_db_is_refused_by_every_open_path() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("groups.redb");
+        let dek = [0x37u8; 32];
+        drop(RedbBackend::open(&path, &dek).expect("create"));
+        assert!(RedbBackend::dek_opens(&path, &dek).expect("probe before the link"));
+
+        let alias = dir.path().join("alias.redb");
+        std::fs::hard_link(&path, &alias).expect("hard link");
+
+        RedbBackend::dek_opens(&path, &dek).expect_err("dek_opens must refuse nlink > 1");
+        RedbBackend::rotate_group_dek(&path, &dek, &[0x38u8; 32])
+            .expect_err("rotate_group_dek must refuse nlink > 1");
+        RedbBackend::open(&path, &dek).expect_err("open must refuse nlink > 1");
+
+        std::fs::remove_file(&alias).expect("unlink alias");
+        assert!(
+            RedbBackend::dek_opens(&path, &dek).expect("probe after the link is gone"),
+            "the refused rotation must not have re-sealed anything"
+        );
     }
 
     #[test]
