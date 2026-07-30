@@ -356,7 +356,9 @@ impl IOProvider for GuiIOProvider {
         })
     }
     fn stdout(&self) -> Box<dyn tokio::io::AsyncWrite + Unpin + Send> {
-        Box::new(GuiStdout(self.stdout_tx.clone()))
+        Box::new(GuiStdout(tokio_util::sync::PollSender::new(
+            self.stdout_tx.clone(),
+        )))
     }
 }
 
@@ -404,24 +406,54 @@ impl tokio::io::AsyncRead for GuiStdin {
 }
 
 #[cfg(feature = "gui")]
-struct GuiStdout(tokio::sync::mpsc::Sender<Vec<u8>>);
+struct GuiStdout(tokio_util::sync::PollSender<Vec<u8>>);
 #[cfg(feature = "gui")]
 impl tokio::io::AsyncWrite for GuiStdout {
+    /// One `poll_write` == one message queued for the GUI drain task, with
+    /// backpressure when the bounded channel is full.
+    ///
+    /// The *peer* paces the chat packets this writer prints, so a full channel
+    /// is a normal, reachable state — and `try_send` plus a bare
+    /// `Poll::Pending` used to make it a permanent one: nothing registered the
+    /// caller's waker, so no amount of draining could reschedule the task and
+    /// the write never completed. That froze more than the display: the
+    /// `chat_loop` receive task holds the stdout mutex across its writes, so
+    /// the send side's next prompt blocked on that mutex for the rest of the
+    /// session. `poll_reserve` parks in the channel's own waiter queue, so the
+    /// drain wakes it — as does the receiver being dropped, which still
+    /// surfaces as the same `BrokenPipe`. Waiting (not dropping) is what the
+    /// bounded stdin channel above does for the same reason: a dropped write
+    /// would silently lose a line of the peer's chat.
     fn poll_write(
         self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        let data = buf.to_vec();
-        match self.0.try_send(data) {
-            Ok(_) => std::task::Poll::Ready(Ok(buf.len())),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => std::task::Poll::Pending,
-            Err(_) => std::task::Poll::Ready(Err(std::io::Error::new(
+        let this = self.get_mut();
+        match this.0.poll_reserve(cx) {
+            // A slot is reserved for this task alone; `send_item` cannot park,
+            // and must be called before returning so no reservation outlives
+            // the call that made it.
+            std::task::Poll::Ready(Ok(())) => match this.0.send_item(buf.to_vec()) {
+                Ok(()) => std::task::Poll::Ready(Ok(buf.len())),
+                Err(_) => std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "GUI stdout closed",
+                ))),
+            },
+            std::task::Poll::Ready(Err(_)) => std::task::Poll::Ready(Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "GUI stdout closed",
             ))),
+            // No byte of `buf` was consumed, and `cx`'s waker is registered.
+            std::task::Poll::Pending => std::task::Poll::Pending,
         }
     }
+    /// Nothing can be buffered here to flush: `poll_write` holds a reservation
+    /// only between its own `poll_reserve` and `send_item`, so every byte it
+    /// has accepted is already in the channel and a `Pending` write accepted
+    /// none. `poll_shutdown` is trivial for the same reason — the drain task
+    /// ends when the last sender drops, which dropping this writer does.
     fn poll_flush(
         self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
@@ -1392,5 +1424,60 @@ mod tests {
         // subsystems), so they are intentionally NOT bumped by this flag-day.
         assert_eq!(ALPN_MLS, b"nkct/mls/1", "MLS ALPN is intentionally unbumped");
         assert_eq!(ALPN_INBOX, b"nkct/inbox/1", "inbox ALPN is intentionally unbumped");
+    }
+
+    // A full GUI stdout channel must be a pause, never a stop. The peer paces
+    // the writes, so it decides when the bounded channel fills; if `poll_write`
+    // parks without registering the waker, the drain can never reschedule the
+    // writer and the chat display is dead for the rest of the session. The
+    // clock is paused, so the "still parked" probe below costs no wall time and
+    // the "was woken" probe fails (rather than hanging) if the wakeup is lost.
+    #[cfg(feature = "gui")]
+    #[tokio::test(start_paused = true)]
+    async fn gui_stdout_full_channel_parks_and_the_drain_wakes_it() {
+        use tokio::io::AsyncWriteExt;
+
+        const PROBE: std::time::Duration = std::time::Duration::from_secs(1);
+
+        // Capacity 1: "full" is one un-drained row away, as it is after a burst.
+        let (stdout_tx, mut stdout_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let (_stdin_tx, stdin_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1);
+        let provider = GuiIOProvider {
+            stdin_rx: Arc::new(tokio::sync::Mutex::new(stdin_rx)),
+            stdout_tx,
+        };
+
+        // Direction 1: with room in the channel an ordinary write completes on
+        // the spot, exactly as every honest chat line must.
+        let mut writer = provider.stdout();
+        tokio::time::timeout(PROBE, writer.write_all(b"first"))
+            .await
+            .expect("an uncontended write must not park")
+            .expect("an uncontended write must not fail");
+
+        // Direction 2: the channel is now full, so the next write must park...
+        let mut parked = tokio::spawn(async move { writer.write_all(b"second").await });
+        assert!(
+            tokio::time::timeout(PROBE, &mut parked).await.is_err(),
+            "a write into a full channel must wait for the drain, not resolve"
+        );
+
+        // ...and must be woken once the drain takes a row.
+        assert_eq!(stdout_rx.recv().await.as_deref(), Some(&b"first"[..]));
+        tokio::time::timeout(PROBE, &mut parked)
+            .await
+            .expect("draining the channel must wake the parked write")
+            .expect("the woken write task must not panic")
+            .expect("the woken write must succeed");
+        assert_eq!(stdout_rx.recv().await.as_deref(), Some(&b"second"[..]));
+
+        // And a closed channel (GUI gone) still reports EOF rather than waiting.
+        let mut after_close = provider.stdout();
+        drop(stdout_rx);
+        let err = tokio::time::timeout(PROBE, after_close.write_all(b"third"))
+            .await
+            .expect("a write to a closed channel must not park")
+            .expect_err("a write to a closed channel must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
     }
 }
