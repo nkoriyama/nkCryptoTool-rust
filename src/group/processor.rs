@@ -1604,7 +1604,12 @@ impl GroupChatProcessor {
     /// against and [`known_member_addrs`](Self::known_member_addrs) filters by,
     /// so both sides key on one notion of identity (the PeerId carried in the
     /// member's own credential, via `peer_id_from_credential`).
-    fn current_member_node_ids(
+    ///
+    /// Crate-visible because a long-running chat/listen session cannot use
+    /// `known_member_addrs`: it resolves its recipients once and then holds
+    /// that `Vec`, so it needs the roster itself to tell which of the peers it
+    /// already holds have since left (see `cli::prune_departed_recipients`).
+    pub(crate) fn current_member_node_ids(
         &self,
         gid: &GroupId,
     ) -> Result<std::collections::HashSet<[u8; 32]>, GroupError> {

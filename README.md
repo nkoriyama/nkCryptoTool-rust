@@ -529,6 +529,14 @@ P2P トランスポート Iroh を使用した、PQC 認証付きの安全な通
   `remove_member` Commit により、エポック更新で過去の鍵が無効化される。
   退会したメンバーは新 epoch の Application message を**復号できない**ことを
   PCS テストで pin している (`remove_member_blocks_new_epoch_decrypt`)。
+  さらに、`chat-group` / `listen` の**実行中セッション**は、他メンバーの Commit を
+  受信して epoch が進むたびに roster を読み直し、**直前の roster にはいて今はいない**
+  ノードだけを宛先リストから外す。退会したメンバーは復号できないだけでなく、その場で
+  宛先から外れる (再起動不要) ため、接続の継続や送信タイミング・サイズといった
+  メタデータも渡らない。外れると `[mls] dropped N recipient(s) removed from this group`
+  が表示される。差分での判定なので、`--mls-recipient-ticket` や `/peer` で明示的に
+  指定した roster 外の宛先、および (`listen` は宛先リストを全グループで共有するため)
+  他グループのメンバーは、この処理では外れない。
 
 #### CLI 使用例 (2 人グループ)
 
