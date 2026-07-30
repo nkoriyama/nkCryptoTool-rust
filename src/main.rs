@@ -535,8 +535,9 @@ fn private_key_file_is_encrypted(path: &Option<String>) -> bool {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Synchronous entry point: everything here runs single-threaded, before the
+/// tokio runtime spawns its worker threads.
+fn main() -> anyhow::Result<()> {
     // VAES release variant: the avx512 aes backend is fixed at compile time
     // (no runtime fallback), so on a CPU without VAES/AVX-512 this binary
     // would die with an opaque SIGILL somewhere inside the first AES call.
@@ -565,6 +566,29 @@ async fn main() -> anyhow::Result<()> {
 
     nk_crypto_tool::utils::disable_core_dumps();
 
+    // Take NK_PASSPHRASE out of the process environment (latching its value for
+    // the readers below) before anything can hand that environment to a child:
+    // `--serve-shell` gives an authorized peer a PTY whose environment
+    // portable-pty seeds from `std::env::vars_os()`. This must run here, in the
+    // synchronous entry point — `remove_var` may not race other threads, and
+    // the tokio runtime's workers do not exist yet. It must also stay *after*
+    // `disable_core_dumps`, whose PR_SET_DUMPABLE=0 is what keeps a same-uid
+    // peer from reading the execve environment residue in /proc/<pid>/environ
+    // that `remove_var` cannot erase.
+    nk_crypto_tool::utils::scrub_env_passphrase();
+
+    // Sample the process umask. `umask(2)` has no read-only form, so reading it
+    // is a process-global read-modify-write that must not race a thread
+    // creating a file — hence here, before the runtime exists, and exactly
+    // once. scp needs it to cap the peer-chosen file mode it is handed on the
+    // wire at what the operator's own umask would have allowed.
+    nk_crypto_tool::scp::init_process_umask();
+
+    async_main()
+}
+
+#[tokio::main]
+async fn async_main() -> anyhow::Result<()> {
     // Diagnostics: when RUST_LOG is set, install a tracing subscriber so iroh's
     // internal logs (magicsock hole-punch, relay fallback, QUIC handshake) and
     // our own tracing reach stderr. Silent by default — normal runs are
@@ -747,12 +771,12 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Initial passphrase from CLI args is now removed for security.
-    let mut passphrase = if let Ok(p) = std::env::var("NK_PASSPHRASE") {
+    let mut passphrase = if let Some(p) = nk_crypto_tool::utils::env_passphrase() {
         if p.is_empty() {
             None
         } else {
             eprintln!("WARNING: Using passphrase from NK_PASSPHRASE environment variable. This is less secure than interactive entry.");
-            Some(Zeroizing::new(p))
+            Some(p)
         }
     } else {
         None
@@ -2793,9 +2817,14 @@ async fn run_prekey_recv(
                 // Name by batch cursor + index, not by index alone: the cursor
                 // advances every run, so a later `recv` writing its own
                 // envelope 0 cannot clobber a previous run's `<out>.0`. Within
-                // one batch the cursor is constant, so `i` disambiguates; a
-                // crash-replay of the *same* batch reuses the same cursor and
-                // idempotently overwrites identical content.
+                // one batch the cursor is constant, so `i` disambiguates.
+                // Re-running after a crash part-way through this loop does not
+                // rewrite the batch: every envelope in it was already opened,
+                // and `open` refuses a second open of the same envelope — its
+                // one-time prekey is gone, or, for static-only, its digest is
+                // in the store's seen cache. The files written before the
+                // crash therefore stay, and the rest are lost rather than
+                // silently reproduced.
                 let path = format!("{out_base}.{cursor}.{i}");
                 write_plaintext_private(&path, plaintext.as_slice())?;
                 println!("Decrypted envelope {i} → {path} ({} bytes)", plaintext.len());

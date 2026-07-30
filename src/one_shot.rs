@@ -34,6 +34,18 @@
 //! compromise of the recipient's *static* key alone cannot reconstruct a
 //! full-mode session key — that is the post-quantum forward secrecy.
 //!
+//! A static-only envelope consumes no prekey, so it gets the equivalent
+//! single-use gate from the store's seen-envelope cache
+//! ([`PrekeyStore::record_static_only_seen`]), likewise recorded only after
+//! the tag verifies: the untrusted DS cannot make one envelope decrypt twice.
+//! That closes the *replay* half of a DS-forced downgrade. It does not
+//! restore forward secrecy — only a real prekey can, and whether a
+//! downgraded envelope is accepted at all remains the [`FsProfile`] policy.
+//! The downgrade itself stays the DS's to force, but no longer silently: a
+//! static-only envelope arriving while our *own* pool is stocked means the
+//! DS answered the sender's FETCH "depleted" about a pool that was not, and
+//! [`open`] says so on stderr.
+//!
 //! ## Envelope wire format
 //!
 //! ```text
@@ -108,6 +120,11 @@ pub enum OneShotError {
     DowngradeRejected,
     #[error("prekey {0} not in store (consumed, replayed, or unknown) — cannot decrypt")]
     PrekeyMissing(u32),
+    #[error(
+        "static-only envelope has already been opened by this recipient \
+         (re-delivered by the delivery service) — refusing to return the plaintext twice"
+    )]
+    StaticOnlyReplay,
     #[error("recipient bundle: {0}")]
     Bundle(String),
     #[error("recipient bundle self-signature does not verify (corrupt or tampered)")]
@@ -233,14 +250,19 @@ struct Parsed {
 
 /// Open an envelope produced by [`seal`]. For full mode, loads the matching
 /// prekey private key from `store`, decrypts, and — only on a verified
-/// decrypt — deletes that one-time key so it can never be reused. Returns
-/// the plaintext in a `Zeroizing` buffer.
+/// decrypt — deletes that one-time key so it can never be reused. For
+/// static-only mode, which has no key to consume, the verified envelope is
+/// instead recorded in `store`'s seen-envelope cache, so a re-delivered copy
+/// is refused with [`OneShotError::StaticOnlyReplay`] rather than decrypted
+/// again. Returns the plaintext in a `Zeroizing` buffer.
 ///
 /// `profile` is the *recipient's* policy: under [`FsProfile::StrictPqFs`] a
 /// static-only (no forward secrecy) envelope is refused
 /// ([`OneShotError::DowngradeRejected`]) rather than silently accepted — the
 /// receive-side backstop against a sender being forced to downgrade by a
-/// prekey-depletion attack. [`FsProfile::DefaultFallback`] accepts both.
+/// prekey-depletion attack. [`FsProfile::DefaultFallback`] accepts both, but
+/// warns on stderr when an accepted static-only envelope contradicts our own
+/// still-stocked pool (see `warn_static_only_with_stocked_pool`).
 pub fn open(
     static_sk: &HpkeSecretKey,
     static_pk: &HpkePublicKey,
@@ -257,13 +279,11 @@ pub fn open(
     let session_key = match p.mode {
         // Replay note (audit L5): static-only has no per-message prekey to
         // consume, so — unlike MODE_FULL, where a second open finds the prekey
-        // already deleted — this envelope decrypts successfully every time it is
-        // (re)delivered. It provides confidentiality and no forward secrecy, but
-        // no replay protection at this layer. The mitigation is policy:
-        // `FsProfile::StrictPqFs` refuses static-only outright; a
-        // `DefaultFallback` recipient that needs replay protection must dedup on
-        // an upper layer (e.g. a seen-message cache). This is intentional
-        // availability-first behaviour, documented rather than silently relied on.
+        // already deleted — nothing in the key schedule stops a re-delivery.
+        // The equivalent single-use gate is the store's seen-envelope cache,
+        // applied after the AEAD verifies (see the end of this fn). It still
+        // provides no forward secrecy: that remains policy
+        // (`FsProfile::StrictPqFs` refuses static-only outright).
         MODE_STATIC_ONLY => recipient_key_schedule(
             MODE_STATIC_ONLY,
             static_sk,
@@ -319,7 +339,70 @@ pub fn open(
             return Err(OneShotError::PrekeyMissing(id));
         }
     }
+
+    // Static-only mode consumes no prekey, so the delete above never runs for
+    // it and an untrusted delivery service — which chooses, with one
+    // unauthenticated FETCH reply byte, whether the sender downgrades at all —
+    // could otherwise re-deliver the same envelope indefinitely and have it
+    // accepted every time. Give it the equivalent single-use gate. Recorded
+    // only *now*, after the AEAD tag has verified, so a forged envelope cannot
+    // put junk in the cache; the check-and-insert is one redb write
+    // transaction, so concurrent opens of the same envelope serialize and only
+    // the first returns its plaintext.
+    if p.mode == MODE_STATIC_ONLY {
+        if store.record_static_only_seen(envelope)? {
+            return Err(OneShotError::StaticOnlyReplay);
+        }
+        // We are the only party that can see both halves of the DS's lie: the
+        // sender was told our pool was depleted, and we know what our pool
+        // actually holds. Propagate a `count` failure like every other store
+        // call here rather than swallowing it — the same handle committed the
+        // write above, so a failure now is a broken store the recipient needs
+        // to hear about, not a diagnostic to skip.
+        let remaining = store.count()?;
+        if remaining > 0 {
+            warn_static_only_with_stocked_pool(remaining);
+        }
+    }
     Ok(plaintext)
+}
+
+/// Warn that an accepted static-only envelope contradicts our own prekey pool.
+///
+/// The sender falls back to static-only only when the delivery service answers
+/// its prekey FETCH with `REPLY_PREKEY_NONE`; if `remaining` of our one-time
+/// prekeys are still sitting in the local store, the pool the DS described as
+/// depleted was not. That makes the forward-secrecy downgrade — which remains
+/// the DS's to force, and which only [`FsProfile::StrictPqFs`] refuses —
+/// locally *detectable* by the one party holding both facts, instead of
+/// silent.
+///
+/// It is a warning and not a refusal because the inference is one-sided: the
+/// same observation is produced benignly when the pool genuinely ran dry, the
+/// sender fell back, and we restocked before polling. Turning it into an error
+/// would drop legitimate mail on that ordinary sequence.
+fn warn_static_only_with_stocked_pool(remaining: u64) {
+    // Local data only (a count from our own store); no peer-controlled text
+    // reaches the terminal here.
+    eprintln!(
+        "[pqfs] WARNING: accepted a STATIC-ONLY envelope (no post-quantum forward \
+         secrecy) while {remaining} One-Time Prekey(s) remain in the local pool. \
+         The delivery service reported a depleted prekey pool that was not in fact \
+         depleted: it either lied to force this downgrade, or the pool was \
+         restocked after the message was sealed. Use --strict-pqfs to refuse \
+         downgraded envelopes outright."
+    );
+    #[cfg(test)]
+    STOCKED_POOL_WARNINGS.with(|c| c.set(c.get() + 1));
+}
+
+// Test-only observation point for `warn_static_only_with_stocked_pool`, so the
+// unit tests can assert the warning fires on a stocked pool and stays quiet on
+// a genuinely depleted one. Thread-local: each `#[test]` runs on its own
+// thread, so a parallel test run cannot cross-count.
+#[cfg(test)]
+thread_local! {
+    static STOCKED_POOL_WARNINGS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Generate `count` fresh One-Time Prekeys, persist their private keys in
@@ -935,6 +1018,182 @@ mod tests {
         }
 
         task.abort();
+    }
+
+    /// A static-only envelope opens exactly **once**. A hostile delivery
+    /// service that forced the downgrade (by answering every FETCH
+    /// `REPLY_PREKEY_NONE`) can re-deliver the very same bytes; the
+    /// recipient's seen-envelope cache refuses the second open — the
+    /// single-use gate MODE_FULL already gets for free from consuming its
+    /// one-time prekey.
+    ///
+    /// Both sides are asserted: the replay is refused, AND a genuine
+    /// depletion still works — a *different* static-only envelope opens
+    /// normally, so this is a per-envelope gate and not a blanket refusal of
+    /// the availability-first fallback.
+    #[test]
+    fn static_only_envelope_opens_once_then_replay_is_refused() {
+        let dir = tempdir().unwrap();
+        let r = make_recipient(dir.path());
+
+        // The replay cache is a sidecar DB, not a table in prekeys.db: that
+        // file is fully compacted on every consumed one-time prekey and holds
+        // the static identity, and this cache is the one artifact an
+        // unauthenticated depositor can grow. It is created lazily.
+        let seen_db = dir.path().join("prekeys.db.seen");
+        assert!(!seen_db.exists(), "sidecar must not exist before a static-only open");
+
+        let msg = b"availability-first payload";
+        let sealed = seal(&r.static_pk, None, msg).unwrap();
+        assert_eq!(sealed.mode, MODE_STATIC_ONLY);
+
+        // First delivery decrypts.
+        let opened = open(
+            &r.static_sk,
+            &r.static_pk,
+            &r.store,
+            &sealed.envelope,
+            FsProfile::DefaultFallback,
+        )
+        .unwrap();
+        assert_eq!(opened.as_slice(), msg);
+        assert!(seen_db.exists(), "the gate must record into the sidecar DB");
+
+        // The same envelope re-delivered is refused, not decrypted again.
+        match open(
+            &r.static_sk,
+            &r.static_pk,
+            &r.store,
+            &sealed.envelope,
+            FsProfile::DefaultFallback,
+        ) {
+            Err(OneShotError::StaticOnlyReplay) => {}
+            other => panic!("replayed static-only envelope must be refused, got {other:?}"),
+        }
+
+        // A genuinely depleted pool still delivers new messages...
+        let msg2 = b"second availability-first payload";
+        let sealed2 = seal(&r.static_pk, None, msg2).unwrap();
+        assert_eq!(sealed2.mode, MODE_STATIC_ONLY);
+        let opened2 = open(
+            &r.static_sk,
+            &r.static_pk,
+            &r.store,
+            &sealed2.envelope,
+            FsProfile::DefaultFallback,
+        )
+        .unwrap();
+        assert_eq!(opened2.as_slice(), msg2);
+
+        // ...and each of them is itself single-use.
+        match open(
+            &r.static_sk,
+            &r.static_pk,
+            &r.store,
+            &sealed2.envelope,
+            FsProfile::DefaultFallback,
+        ) {
+            Err(OneShotError::StaticOnlyReplay) => {}
+            other => panic!("replayed static-only envelope must be refused, got {other:?}"),
+        }
+
+        // The gate is durable, not process-local: a store reopened from the
+        // same file still refuses the replay (the DS can simply wait).
+        drop(r.store);
+        let reopened = PrekeyStore::open(&dir.path().join("prekeys.db"), &[0x33u8; 32]).unwrap();
+        match open(
+            &r.static_sk,
+            &r.static_pk,
+            &reopened,
+            &sealed.envelope,
+            FsProfile::DefaultFallback,
+        ) {
+            Err(OneShotError::StaticOnlyReplay) => {}
+            other => panic!("replay must stay refused across reopen, got {other:?}"),
+        }
+        // The gate never touched the one-time prekey pool.
+        assert_eq!(reopened.count().unwrap(), 0);
+    }
+
+    fn warn_count() -> usize {
+        STOCKED_POOL_WARNINGS.with(|c| c.get())
+    }
+
+    /// The recipient catches the delivery service lying about depletion — and
+    /// only then. A sender downgrades to static-only exactly when the DS
+    /// answers its prekey FETCH `REPLY_PREKEY_NONE`; if our *own* pool still
+    /// holds keys when that envelope lands, the pool the DS called depleted
+    /// was not depleted. We are the only party holding both facts.
+    ///
+    /// Both directions are asserted, because a detector that always fires
+    /// detects nothing: a genuinely empty pool must stay silent, a stocked
+    /// one must warn.
+    #[test]
+    fn static_only_warns_only_when_our_prekey_pool_is_stocked() {
+        let dir = tempdir().unwrap();
+        let r = make_recipient(dir.path());
+        let base = warn_count();
+
+        // Direction 1 — honest depletion: our pool really is empty, so the
+        // DS's "depleted" was the truth and there is nothing to report.
+        assert_eq!(r.store.count().unwrap(), 0);
+        let honest = seal(&r.static_pk, None, b"honest fallback").unwrap();
+        assert_eq!(honest.mode, MODE_STATIC_ONLY);
+        let opened = open(
+            &r.static_sk,
+            &r.static_pk,
+            &r.store,
+            &honest.envelope,
+            FsProfile::DefaultFallback,
+        )
+        .unwrap();
+        assert_eq!(opened.as_slice(), b"honest fallback");
+        assert_eq!(warn_count(), base, "a genuinely depleted pool must not warn");
+
+        // Direction 2 — the lie: same envelope shape, but our pool is stocked.
+        generate_and_store(&r.store, &r.dsa_priv, 3).unwrap();
+        assert_eq!(r.store.count().unwrap(), 3);
+        let lied = seal(&r.static_pk, None, b"downgrade forced by a lying DS").unwrap();
+        assert_eq!(lied.mode, MODE_STATIC_ONLY);
+        let opened = open(
+            &r.static_sk,
+            &r.static_pk,
+            &r.store,
+            &lied.envelope,
+            FsProfile::DefaultFallback,
+        )
+        .unwrap();
+        // Detection warns; it does not refuse. The message is still delivered
+        // (availability-first stays the default; --strict-pqfs is the refusal).
+        assert_eq!(opened.as_slice(), b"downgrade forced by a lying DS");
+        assert_eq!(warn_count(), base + 1, "a stocked pool must flag the DS's lie");
+
+        // Per envelope, not once per store...
+        let lied2 = seal(&r.static_pk, None, b"second forced downgrade").unwrap();
+        open(
+            &r.static_sk,
+            &r.static_pk,
+            &r.store,
+            &lied2.envelope,
+            FsProfile::DefaultFallback,
+        )
+        .unwrap();
+        assert_eq!(warn_count(), base + 2);
+
+        // ...and it neither consumed a prekey nor displaced the replay gate:
+        // a re-delivery is still refused, and refusing does not warn again.
+        assert_eq!(r.store.count().unwrap(), 3);
+        match open(
+            &r.static_sk,
+            &r.static_pk,
+            &r.store,
+            &lied.envelope,
+            FsProfile::DefaultFallback,
+        ) {
+            Err(OneShotError::StaticOnlyReplay) => {}
+            other => panic!("replay must still be refused, got {other:?}"),
+        }
+        assert_eq!(warn_count(), base + 2, "a refused replay must not warn again");
     }
 
     /// A prekey signed under a *different* identity is rejected before use —

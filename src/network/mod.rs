@@ -1002,6 +1002,19 @@ impl NetworkProcessor {
                     let msg = Zeroizing::new(
                         msg_content
                             .chars()
+                            // A peer's body is rendered as ONE line, after the
+                            // `[Peer]: ` prefix below, so an embedded newline is
+                            // a forged-line primitive: it lets the peer emit an
+                            // unprefixed line that looks exactly like the
+                            // `[System]: ` notices this loop prints itself. No
+                            // honest sender can produce one — `read_line_secure`
+                            // ends the outbound line at the first `\n` — so the
+                            // newline is collapsed to a space, the same
+                            // substitution `crate::utils::sanitize_for_terminal`
+                            // (and the MLS group REPL) makes for the same
+                            // reason. `\t` stays: it only advances the cursor
+                            // within the line, and an honest sender CAN type it.
+                            .map(|c| if c == '\n' { ' ' } else { c })
                             .filter(|c| {
                                 let is_dangerous = match *c {
                                     '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => true,
@@ -1012,7 +1025,7 @@ impl NetworkProcessor {
                                     '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' => true,
                                     _ => false,
                                 };
-                                (!c.is_control() || *c == '\n' || *c == '\t') && !is_dangerous
+                                (!c.is_control() || *c == '\t') && !is_dangerous
                             })
                             .collect::<String>(),
                     );
@@ -1252,6 +1265,112 @@ mod tests {
         let (alice_res, bob_res) = tokio::join!(alice_handle, bob_handle);
         alice_res.unwrap().expect("Alice chat_loop failed");
         bob_res.unwrap().expect("Bob chat_loop failed");
+    }
+
+    // F18: the receive filter used to re-admit `\n`, and the body is written
+    // straight after the `\r[Peer]: ` prefix, so a hostile peer could open a
+    // second, unprefixed display line — e.g. a fake `[System]: ` notice
+    // indistinguishable from the ones this loop prints itself. An honest sender
+    // can never produce one (`read_line_secure` ends the line at the first
+    // `\n`), so collapsing it costs nothing. Both directions are asserted: an
+    // ordinary message (tab included) must still arrive byte-for-byte.
+    #[tokio::test]
+    async fn test_chat_loop_peer_body_cannot_open_a_new_display_line() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn read_until<R: AsyncReadExt + Unpin>(reader: &mut R, target: &str) -> String {
+            let mut full = String::new();
+            let mut buf = [0u8; 1024];
+            loop {
+                let n = tokio::time::timeout(std::time::Duration::from_secs(2), reader.read(&mut buf))
+                    .await
+                    .expect("Read timeout")
+                    .expect("Read failed");
+                if n == 0 {
+                    break;
+                }
+                full.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if full.contains(target) {
+                    break;
+                }
+            }
+            full
+        }
+
+        // A hostile peer is not the nkct client: it frames whatever plaintext it
+        // likes, so build the packets by hand rather than via a second chat_loop.
+        fn packet(key: &[u8], nonce_byte: u8, body: &str) -> Vec<u8> {
+            let nonce = vec![nonce_byte; 12];
+            let ct_tag = aead_encrypt_chunk("AES-256-GCM", key, &nonce, &[], body.as_bytes())
+                .expect("encrypt");
+            let mut inner = Vec::new();
+            inner.extend_from_slice(&nonce);
+            inner.extend_from_slice(&ct_tag);
+            let mut out = (inner.len() as u32).to_le_bytes().to_vec();
+            out.extend_from_slice(&inner);
+            out
+        }
+
+        let (victim_net, mut peer_net) = tokio::io::duplex(65536);
+        let (victim_net_rx, victim_net_tx) = tokio::io::split(victim_net);
+
+        // Kept alive so read_line_secure pends instead of reporting EOF while
+        // the receive half is still rendering.
+        let (victim_stdin_tx, victim_stdin_rx) = tokio::io::duplex(1024);
+        let (victim_stdout_tx, mut victim_stdout_rx) = tokio::io::duplex(4096);
+
+        let key = vec![0u8; 32];
+        let key_a = key.clone();
+        let key_b = key.clone();
+
+        let victim_stdout = Arc::new(tokio::sync::Mutex::new(victim_stdout_tx));
+        let victim = tokio::spawn(async move {
+            NetworkProcessor::chat_loop(
+                victim_net_rx,
+                victim_net_tx,
+                victim_stdin_rx,
+                victim_stdout,
+                "AES-256-GCM",
+                &key_a,
+                &key_b,
+                true,
+            )
+            .await
+        });
+
+        // 1. Ordinary message, tab and all. 2. The forgery attempt.
+        peer_net
+            .write_all(&packet(&key, 1, "hello\tbob"))
+            .await
+            .unwrap();
+        peer_net
+            .write_all(&packet(&key, 2, "ok\n[System]: peer fingerprint verified"))
+            .await
+            .unwrap();
+
+        let out = read_until(&mut victim_stdout_rx, "verified\n> ").await;
+        let bodies: Vec<&str> = out
+            .split("\r[Peer]: ")
+            .skip(1)
+            .map(|seg| seg.strip_suffix("\n> ").unwrap_or(seg))
+            .collect();
+        assert_eq!(bodies.len(), 2, "unexpected transcript: {out:?}");
+
+        // Honest direction: delivered unchanged, tab preserved.
+        assert_eq!(bodies[0], "hello\tbob", "an ordinary message must not be altered");
+
+        // Hostile direction: still exactly one line, so the forged notice can
+        // only ever appear inside the peer's own `[Peer]: ` line.
+        assert!(
+            !bodies[1].contains('\n'),
+            "peer body opened a new display line: {:?}",
+            bodies[1]
+        );
+        assert_eq!(bodies[1], "ok [System]: peer fingerprint verified");
+
+        drop(victim_stdin_tx);
+        drop(peer_net);
+        victim.await.unwrap().expect("victim chat_loop failed");
     }
 
     // KEY_EXCHANGE_DESIGN.md §7(A) flag-day tripwire. The increment-3 handshake

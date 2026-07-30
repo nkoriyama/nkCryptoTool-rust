@@ -35,6 +35,9 @@
 //! channels including in-flight connects), so one client cannot exhaust the server
 //! or affect another. Remote-forward listeners bind `127.0.0.1` on the server
 //! only (no `GatewayPorts`), so a forwarded port is never exposed off-box.
+//! Inbound `Open` frames are separately admission-controlled at
+//! [`MAX_INFLIGHT_OPENS`] concurrent handlers, so a peer that floods `Open`s
+//! cannot spawn handler tasks without bound.
 //!
 //! **Known v1 limitation — no per-channel flow control.** Within *one* client's
 //! connection the demultiplexer applies backpressure globally: a single stuck
@@ -57,7 +60,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{mpsc, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 
 const F_OPEN: u8 = 0x01;
@@ -77,6 +80,21 @@ const MAX_FWD_DATA: usize = 64 * 1024;
 const TCP_READ_BUF: usize = 32 * 1024;
 /// Cap on simultaneously open channels per connection (DoS bound).
 const MAX_CHANNELS: usize = 256;
+/// Cap on peer `Open` frames being handled concurrently per connection (DoS bound).
+///
+/// Each inbound `Open` is handled by its own task, and every path out of
+/// [`Endpoint::handle_open`] — including the deny paths — can park on the bounded
+/// outbound queue, because a peer that stops reading its own stream stalls our
+/// writer. Without a bound a peer could therefore turn a stream of ~29-byte
+/// `Open` frames into an unbounded pile of parked tasks. `handle_open` holds one
+/// permit for its whole lifetime, so this is a hard cap on those tasks.
+///
+/// Twice [`MAX_CHANNELS`] leaves headroom over anything an honest peer can reach:
+/// its opener side spends one of its own `MAX_CHANNELS` permits *before* sending
+/// each `Open` and holds it until the channel ends, so it can never have more than
+/// `MAX_CHANNELS` opens outstanding. Past the cap an `Open` is refused with
+/// `Rejected` (no task spawned, connection left intact).
+const MAX_INFLIGHT_OPENS: usize = 2 * MAX_CHANNELS;
 /// Per-channel, per-direction flow-control window (bytes). A sender may have at
 /// most this many bytes in flight before the receiver acknowledges consumption
 /// via [`FwdFrame::WindowAdjust`]; the receiver enforces it, so a stuck channel
@@ -480,7 +498,17 @@ impl Endpoint {
 
     /// Connector side: an `Open` arrived; authorize, connect to `host:port`, and
     /// bridge. The channel id was chosen by the opener (the other range).
-    async fn handle_open(self: Arc<Self>, chan: u32, host: String, port: u16) {
+    ///
+    /// `_open_permit` is the [`MAX_INFLIGHT_OPENS`] admission permit the caller
+    /// acquired before spawning us; it is released when this task ends, which is
+    /// what bounds the number of these tasks (see [`demux_reader`]).
+    async fn handle_open(
+        self: Arc<Self>,
+        chan: u32,
+        host: String,
+        port: u16,
+        _open_permit: OwnedSemaphorePermit,
+    ) {
         let target = format!("{host}:{port}");
 
         // The peer may only open channels in *its* id range; otherwise a peer
@@ -690,15 +718,32 @@ where
     R: AsyncReadExt + Unpin + Send,
 {
     let mut ctr = 0u64;
+    // Admission control for peer-driven opens, one budget per connection (this
+    // function is the only place `Open` is dispatched, on both the client and the
+    // server side). The permit is taken *before* the spawn and lives for the whole
+    // handler, so at most `MAX_INFLIGHT_OPENS` `handle_open` tasks — and hence at
+    // most that many parked outbound sends and pending audit writes — can exist for
+    // this connection no matter how many `Open` frames the peer sends.
+    let opens = Arc::new(Semaphore::new(MAX_INFLIGHT_OPENS));
     loop {
         let pt = match recv_packet(&mut reader, aead_name, rx_key, &mut ctr).await? {
             Some(p) => p,
             None => break,
         };
         match FwdFrame::decode(&pt)? {
-            FwdFrame::Open { chan, host, port } => {
-                tokio::spawn(endpoint.clone().handle_open(chan, host, port));
-            }
+            FwdFrame::Open { chan, host, port } => match opens.clone().try_acquire_owned() {
+                Ok(permit) => {
+                    tokio::spawn(endpoint.clone().handle_open(chan, host, port, permit));
+                }
+                Err(_) => {
+                    // Refuse inline instead of spawning: no new task, and awaiting
+                    // the refusal here is the backpressure that stops a flooding
+                    // peer (we stop reading its stream until our writer drains)
+                    // rather than tearing down a connection an honest peer could
+                    // still use. Static reason: nothing peer-controlled is echoed.
+                    endpoint.reject(chan, "too many concurrent opens".into()).await;
+                }
+            },
             FwdFrame::BindRequest { req, bind_port, host, port } => {
                 // Await inline (not spawn) so the listener's accept task is
                 // recorded in `bind_tasks` before the demux can return; otherwise a
@@ -1118,6 +1163,72 @@ mod tests {
         std::fs::write(&path, format!("{fph}  allow=\"*:443, db.internal:*\"\n")).unwrap();
         assert!(ForwardPolicy::load(path.to_str().unwrap()).is_ok());
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A peer that floods `Open` frames while never letting our writer drain (it
+    /// stopped reading its own receive window) must not make us spawn one handler
+    /// task per frame. `demux_reader` admits at most `MAX_INFLIGHT_OPENS` concurrent
+    /// handlers and then stops consuming frames instead of growing the task pile.
+    #[tokio::test]
+    async fn open_flood_is_bounded_by_admission_control() {
+        let aead = "aes-256-gcm";
+        let key = [7u8; 32];
+
+        // Far more `Open`s than the admission bound, all the same wire size.
+        let n = MAX_INFLIGHT_OPENS + 8;
+        let mut stream: Vec<u8> = Vec::new();
+        let mut ctr = 0u64;
+        for i in 0..n {
+            let f = FwdFrame::Open {
+                chan: SERVER_CHAN_BASE + i as u32,
+                host: "127.0.0.1".into(),
+                port: 9,
+            };
+            send_packet(&mut stream, aead, &key, &mut ctr, &f.encode()).await.unwrap();
+        }
+        let frame_len = stream.len() / n;
+
+        // Forward client that requested no `-R` destination, so every `Open` is
+        // denied ("destination not requested by client") and reaches `reject`.
+        // `frame_rx` is held but never polled: the outbound queue therefore fills
+        // and stays full, exactly as it does when the peer stalls our writer.
+        let (frame_tx, mut frame_rx) = mpsc::channel::<FwdFrame>(1);
+        let endpoint = Arc::new(Endpoint {
+            frame_tx,
+            registry: Arc::new(Mutex::new(HashMap::new())),
+            sem: Arc::new(Semaphore::new(MAX_CHANNELS)),
+            next_chan: AtomicU32::new(CLIENT_CHAN_BASE),
+            role: Role::Client { remote_dests: HashSet::new() },
+            bind_tasks: Mutex::new(Vec::new()),
+        });
+
+        let mut reader: &[u8] = &stream;
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            demux_reader(&mut reader, aead, &key, endpoint.clone()),
+        )
+        .await;
+
+        // Without admission control `demux_reader` only spawns and never blocks, so
+        // it drains the whole stream and returns `Ok(())`, leaving one parked task
+        // per frame. With it, the reader must still be inside the loop.
+        assert!(res.is_err(), "demux_reader consumed the whole Open flood instead of stopping");
+        let consumed = (stream.len() - reader.len()) / frame_len;
+        assert!(
+            consumed <= MAX_INFLIGHT_OPENS + 2,
+            "consumed {consumed} Open frames, expected to stop at the {MAX_INFLIGHT_OPENS} bound"
+        );
+        // ...and not stop early: opens up to the bound are admitted as before.
+        assert!(
+            consumed >= MAX_INFLIGHT_OPENS,
+            "only {consumed} Open frames admitted, below the {MAX_INFLIGHT_OPENS} bound"
+        );
+        // The denial path really ran: one refusal reached the one-slot queue before
+        // the (stalled) writer stopped it.
+        assert!(
+            matches!(frame_rx.try_recv(), Ok(FwdFrame::Rejected { .. })),
+            "expected a queued Rejected frame"
+        );
     }
 
     #[test]

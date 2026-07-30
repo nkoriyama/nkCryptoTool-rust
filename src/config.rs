@@ -260,6 +260,20 @@ pub struct CryptoConfig {
     /// the received bundle under (`<handle>.nkkb`).
     pub keybundle_handle: Option<String>,
     pub allow_unauth: bool,
+    /// Refuse an initiator that does not set `INITIATOR_SELF_AUTH`, *even on a
+    /// node that is otherwise open* (`allow_unauth`).
+    ///
+    /// `allow_unauth` answers "may a peer I was never told about connect?".
+    /// This answers the narrower "must that peer at least say who it is?", and
+    /// the two are independent: a listener whose capability is a one-shot
+    /// ticket handed to one person cannot enumerate that person's key in
+    /// advance, but it can insist the session be *attributable* — a
+    /// `PeerId::Pubkey` fingerprint the operator can be shown and compare out
+    /// of band, instead of `PeerId::Node`, which is a free-to-mint transport id
+    /// that names nobody. Set by the GUI file-receive listener, which has
+    /// neither a keyring nor a pinned sender; `false` everywhere else, so CLI
+    /// `--allow-unauth` semantics are unchanged.
+    pub require_initiator_self_auth: bool,
     pub force: bool,
     pub handshake_timeout: u64,
     /// Path to the redb keyring (contacts + allowlist tables). Server-side authz
@@ -362,6 +376,7 @@ impl Default for CryptoConfig {
             scp_recursive: false,
             scp_resume: false,
             allow_unauth: false,
+            require_initiator_self_auth: false,
             force: false,
             handshake_timeout: 15,
             keyring_db: None,

@@ -374,6 +374,89 @@ mod tests {
         assert!(!ui.get_chat_area_visible(), "chat-area must NOT be visible in non-Chat mode");
     }
 
+    // ===== F12: receive-listener authorization + peer identity display =====
+
+    /// The receive listener must not admit an anonymous sender. It has no
+    /// keyring and, by default, no pinned sender — the ticket is the whole
+    /// capability — so the only thing that makes the transfer attributable is
+    /// insisting the sender sign the handshake. The end-to-end refusal is
+    /// asserted over a real handshake in
+    /// `p2p::backend::iroh::tests::gui_file_receive_listener_requires_a_sender_identity`;
+    /// this pins the config the button hands it.
+    #[test]
+    fn listen_config_requires_sender_identity_by_default() {
+        use nk_crypto_tool::gui::build_file_receive_config;
+
+        // The default flow: both key fields left empty.
+        let config = build_file_receive_config("", "");
+        assert!(
+            config.require_initiator_self_auth,
+            "a sender that presents no ML-DSA identity must be refused"
+        );
+        assert!(config.signing_privkey.is_none());
+        assert!(config.signing_pubkey.is_none());
+        assert!(config.serve_chat, "the receive listener is the chat/file server role");
+        // No allowlist and no pin: the node really is open to whoever holds the
+        // ticket, and says so rather than leaving it implicit. This is also what
+        // keeps the honest flow working under a default-deny authorization arm.
+        assert!(config.allow_unauth);
+    }
+
+    /// The optional "expected sender" field is load-bearing when filled in:
+    /// `signing_pubkey` pins that one key in the handshake, so the node is no
+    /// longer open and must not claim to be.
+    #[test]
+    fn listen_config_pins_expected_sender_when_supplied() {
+        use nk_crypto_tool::gui::build_file_receive_config;
+
+        let config = build_file_receive_config("/keys/mine.priv", "/keys/bob.pub");
+        assert_eq!(config.signing_privkey.as_deref(), Some("/keys/mine.priv"));
+        assert_eq!(config.signing_pubkey.as_deref(), Some("/keys/bob.pub"));
+        assert!(config.require_initiator_self_auth);
+        assert!(!config.allow_unauth, "a pinned sender is not an open node");
+    }
+
+    /// Whoever connected must be nameable in the UI: a fixed-width hex
+    /// fingerprint of the peer's ML-DSA key, and a loud label if somehow no
+    /// identity was established.
+    #[test]
+    fn peer_identity_label_shows_fixed_width_fingerprint() {
+        use nk_crypto_tool::gui::format_peer_identity;
+
+        let label = format_peer_identity(Some([0xabu8; 32]));
+        // 64 hex chars from 32 raw bytes: no peer-controlled character reaches
+        // the UI, so no terminal sanitization is required.
+        let rendered = label.rsplit(' ').next().unwrap();
+        assert_eq!(rendered, "ab".repeat(32), "got: {label}");
+        assert!(
+            rendered.len() == 64 && rendered.chars().all(|c| c.is_ascii_hexdigit()),
+            "fingerprint must render as exactly 64 hex chars: {label}"
+        );
+
+        let anon = format_peer_identity(None);
+        assert!(anon.contains("anonymous"), "got: {anon}");
+    }
+
+    /// The identity label is a first-class UI property: empty before a
+    /// handshake, and it outlives the transfer so the user can still compare it
+    /// out of band after the file has landed.
+    #[test]
+    fn peer_fingerprint_property_persists_after_transfer() {
+        let ui = ui();
+        assert_eq!(ui.get_peer_fingerprint(), "");
+
+        ui.set_transfer_mode(TransferMode::FileReceive);
+        ui.set_peer_fingerprint("Sender identity (ML-DSA fingerprint): abcd".into());
+        ui.set_connected(true);
+        assert!(ui.get_peer_fingerprint().contains("abcd"));
+
+        // Transfer ends: the receive panel goes away, the identity does not.
+        ui.set_connected(false);
+        ui.set_file_transfer_active(false);
+        assert!(!ui.get_file_transfer_visible());
+        assert!(ui.get_peer_fingerprint().contains("abcd"));
+    }
+
     #[test]
     fn test_file_transfer_visibility_chat_vs_file_modes() {
         let ui = ui();
@@ -618,6 +701,156 @@ mod tests {
         let s = format_transfer_status(2000, Some(1000));
         // 200% capped to 100%
         assert!(s.contains("(100%)"), "got: {}", s);
+    }
+
+    // ===== F13: bounds on the peer-fed chat message model =====
+
+    /// The peer decides how many chat packets to send and each one became a
+    /// retained row, so the model must keep only the newest `MAX_CHAT_ROWS` and
+    /// drop the oldest. The other direction matters just as much: an ordinary
+    /// conversation must still show every message it sent, in order.
+    #[test]
+    fn chat_model_keeps_newest_rows_and_drops_oldest() {
+        use nk_crypto_tool::gui::{append_chat_rows, MAX_CHAT_ROWS};
+        use slint::Model;
+
+        let ui = ui();
+
+        // Honest direction: a short conversation is delivered in full, in order.
+        append_chat_rows(&ui, (0..5).map(|i| format!("hello {i}")));
+        let m = ui.get_messages();
+        assert_eq!(m.row_count(), 5, "a normal conversation must show every message");
+        for i in 0..5 {
+            assert_eq!(m.row_data(i).unwrap().text, format!("hello {i}"));
+        }
+
+        // Hostile direction: a flood is bounded, newest kept, oldest evicted.
+        let flood = MAX_CHAT_ROWS * 3;
+        append_chat_rows(&ui, (0..flood).map(|i| format!("flood {i}")));
+        let m = ui.get_messages();
+        assert_eq!(
+            m.row_count(),
+            MAX_CHAT_ROWS,
+            "the peer must not decide how many rows this process retains"
+        );
+        assert_eq!(
+            m.row_data(MAX_CHAT_ROWS - 1).unwrap().text,
+            format!("flood {}", flood - 1),
+            "the newest message must survive the cap"
+        );
+        assert_eq!(
+            m.row_data(0).unwrap().text,
+            format!("flood {}", flood - MAX_CHAT_ROWS),
+            "eviction must take the oldest row, in order"
+        );
+    }
+
+    /// Appending must mutate the model already in the property instead of
+    /// building a replacement out of a full copy of it — the copy is what made
+    /// showing N messages cost O(N^2) row copies on the UI thread.
+    #[test]
+    fn chat_model_is_appended_in_place() {
+        use nk_crypto_tool::gui::append_chat_rows;
+        use slint::Model;
+
+        let ui = ui();
+        append_chat_rows(&ui, ["first".to_string()]);
+        let model_after_first = ui.get_messages();
+
+        for i in 0..50 {
+            append_chat_rows(&ui, [format!("row {i}")]);
+            assert!(
+                ui.get_messages() == model_after_first,
+                "row {i} replaced the whole model instead of pushing into it"
+            );
+        }
+        assert_eq!(ui.get_messages().row_count(), 51);
+    }
+
+    /// Peer-authored text must be bounded and sanitized before it becomes a
+    /// row, and the truncation must be visible; a normal-length message must
+    /// come through unchanged.
+    #[test]
+    fn chat_row_bounds_peer_text_but_leaves_normal_messages_intact() {
+        use nk_crypto_tool::gui::{format_chat_row, MAX_CHAT_ROW_CHARS};
+
+        // chat_loop writes the prompt decoration and the body separately.
+        assert_eq!(format_chat_row(b"\r[Peer]: "), None, "decoration is not a message");
+        assert_eq!(format_chat_row(b"\n> "), None);
+
+        // Honest direction: an ordinary message arrives whole and unmarked.
+        let normal = "shall we meet at 18:00? 日本語もそのまま";
+        let row = format_chat_row(format!("\r[Peer]: {normal}\n> ").as_bytes()).unwrap();
+        assert_eq!(row, normal, "a normal message must not be altered");
+        assert!(!row.contains("truncated"));
+
+        // Still whole right up to the ceiling.
+        let at_cap = "a".repeat(MAX_CHAT_ROW_CHARS);
+        assert_eq!(format_chat_row(at_cap.as_bytes()).unwrap(), at_cap);
+
+        // Hostile direction: a packet-sized body becomes one bounded row that
+        // says it was clipped.
+        let huge = "A".repeat(65_000);
+        let row = format_chat_row(huge.as_bytes()).unwrap();
+        assert!(
+            row.ends_with("…[truncated]"),
+            "truncation must be visible to the user"
+        );
+        assert!(
+            row.chars().count() <= MAX_CHAT_ROW_CHARS + "…[truncated]".chars().count(),
+            "row rendered {} chars",
+            row.chars().count()
+        );
+
+        // Terminal / bidi control characters never reach the row.
+        let hostile = format_chat_row("x\u{1b}[2K\u{202E}y".as_bytes()).unwrap();
+        assert!(!hostile.contains('\u{1b}') && !hostile.contains('\u{202E}'));
+    }
+
+    /// The peer paces the arrival of rows and Slint's event-loop queue is
+    /// unbounded, so a burst must collapse into a single pending closure
+    /// carrying a bounded batch — while a normally paced conversation still
+    /// schedules, and delivers, every message.
+    #[test]
+    fn chat_row_queue_coalesces_bursts_and_never_loses_the_next_message() {
+        use nk_crypto_tool::gui::{ChatRowQueue, MAX_CHAT_ROWS};
+
+        let q = ChatRowQueue::new();
+
+        // Honest direction: one row at a time, each drained before the next
+        // arrives, so each schedules its own UI update and is delivered.
+        for i in 0..5 {
+            assert!(q.stage(format!("paced {i}")), "a fresh row must schedule a UI update");
+            assert_eq!(q.take(), vec![format!("paced {i}")]);
+        }
+
+        // Hostile direction: a burst arrives while one closure is pending.
+        let burst = MAX_CHAT_ROWS * 4;
+        let mut posts = 0;
+        for i in 0..burst {
+            if q.stage(format!("burst {i}")) {
+                posts += 1;
+            }
+        }
+        assert_eq!(
+            posts, 1,
+            "a burst of {burst} packets must not queue {burst} event-loop closures"
+        );
+
+        let batch = q.take();
+        assert!(
+            batch.len() <= MAX_CHAT_ROWS,
+            "staged {} rows, cap is {MAX_CHAT_ROWS}",
+            batch.len()
+        );
+        assert_eq!(
+            batch.last().unwrap(),
+            &format!("burst {}", burst - 1),
+            "the newest rows must be the ones that survive"
+        );
+
+        // No lost wakeup: after the drain, the next row schedules again.
+        assert!(q.stage("after".to_string()));
     }
 
     #[test]

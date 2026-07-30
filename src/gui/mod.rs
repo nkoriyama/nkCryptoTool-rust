@@ -91,6 +91,157 @@ pub fn format_transfer_status(sent: u64, total: Option<u64>) -> String {
     }
 }
 
+/// F13: hard ceiling on how many chat rows the GUI retains.
+///
+/// One accepted chat packet becomes one row, and the peer decides how many
+/// packets to send, so without a ceiling the peer alone decides how much heap
+/// this process keeps and how much the list view has to lay out. 1000 rows is
+/// far more scrollback than a real session needs (an hour of brisk
+/// back-and-forth is well under 100 rows) and costs at most ~1 MB even with
+/// every row at `MAX_CHAT_ROW_CHARS`.
+#[cfg(feature = "gui")]
+pub const MAX_CHAT_ROWS: usize = 1000;
+
+/// F13: hard ceiling on the rendered length of one chat row, in characters.
+///
+/// A chat packet carries up to ~65 KB of peer-authored body (`network`'s
+/// `chunk_len` ceiling is 70000 bytes) and every byte of it used to land in a
+/// `SharedString`. 256 is the same bound every other peer-string sink in the
+/// tree uses (`scp`, `forward`), and `sanitize_for_terminal_bounded` appends a
+/// visible `…[truncated]` marker so a clipped message never reads as complete.
+#[cfg(feature = "gui")]
+pub const MAX_CHAT_ROW_CHARS: usize = 256;
+
+/// F13: render one `stdout` write from the chat loop as a display row, or
+/// `None` when it carries nothing to show.
+///
+/// `chat_loop` writes a peer message as three separate writes — `"\r[Peer]: "`,
+/// the body, `"\n> "` — so the prompt decoration arrives as its own write and
+/// trims down to nothing. The trims and the empty / `">"` skip are unchanged
+/// from the original inline code; what is new is the bound. The body reaching
+/// here is filtered for control and bidi characters by `chat_loop`, but that
+/// filter keeps `\n`/`\t`, misses U+200E/U+200F, and above all bounds nothing,
+/// so one packet could put ~65 KB into a single list row.
+/// `sanitize_for_terminal_bounded` is the only length bound applied to a chat
+/// row — there is deliberately no second, different one downstream.
+///
+/// Public so the row bound can be tested without a peer.
+#[cfg(feature = "gui")]
+pub fn format_chat_row(data: &[u8]) -> Option<String> {
+    let msg = String::from_utf8_lossy(data);
+    let trimmed = msg
+        .trim_start_matches("\r[Peer]: ")
+        .trim_end_matches("\n> ")
+        .trim_start_matches("> ");
+    if trimmed.is_empty() || trimmed == ">" {
+        return None;
+    }
+    Some(crate::utils::sanitize_for_terminal_bounded(
+        trimmed,
+        MAX_CHAT_ROW_CHARS,
+    ))
+}
+
+/// F13: staging buffer between the network drain task and the Slint event loop.
+///
+/// The peer sets the rate at which chat packets arrive and
+/// `slint::invoke_from_event_loop` queues without limit, so posting one closure
+/// per packet lets the peer grow that queue — and the strings held in it —
+/// without bound while the event loop falls further behind. Rows are staged
+/// here instead, and staging hands out the obligation to post *one* closure:
+/// every row staged while that closure is still pending is picked up by it when
+/// it runs, so at most one closure is outstanding no matter how fast the peer
+/// sends. The buffer is itself capped at `MAX_CHAT_ROWS`, since anything older
+/// than that would be evicted by the model cap the moment it was applied.
+#[cfg(feature = "gui")]
+#[derive(Default)]
+pub struct ChatRowQueue {
+    inner: parking_lot::Mutex<ChatRowQueueInner>,
+}
+
+#[cfg(feature = "gui")]
+#[derive(Default)]
+struct ChatRowQueueInner {
+    rows: std::collections::VecDeque<String>,
+    /// True while a closure that will drain `rows` is queued on the event loop.
+    posted: bool,
+}
+
+#[cfg(feature = "gui")]
+impl ChatRowQueue {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stage one row. Returns `true` if the caller must post exactly one
+    /// event-loop closure that calls [`ChatRowQueue::take`]; `false` means such
+    /// a closure is already pending and will carry this row too.
+    pub fn stage(&self, row: String) -> bool {
+        let mut inner = self.inner.lock();
+        inner.rows.push_back(row);
+        while inner.rows.len() > MAX_CHAT_ROWS {
+            inner.rows.pop_front();
+        }
+        if inner.posted {
+            false
+        } else {
+            inner.posted = true;
+            true
+        }
+    }
+
+    /// Take everything staged and clear the pending flag in one critical
+    /// section, so a row staged after this point always schedules a fresh post
+    /// (no lost wakeup).
+    pub fn take(&self) -> Vec<String> {
+        let mut inner = self.inner.lock();
+        inner.posted = false;
+        inner.rows.drain(..).collect()
+    }
+
+    /// Clear the pending flag without draining, for a caller whose post failed
+    /// (the event loop is gone). The staged rows stay for the next attempt.
+    pub fn release(&self) {
+        self.inner.lock().posted = false;
+    }
+}
+
+/// F13: append `rows` to the chat model in place, evicting the oldest rows so
+/// the model never holds more than [`MAX_CHAT_ROWS`].
+///
+/// `messages` holds a `VecModel`, so appending is a push into the model that is
+/// already there rather than a copy of every existing row into a freshly
+/// allocated one — the latter made showing N messages cost O(N^2) row copies on
+/// the UI thread. The first call swaps the `.slint` literal model for a
+/// `VecModel`, carrying over whatever rows it held.
+#[cfg(feature = "gui")]
+pub fn append_chat_rows(ui: &ChatWindow, rows: impl IntoIterator<Item = String>) {
+    if ui
+        .get_messages()
+        .as_any()
+        .downcast_ref::<VecModel<StandardListViewItem>>()
+        .is_none()
+    {
+        let existing = ui.get_messages();
+        let carried: Vec<StandardListViewItem> = (0..existing.row_count())
+            .filter_map(|i| existing.row_data(i))
+            .collect();
+        ui.set_messages(slint::ModelRc::new(VecModel::from(carried)));
+    }
+    let model = ui.get_messages();
+    let Some(vec_model) = model.as_any().downcast_ref::<VecModel<StandardListViewItem>>() else {
+        return;
+    };
+    for row in rows {
+        while vec_model.row_count() >= MAX_CHAT_ROWS {
+            vec_model.remove(0);
+        }
+        vec_model.push(StandardListViewItem::from(slint::SharedString::from(
+            row.as_str(),
+        )));
+    }
+}
+
 /// F3: Build a progress callback + pump task that updates the UI
 /// transfer-progress / transfer-bytes / transfer-total / transfer-status
 /// properties from a tokio::sync::mpsc::channel(1) (latest-wins via
@@ -132,6 +283,61 @@ pub fn make_progress_pipeline(
     });
 
     (cb, pump)
+}
+
+/// Build the `CryptoConfig` for the "Generate Ticket and Wait" (FileReceive)
+/// listener. Public so the handshake-level regression test can drive the real
+/// admission path with exactly the config the button builds, rather than a
+/// hand-copied approximation that can drift from it.
+///
+/// `privkey` / `pubkey` are the raw UI fields; empty means "not supplied".
+///
+/// Authorization posture, in one place because all three parts interact:
+///
+/// * `signing_pubkey` (the optional "expected sender" field) pins one sender
+///   when supplied: the handshake binds wire field #6 to it before verifying
+///   `sig_I`, so only that key completes the handshake.
+/// * When it is NOT supplied the node has no allowlist and no pin, so it is
+///   open to whoever holds the ticket — `allow_unauth` says so honestly.
+/// * `require_initiator_self_auth` is what keeps "open" from meaning
+///   "anonymous". The ticket is the capability, so requiring a signature keeps
+///   nobody out who has the ticket — an attacker can mint a key. What it buys
+///   is that the session has an *identity*: a fingerprint the UI shows the
+///   user, who can compare it out of band against the sender they meant.
+///   Without it the peer is a `PeerId::Node` and the transfer is
+///   unattributable.
+#[cfg(feature = "gui")]
+pub fn build_file_receive_config(privkey: &str, pubkey: &str) -> crate::config::CryptoConfig {
+    let mut config = crate::config::CryptoConfig::default();
+    config.signing_privkey = if privkey.is_empty() { None } else { Some(privkey.to_string()) };
+    config.signing_pubkey = if pubkey.is_empty() { None } else { Some(pubkey.to_string()) };
+    config.chat_mode = false;
+    // This IS the chat/file server role — the GUI's receive button
+    // listens on ALPN_FILE. `serve_chat` is what the ALPN dispatch
+    // checks before serving that protocol, so a listener that does not
+    // declare the role is refused (as a `--serve-shell` node now is).
+    config.serve_chat = true;
+    config.transport = crate::config::TransportKind::Iroh;
+    config.allow_unauth = config.signing_pubkey.is_none();
+    config.require_initiator_self_auth = true;
+    config
+}
+
+/// The UI label for the peer identity established by the handshake.
+///
+/// `crate::shell::fp_hex` is a fixed-width rendering of 32 raw bytes (64
+/// lowercase hex chars, `{b:02x}` per byte), so the peer controls no character
+/// of it and it needs no `sanitize_for_terminal_bounded` pass. The `None` arm
+/// is a fixed literal for the same reason.
+#[cfg(feature = "gui")]
+pub fn format_peer_identity(peer_fp: Option<[u8; 32]>) -> String {
+    match peer_fp {
+        Some(fp) => format!("Sender identity (ML-DSA fingerprint): {}", crate::shell::fp_hex(&fp)),
+        // Only reachable on a listener that does not set
+        // `require_initiator_self_auth`; say so loudly rather than leaving the
+        // label blank, which reads like "not connected yet".
+        None => "⚠ Sender did not present an identity (anonymous)".to_string(),
+    }
 }
 
 #[cfg(feature = "gui")]
@@ -245,12 +451,18 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "gui-notifications")]
     let nm = notif_manager.clone();
     
+    // F13: rows are staged here and applied in batches. The peer paces the
+    // arrival of chat packets, so one event-loop closure per packet would let
+    // it grow Slint's unbounded event queue at will.
+    let chat_rows = Arc::new(ChatRowQueue::new());
+
     tokio::spawn(async move {
         while let Some(data) = stdout_rx.recv().await {
-            let msg = String::from_utf8_lossy(&data).to_string();
-            let clean_msg = msg.trim_start_matches("\r[Peer]: ").trim_end_matches("\n> ").trim_start_matches("> ").to_string();
-            if clean_msg.is_empty() || clean_msg == ">" { continue; }
-            
+            // F13: peer text is bounded and sanitized before it becomes a row.
+            let Some(clean_msg) = format_chat_row(&data) else {
+                continue;
+            };
+
             #[cfg(feature = "gui-notifications")]
             {
                  // M4: Trigger notification. `None` because no authenticated
@@ -261,18 +473,24 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                  let _ = nm.notify_message(None, false);
             }
 
+            if !chat_rows.stage(clean_msg) {
+                // A closure is already queued on the event loop and will carry
+                // this row; queueing another one only grows the queue.
+                continue;
+            }
             let ui_handle = ui_handle_out.clone();
-            let _ = slint::invoke_from_event_loop(move || {
+            let rows_for_ui = chat_rows.clone();
+            let posted = slint::invoke_from_event_loop(move || {
+                // Take first and unconditionally, so the pending flag is
+                // cleared even if the window has gone away.
+                let batch = rows_for_ui.take();
                 if let Some(ui) = ui_handle.upgrade() {
-                    let messages = ui.get_messages();
-                    let new_messages = VecModel::default();
-                    for i in 0..messages.row_count() {
-                        new_messages.push(messages.row_data(i).unwrap());
-                    }
-                    new_messages.push(StandardListViewItem::from(slint::SharedString::from(clean_msg.as_str())));
-                    ui.set_messages(slint::ModelRc::new(new_messages));
+                    append_chat_rows(&ui, batch);
                 }
             });
+            if posted.is_err() {
+                chat_rows.release();
+            }
         }
     });
 
@@ -695,17 +913,7 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         let recv_path = std::path::PathBuf::from(&save_dir).join(&final_name);
 
         let task = tokio::spawn(async move {
-            let mut config = crate::config::CryptoConfig::default();
-            config.signing_privkey = if privkey.is_empty() { None } else { Some(privkey.clone()) };
-            config.signing_pubkey = if pubkey.is_empty() { None } else { Some(pubkey.clone()) };
-            config.chat_mode = false;
-            // This IS the chat/file server role — the GUI's receive button
-            // listens on ALPN_FILE. `serve_chat` is what the ALPN dispatch
-            // checks before serving that protocol, so a listener that does not
-            // declare the role is refused (as a `--serve-shell` node now is).
-            config.serve_chat = true;
-            config.transport = crate::config::TransportKind::Iroh;
-            config.allow_unauth = true;
+            let config = build_file_receive_config(&privkey, &pubkey);
 
             let file_io = match crate::network::FileIOProvider::new_recv(recv_path.clone()).await {
                 Ok(p) => Arc::new(p),
@@ -730,7 +938,22 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
             };
-            let processor = crate::p2p::NetworkProcessor::new(config.clone(), endpoint, file_io as Arc<dyn crate::network::IOProvider>);
+            let mut processor = crate::p2p::NetworkProcessor::new(config.clone(), endpoint, file_io as Arc<dyn crate::network::IOProvider>);
+            // Activate keyring authorization on the same terms as every other
+            // listener (main.rs / network::run_server). With no `keyring_db`
+            // configured — the GUI has no field for one — this is a no-op, so
+            // the honest flow is unaffected; it is here so a keyring, once
+            // configured, is actually consulted instead of silently ignored.
+            if let Err(e) = processor.preload_allowlist().await {
+                let ui_handle = ui_handle.clone();
+                let msg = format!("Keyring allowlist: {}", e);
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_handle.upgrade() {
+                        ui.set_connection_error(msg.into());
+                    }
+                });
+                return;
+            }
 
             let ui_handle_ticket = ui_handle.clone();
             let on_ticket = move |ticket: &crate::ticket::Ticket| {
@@ -744,9 +967,15 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let ui_handle_handshake = ui_handle.clone();
-            let on_handshake = move || {
+            let on_handshake = move |peer_fp: Option<[u8; 32]>| {
+                // Who actually connected. On a listener whose only admission
+                // control is "holds the ticket", this is the one thing that
+                // distinguishes the sender the user handed the ticket to from
+                // anyone else who saw it, so it is shown before the bytes land.
+                let identity = format_peer_identity(peer_fp);
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_handle_handshake.upgrade() {
+                        ui.set_peer_fingerprint(identity.into());
                         ui.set_listening(false);
                         ui.set_connected(true);
                         ui.set_file_transfer_active(true);

@@ -44,6 +44,11 @@ export component ChatWindow inherits Window {
     // F2: Listen mode (FileReceive)
     in-out property <bool> listening: false;
     in-out property <string> generated-ticket: "";
+    // Identity of the peer that completed the handshake, as rendered by
+    // gui::format_peer_identity (fixed-width ML-DSA fingerprint hex). Empty
+    // until a handshake completes. Deliberately outlives the transfer so the
+    // user can still compare it out of band after the file has landed.
+    in-out property <string> peer-fingerprint: "";
     in-out property <bool> file-transfer-active: false;
     in-out property <string> transfer-status: "";
 
@@ -84,6 +89,14 @@ export component ChatWindow inherits Window {
         if connection-error != "" : Text {
             text: connection-error;
             color: red;
+        }
+
+        // Authenticated peer identity (who the handshake says connected)
+        if peer-fingerprint != "" : Text {
+            text: peer-fingerprint;
+            color: #0060a0;
+            font-size: 11px;
+            wrap: word-wrap;
         }
 
         // F1: Transfer Mode toggle (3-way selector)
@@ -178,6 +191,7 @@ export component ChatWindow inherits Window {
                     text: transfer-mode == TransferMode.Chat ? "Connect" : (transfer-mode == TransferMode.FileSend ? "Send File" : "Generate Ticket and Wait");
                     clicked => {
                         root.connection-error = "";
+                        root.peer-fingerprint = "";
                         if (transfer-mode == TransferMode.FileReceive) {
                             root.listen-pressed(root.privkey-path, root.pubkey-path);
                         } else {

@@ -136,6 +136,21 @@ RTT 100ms・10,000 ファイルなら約 1,000 秒が帯域・暗号速度と無
 - **MkDir も open 後再検証**: 作成後に `canonicalize` して write ルート配下か再確認し、外れたら
   作成物を `rmdir` して拒否（`confine`→`create_dir` 間の中間 symlink すり替え TOCTOU 封じ。
   ファイルの `/proc/self/fd` 再検証と対をなす）。
+- **MkDir の `mode` は「作成物だけ」に `clamp_dir_mode` で上限をかけて適用する**: `mode` は
+  ピアが選ぶワイヤ値なので、①**自分がこの転送で作成したディレクトリにだけ**（`create_dir` が
+  `AlreadyExists` を返したエントリには一切 chmod しない）、②`(mode & 0o0777) & !0o022` に
+  丸めて適用する＝**group/other write は必ず落とす**。②が無いと write グラントを持つピアが
+  `MkDir{mode:0o777}` で write ルート内に world-writable な置き場を作れ、サーバ上の他の
+  ローカルユーザがそこへ書き込める（後からそこにアップロードされるファイルの差し替えを
+  含む）。①が無いと同じピアが受信側の保存領域（put ならサーバの write ルート、get なら
+  クライアントのローカル保存先）配下の**既存**ディレクトリを狙って `MkDir{path:<既存>, mode:…}`
+  を送るだけで、運用者の `0o700` を `0o755` に広げたり、逆に `0o700` へ狭めて運用者の
+  グループを締め出せる（get 側の `~/.ssh` がこの形）。この①②は**受信側 2 か所——
+  クライアントの `recv_tree`（`get -r`）とサーバの `run_scp_server`（`put -r`）——で同一**。
+  よって新規作成される `0o775` / `0o777` のディレクトリはどちら向きの転送でも `0o755` として
+  着地し、既存ディレクトリは**どちら向きでも mode が変わらない**（エントリ自体は `Ack`＝
+  既存ツリーへの再 put は従来どおり成功し、mode だけが手つかずで残る）。OpenSSH scp は
+  逆側の同じトレードで、`-p` 無しではリモート mode を無視する。
 - **部分失敗（＝パイプライン下の在庫の運命を明示）**: エントリ毎に `Ack`/`Fail`。confine 拒否・
   stage/commit 失敗は `Fail`（ワイヤは一律 "denied"）で、**サーバはバッチを止めず次のエントリを
   処理し続ける**＝ scp `-r` 互換の「エラーでも続行し最後に集計」。put はパイプライン送信なので
@@ -165,7 +180,7 @@ C: Put{path, mode, size}
 S: 認可(write) + confine。拒否なら Err("denied") で終了。
 S: staging temp を O_NOFOLLOW|0600|create_new で final の同一ディレクトリに作成。
 C: Data* → Eof
-S: temp へ書き込み。Eof 受信で fsync → fchmod(mode & 0o0777) → atomic rename(temp→final)。
+S: temp へ書き込み。Eof 受信で fsync → fchmod(clamp_file_mode(mode)) → atomic rename(temp→final)。
 S: Ok（失敗時は Err、temp は破棄）
 ```
 
@@ -219,13 +234,28 @@ a6fc484e...  read="/srv/pub, /home/opc/out"  write="/home/opc/incoming"
 - `user=` は**サーバ自身のユーザを指す時のみ許可**（per-user インスタンスモデル、
   `enforce_scp_user`）。別ユーザ／未知ユーザを指す行は、そのピアのセッションを拒否
   （ワイヤ上は一様に "denied"、理由は監査ログにのみ記録）。上記「やらないこと」参照。
-- `mode` は**開いている fd に対して** `fchmod(mode & 0o0777)` で適用する。パスベースの
+- `mode` は**開いている fd に対して** `fchmod` で適用する。パスベースの
   `set_permissions(temp)` をクローズ後に呼ぶと、temp を symlink にすり替える TOCTOU で
-  無関係ファイルを chmod されうるため、fd 経由にして封じる。マスクは `0o0777`＝
-  **setuid/setgid/sticky を必ず除去**：アップロード（サーバ側）でもダウンロード
-  （クライアント側）でも、ピアが選んだ権限昇格ビットを持つファイルは決して残らない。
-  これは put/get 双方が共有する `Staged::commit` の一点で担保する。（予約: write ルート
-  単位で mode をさらに絞る（umask 相当）余地。）
+  無関係ファイルを chmod されうるため、fd 経由にして封じる。
+- `mode` は**ピアが選ぶワイヤ値**なので、そのままは決して適用しない。`fchmod` は umask で
+  フィルタされないため、素通しはピアに「相手ホスト上のファイル権限」を丸ごと渡すのと同じ
+  （悪意あるサーバが `--scp-get secret.pem` に `Put{mode:0o666}` で応答すれば、operator の
+  鍵が全ローカルユーザから読めて書けるファイルとして着地する）。よって
+  `clamp_file_mode` が**下方向のみの上限を 3 段**かける:
+  1. `& 0o0777`＝**setuid/setgid/sticky を必ず除去**。アップロード（サーバ側）でも
+     ダウンロード（クライアント側）でも、ピアが選んだ権限昇格ビットは決して残らない。
+  2. `& !0o022`＝**group/world write を無条件に拒否**。`umask 000` の operator でも、
+     他のローカルユーザが中身を差し替えられるファイルは生まれない。
+  3. `& !umask`＝**自プロセスが自分で作るファイルより広くならない**。group/other の
+     read ビットを決めるのはピアではなく operator の umask になる（`umask 022` なら
+     `0o666`→`0o644`、`umask 077` なら `0o600`）。OpenSSH scp も `-p` 無しでは
+     リモート mode を無視して local umask に従う。本実装に `-p` 相当は無いので umask が常に勝つ。
+
+  umask は `main` が**tokio ランタイム構築前**（＝まだシングルスレッド）に一度だけ採取して
+  `OnceLock` に保持する（`umask(2)` に読み取り専用形が無く、読むこと自体が
+  プロセス全体の read-modify-write になるため）。採取されていない場合（ライブラリ埋め込み・
+  単体テスト）は最も厳しい `0o077` にフォールバックする＝広い側へ倒れない。
+  これら全部を put/get 双方が共有する `Staged::commit` の一点で担保する。
 
 ## パス confinement（本機能の要）
 

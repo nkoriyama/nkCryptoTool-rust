@@ -671,13 +671,20 @@ pub(crate) async fn audit(path: Option<&str>, fp: &[u8; 32], event: &str) -> std
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // Neutralize control characters (notably newlines) in the event — part of
-    // it is client-supplied (the command), so a raw `\n` would let a peer forge
-    // additional audit records / erase its tracks.
-    let safe_event: String = event
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    // Neutralize terminal-spoofing characters in the event — part of it is
+    // peer-supplied (the shell command, an scp path, a forward target host), so
+    // a raw `\n` would let a peer forge additional audit records / erase its
+    // tracks, and a bidi override or zero-width mark would let it make the
+    // record *render* as a different, benign-looking one when the operator reads
+    // the trail. `sanitize_for_terminal` is the shared gate for both classes: it
+    // maps exactly those characters to a space (a superset of the control-only
+    // filter this replaces, with the same replacement), so an honest record is
+    // written byte for byte as before. Unbounded on purpose: an audit record is
+    // the only server-side evidence of what a peer asked for, so truncating it
+    // would destroy evidence — the length is already capped upstream (a forward
+    // host is ≤255 bytes, an scp path by the path limit, a shell command by the
+    // frame cap).
+    let safe_event = crate::utils::sanitize_for_terminal(event);
     let line = format!("{ts} fp={} {safe_event}\n", fp_hex(fp));
     let path = path.to_string();
     tokio::task::spawn_blocking(move || {
@@ -2146,5 +2153,49 @@ mod tests {
             .unwrap();
         assert_eq!(out, b"line-one\nline-two\n");
         server.await.unwrap().unwrap();
+    }
+
+    // ---- F17: peer-chosen text must not be able to re-render an audit record ----
+
+    /// Every audit event carries text the peer chose (a forward target host, an
+    /// scp path, the shell command). A bidi override or zero-width mark in it
+    /// must not reach the log: it would make the record render as a *different*
+    /// target when the operator reads the trail, and that trail is the only
+    /// server-side evidence of what the peer actually asked for. An ordinary
+    /// record must still be written byte for byte.
+    #[tokio::test]
+    async fn audit_neutralizes_bidi_marks_and_leaves_an_ordinary_record_intact() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("nkct_audit_f17_{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let p = path.to_str().unwrap().to_string();
+        let fp = [0x11u8; 32];
+
+        // A peer-chosen forward target carrying RLO + a zero-width space, then
+        // an ordinary one.
+        audit(Some(&p), &fp, "fwd allow \u{202E}gro.elpmaxe\u{200B}:443").await.unwrap();
+        audit(Some(&p), &fp, "fwd allow db.internal:5432").await.unwrap();
+
+        let log = std::fs::read_to_string(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let mut lines = log.lines();
+        let hostile = lines.next().expect("first record");
+        let honest = lines.next().expect("second record");
+
+        // Direction 1: the spoofing characters are gone, replaced in place, and
+        // the rest of the host is still legible as evidence.
+        assert!(!hostile.contains('\u{202E}'), "bidi override survived: {hostile:?}");
+        assert!(!hostile.contains('\u{200B}'), "zero-width mark survived: {hostile:?}");
+        assert!(
+            hostile.ends_with("fwd allow  gro.elpmaxe :443"),
+            "unexpected sanitized record: {hostile:?}"
+        );
+
+        // Direction 2: an ordinary record is unchanged — same fields, host and
+        // port byte-identical, nothing truncated or stripped.
+        assert!(
+            honest.ends_with(&format!(" fp={} fwd allow db.internal:5432", fp_hex(&fp))),
+            "ordinary record was altered: {honest:?}"
+        );
     }
 }

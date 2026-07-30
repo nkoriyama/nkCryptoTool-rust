@@ -372,6 +372,35 @@ impl Reassembler {
             Ok(f) => f,
             Err(e) => return FileStatus::Error(format!("stage {tmp_path:?}: {e}")),
         };
+        // A re-START under the same key supersedes any transfer already open on
+        // it, and `Partial` has no `Drop`, so the superseded staging file has to
+        // be unlinked here or it is orphaned in the receive directory forever.
+        // Order matters twice:
+        //   * the new staging file is created *first* (above), so a create that
+        //     fails cannot destroy an in-progress transfer; and
+        //   * the old entry is taken out of the map *before* the unlink, so its
+        //     `File` is dropped and the handle closed first — `create_owner_only`
+        //     opens with a deny-all share mode on Windows, where deleting a path
+        //     this process still holds open fails with a sharing violation.
+        // Nothing between here and the `insert` below can return early, so no new
+        // orphan can be created in the gap. The path comparison only matters when
+        // something outside this process removed the old `.part` (a same-name
+        // re-START with the file still there fails in `exclusive_create` and
+        // returns above) — in that case the old path names the file we just
+        // created, which must not be deleted.
+        if let Some(old) = self.partial.remove(&key) {
+            drop(old.file);
+            if old.tmp_path != tmp_path {
+                if let Err(e) = std::fs::remove_file(&old.tmp_path) {
+                    // Non-fatal, but never silent: a failure here is exactly the
+                    // leak this cleanup exists to prevent.
+                    eprintln!(
+                        "[mls] warning: could not remove superseded staging file {:?}: {e}",
+                        old.tmp_path
+                    );
+                }
+            }
+        }
         let started = self.next_started;
         self.next_started += 1;
         self.partial.insert(
@@ -618,6 +647,45 @@ mod tests {
             .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
             .collect();
         assert!(leftover.is_empty(), "no file committed on integrity failure");
+    }
+
+    #[test]
+    fn restart_of_a_transfer_does_not_orphan_its_staging_file() {
+        // A sender opens a transfer, streams data into `.a.bin.<id>.part`, then
+        // re-STARTs the *same* id under a different name. The old staging file
+        // is superseded and no code path will ever look at it again, so it must
+        // be unlinked here; otherwise repeating this leaks staging files (up to
+        // MAX_FILE_SIZE each) into the receive dir without bound.
+        let recv = tempdir().unwrap();
+        let mut r = Reassembler::new(recv.path().to_path_buf());
+        let g = [4u8; 32];
+        let id = [0xabu8; ID_LEN];
+        let count_parts = || {
+            std::fs::read_dir(recv.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+                .count()
+        };
+
+        assert!(matches!(
+            r.ingest(&g, 1, &encode_start(&id, 4096, "a.bin")),
+            Some(FileStatus::Started { .. })
+        ));
+        assert!(matches!(
+            r.ingest(&g, 1, &encode_data(&id, 0, &[7u8; 512])),
+            Some(FileStatus::Progress { .. })
+        ));
+        assert_eq!(count_parts(), 1, "one staging file after the first START");
+
+        // Re-START the same (group, sender, id) under a new name.
+        assert!(matches!(
+            r.ingest(&g, 1, &encode_start(&id, 4096, "b.bin")),
+            Some(FileStatus::Started { .. })
+        ));
+        assert_eq!(count_parts(), 1, "re-START must not leave the old .part behind");
+        assert!(recv.path().join(format!(".b.bin.{}.part", hex16(&id))).exists());
+        assert!(!recv.path().join(format!(".a.bin.{}.part", hex16(&id))).exists());
     }
 
     #[test]

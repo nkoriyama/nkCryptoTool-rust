@@ -10,8 +10,8 @@ set -u
 
 BIN="$PWD/target/release/nk-crypto-tool"
 unset RUST_LOG NK_PASSPHRASE
-ROOT=/tmp/scp
-rm -rf "$ROOT"; mkdir -p "$ROOT/srv" "$ROOT/cli" "$ROOT/keys"
+ROOT=$(mktemp -d "${TMPDIR:-/tmp}/nkct-scp-demo.XXXXXX") || exit 1
+mkdir -p "$ROOT/srv" "$ROOT/cli" "$ROOT/keys"
 SRV=""
 trap 'kill $SRV 2>/dev/null; rm -rf "$ROOT"' EXIT
 

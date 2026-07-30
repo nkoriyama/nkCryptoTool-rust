@@ -982,6 +982,55 @@ mod tests {
         assert!(client_res.unwrap().is_err());
     }
 
+    /// Authentication is not authorization. A chat/file server with NO source of
+    /// authorization — no keyring allowlist, no pinned client key — and without
+    /// the explicit `--allow-unauth` opt-in must refuse a peer that merely signs
+    /// with a key it minted itself: holding the ticket is not permission to read
+    /// the operator's stdin. Previously the allowlist/grant block was skipped
+    /// entirely when no keyring was configured, so such a peer was admitted.
+    #[tokio::test]
+    #[serial]
+    async fn chat_without_any_authorization_source_rejects_self_signed_peer() {
+        reset_state();
+        let dir = tempdir().unwrap();
+        let c_key_path = dir.path().join("c.priv.pem");
+        let (c_priv, _c_pub, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+        fs::write(&c_key_path, utils::wrap_to_pem(&utils::wrap_pqc_priv_to_pkcs8(&c_priv, "ML-DSA-65").unwrap(), "PRIVATE KEY")).unwrap();
+        let (ticket_tx, ticket_rx) = tokio::sync::oneshot::channel();
+        let mut server_config = CryptoConfig::default();
+        server_config.transport = crate::config::TransportKind::Iroh;
+        server_config.chat_mode = true;
+        // The vulnerable shape: a bare `--serve-chat` — no keyring_db, no
+        // signing_pubkey pin, and allow_unauth left at its default (false).
+        server_config.allow_unauth = false;
+        server_config.handshake_timeout = 30;
+        let _server_task = tokio::spawn(async move {
+            let mut processor = new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await;
+            processor.preload_allowlist().await.unwrap();
+            let _ = processor.start_with_ticket_callback(|ticket| {
+                let _ = ticket_tx.send(ticket.to_string());
+            }).await;
+        });
+        let ticket_str = tokio::time::timeout(Duration::from_secs(60), ticket_rx).await.unwrap().unwrap();
+        let mut client_config = CryptoConfig::default();
+        client_config.transport = crate::config::TransportKind::Iroh;
+        client_config.connect_addr = Some(modify_ticket(&ticket_str, None, None));
+        client_config.chat_mode = true;
+        // Self-authenticates with a key of its own making, and does not pin the
+        // server (anonymous-server mode, as in the multi-client test below).
+        client_config.allow_unauth = true;
+        client_config.signing_privkey = Some(c_key_path.to_str().unwrap().to_string());
+        client_config.handshake_timeout = 30;
+        let client_res = tokio::time::timeout(Duration::from_secs(60), async {
+            let processor = new_iroh_with_io_for_test(client_config, Arc::new(TestIOProvider)).await;
+            processor.run_connect().await
+        }).await;
+        assert!(
+            client_res.unwrap().is_err(),
+            "an authenticated but unknown peer must not get a chat session on a node with no allowlist and no pinned key"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_iroh_handshake_multi_client_auth_success() {
@@ -1094,5 +1143,116 @@ mod tests {
             processor.run_connect().await
         }).await;
         assert!(client_res.unwrap().is_ok());
+    }
+
+    /// F12: the GUI "Generate Ticket and Wait" listener has no keyring and, in
+    /// the default flow, no pinned sender — the ticket is the entire
+    /// capability. It previously hardcoded `allow_unauth = true`, so a peer
+    /// that set no `INITIATOR_SELF_AUTH` flag completed the handshake and its
+    /// bytes were written to the user's chosen destination with no identity
+    /// ever established, displayed or recorded.
+    ///
+    /// Both directions are asserted against the config the button actually
+    /// builds (`gui::build_file_receive_config`, so the test cannot drift from
+    /// the UI):
+    ///   1. an anonymous dialer is refused, and
+    ///   2. an ordinary sender that signs the handshake is still served, with
+    ///      the handshake-done callback naming its fingerprint — which is the
+    ///      point, since requiring a signature keeps nobody who holds the
+    ///      ticket out (an attacker mints a key); it makes the session
+    ///      *attributable* so the user can compare it out of band.
+    #[cfg(feature = "gui")]
+    #[tokio::test]
+    #[serial]
+    async fn gui_file_receive_listener_requires_a_sender_identity() {
+        // ---- direction 1: the anonymous sender must be refused ----
+        reset_state();
+        let (ticket_tx, ticket_rx) = tokio::sync::oneshot::channel();
+        // Exactly the default GUI flow: no private key, and the "Public Key
+        // Path (expected sender, optional)" field left empty.
+        let mut server_config = crate::gui::build_file_receive_config("", "");
+        server_config.handshake_timeout = 30;
+        assert!(server_config.signing_pubkey.is_none(), "default flow pins no sender");
+        let anon_server = tokio::spawn(async move {
+            let mut processor = new_iroh_with_io_for_test(server_config, Arc::new(TestIOProvider)).await;
+            processor.preload_allowlist().await.unwrap();
+            let _ = processor.start_with_ticket_callback(|ticket| {
+                let _ = ticket_tx.send(ticket.to_string());
+            }).await;
+        });
+        let ticket_str = tokio::time::timeout(Duration::from_secs(60), ticket_rx).await.unwrap().unwrap();
+        let mut anon_client = CryptoConfig::default();
+        anon_client.transport = crate::config::TransportKind::Iroh;
+        anon_client.connect_addr = Some(modify_ticket(&ticket_str, None, None));
+        anon_client.chat_mode = false; // ALPN_FILE, as the GUI listener serves
+        anon_client.allow_unauth = true; // presents no key, pins nothing
+        anon_client.handshake_timeout = 30;
+        let anon_res = tokio::time::timeout(Duration::from_secs(60), async {
+            let processor = new_iroh_with_io_for_test(anon_client, Arc::new(TestIOProvider)).await;
+            processor.run_connect().await
+        }).await;
+        anon_server.abort();
+        assert!(
+            anon_res.unwrap().is_err(),
+            "a peer that presents no ML-DSA identity must not be able to write a file \
+             to the GUI receiver's chosen destination"
+        );
+
+        // ---- direction 2: a self-authenticating sender is still served, and
+        // the listener learns its fingerprint ----
+        reset_state();
+        let dir = tempdir().unwrap();
+        let sender_key = dir.path().join("sender.priv.pem");
+        let (priv_raw, pub_raw, _) = backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+        fs::write(
+            &sender_key,
+            utils::wrap_to_pem(
+                &utils::wrap_pqc_priv_to_pkcs8(&priv_raw, "ML-DSA-65").unwrap(),
+                "PRIVATE KEY",
+            ),
+        ).unwrap();
+        let expected_fp: [u8; 32] = Sha3_256::digest(&pub_raw).into();
+
+        let (ticket_tx2, ticket_rx2) = tokio::sync::oneshot::channel();
+        let (fp_tx, fp_rx) = tokio::sync::oneshot::channel();
+        let mut server_config2 = crate::gui::build_file_receive_config("", "");
+        server_config2.handshake_timeout = 30;
+        let signed_server = tokio::spawn(async move {
+            let mut processor = new_iroh_with_io_for_test(server_config2, Arc::new(TestIOProvider)).await;
+            processor.preload_allowlist().await.unwrap();
+            let mut fp_tx = Some(fp_tx);
+            // Single-shot, like the GUI listener, so the handshake-done
+            // callback that carries the peer identity to the UI is the one
+            // under test.
+            let _ = processor.run_listen_once_with_progress(
+                |ticket| { let _ = ticket_tx2.send(ticket.to_string()); },
+                move |peer_fp| { let _ = fp_tx.take().unwrap().send(peer_fp); },
+                None,
+            ).await;
+        });
+        let ticket_str2 = tokio::time::timeout(Duration::from_secs(60), ticket_rx2).await.unwrap().unwrap();
+        let mut signed_client = CryptoConfig::default();
+        signed_client.transport = crate::config::TransportKind::Iroh;
+        signed_client.connect_addr = Some(modify_ticket(&ticket_str2, None, None));
+        signed_client.chat_mode = false;
+        signed_client.allow_unauth = true; // the receiver is anonymous; pin nothing
+        signed_client.signing_privkey = Some(sender_key.to_str().unwrap().to_string());
+        signed_client.handshake_timeout = 30;
+        let signed_res = tokio::time::timeout(Duration::from_secs(60), async {
+            let processor = new_iroh_with_io_for_test(signed_client, Arc::new(TestIOProvider)).await;
+            processor.run_connect().await
+        }).await;
+        assert!(
+            signed_res.unwrap().is_ok(),
+            "the honest flow must survive: a sender that signs the handshake is still served \
+             without the receiver configuring a keyring or pasting a public key"
+        );
+        let seen_fp = tokio::time::timeout(Duration::from_secs(60), fp_rx).await.unwrap().unwrap();
+        assert_eq!(
+            seen_fp,
+            Some(expected_fp),
+            "the listener must be handed the sender's fingerprint so the UI can display it"
+        );
+        signed_server.abort();
     }
 }

@@ -91,13 +91,18 @@ pub enum MlsCommand {
     ///                              to all `/peer` recipients in the active
     ///                              group (silently dropped if either is unset)
     ///
-    /// Inbound `NewGroup` events auto-set the active group id, so a
-    /// freshly-invited peer that has the inviter's ticket via
-    /// `/peer` is ready to chat as soon as the Welcome arrives.
+    /// An inbound `NewGroup` event sets the active group id when none is
+    /// active yet, so a freshly-invited peer that has the inviter's ticket
+    /// via `/peer` is ready to chat as soon as the Welcome arrives. It never
+    /// *replaces* an active group: a Welcome from an unauthenticated peer
+    /// would otherwise silently re-point everything typed next into a group
+    /// of the sender's choosing. Such a group is still joined, and the
+    /// printed `[joined] <gid> (not active …)` line carries the `/gid` to
+    /// switch into it on purpose.
     Listen {
         /// Optional initial group_id. If unset, the listener waits for
         /// the first `NewGroup` event (from an inbound Welcome) and
-        /// adopts that gid.
+        /// adopts that gid. If set, only `/gid` can change it.
         group_id: Option<GroupId>,
         /// Initial recipient tickets. More can be added later via
         /// the `/peer` stdin command.
@@ -388,9 +393,22 @@ where
                 // inbound message would permanently stop MLS delivery for the
                 // whole session.
                 Err(e) => {
+                    // The rendered error can carry peer-chosen text — a QUIC
+                    // close reason arrives here inside
+                    // `Transport(Accept("accept_bi: ..."))` — and this REPL is
+                    // where the operator reads `[joined]` / `[epoch advanced]` /
+                    // `[removed]` to judge who is in the group. Strip the
+                    // control/bidi characters that would let a peer erase or
+                    // forge those lines, exactly as `render_event` does for
+                    // message bodies. Bounding is safe here: every `GroupError`
+                    // variant `accept_next` can return prints its own
+                    // scaffolding (`transport: accept failed: …`) first and the
+                    // peer's bytes last, so the cut can only drop attacker-
+                    // chosen tail, never a diagnostic the operator needs.
+                    let msg = crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256);
                     let mut out = inbound_stdout.lock().await;
                     let _ = out
-                        .write_all(format!("[err] {e}\n> ").as_bytes())
+                        .write_all(format!("[err] {msg}\n> ").as_bytes())
                         .await;
                     let _ = out.flush().await;
                 }
@@ -454,7 +472,7 @@ where
 //
 // Inbound half:
 //   accept_next() → render → push line to stdout
-//   NewGroup → also update `group_id`
+//   NewGroup → also adopt into `group_id`, but only when it is unset
 //   RemovedFromGroup → also break the outer loop
 //
 // Outbound half (this fn):
@@ -552,12 +570,18 @@ pub async fn listen_loop(
                             continue;
                         }
                     };
-                    // Side-effect: NewGroup → adopt the gid; Removed →
-                    // signal the outer loop. Same logic as the inbound
-                    // task; factor later if a third source appears.
+                    // Side-effect: NewGroup → adopt the gid only if that does
+                    // not displace an already-active group, and announce which
+                    // it was (see `adopt_new_group`); Removed → signal the
+                    // outer loop. Same logic as the inbound task; factor later
+                    // if a third source appears.
                     if let IncomingGroupEvent::NewGroup { id } = &evt {
-                        let mut g = group_id.lock().await;
-                        *g = Some(*id);
+                        let line = adopt_new_group(&group_id, id).await;
+                        let mut out = stdout.lock().await;
+                        let _ = out.write_all(line.as_bytes()).await;
+                        let _ = out.write_all(b"\n").await;
+                        let _ = out.flush().await;
+                        continue;
                     }
                     let is_removed = matches!(evt, IncomingGroupEvent::RemovedFromGroup { .. });
                     if let Some(line) = event_to_line(&evt, &reasm).await {
@@ -598,11 +622,18 @@ pub async fn listen_loop(
                         continue;
                     }
                 };
-                // Side effects: adopt the gid on join; on self-removal print,
-                // signal the outer loop, and stop.
+                // Side effects: on join adopt the gid unless that would
+                // displace an already-active group, and print which it was
+                // (see `adopt_new_group`); on self-removal print, signal the
+                // outer loop, and stop.
                 match &evt {
                     IncomingGroupEvent::NewGroup { id } => {
-                        *group_id.lock().await = Some(*id);
+                        let line = adopt_new_group(&group_id, id).await;
+                        let mut out = stdout.lock().await;
+                        let _ = out.write_all(line.as_bytes()).await;
+                        let _ = out.write_all(b"\n").await;
+                        let _ = out.flush().await;
+                        continue;
                     }
                     IncomingGroupEvent::RemovedFromGroup { .. } => {
                         if let Some(line) = event_to_line(&evt, &reasm).await {
@@ -807,6 +838,44 @@ pub async fn listen_loop(
         t.abort();
     }
     Ok(())
+}
+
+/// Decide whether an inbound `NewGroup` may become the listener's active
+/// send target, and render the operator-facing line announcing it.
+///
+/// By the time we get here the Welcome has already been processed, so we are
+/// a member of `id` either way — this governs only *which* group the lines the
+/// operator subsequently types are encrypted to. Adopting unconditionally let
+/// any peer holding one of our published KeyPackages silently re-point the
+/// session: the operator kept typing, every line was encrypted to the
+/// intruder's group instead of the intended one, the REPL still echoed
+/// `[me] …`, and the intended recipients could not read it. So a new gid is
+/// adopted only when no group is active yet, or when the Welcome is for the
+/// group that is already active (a re-add must not read as a refusal).
+/// Otherwise the group is joined but not activated and the operator is told
+/// the `/gid` needed to switch into it deliberately.
+///
+/// `GroupId`'s `Display` is `hex::encode` of its 32 raw bytes, so the
+/// rendered gid carries no peer-controlled text and needs no terminal
+/// sanitising.
+async fn adopt_new_group(
+    group_id: &tokio::sync::Mutex<Option<GroupId>>,
+    id: &GroupId,
+) -> String {
+    let mut active = group_id.lock().await;
+    let adopted = match *active {
+        None => {
+            *active = Some(*id);
+            true
+        }
+        Some(current) => current == *id,
+    };
+    drop(active);
+    if adopted {
+        format!("[joined] {id} (active)")
+    } else {
+        format!("[joined] {id} (not active — /gid {id} to switch)")
+    }
 }
 
 fn parse_gid_hex(hex: &str) -> anyhow::Result<GroupId> {
@@ -1167,6 +1236,67 @@ mod tests {
         let bob_members = list_members(&bob, &gid).await.expect("bob members");
         assert_eq!(alice_members.len(), 2);
         assert_eq!(bob_members.len(), 2);
+    }
+
+    /// An inbound Welcome must never silently re-point the listener's active
+    /// group, and must still adopt when no group is active yet.
+    ///
+    /// Regression: `listen_loop`'s inbound task and its inbox-poll task both
+    /// overwrote the shared active gid on every `NewGroup`, so any peer
+    /// holding one of our published KeyPackages could deliver a Welcome and
+    /// redirect every line the operator typed afterwards into a group it
+    /// controls — overriding even an explicit `--mls-group-id`. Both sinks now
+    /// route the decision through `adopt_new_group`.
+    #[tokio::test]
+    async fn inbound_welcome_never_replaces_the_active_group() {
+        use tokio::sync::Mutex;
+
+        let team = GroupId::new([0x11; 32]);
+        let intruder = GroupId::new([0xaa; 32]);
+
+        // An explicitly-set active group (`--mls-group-id`, or `/gid`)
+        // survives a Welcome for a different group, and the operator is told
+        // exactly what to type to switch.
+        let active = Mutex::new(Some(team));
+        let line = adopt_new_group(&active, &intruder).await;
+        assert_eq!(
+            *active.lock().await,
+            Some(team),
+            "an inbound Welcome must not replace the active group"
+        );
+        assert!(
+            line.contains(&format!("/gid {intruder}")),
+            "non-adoption must surface the /gid needed to switch, got {line:?}"
+        );
+
+        // The honest first-Welcome flow (listener started with no
+        // --mls-group-id) still adopts, with no extra operator step.
+        let active = Mutex::new(None);
+        let line = adopt_new_group(&active, &team).await;
+        assert_eq!(
+            *active.lock().await,
+            Some(team),
+            "the first Welcome must still become the active group"
+        );
+        assert!(
+            !line.contains("/gid "),
+            "an adopted group needs no switch hint, got {line:?}"
+        );
+
+        // A second Welcome, from a different group, does not displace the
+        // group adopted from the first one.
+        let line = adopt_new_group(&active, &intruder).await;
+        assert_eq!(*active.lock().await, Some(team));
+        assert!(line.contains(&format!("/gid {intruder}")), "got {line:?}");
+
+        // A re-add / re-invite for the group that is already active is not a
+        // spurious refusal: it stays active and prints no switch hint.
+        let line = adopt_new_group(&active, &team).await;
+        assert_eq!(*active.lock().await, Some(team));
+        assert!(
+            !line.contains("/gid "),
+            "a re-add of the active group must not read as a refusal, got {line:?}"
+        );
     }
 
     /// `print_local_address` round-trips through the Ticket codec.
