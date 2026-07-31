@@ -460,6 +460,19 @@ impl Reassembler {
             Some(p) => p,
             None => return FileStatus::Error("END for unknown/forgotten transfer".into()),
         };
+        // Close the staging handle before *any* of the path operations below:
+        // every exit from here on either unlinks `tmp_path` or renames it onto
+        // the destination, and `create_owner_only` opens with a deny-all share
+        // mode on Windows, where renaming or deleting a path this process still
+        // holds open fails with a sharing violation — the same reason the
+        // superseded-transfer cleanup in `on_start` drops first. Flushing has to
+        // precede the close, so it is hoisted above the count/size checks, but
+        // its *result* is still reported at the original point: the error a
+        // doomed transfer reports, and its precedence, are unchanged. (Writes in
+        // `on_data` go straight to the `File`, so this flush is a no-op and puts
+        // no new bytes on disk for a transfer that is about to be unlinked.)
+        let flushed = p.file.flush();
+        drop(p.file);
         if p.next_seq != total_chunks {
             let _ = std::fs::remove_file(&p.tmp_path);
             return FileStatus::Error(format!(
@@ -471,7 +484,7 @@ impl Reassembler {
             let _ = std::fs::remove_file(&p.tmp_path);
             return FileStatus::Error("END size mismatch".into());
         }
-        if let Err(e) = p.file.flush() {
+        if let Err(e) = flushed {
             let _ = std::fs::remove_file(&p.tmp_path);
             return FileStatus::Error(format!("flush: {e}"));
         }
@@ -501,6 +514,8 @@ impl Reassembler {
 
     fn abort(&mut self, key: &TransferKey) {
         if let Some(p) = self.partial.remove(key) {
+            // Handle first, path second — see `on_end`.
+            drop(p.file);
             let _ = std::fs::remove_file(&p.tmp_path);
         }
     }
@@ -686,6 +701,78 @@ mod tests {
         assert_eq!(count_parts(), 1, "re-START must not leave the old .part behind");
         assert!(recv.path().join(format!(".b.bin.{}.part", hex16(&id))).exists());
         assert!(!recv.path().join(format!(".a.bin.{}.part", hex16(&id))).exists());
+    }
+
+    #[test]
+    fn no_exit_from_end_leaves_a_staging_file_behind() {
+        // Every exit from `on_end` disposes of the staging file — the failure
+        // paths unlink it, the success path renames it onto the claimed
+        // destination — and each of them must run *after* the staging handle is
+        // closed: `create_owner_only` opens with a deny-all share mode on
+        // Windows, so an exit still holding it would leave the `.part` orphaned
+        // (and would fail the rename, never completing the transfer at all).
+        //
+        // Honest caveat: on unix this holds with or without that close, because
+        // unlinking and renaming an open file both succeed — so this test
+        // regresses the handle lifetime only on Windows. It is left portable
+        // rather than `#[cfg(windows)]` so the disposal itself stays guarded
+        // everywhere.
+        let recv = tempdir().unwrap();
+        let parts = || -> Vec<String> {
+            std::fs::read_dir(recv.path())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.ends_with(".part"))
+                .collect()
+        };
+        let mut r = Reassembler::new(recv.path().to_path_buf());
+        let g = [0x5au8; 32];
+        let body = vec![3u8; 300];
+        let sha: [u8; 32] = Sha3_256::digest(&body).into();
+
+        // END chunk-count mismatch.
+        let id = [0x01u8; ID_LEN];
+        r.ingest(&g, 1, &encode_start(&id, 300, "count.bin"));
+        r.ingest(&g, 1, &encode_data(&id, 0, &body));
+        assert!(matches!(r.ingest(&g, 1, &encode_end(&id, 2, &sha)), Some(FileStatus::Error(_))));
+        assert_eq!(parts(), Vec::<String>::new(), "count mismatch left a staging file");
+
+        // END size mismatch (fewer bytes than START declared).
+        let id = [0x02u8; ID_LEN];
+        r.ingest(&g, 1, &encode_start(&id, 300, "size.bin"));
+        r.ingest(&g, 1, &encode_data(&id, 0, &body[..100]));
+        assert!(matches!(r.ingest(&g, 1, &encode_end(&id, 1, &sha)), Some(FileStatus::Error(_))));
+        assert_eq!(parts(), Vec::<String>::new(), "size mismatch left a staging file");
+
+        // SHA3-256 mismatch.
+        let id = [0x03u8; ID_LEN];
+        r.ingest(&g, 1, &encode_start(&id, 300, "sha.bin"));
+        r.ingest(&g, 1, &encode_data(&id, 0, &body));
+        assert!(matches!(
+            r.ingest(&g, 1, &encode_end(&id, 1, &[0xffu8; 32])),
+            Some(FileStatus::Error(_))
+        ));
+        assert_eq!(parts(), Vec::<String>::new(), "sha mismatch left a staging file");
+
+        // Abort (out-of-order DATA) unlinks its staging file too.
+        let id = [0x04u8; ID_LEN];
+        r.ingest(&g, 1, &encode_start(&id, 300, "abort.bin"));
+        assert!(matches!(r.ingest(&g, 1, &encode_data(&id, 7, &body)), Some(FileStatus::Error(_))));
+        assert_eq!(parts(), Vec::<String>::new(), "abort left a staging file");
+
+        // The honest path still commits the exact bytes, and consumes the
+        // staging file in doing so.
+        let id = [0x05u8; ID_LEN];
+        r.ingest(&g, 1, &encode_start(&id, 300, "ok.bin"));
+        r.ingest(&g, 1, &encode_data(&id, 0, &body));
+        let out = match r.ingest(&g, 1, &encode_end(&id, 1, &sha)) {
+            Some(FileStatus::Completed { path, .. }) => path,
+            other => panic!("honest transfer must complete, got {other:?}"),
+        };
+        assert_eq!(out, recv.path().join("ok.bin"));
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        assert_eq!(parts(), Vec::<String>::new(), "success path left a staging file");
     }
 
     #[test]

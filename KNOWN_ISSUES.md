@@ -68,6 +68,16 @@ trade-off is explicit rather than forgotten.
    Slowloris shape) is recorded against the throttle. Fully preventing it needs
    something the transport does not offer here — proof-of-work, or an
    address-level rate limit below the overlay. Accepted at this level.
+8. **MLS group file receive is unverified on Windows** (`group/file_xfer.rs`,
+   2026-07): every Windows CI job builds `--no-default-features --features
+   backend-rustcrypto`, so the `mls` module — including the receive-side
+   staging/publish path — is never compiled or run on a Windows host. That
+   staging file comes from `create_owner_only`, which opens with a deny-all
+   share mode there, so *every* path operation on it (the unlinks on a failed
+   `END`, and the rename that publishes a completed file) has to follow the
+   handle close; `Reassembler::on_end` / `abort` now order it that way, but the
+   ordering is reasoned from the Win32 sharing rules, not observed. Until a
+   Windows job enables `mls`, treat group file receive there as untested.
 
 (Several other audit findings — the ECDSA verify bug, network-receive release
 of unverified plaintext, the `Ticket::from_str` DoS, plaintext ECC keys, and
