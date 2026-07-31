@@ -32,6 +32,14 @@ keys_chat/
 test.dec
 test_file.txt
 
+# Integration tests write their key material and round-trip files straight into
+# tests/ rather than a tempdir, so a plain `cargo test` leaves private keys in
+# the worktree. Ignore them: jj auto-tracks anything not listed here, which is
+# how they nearly ended up in a commit.
+tests/temp_*_keys/
+tests/input_*.txt
+tests/output_*.enc
+
 # Network chat test artifacts
 ticket.txt
 ticket.log
