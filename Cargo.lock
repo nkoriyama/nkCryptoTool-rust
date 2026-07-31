@@ -5213,6 +5213,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing-subscriber",
  "uniffi",
  "windows-sys 0.59.0",

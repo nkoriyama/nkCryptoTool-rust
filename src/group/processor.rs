@@ -1578,19 +1578,13 @@ impl GroupChatProcessor {
         if tickets.is_empty() {
             return;
         }
-        let members: std::collections::HashSet<[u8; 32]> =
-            match self.client.load_group(gid.as_bytes()) {
-                Ok(group) => group
-                    .roster()
-                    .members_iter()
-                    .filter_map(|m| Self::peer_id_from_credential(&m.signing_identity.credential))
-                    .map(|pid| *pid.as_bytes())
-                    .collect(),
-                Err(e) => {
-                    eprintln!("[mls] cannot validate member tickets (group load failed): {e}");
-                    return;
-                }
-            };
+        let members = match self.current_member_node_ids(gid) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("[mls] cannot validate member tickets (group load failed): {e}");
+                return;
+            }
+        };
         for t in tickets {
             let node_id = *t.peer_addr().peer_id.as_bytes();
             if !members.contains(&node_id) {
@@ -1605,14 +1599,68 @@ impl GroupChatProcessor {
         }
     }
 
+    /// The transport node ids of a group's **current** members — the exact set
+    /// [`remember_member_tickets`](Self::remember_member_tickets) validates
+    /// against and [`known_member_addrs`](Self::known_member_addrs) filters by,
+    /// so both sides key on one notion of identity (the PeerId carried in the
+    /// member's own credential, via `peer_id_from_credential`).
+    ///
+    /// Crate-visible because a long-running chat/listen session cannot use
+    /// `known_member_addrs`: it resolves its recipients once and then holds
+    /// that `Vec`, so it needs the roster itself to tell which of the peers it
+    /// already holds have since left (see `cli::prune_departed_recipients`).
+    pub(crate) fn current_member_node_ids(
+        &self,
+        gid: &GroupId,
+    ) -> Result<std::collections::HashSet<[u8; 32]>, GroupError> {
+        let group = self
+            .client
+            .load_group(gid.as_bytes())
+            .map_err(|e| GroupError::Backend(format!("load_group for member roster: {e}")))?;
+        Ok(group
+            .roster()
+            .members_iter()
+            .filter_map(|m| Self::peer_id_from_credential(&m.signing_identity.credential))
+            .map(|pid| *pid.as_bytes())
+            .collect())
+    }
+
     /// Return the remembered recipient addresses for a group (delivery hints).
     /// A stored ticket that no longer parses is skipped rather than failing the
     /// whole lookup.
+    ///
+    /// The stored book is **advisory**: a row can go stale behind our back, so
+    /// every hint is re-checked against the group's **live roster** here, on
+    /// every read. The write-time check in
+    /// [`remember_member_tickets`](Self::remember_member_tickets) is not enough
+    /// on its own — a member evicted by *another* member's Commit leaves the
+    /// roster without this node ever touching the address book, and its row
+    /// simply stays there. Filtering on read is what guarantees such a stale row
+    /// can never produce a non-member recipient: we must not keep dialling an
+    /// evicted peer and leaking ciphertext / timing metadata at it.
+    ///
+    /// This fails **closed**: a hint whose node id is not on the live roster is
+    /// dropped, and a group whose MLS state cannot be loaded yields an error
+    /// rather than the unchecked book. An explicit `--mls-recipient-ticket`
+    /// bypasses the book entirely, so the operator keeps a way to reach a peer
+    /// this filter cannot vouch for.
     pub fn known_member_addrs(&self, gid: &GroupId) -> Result<Vec<PeerAddr>, GroupError> {
+        let members = self.current_member_node_ids(gid)?;
         let mut out = Vec::new();
         for (_node_id, ticket_str) in self.storage.list_member_addrs(gid.as_bytes())? {
             match ticket_str.parse::<crate::ticket::Ticket>() {
-                Ok(t) => out.push(t.peer_addr()),
+                Ok(t) => {
+                    let addr = t.peer_addr();
+                    if !members.contains(addr.peer_id.as_bytes()) {
+                        // Static literal: never echo the stored ticket or node
+                        // id, both of which are peer-influenced.
+                        eprintln!(
+                            "[mls] dropping a remembered address whose node is not a current group member"
+                        );
+                        continue;
+                    }
+                    out.push(addr);
+                }
                 Err(e) => eprintln!("[mls] skipping unparseable stored ticket: {e}"),
             }
         }
@@ -3055,6 +3103,204 @@ mod tests {
                 // to even attempt decryption.
             }
         }
+    }
+
+    /// A remembered delivery hint is only handed out while its node is still on
+    /// the group's roster.
+    ///
+    /// `known_member_addrs` re-checks every stored row against the current
+    /// members, so a row that went stale behind our back — written by an older
+    /// revision, or left behind by a removal this node never authored — can
+    /// never become an auto-resolved recipient. Both directions are asserted:
+    /// the stranger's hint is dropped **and** the current member's hint is still
+    /// returned (an over-firing filter would silently stop delivering to
+    /// legitimate members).
+    #[tokio::test]
+    async fn known_member_addrs_drops_hints_for_non_members() {
+        let (alice, _dir) = build_proc("alice", 1);
+        let gid = alice.create_group().await.expect("create_group");
+
+        // Alice is the group's only member, and her credential carries her mock
+        // endpoint's PeerId — the node id the address book is keyed by.
+        let alice_node = *alice.endpoint.local_id().as_bytes();
+        assert_eq!(alice_node, [1u8; 32], "build_proc peer_byte 1");
+        let stranger_node = [9u8; 32];
+
+        // Write both hints straight to storage, bypassing the write-time check
+        // in `remember_member_tickets` — that is exactly the shape a row left
+        // stale by a remote removal has.
+        for node in [alice_node, stranger_node] {
+            let ticket = crate::ticket::Ticket::new(PeerAddr::new(PeerId::new(node)), None, None);
+            alice
+                .storage
+                .put_member_addr(gid.as_bytes(), &node, &ticket.to_string())
+                .expect("put_member_addr");
+        }
+        assert_eq!(
+            alice
+                .storage
+                .list_member_addrs(gid.as_bytes())
+                .expect("list_member_addrs")
+                .len(),
+            2,
+            "both hints must be in the book before the read filter runs"
+        );
+
+        let resolved: Vec<[u8; 32]> = alice
+            .known_member_addrs(&gid)
+            .expect("known_member_addrs")
+            .iter()
+            .map(|a| *a.peer_id.as_bytes())
+            .collect();
+        assert!(
+            resolved.contains(&alice_node),
+            "a current member's hint must still resolve (filter over-fired): {resolved:?}"
+        );
+        assert!(
+            !resolved.contains(&stranger_node),
+            "a hint for a node that is not a current member must not resolve"
+        );
+        assert_eq!(resolved.len(), 1, "exactly one member is in this group");
+    }
+
+    /// A member evicted by *another* member's Commit stops being an
+    /// auto-resolved recipient on this node too.
+    ///
+    /// Alice removes Bob and Carol learns of it only by processing Alice's
+    /// Commit (`accept_next` → `EpochAdvanced`) — the path that never touches
+    /// Carol's address book, so Bob's row is still sitting there afterwards.
+    /// Carol remembered both hints while Bob was still a member, so both resolve
+    /// before the Commit; afterwards `known_member_addrs` filters Bob's stale row
+    /// against the new roster and yields Alice only — Alice still resolving, so
+    /// surviving members keep being delivered to.
+    #[tokio::test]
+    async fn remote_remove_commit_stops_addressing_evicted_member() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_proc_on_net(&net, "alice", 1);
+        let (bob, _dir_b) = build_proc_on_net(&net, "bob", 2);
+        let (carol, _dir_c) = build_proc_on_net(&net, "carol", 3);
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+
+        // ---- build the 3-member group (Alice, Bob, Carol) --------------
+        let gid = alice.create_group().await.expect("create_group");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            tokio::task::yield_now().await;
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome→bob");
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .expect("bob welcome timeout")
+                .expect("bob task")
+        };
+        let add_carol = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+        let bob_task = tokio::spawn(async move {
+            bob.accept_next().await.expect("bob accepts commit");
+            bob
+        });
+        let carol_task = tokio::spawn(async move {
+            carol.accept_next().await.expect("carol accepts welcome");
+            carol
+        });
+        tokio::task::yield_now().await;
+        alice
+            .send_welcome_to(&carol_addr, &add_carol.welcome)
+            .await
+            .expect("welcome→carol");
+        alice
+            .broadcast_commit(&add_carol.commit, &[bob_addr.clone()])
+            .await
+            .expect("commit→bob");
+        let _bob = tokio::time::timeout(std::time::Duration::from_secs(5), bob_task)
+            .await
+            .expect("bob commit timeout")
+            .expect("bob task");
+        let carol = tokio::time::timeout(std::time::Duration::from_secs(5), carol_task)
+            .await
+            .expect("carol welcome timeout")
+            .expect("carol task");
+
+        // ---- Carol remembers both peers while both are members ---------
+        let alice_node = *alice_addr.peer_id.as_bytes();
+        let bob_node = *bob_addr.peer_id.as_bytes();
+        carol.remember_member_tickets(
+            &gid,
+            &[
+                crate::ticket::Ticket::new(alice_addr.clone(), None, None),
+                crate::ticket::Ticket::new(bob_addr.clone(), None, None),
+            ],
+        );
+        let mut before: Vec<[u8; 32]> = carol
+            .known_member_addrs(&gid)
+            .expect("carol hints before")
+            .iter()
+            .map(|a| *a.peer_id.as_bytes())
+            .collect();
+        before.sort();
+        let mut both = vec![alice_node, bob_node];
+        both.sort();
+        assert_eq!(
+            before, both,
+            "both hints must resolve while both peers are members"
+        );
+
+        // ---- Alice removes Bob; only Carol processes the Commit ---------
+        // Bob is leaf 1 (added first); pinned by the sibling P6 test.
+        let remove_commit = alice.remove_member(&gid, 1).await.expect("remove bob");
+        let carol_task = tokio::spawn(async move {
+            let evt = carol.accept_next().await.expect("carol accepts remove commit");
+            (evt, carol)
+        });
+        tokio::task::yield_now().await;
+        alice
+            .broadcast_commit(&remove_commit, &[carol_addr.clone()])
+            .await
+            .expect("remove commit→carol");
+        let (carol_evt, carol) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            carol_task,
+        )
+        .await
+        .expect("carol remove-commit timeout")
+        .expect("carol task");
+        match carol_evt {
+            IncomingGroupEvent::EpochAdvanced { group_id, new_epoch } => {
+                assert_eq!(group_id, gid);
+                assert_eq!(new_epoch, 3, "epoch advances to 3 on remove");
+            }
+            other => panic!("carol expected EpochAdvanced(3), got {other:?}"),
+        }
+
+        // ---- the evicted member is no longer an auto-resolved recipient --
+        // Only the resolved set is asserted on. Whether Bob's *row* survives in
+        // `mls_member_addr` is an implementation detail: the read filter makes
+        // such a row inert either way, so pinning it would over-specify.
+        let resolved: Vec<[u8; 32]> = carol
+            .known_member_addrs(&gid)
+            .expect("carol hints after")
+            .iter()
+            .map(|a| *a.peer_id.as_bytes())
+            .collect();
+        assert!(
+            !resolved.contains(&bob_node),
+            "an auto-resolved send must not target the evicted member"
+        );
+        assert_eq!(
+            resolved,
+            vec![alice_node],
+            "the surviving member must still be resolved"
+        );
     }
 
     /// `remove_member` rejects an invalid leaf index. The exact error

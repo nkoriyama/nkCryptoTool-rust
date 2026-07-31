@@ -50,7 +50,7 @@
 //! `mls-rs`'s `async` feature these impls must grow the same `maybe_async`
 //! attributes the sqlite provider uses.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -128,6 +128,50 @@ const TBL_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("inbox_meta
 // Prekey store (local one-time/static prekey secret keys; see `crate::prekey`).
 const TBL_PK_ONETIME: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pk_onetime");
 const TBL_PK_STATIC: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pk_static");
+/// Single-use gate for static-only one-shot envelopes (`crate::one_shot`):
+/// `blind_index(envelope_tag)` → empty value (the key is the whole record). A
+/// static-only envelope consumes no one-time prekey, so it has no natural
+/// replay gate; this table is it. Keyed by a blind index so a stolen DB file
+/// does not reveal which envelope digests were received.
+///
+/// **It is the only table that does not live in the prekey database.** It sits
+/// alone in a sidecar redb file, `<prekey-db-path>.seen`
+/// ([`RedbPrekeyStore::seen_db_path`]), created on the first static-only open.
+/// Both reasons follow from this being the one artifact an *unauthenticated*
+/// depositor can grow without bound:
+///
+/// * [`RedbPrekeyStore::delete`] calls [`Database::compact`] after every
+///   consumed one-time prekey, to physically scrub the deleted secret's pages.
+///   `compact` rewrites every page of every table in the file. Had the cache
+///   shared that file, each legitimate `MODE_FULL` receipt — the
+///   forward-secrecy path — would pay a cost proportional to a table the
+///   attacker chooses the size of. In the sidecar, `compact` stays
+///   proportional to the prekey material it exists to scrub.
+/// * The prekey database also holds the long-term static X-Wing identity
+///   (`TBL_PK_STATIC`). Reclaiming cache space must not mean deleting that
+///   identity and orphaning every `NKB1` bundle already handed out. Deleting
+///   the sidecar re-opens replay for previously seen envelopes and costs
+///   nothing else; anyone able to delete it could equally delete the prekey
+///   database itself, so this adds no reach.
+///
+/// **Nothing is ever evicted, deliberately.** Any capacity bound here would be
+/// steerable by the very attacker this table exists to stop: the delivery
+/// service can mint fresh static-only envelopes for us from public data alone
+/// (our static X-Wing key out of our own `NKB1` bundle; `open` authenticates no
+/// sender), so under any eviction rule keyed to arrival it just deposits enough
+/// fresh envelopes to push a victim's tag out and then replays it. Retaining
+/// every tag removes the steering entirely rather than pricing it.
+///
+/// **Residual, stated plainly.** The table grows monotonically in the number of
+/// *distinct* static-only envelopes this recipient has opened, nothing prunes
+/// it, and a depositor we never authenticate can drive that growth. What is
+/// bounded is only the exchange rate: a measured row costs ~59 B at 10k rows
+/// and ~74 B at 1M, against the ~1.2 KB envelope the attacker had to transmit
+/// and we had to X-Wing-decapsulate — roughly 17 bytes on the wire per byte of
+/// cache. So the residual is disk, and only disk: it is off the compaction path
+/// and out of the identity file, and rows appear only in the degraded
+/// static-only mode, never for a recipient whose prekey pool is kept stocked.
+const TBL_PK_SEEN: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pk_seen");
 /// Plaintext meta for the prekey store: monotonic id high-water mark
 /// (`b"seq_next"` → u64 BE) and the inbox poll cursor (`b"inbox_cursor"`).
 const TBL_PK_META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("pk_meta");
@@ -846,11 +890,21 @@ fn seal_value(
 }
 
 /// Open (or create) a redb database, ensuring the file is owner-only from the
-/// moment it exists. `Database::create` alone would create the file under the
-/// default umask / inherited ACL and leave a brief window before
-/// `tighten_permissions` re-locks it; pre-creating exclusively with owner-only
-/// permissions (unix 0600 / windows owner-only DACL) closes that window. An
-/// already-present DB is opened as-is (then still tightened by the caller).
+/// moment it exists and that no link at `path` is ever followed.
+///
+/// Two properties, and both need redb to be kept away from the path.
+/// `Database::create` alone would create the file under the default umask /
+/// inherited ACL and leave a window before `tighten_permissions` re-locks it,
+/// so the file is pre-created exclusively at unix 0600 / a windows owner-only
+/// DACL. But the exclusive create *also* fails with `AlreadyExists` against a
+/// symlink planted at `path`, and handing redb the path after that let it
+/// re-resolve and follow the very link the create had refused — initializing a
+/// fresh ~1 MiB database over whatever the link aimed at, since redb adopts any
+/// empty file as a new database. So redb is given an already-validated handle
+/// via `create_file` instead: the path is resolved only by `secure_fs`, only
+/// under no-follow, and a link is refused before a byte is written rather than
+/// by the caller's `harden_owner_only` after the damage. Permissions on an
+/// already-present database are still the caller's to tighten.
 fn open_db_secure(path: &Path) -> Result<Database, RedbStorageError> {
     match crate::secure_fs::create_owner_only(path, false) {
         // Pre-created an empty owner-only file; redb initializes it as a new DB.
@@ -859,7 +913,15 @@ fn open_db_secure(path: &Path) -> Result<Database, RedbStorageError> {
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => return Err(RedbStorageError::Backend(format!("precreate db: {e}"))),
     }
-    Database::create(path).map_err(|e| RedbStorageError::Backend(e.to_string()))
+    // Reopened rather than kept from the create above, whose handle is
+    // write-only on both platforms while redb needs read+write. This open is
+    // no-follow too, so losing the race to a link swapped in behind the create
+    // costs an error, never the target file.
+    let file = crate::secure_fs::open_existing_no_follow_shared(path)
+        .map_err(|e| RedbStorageError::Backend(format!("open db: {e}")))?;
+    Database::builder()
+        .create_file(file)
+        .map_err(|e| RedbStorageError::Backend(e.to_string()))
 }
 
 /// Decrypt a record produced by [`seal_value`], verifying the slot binding.
@@ -1689,12 +1751,23 @@ impl RedbInboxStore {
 /// copy-on-write, so [`delete`](Self::delete) / [`delete_all`](Self::delete_all)
 /// follow the remove with [`Database::compact`], which rewrites the file
 /// dropping the freed pages — matching SQLCipher's *logical* guarantee. (Both
-/// are best-effort against physical recovery on wear-levelled SSDs.)
+/// are best-effort against physical recovery on wear-levelled SSDs.) Because
+/// that rewrite touches every page in the file, this database deliberately
+/// holds prekey material only: the static-only replay cache is a sidecar file
+/// (see `TBL_PK_SEEN`) so `compact`'s cost never tracks anything a remote
+/// depositor can grow.
 ///
 /// Holds the `Database` behind a `Mutex` so the `&self` API can still take the
 /// `&mut` that `compact` requires.
 pub struct RedbPrekeyStore {
     db: std::sync::Mutex<Database>,
+    /// Sidecar database holding `TBL_PK_SEEN` and nothing else, opened lazily
+    /// on the first static-only open so a recipient that never receives a
+    /// downgraded envelope never creates the file. Laziness costs no
+    /// atomicity: this `Mutex` is held across the create *and* the whole
+    /// check-and-insert transaction (see [`Self::record_static_only_seen`]).
+    seen_db: std::sync::Mutex<Option<Database>>,
+    seen_path: PathBuf,
     keys: RecordKeys,
     db_binding: Vec<u8>,
 }
@@ -1722,11 +1795,25 @@ impl RedbPrekeyStore {
                 wtx.open_table(def)
                     .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
             }
+            // The static-only replay cache belongs in the sidecar DB, never
+            // here (see `TBL_PK_SEEN`). `delete_table` returns `false` without
+            // creating anything when the table is absent, which is every file
+            // written by a released build; it only bites on a `prekeys.db` from
+            // the unreleased intermediate revision that did put `pk_seen`
+            // inline, where it drops the dead table so it stops being rewritten
+            // by `delete`'s compaction. Those rows are not migrated: they are
+            // replay-cache state from a build that never shipped, and losing
+            // them only means envelopes opened under that build could be
+            // replayed once more.
+            wtx.delete_table(TBL_PK_SEEN)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
             wtx.commit()
                 .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         }
         let me = Self {
             db: std::sync::Mutex::new(db),
+            seen_db: std::sync::Mutex::new(None),
+            seen_path: Self::seen_db_path(path),
             keys: RecordKeys::derive(dek),
             db_binding,
         };
@@ -2086,6 +2173,92 @@ impl RedbPrekeyStore {
     pub fn set_inbox_cursor(&self, cursor: u64) -> Result<(), RedbStorageError> {
         self.meta_set_u64(PK_CURSOR_KEY, cursor)
     }
+
+    /// Path of the sidecar database that holds the static-only replay cache:
+    /// the prekey database path with `.seen` appended, the same way
+    /// [`AtRestPaths::beside_db`](crate::group::at_rest::AtRestPaths::beside_db)
+    /// names `prekeys.db.at-rest.key` beside `prekeys.db`. Derived, never
+    /// configured — which file the cache lives in is an internal storage
+    /// detail, not an operator knob.
+    pub(crate) fn seen_db_path(path: &Path) -> PathBuf {
+        let mut s = path.to_path_buf().into_os_string();
+        s.push(".seen");
+        PathBuf::from(s)
+    }
+
+    /// Create/open the sidecar and make sure its one table exists. It carries
+    /// no DEK sentinel because it stores no sealed values — only blind-index
+    /// keys, which a wrong DEK would simply fail to match. A wrong DEK is
+    /// already rejected by the prekey database's own sentinel long before any
+    /// static-only envelope reaches here.
+    fn open_seen_db(&self) -> Result<Database, RedbStorageError> {
+        let db = open_db_secure(&self.seen_path)?;
+        let wtx = db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        wtx.open_table(TBL_PK_SEEN)
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        self.tighten(&self.seen_path)?;
+        Ok(db)
+    }
+
+    /// Blind index for the seen-envelope cache: `HMAC-SHA256(k_bi, tag)`, the
+    /// same construction [`RedbBackend::blind_index`] uses for recipient ids.
+    /// `RedbPrekeyStore` carries its own [`RecordKeys`] rather than a backend
+    /// handle, so the two-line HMAC lives here instead of being plumbed in.
+    fn seen_index(&self, tag: &[u8]) -> [u8; BLIND_INDEX_LEN] {
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(self.keys.k_bi.as_slice())
+            .expect("HMAC accepts any key length");
+        mac.update(tag);
+        mac.finalize().into_bytes().into()
+    }
+
+    /// Record `tag` (a digest of a *verified* static-only one-shot envelope) in
+    /// the single-use cache, returning `true` if it was **already** there —
+    /// i.e. this exact envelope has been opened before and is being
+    /// re-delivered.
+    ///
+    /// The membership test and the insert share one redb write transaction, so
+    /// two concurrent opens of the same envelope serialize and exactly one of
+    /// them observes `false` — the same serialization point [`Self::delete`]
+    /// gives full-mode envelopes via the consumed one-time prekey.
+    ///
+    /// The record is permanent: see `TBL_PK_SEEN` for why an eviction rule
+    /// would hand the gate's bypass back to the delivery service, for why the
+    /// cache is a sidecar database rather than a table in this store, and for
+    /// the residual that retaining every tag leaves.
+    pub fn record_static_only_seen(&self, tag: &[u8]) -> Result<bool, RedbStorageError> {
+        let key = self.seen_index(tag);
+        // Held across the lazy create and the transaction below, so the
+        // check-and-insert stays a single serialization point.
+        let mut slot = self.seen_db.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(self.open_seen_db()?);
+        }
+        let db = slot.as_ref().expect("just populated");
+        let wtx = db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let already = {
+            let mut seen = wtx
+                .open_table(TBL_PK_SEEN)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let present = seen
+                .get(key.as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+                .is_some();
+            if !present {
+                seen.insert(key.as_slice(), [].as_slice())
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            }
+            present
+        };
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        Ok(already)
+    }
 }
 
 /// Extract the trailing 8-byte big-endian id from a `bi ‖ id_be` composite key.
@@ -2327,6 +2500,99 @@ mod tests {
         // world readable — not even in the window before tighten_permissions.
         let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
         assert_eq!(mode & 0o077, 0, "redb DB file must not be group/other accessible (mode {mode:o})");
+    }
+
+    /// A symlink planted at a database path must not be followed. Handing
+    /// `redb` the *path* let it re-resolve what the owner-only pre-create had
+    /// already refused, so a link aimed at any file the victim could write was
+    /// overwritten with a fresh database; the engine now only ever receives an
+    /// already-validated no-follow handle. Covers every `open_db_secure`
+    /// caller, the lazily-created `.seen` sidecar included.
+    #[cfg(unix)]
+    #[test]
+    fn db_path_symlink_is_refused_leaving_target_intact() {
+        let dir = tempdir().expect("tempdir");
+        // Zero length on purpose: redb treats an empty file as "no database
+        // yet" and initializes it in place, which is what turns a followed
+        // link into the destruction of the target. A non-empty target would be
+        // rejected as a corrupt database and hide the defect.
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"").expect("write victim");
+        let path = dir.path().join("groups.redb");
+        std::os::unix::fs::symlink(&victim, &path).expect("plant symlink");
+
+        RedbBackend::open(&path, &[0x37u8; 32])
+            .expect_err("a symlink at the DB path must not be opened");
+
+        assert_eq!(
+            std::fs::metadata(&victim).expect("victim still present").len(),
+            0,
+            "the symlink target must not be written through by the DB open"
+        );
+        // Refused, not deleted: the link itself is left exactly as planted.
+        assert!(
+            std::fs::symlink_metadata(&path)
+                .expect("link still present")
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    /// The other direction of the no-follow open: refusing links must not cost
+    /// the honest case. An existing database re-opens through the handle and
+    /// still reads back what a previous session committed.
+    #[test]
+    fn existing_db_reopens_with_records_intact() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("groups.redb");
+        let dek = [0x37u8; 32];
+        let state = GroupState {
+            id: vec![1, 2, 3, 4],
+            data: Zeroizing::new(vec![9u8; 512]),
+        };
+        {
+            let b = RedbBackend::open(&path, &dek).expect("create");
+            let mut gs = b.group_state_storage();
+            gs.write(state.clone(), vec![], vec![]).expect("write");
+        }
+        let b = RedbBackend::open(&path, &dek).expect("reopen existing");
+        let gs = b.group_state_storage();
+        let got = gs.state(&state.id).expect("state").expect("present");
+        assert_eq!(&*got, &*state.data);
+    }
+
+    /// Deliberate behaviour change, pinned: `dek_opens` and `rotate_group_dek`
+    /// now refuse a database carrying a second hard link, which they used to
+    /// accept — only `RedbBackend::open` refused it before, and only later, via
+    /// `tighten_permissions`. A second name for a secret database is the
+    /// aliasing primitive `secure_fs` exists to refuse, and `nlink > 1` taints
+    /// *both* names, so a database a hard-linking backup has touched needs the
+    /// extra name dropped (or a real copy taken) before it opens again.
+    /// Refusal costs nothing: the rotation in particular is turned away before
+    /// it rewrites a single record, which the re-probe under the *old* DEK
+    /// proves.
+    #[cfg(unix)]
+    #[test]
+    fn hard_linked_db_is_refused_by_every_open_path() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("groups.redb");
+        let dek = [0x37u8; 32];
+        drop(RedbBackend::open(&path, &dek).expect("create"));
+        assert!(RedbBackend::dek_opens(&path, &dek).expect("probe before the link"));
+
+        let alias = dir.path().join("alias.redb");
+        std::fs::hard_link(&path, &alias).expect("hard link");
+
+        RedbBackend::dek_opens(&path, &dek).expect_err("dek_opens must refuse nlink > 1");
+        RedbBackend::rotate_group_dek(&path, &dek, &[0x38u8; 32])
+            .expect_err("rotate_group_dek must refuse nlink > 1");
+        RedbBackend::open(&path, &dek).expect_err("open must refuse nlink > 1");
+
+        std::fs::remove_file(&alias).expect("unlink alias");
+        assert!(
+            RedbBackend::dek_opens(&path, &dek).expect("probe after the link is gone"),
+            "the refused rotation must not have re-sealed anything"
+        );
     }
 
     #[test]
@@ -2671,6 +2937,99 @@ mod tests {
         assert_eq!(s.fetch_prekey(&rcpt).expect("f3"), Some(vec![4u8; 4]));
         assert_eq!(s.fetch_prekey(&rcpt).expect("f4"), None);
         assert_eq!(s.count_prekeys(&rcpt).expect("count0"), 0);
+    }
+
+    /// Sorted table names of a redb file, opened raw (no store handle, so the
+    /// caller must have dropped it — redb holds the file lock for a `Database`).
+    fn table_names(path: &Path) -> Vec<String> {
+        use redb::TableHandle;
+        let db = Database::open(path).expect("raw open");
+        let rtx = db.begin_read().expect("read txn");
+        let mut names: Vec<String> = rtx
+            .list_tables()
+            .expect("list tables")
+            .map(|t| t.name().to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The static-only replay cache must NOT live in the prekey database.
+    /// Two reasons, both load-bearing: [`RedbPrekeyStore::delete`] compacts
+    /// that file — rewriting every page of every table — after every consumed
+    /// one-time prekey, so a table an unauthenticated depositor grows without
+    /// bound would tax the forward-secrecy path forever; and the same file
+    /// holds the long-term static X-Wing identity, which must not have to be
+    /// destroyed to reclaim cache space.
+    ///
+    /// Asserts both halves: the prekey DB's table set is exactly the set it
+    /// had before the cache existed, and the cache is a `.seen` sidecar that
+    /// is created lazily and actually gates.
+    #[test]
+    fn replay_cache_lives_in_a_sidecar_db_not_the_prekey_db() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("prekeys.redb");
+        let seen_path = RedbPrekeyStore::seen_db_path(&path);
+        let store = RedbPrekeyStore::open(&path, &[0x21u8; 32]).expect("open");
+
+        // Lazy: a recipient that never receives a downgraded envelope never
+        // creates the file.
+        assert!(!seen_path.exists(), "sidecar must not exist before first use");
+
+        assert!(!store.record_static_only_seen(b"tag-a").expect("first a"));
+        assert!(store.record_static_only_seen(b"tag-a").expect("replay a"));
+        assert!(!store.record_static_only_seen(b"tag-b").expect("first b"));
+        assert!(seen_path.exists(), "sidecar must exist once the gate is used");
+
+        drop(store);
+        assert_eq!(
+            table_names(&path),
+            vec!["dek_sentinel", "pk_meta", "pk_onetime", "pk_static"],
+            "the prekey DB must carry prekey material only — no replay cache \
+             riding along in delete()'s compaction, and none to strand the \
+             static identity"
+        );
+        assert_eq!(table_names(&seen_path), vec!["pk_seen"]);
+
+        // Durable across a reopen: the DS can simply wait before replaying.
+        let store = RedbPrekeyStore::open(&path, &[0x21u8; 32]).expect("reopen");
+        assert!(store.record_static_only_seen(b"tag-a").expect("replay after reopen"));
+        assert!(!store.record_static_only_seen(b"tag-c").expect("first c"));
+    }
+
+    /// A `prekeys.db` written by the unreleased intermediate revision has an
+    /// inline `pk_seen` table. Opening it must not break, and must drop the
+    /// dead table so it stops being rewritten by `delete`'s compaction. Its
+    /// rows are deliberately not migrated (see [`RedbPrekeyStore::open`]).
+    #[test]
+    fn inline_pk_seen_from_the_intermediate_layout_is_dropped_on_open() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("prekeys.redb");
+        RedbPrekeyStore::open(&path, &[0x22u8; 32]).expect("open");
+        {
+            // Reconstruct the intermediate layout by hand.
+            let db = Database::create(&path).expect("raw open");
+            let wtx = db.begin_write().expect("write txn");
+            {
+                let mut t = wtx.open_table(TBL_PK_SEEN).expect("create pk_seen");
+                t.insert(b"stale".as_slice(), [].as_slice()).expect("insert");
+            }
+            wtx.commit().expect("commit");
+            drop(db); // redb holds the file lock for the life of the handle
+            assert!(table_names(&path).contains(&"pk_seen".to_string()));
+        }
+
+        let store = RedbPrekeyStore::open(&path, &[0x22u8; 32]).expect("open intermediate file");
+        // Still fully functional, and now gating through the sidecar.
+        assert!(!store.record_static_only_seen(b"tag").expect("record"));
+        assert!(store.record_static_only_seen(b"tag").expect("replay"));
+        drop(store);
+        assert_eq!(
+            table_names(&path),
+            vec!["dek_sentinel", "pk_meta", "pk_onetime", "pk_static"],
+            "the dead inline pk_seen table must be dropped on open"
+        );
+        assert_eq!(table_names(&RedbPrekeyStore::seen_db_path(&path)), vec!["pk_seen"]);
     }
 
     #[test]

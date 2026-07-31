@@ -726,7 +726,10 @@ impl NetworkProcessor {
                 )
                 .await
                 {
-                    eprintln!("Connection failed: {}", e);
+                    // The error text can embed peer-supplied bytes (e.g. the
+                    // requested path in an scp denial), so it goes through the
+                    // same terminal filter as the two prints above.
+                    eprintln!("Connection failed: {}", Self::sanitize_for_terminal(&e.to_string()));
                 }
             });
         }
@@ -742,9 +745,17 @@ impl NetworkProcessor {
         F1: FnOnce(&Ticket),
         F2: FnOnce() + Send + 'static,
     {
-        self.run_listen_once_with_progress(on_ticket, on_handshake_done, None).await
+        self.run_listen_once_with_progress(on_ticket, |_peer_fp| on_handshake_done(), None).await
     }
 
+    /// `on_handshake_done` receives the peer's authenticated identity: the
+    /// SHA3-256 fingerprint of the ML-DSA key it signed the handshake with, or
+    /// `None` when the peer connected anonymously (only possible on a node that
+    /// allows it — see `CryptoConfig::require_initiator_self_auth`). A caller
+    /// with a user in front of it is expected to display it, because on a node
+    /// whose only admission control is "holds the ticket" the fingerprint is
+    /// the sole means of telling the intended sender from anyone else who saw
+    /// the ticket.
     pub async fn run_listen_once_with_progress<F1, F2>(
         &self,
         on_ticket: F1,
@@ -753,7 +764,7 @@ impl NetworkProcessor {
     ) -> Result<()>
     where
         F1: FnOnce(&Ticket),
-        F2: FnOnce() + Send + 'static,
+        F2: FnOnce(Option<[u8; 32]>) + Send + 'static,
     {
         let local_addr = self.endpoint.local_addr().await
             .map_err(|e| CryptoError::Parameter(format!("Local addr: {}", e)))?;
@@ -785,7 +796,7 @@ impl NetworkProcessor {
         on_progress: Option<crate::network::ProgressCallback>,
     ) -> Result<()>
     where
-        F: FnOnce() + Send + 'static,
+        F: FnOnce(Option<[u8; 32]>) + Send + 'static,
     {
         let pending = self.endpoint.accept().await
             .map_err(|e| CryptoError::Parameter(format!("Accept failed: {}", e)))?;
@@ -897,7 +908,7 @@ impl NetworkProcessor {
         remote_peer_id: P2pPeerId,
         cached_allowlist: Option<Arc<AllowlistSource>>,
         io_provider: Arc<dyn IOProvider>,
-        on_handshake_done: Option<Box<dyn FnOnce() + Send>>,
+        on_handshake_done: Option<Box<dyn FnOnce(Option<[u8; 32]>) + Send>>,
         on_progress: Option<crate::network::ProgressCallback>,
         admission: Option<Admission>,
     ) -> Result<()> {
@@ -986,7 +997,17 @@ impl NetworkProcessor {
                 let hash: [u8; 32] = Sha3_256::digest(pk).into();
                 peer_id_opt = Some(PeerId::Pubkey(hash));
                 eprintln!("Client authenticated successfully (auth: {}).", config.pqc_dsa_algo);
-            } else if !config.allow_unauth || config.signing_pubkey.is_some() {
+            } else if !config.allow_unauth
+                || config.require_initiator_self_auth
+                || config.signing_pubkey.is_some()
+            {
+                // `require_initiator_self_auth` is the third, independent reason
+                // to refuse an anonymous initiator: an open node (`allow_unauth`,
+                // no pin) that still wants every session to carry an identity.
+                // Without it the only `peer_id` available below is
+                // `PeerId::Node` — the peer's transport key, which it mints per
+                // connection and which therefore cannot be shown to an operator
+                // as "who connected". See `CryptoConfig::require_initiator_self_auth`.
                 return Err(CryptoError::Parameter("Handshake failed: Client authentication required".to_string()));
             }
 
@@ -1037,6 +1058,47 @@ impl NetworkProcessor {
                         return Err(CryptoError::Parameter("Anonymous peer not allowed when allowlist is active".to_string()));
                     }
                 }
+            } else if (config.chat_mode || config.file_mode)
+                && config.signing_pubkey.is_none()
+                && !config.allow_unauth
+            {
+                // Default-deny for chat / file-receive when the node has NO
+                // source of authorization at all.
+                //
+                // Authentication is not authorization. Reaching here with
+                // `allow_unauth == false` means the peer produced a valid
+                // sig_I, but that only proves it holds *some* ML-DSA key —
+                // one it can mint itself. The membership + grant-mask check
+                // above (the only place `required_grant_bit`'s GRANT_ALL for
+                // chat/file is ever consulted) runs solely in the
+                // `cached_allowlist` arm, so without a keyring
+                // (`--keyring-db`) *and* without a pinned client key
+                // (`--signing-pubkey`, bound to #6 before sig_I is verified)
+                // nothing constrains *which* identity is admitted: every
+                // holder of the ticket could open a session against the
+                // operator's stdin (chat) or stream up to MAX_FILE_SIZE into
+                // its stdout (file-receive).
+                //
+                // shell / scp / forward already require one of those two
+                // sources before they will serve at all (see main.rs); this is
+                // the same rule for the two services that lacked it, applied
+                // here rather than at startup so it holds for every caller of
+                // this function — the persistent listener, the single-shot
+                // path, and embedders that build a `NetworkProcessor`
+                // directly — not just the CLI.
+                //
+                // `--allow-unauth` stays the explicit opt-in to an open node,
+                // so an operator can still run one deliberately; a bare
+                // `--serve-chat` must now name a keyring, a pinned key, or
+                // that flag. The refusal happens before any responder field is
+                // written, so the peer learns nothing beyond a closed
+                // connection (same disclosure posture as the ALPN gate).
+                return Err(CryptoError::Parameter(
+                    "Peer authorization is not configured for chat/file-receive: this node accepts \
+                     no one until it is told who may connect (--keyring-db allowlist and/or \
+                     --signing-pubkey pinned peer), or is opened deliberately with --allow-unauth"
+                        .to_string(),
+                ));
             }
 
             let kem_algo = config.pqc_kem_algo.clone();
@@ -1196,7 +1258,10 @@ impl NetworkProcessor {
 
         let mut on_handshake_done = on_handshake_done;
         if let Some(cb) = on_handshake_done.take() {
-            cb();
+            // Hand the caller the identity that was actually authenticated, so a
+            // UI can name the peer it is about to accept bytes from instead of
+            // reporting a nameless "connected".
+            cb(shell_peer_fp);
         }
 
         let _chat_guard = if config.chat_mode {
@@ -2234,7 +2299,7 @@ mod tests {
         let client_proc = NetworkProcessor::new(client_config, client_ep, Arc::new(TestIOProvider));
 
         let server_task = tokio::spawn(async move {
-            server_proc.run_listen_once_with_progress(|_| {}, || {}, None).await
+            server_proc.run_listen_once_with_progress(|_| {}, |_| {}, None).await
         });
 
         let client_res = client_proc.run_connect().await;
@@ -2278,7 +2343,7 @@ mod tests {
         let client_proc = NetworkProcessor::new(client_config, client_ep, Arc::new(TestIOProvider));
 
         let server_task = tokio::spawn(async move {
-            server_proc.run_listen_once_with_progress(|_| {}, || {}, None).await
+            server_proc.run_listen_once_with_progress(|_| {}, |_| {}, None).await
         });
         let client_res = client_proc.run_connect().await;
 
@@ -2362,7 +2427,7 @@ mod tests {
             NetworkProcessor::new(server_config, server_ep, Arc::new(TestIOProvider));
         let server_task = tokio::spawn(async move {
             server_proc
-                .run_listen_once_with_progress(|_| {}, || {}, None)
+                .run_listen_once_with_progress(|_| {}, |_| {}, None)
                 .await
         });
 

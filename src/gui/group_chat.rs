@@ -51,6 +51,12 @@ use crate::group::{
 // `GroupChatWindow` type; we re-import it here for ergonomics.
 use crate::gui::GroupChatWindow;
 
+// The 1:1 chat window's bounds, reused rather than re-derived: both windows
+// feed a `StandardListView` of `StandardListViewItem` from peer-paced text,
+// so the ceilings and the reasoning behind them are the same. See
+// `crate::gui` for why each number is what it is.
+use crate::gui::{ChatRowQueue, MAX_CHAT_ROWS, MAX_CHAT_ROW_CHARS};
+
 /// Run the MLS group chat GUI. Blocks the calling task until the user
 /// closes the window or the Slint event loop exits.
 ///
@@ -95,11 +101,15 @@ pub async fn run_group_gui(
     // -------- inbound task -------------------------------------------
     let inbound_proc = Arc::clone(&processor);
     let inbound_ui = ui_handle.clone();
+    // A group member paces `accept_next` and Slint's event-loop queue is
+    // unbounded, so rows are staged here instead of posting one closure per
+    // event — see `push_event_into_ui`.
+    let inbound_rows = Arc::new(ChatRowQueue::new());
     tokio::spawn(async move {
         loop {
             match inbound_proc.accept_next().await {
                 Ok(evt) => {
-                    push_event_into_ui(&inbound_ui, evt);
+                    push_event_into_ui(&inbound_ui, &inbound_rows, evt);
                 }
                 Err(e) => {
                     // Transport errors usually mean the endpoint
@@ -382,24 +392,82 @@ fn set_status(ui_handle: &Weak<GroupChatWindow>, msg: String, is_error: bool) {
     });
 }
 
-fn push_event_into_ui(ui_handle: &Weak<GroupChatWindow>, evt: IncomingGroupEvent) {
+/// Stage one inbound event as a display row and, if no drain is already
+/// pending, post the single event-loop closure that will apply it.
+///
+/// `accept_next` returns as fast as the group's members send, and
+/// `slint::invoke_from_event_loop` queues without limit, so one closure per
+/// event let a member grow that queue — and the `String`s captured in it —
+/// while the event loop fell further behind. Staging hands out the obligation
+/// to post exactly *one* closure: rows staged while it is still pending are
+/// picked up by it when it runs, so a burst of N events costs one closure
+/// carrying at most `MAX_CHAT_ROWS` rows instead of N closures.
+fn push_event_into_ui(
+    ui_handle: &Weak<GroupChatWindow>,
+    rows: &Arc<ChatRowQueue>,
+    evt: IncomingGroupEvent,
+) {
     let line = render_event(&evt);
+    if !rows.stage(line) {
+        // A closure is already queued and will carry this row too; posting
+        // another one would only deepen the queue we are trying to bound.
+        return;
+    }
     let ui_h = ui_handle.clone();
-    let _ = slint::invoke_from_event_loop(move || {
+    let rows_for_ui = Arc::clone(rows);
+    let posted = slint::invoke_from_event_loop(move || {
+        // Drain first and unconditionally, so the pending flag is cleared
+        // even when the window has already gone away.
+        let batch = rows_for_ui.take();
         if let Some(ui) = ui_h.upgrade() {
-            append_message(&ui, line);
+            for line in batch {
+                append_message(&ui, line);
+            }
         }
     });
+    if posted.is_err() {
+        // The event loop is gone; drop the obligation so a later row can try
+        // again rather than staging forever behind a closure that never ran.
+        rows.release();
+    }
 }
 
+/// Append one rendered row to the message model, evicting the oldest rows so
+/// the model never holds more than [`MAX_CHAT_ROWS`].
+///
+/// This is `gui::append_chat_rows` applied to this window: Slint generates a
+/// distinct type per component and `ChatWindow`/`GroupChatWindow` share no
+/// trait exposing `get_messages`, so the body is restated rather than called.
+/// The append is a `push` into the model already in the property instead of a
+/// copy of every existing row into a freshly allocated one — the copy made
+/// showing N messages cost O(N^2) row copies on the event-loop thread, and a
+/// group member chooses N. The first call swaps the `.slint` literal model for
+/// a `VecModel`, carrying over whatever rows it held; `filter_map` rather than
+/// `unwrap` because a model may shrink between `row_count` and `row_data`.
+///
+/// Both callers reach the cap through here — the inbound event path and the
+/// local echo in `wire_send_message` — so no row source escapes it.
 fn append_message(ui: &GroupChatWindow, line: String) {
-    let cur = ui.get_messages();
-    let m = VecModel::<StandardListViewItem>::default();
-    for i in 0..cur.row_count() {
-        m.push(cur.row_data(i).unwrap());
+    if ui
+        .get_messages()
+        .as_any()
+        .downcast_ref::<VecModel<StandardListViewItem>>()
+        .is_none()
+    {
+        let existing = ui.get_messages();
+        let carried: Vec<StandardListViewItem> = (0..existing.row_count())
+            .filter_map(|i| existing.row_data(i))
+            .collect();
+        ui.set_messages(ModelRc::new(VecModel::from(carried)));
     }
-    m.push(StandardListViewItem::from(SharedString::from(line.as_str())));
-    ui.set_messages(ModelRc::new(m));
+    let model = ui.get_messages();
+    let Some(vec_model) = model.as_any().downcast_ref::<VecModel<StandardListViewItem>>() else {
+        return;
+    };
+    while vec_model.row_count() >= MAX_CHAT_ROWS {
+        vec_model.remove(0);
+    }
+    vec_model.push(StandardListViewItem::from(SharedString::from(line.as_str())));
 }
 
 fn render_event(evt: &IncomingGroupEvent) -> String {
@@ -410,7 +478,37 @@ fn render_event(evt: &IncomingGroupEvent) -> String {
             sender_index,
             body,
         } => {
-            let text = String::from_utf8_lossy(body);
+            // UTF-8 lossy so a member sending malformed bytes can't crash our
+            // display; matches the CLI twin in `group::cli` and the 1:1 chat
+            // policy. Then sanitize, for the same reason the CLI does: this
+            // list is where the operator reads the `[joined]` / `[epoch]` /
+            // `[removed]` lines that back their trust decisions, so a body
+            // carrying line structure or a bidi override forges them.
+            //
+            // A `StandardListViewItem` is not a terminal, so the half of
+            // `sanitize_for_terminal` that neutralizes cursor motion (ESC, \r)
+            // is inert here — a Slint `Text` draws those, it does not obey
+            // them. The half that matters is the one that survives the change
+            // of medium: the bidi overrides and isolates reorder the glyphs
+            // *within* the row, so a member can make their own line read as an
+            // `[epoch]` or `[removed]` line, and the zero-width marks hide
+            // text inside it. `\n` is a forged-line primitive either way — the
+            // row is one fixed-height, non-wrapping, eliding line, so an
+            // embedded newline either draws over the row's neighbours or
+            // silently hides the rest of the body from the operator. Replacing
+            // all of them with a space is therefore right here too, and
+            // stripping the inert controls costs nothing.
+            //
+            // Bounded because the length of the body is the member's choice
+            // and a row is retained until the `MAX_CHAT_ROWS` cap evicts it.
+            // Same ceiling as the 1:1 window's `format_chat_row`, and the only
+            // length bound on the body — deliberately no second, different one
+            // downstream. The `[leaf .. @ ..]` prefix is ours, not the peer's,
+            // so it is outside the bound.
+            let text = crate::utils::sanitize_for_terminal_bounded(
+                &String::from_utf8_lossy(body),
+                MAX_CHAT_ROW_CHARS,
+            );
             format!("[leaf {sender_index} @ {group_id}] {text}")
         }
         IncomingGroupEvent::EpochAdvanced {
@@ -500,6 +598,183 @@ mod tests {
         ] {
             assert!(!render_event(&evt).is_empty());
         }
+    }
+
+    /// Build a real `GroupChatWindow` against the headless test backend, the
+    /// same way `tests/gui_test.rs` builds a `ChatWindow`. The model bounds
+    /// are only meaningful against the model Slint actually hands out, so
+    /// these tests drive the generated component rather than a stand-in.
+    fn group_ui() -> GroupChatWindow {
+        i_slint_backend_testing::init_no_event_loop();
+        GroupChatWindow::new().unwrap()
+    }
+
+    /// A member's message body is peer-authored text rendered into the list
+    /// the operator reads `[joined]` / `[epoch]` / `[removed]` lines from, so
+    /// it must not be able to carry line structure, bidi reordering or
+    /// unbounded length into a row. The other direction matters just as much:
+    /// an ordinary message must arrive exactly as it was sent.
+    #[test]
+    fn render_event_neutralizes_hostile_bodies_but_leaves_normal_text_intact() {
+        let gid = GroupId::new([1u8; 32]);
+        let render = |body: &[u8]| {
+            render_event(&IncomingGroupEvent::Message {
+                group_id: gid,
+                sender_index: 3,
+                body: body.to_vec(),
+            })
+        };
+
+        // Honest direction: an ordinary message is passed through verbatim.
+        let normal = "shall we meet at 18:00? 日本語もそのまま";
+        let row = render(normal.as_bytes());
+        assert!(
+            row.ends_with(normal),
+            "a normal message must not be altered, got: {row}"
+        );
+        assert!(!row.contains("truncated"));
+
+        // Honest direction: still whole right up to the ceiling.
+        let at_cap = "a".repeat(MAX_CHAT_ROW_CHARS);
+        assert!(render(at_cap.as_bytes()).ends_with(&at_cap));
+
+        // Hostile direction: newline padding cannot forge the event lines the
+        // operator reads above this one.
+        let forged = render(b"hi\n[epoch] 00 -> 99\n[removed] 00 by leaf 0");
+        assert!(
+            !forged.contains('\n') && !forged.contains('\r'),
+            "a member must not be able to put line structure in a row: {forged}"
+        );
+
+        // Hostile direction: bidi overrides / isolates and the zero-width
+        // marks reorder or hide glyphs inside the row even in a GUI.
+        let bidi = render("x\u{202E}y\u{2066}z\u{200B}w\u{200F}v".as_bytes());
+        for c in ['\u{202E}', '\u{2066}', '\u{200B}', '\u{200F}'] {
+            assert!(!bidi.contains(c), "{c:?} survived into the row: {bidi}");
+        }
+
+        // Hostile direction: terminal control bytes never reach the row.
+        let ctrl = render(b"x\x1b[2Ky\x07");
+        assert!(!ctrl.contains('\u{1b}') && !ctrl.contains('\u{7}'));
+
+        // Hostile direction: an oversized body becomes one bounded row that
+        // visibly says it was clipped.
+        let huge = render("A".repeat(65_000).as_bytes());
+        assert!(
+            huge.ends_with("…[truncated]"),
+            "truncation must be visible to the operator"
+        );
+        assert!(
+            huge.chars().count() <= MAX_CHAT_ROW_CHARS + "…[truncated]".chars().count() + 128,
+            "row rendered {} chars",
+            huge.chars().count()
+        );
+
+        // Malformed UTF-8 is replaced, not rejected: the row still renders.
+        assert!(!render(&[0xff, 0xfe, b'h', b'i']).is_empty());
+    }
+
+    /// A member decides how many events to send and each one became a
+    /// retained row, so the model must keep only the newest `MAX_CHAT_ROWS`
+    /// and evict oldest-first — while an ordinary conversation still shows
+    /// every message it sent, in order.
+    #[test]
+    fn append_message_bounds_a_flood_and_keeps_a_normal_conversation() {
+        use slint::Model;
+
+        let ui = group_ui();
+
+        // Honest direction: a short conversation is delivered in full.
+        for i in 0..5 {
+            append_message(&ui, format!("hello {i}"));
+        }
+        let m = ui.get_messages();
+        assert_eq!(m.row_count(), 5, "a normal conversation must show every message");
+        for i in 0..5 {
+            assert_eq!(m.row_data(i).unwrap().text, format!("hello {i}"));
+        }
+
+        // Hostile direction: a flood is bounded, newest kept, oldest evicted.
+        let flood = MAX_CHAT_ROWS * 3;
+        for i in 0..flood {
+            append_message(&ui, format!("flood {i}"));
+        }
+        let m = ui.get_messages();
+        assert_eq!(
+            m.row_count(),
+            MAX_CHAT_ROWS,
+            "a member must not decide how many rows this process retains"
+        );
+        assert_eq!(
+            m.row_data(MAX_CHAT_ROWS - 1).unwrap().text,
+            format!("flood {}", flood - 1),
+            "the newest message must survive the cap"
+        );
+        assert_eq!(
+            m.row_data(0).unwrap().text,
+            format!("flood {}", flood - MAX_CHAT_ROWS),
+            "eviction must take the oldest row, in order"
+        );
+    }
+
+    /// Appending must mutate the model already in the property instead of
+    /// building a replacement out of a full copy of it — the copy is what made
+    /// showing N messages cost O(N^2) row copies on the event-loop thread.
+    #[test]
+    fn append_message_mutates_the_model_in_place() {
+        use slint::Model;
+
+        let ui = group_ui();
+        append_message(&ui, "first".to_string());
+        let model_after_first = ui.get_messages();
+
+        for i in 0..50 {
+            append_message(&ui, format!("row {i}"));
+            assert!(
+                ui.get_messages() == model_after_first,
+                "row {i} replaced the whole model instead of pushing into it"
+            );
+        }
+        assert_eq!(ui.get_messages().row_count(), 51);
+    }
+
+    /// Inbound events must be staged rather than each posting its own
+    /// event-loop closure. With no loop running to drain it, a burst leaves
+    /// every row in the queue — bounded to `MAX_CHAT_ROWS` — which is only
+    /// true if `push_event_into_ui` routes through the queue at all.
+    #[test]
+    fn push_event_into_ui_coalesces_a_burst_through_the_queue() {
+        let ui = group_ui();
+        let handle = ui.as_weak();
+        let rows = Arc::new(ChatRowQueue::new());
+        let gid = GroupId::new([2u8; 32]);
+
+        let burst = MAX_CHAT_ROWS * 3;
+        for i in 0..burst {
+            push_event_into_ui(
+                &handle,
+                &rows,
+                IncomingGroupEvent::Message {
+                    group_id: gid,
+                    sender_index: 1,
+                    body: format!("burst {i}").into_bytes(),
+                },
+            );
+        }
+
+        let batch = rows.take();
+        assert_eq!(
+            batch.len(),
+            MAX_CHAT_ROWS,
+            "a burst of {burst} events must stage a bounded batch, not one closure each"
+        );
+        assert!(
+            batch.last().unwrap().ends_with(&format!("burst {}", burst - 1)),
+            "the newest rows must be the ones that survive"
+        );
+
+        // No lost wakeup: after the drain, the next event schedules again.
+        assert!(rows.stage("after".to_string()));
     }
 
     /// `parse_group_id` accepts 64-hex strings (32 bytes) and rejects

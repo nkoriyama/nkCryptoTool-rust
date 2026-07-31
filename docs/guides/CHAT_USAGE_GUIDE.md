@@ -152,6 +152,15 @@ Client authenticated successfully.        ← Alice 側
 > [Peer]: doing great
 ```
 
+> **表示上の注意**: 受信した本文は `[Peer]: ` 付きの **論理行 1 本** として出力される。
+> 本文中の改行は空白に潰されるため、peer が `\n` でこの行から抜け出すことはできない
+> (nkct クライアントは Enter ごとに 1 メッセージを送るので、正規の送信側が改行入りの
+> 本文を送ることはそもそも無い)。ただし本文長に上限は無く、長い本文は端末幅で折り返される。
+> peer が十分な空白の後に文字列を置けば折り返し後の物理行の先頭にそれを出せるので、偽の
+> `[System]: ...` 通知のような **prefix の無い見た目の行** は依然として作れる。
+> 行頭から始まることをローカル出力の証拠にしてはいけない。タブは保持され、peer の行内で
+> カーソルを右に進める。(CLI チャットの話。GUI は `[Peer]: ` を剥がすので prefix は付かない。)
+
 **終了**: `Ctrl-D` で stdin を閉じる → clean exit (F-IROH-39 修正後)
 
 ---
@@ -231,11 +240,17 @@ listener 側の keyring（redb）の allowlist テーブルに許可指紋を登
 
 ```bash
 # 受信 (端末 A)
-nkct ... --serve-chat --signing-privkey ... > received_file.bin
+nkct ... --serve-chat --signing-privkey ... \
+  --signing-pubkey ~/nkct/bob_public.key > received_file.bin
 
 # 送信 (端末 B)
 cat my_file.bin | nkct ... --connect <ticket> --signing-privkey ...
 ```
+
+> 受信側は chat と同じく「誰を通すか」の指定が必須。`--signing-pubkey`
+> (1 ピアを pin) か `--keyring-db` (allowlist) のどちらも無い listener は、
+> ticket を持つ誰かが署名付きで繋いできても接続を拒否する
+> (意図的に開けたい場合のみ `--allow-unauth`)。
 
 > 現状は **stdin/stdout 経由のみ**。ファイルパス直接指定は未対応 (F-IROH-37)。
 

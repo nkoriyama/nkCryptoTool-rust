@@ -8,8 +8,8 @@ set -u
 
 BIN="$PWD/target/release/nk-crypto-tool"
 unset NK_PASSPHRASE RUST_LOG
-ROOT=/tmp/nkct-nested
-rm -rf "$ROOT"; mkdir -p "$ROOT"/{shk,shc,sck,scc,A}
+ROOT=$(mktemp -d "${TMPDIR:-/tmp}/nkct-nested-demo.XXXXXX") || exit 1
+mkdir -p "$ROOT"/{shk,shc,sck,scc,A}
 SHSRV=""; SHCLI=""
 trap 'kill $SHCLI $SHSRV 2>/dev/null; rm -rf "$ROOT"' EXIT
 

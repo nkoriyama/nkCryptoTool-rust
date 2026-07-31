@@ -13,6 +13,7 @@ use pkcs8::der::Decode;
 use std::ops::{Deref, DerefMut};
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Neutralize terminal-spoofing characters in a string that may embed
 /// remote-supplied bytes (a peer's chat body, an error string a peer
@@ -372,10 +373,47 @@ impl DerefMut for SecureBuffer {
     }
 }
 
+/// Process-wide latch holding the `NK_PASSPHRASE` value read at startup.
+///
+/// `None` covers both "not set" and "not valid UTF-8", exactly like the
+/// `std::env::var(..).ok()` this replaces.
+static ENV_PASSPHRASE: OnceLock<Option<Zeroizing<String>>> = OnceLock::new();
+
+fn env_passphrase_latch() -> &'static Option<Zeroizing<String>> {
+    ENV_PASSPHRASE.get_or_init(|| std::env::var("NK_PASSPHRASE").ok().map(Zeroizing::new))
+}
+
+/// Capture `NK_PASSPHRASE` into the process-wide latch, then remove it from the
+/// process environment.
+///
+/// This passphrase unlocks the long-term signing key, every `my-identities`
+/// record in `keyring.db` and the MLS/at-rest stores, so it must not survive in
+/// the environment: `--serve-shell` hands a PTY to an authorized peer and
+/// `portable_pty` seeds that child from `std::env::vars_os()`, which would hand
+/// the peer the passphrase (the `tpm2` helper and the `__nnp-exec` trampoline
+/// inherit the environment too).
+///
+/// The latch is populated *before* the removal, so no later reader can observe
+/// it empty. Call once at startup, before any thread is spawned and before any
+/// endpoint or PTY exists.
+pub fn scrub_env_passphrase() {
+    let _ = env_passphrase_latch();
+    std::env::remove_var("NK_PASSPHRASE");
+}
+
+/// The `NK_PASSPHRASE` value captured at startup, if it was set.
+///
+/// When `scrub_env_passphrase` was never called (library embedding, unit
+/// tests) the first call reads the environment itself, so behaviour there is
+/// unchanged.
+pub fn env_passphrase() -> Option<Zeroizing<String>> {
+    env_passphrase_latch().clone()
+}
+
 pub fn get_masked_passphrase() -> Result<Zeroizing<String>> {
-    if let Ok(pass) = std::env::var("NK_PASSPHRASE") {
+    if let Some(pass) = env_passphrase() {
         eprintln!("WARNING: Using passphrase from NK_PASSPHRASE environment variable. This is less secure than interactive entry.");
-        return Ok(Zeroizing::new(pass));
+        return Ok(pass);
     }
     print!("Enter passphrase: ");
     io::stdout().flush()?;
@@ -384,12 +422,12 @@ pub fn get_masked_passphrase() -> Result<Zeroizing<String>> {
 }
 
 pub fn get_and_verify_passphrase(prompt: &str) -> Result<Option<Zeroizing<String>>> {
-    if let Ok(pass) = std::env::var("NK_PASSPHRASE") {
+    if let Some(pass) = env_passphrase() {
         if pass.is_empty() {
             return Ok(None);
         }
         eprintln!("WARNING: Using passphrase from NK_PASSPHRASE environment variable. This is less secure than interactive entry.");
-        return Ok(Some(Zeroizing::new(pass)));
+        return Ok(Some(pass));
     }
     println!("{}", prompt);
     println!("(Enter nothing to skip encryption and save key in plaintext)");

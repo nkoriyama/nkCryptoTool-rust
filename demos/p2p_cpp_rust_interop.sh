@@ -17,8 +17,8 @@ set -u
 RUST="$PWD/target/release/nk-crypto-tool"
 CPP="$PWD/../nkCryptoTool/build-both/nkCryptoTool"
 unset RUST_LOG NK_PASSPHRASE
-ROOT=/tmp/xrole
-rm -rf "$ROOT"; mkdir -p "$ROOT"/{srv,cli,rdb,cdb} "$ROOT"/keys/{s,c}
+ROOT=$(mktemp -d "${TMPDIR:-/tmp}/nkct-xrole-demo.XXXXXX") || exit 1
+mkdir -p "$ROOT"/{srv,cli,rdb,cdb} "$ROOT"/keys/{s,c}
 SRV=""
 trap 'kill $SRV 2>/dev/null; rm -rf "$ROOT"' EXIT
 

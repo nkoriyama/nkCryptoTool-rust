@@ -91,13 +91,18 @@ pub enum MlsCommand {
     ///                              to all `/peer` recipients in the active
     ///                              group (silently dropped if either is unset)
     ///
-    /// Inbound `NewGroup` events auto-set the active group id, so a
-    /// freshly-invited peer that has the inviter's ticket via
-    /// `/peer` is ready to chat as soon as the Welcome arrives.
+    /// An inbound `NewGroup` event sets the active group id when none is
+    /// active yet, so a freshly-invited peer that has the inviter's ticket
+    /// via `/peer` is ready to chat as soon as the Welcome arrives. It never
+    /// *replaces* an active group: a Welcome from an unauthenticated peer
+    /// would otherwise silently re-point everything typed next into a group
+    /// of the sender's choosing. Such a group is still joined, and the
+    /// printed `[joined] <gid> (not active …)` line carries the `/gid` to
+    /// switch into it on purpose.
     Listen {
         /// Optional initial group_id. If unset, the listener waits for
         /// the first `NewGroup` event (from an inbound Welcome) and
-        /// adopts that gid.
+        /// adopts that gid. If set, only `/gid` can change it.
         group_id: Option<GroupId>,
         /// Initial recipient tickets. More can be added later via
         /// the `/peer` stdin command.
@@ -366,17 +371,53 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // Shared with the inbound task rather than owned by the sending half: the
+    // set is resolved once before the loop starts, but the group's membership
+    // changes underneath it, and this process is the one that observes the
+    // Commit doing so (see `prune_departed_recipients`).
+    let recipients = Arc::new(tokio::sync::Mutex::new(recipients));
+
+    // Membership baseline. This loop addresses exactly one group and its
+    // inbound task is the only reader and writer, so the map is moved in
+    // rather than shared. Seeded before the task can observe an event, so the
+    // very first Commit is already a measurable delta.
+    let rosters = tokio::sync::Mutex::new(RosterSnapshots::new());
+    seed_roster(&processor, &rosters, &group_id).await;
+
     // Inbound task: run accept_next forever, push decoded events to
     // stdout via the shared writer.
     let inbound_processor = Arc::clone(&processor);
     let inbound_stdout = Arc::clone(&stdout);
+    let inbound_recipients = Arc::clone(&recipients);
     let inbound = tokio::spawn(async move {
         loop {
             match inbound_processor.accept_next().await {
                 Ok(evt) => {
                     let line = render_event(&evt);
+                    // A Commit that evicted somebody *else* surfaces here as
+                    // EpochAdvanced, and the event does not name who left, so
+                    // the roster is re-read and diffed on any epoch change of
+                    // our group.
+                    let pruned = match &evt {
+                        IncomingGroupEvent::EpochAdvanced { group_id: g, .. }
+                            if *g == group_id =>
+                        {
+                            prune_departed_recipients(
+                                &inbound_processor,
+                                &group_id,
+                                &inbound_recipients,
+                                &rosters,
+                            )
+                            .await
+                        }
+                        _ => None,
+                    };
                     let mut out = inbound_stdout.lock().await;
                     let _ = out.write_all(line.as_bytes()).await;
+                    if let Some(note) = pruned {
+                        let _ = out.write_all(b"\n").await;
+                        let _ = out.write_all(note.as_bytes()).await;
+                    }
                     let _ = out.write_all(b"\n> ").await;
                     let _ = out.flush().await;
                 }
@@ -388,9 +429,22 @@ where
                 // inbound message would permanently stop MLS delivery for the
                 // whole session.
                 Err(e) => {
+                    // The rendered error can carry peer-chosen text — a QUIC
+                    // close reason arrives here inside
+                    // `Transport(Accept("accept_bi: ..."))` — and this REPL is
+                    // where the operator reads `[joined]` / `[epoch advanced]` /
+                    // `[removed]` to judge who is in the group. Strip the
+                    // control/bidi characters that would let a peer erase or
+                    // forge those lines, exactly as `render_event` does for
+                    // message bodies. Bounding is safe here: every `GroupError`
+                    // variant `accept_next` can return prints its own
+                    // scaffolding (`transport: accept failed: …`) first and the
+                    // peer's bytes last, so the cut can only drop attacker-
+                    // chosen tail, never a diagnostic the operator needs.
+                    let msg = crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256);
                     let mut out = inbound_stdout.lock().await;
                     let _ = out
-                        .write_all(format!("[err] {e}\n> ").as_bytes())
+                        .write_all(format!("[err] {msg}\n> ").as_bytes())
                         .await;
                     let _ = out.flush().await;
                 }
@@ -423,8 +477,24 @@ where
             let _ = out.flush().await;
             continue;
         }
+        // Snapshot under the lock, send without it: the fan-out awaits
+        // peer-controlled endpoints and must not block the inbound task's
+        // prune.
+        let recips = recipients.lock().await.clone();
+        // The prune can empty this list, and `fanout_send`'s empty-list early
+        // return is an `Ok` — without this the operator would keep typing into
+        // a session that silently delivers to nobody. Same guard `listen_loop`
+        // already has for a set that started empty.
+        if recips.is_empty() {
+            let mut out = stdout.lock().await;
+            let _ = out
+                .write_all("[mls] no recipients — nothing to deliver to\n> ".as_bytes())
+                .await;
+            let _ = out.flush().await;
+            continue;
+        }
         match processor
-            .send_application_message(&group_id, body.as_bytes(), &recipients)
+            .send_application_message(&group_id, body.as_bytes(), &recips)
             .await
         {
             Ok(_) => {
@@ -454,7 +524,7 @@ where
 //
 // Inbound half:
 //   accept_next() → render → push line to stdout
-//   NewGroup → also update `group_id`
+//   NewGroup → also adopt into `group_id`, but only when it is unset
 //   RemovedFromGroup → also break the outer loop
 //
 // Outbound half (this fn):
@@ -498,6 +568,16 @@ pub async fn listen_loop(
 
     let group_id = Arc::new(Mutex::new(initial_group_id));
     let recipients = Arc::new(Mutex::new(initial_recipients));
+    // Membership baselines, one per group. Unlike `chat_group_loop` this loop
+    // has one recipient list but many possible groups — `/gid` switches which
+    // one it addresses — so a single baseline would end up measuring one
+    // group's Commit against another group's roster. Seeded here for a group
+    // named on the command line, and by `seed_roster` wherever a group first
+    // becomes reachable later (`[joined]`, `/gid`).
+    let rosters = Arc::new(Mutex::new(RosterSnapshots::new()));
+    if let Some(gid) = initial_group_id {
+        seed_roster(&processor, &rosters, &gid).await;
+    }
 
     // Channel: inbound task signals "we were removed; please stop".
     let (kill_tx, mut kill_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -515,6 +595,8 @@ pub async fn listen_loop(
     let inbox_task: Option<tokio::task::JoinHandle<()>> = if processor.inbox().is_some() {
         let processor = Arc::clone(&processor);
         let group_id = Arc::clone(&group_id);
+        let recipients = Arc::clone(&recipients);
+        let rosters = Arc::clone(&rosters);
         let stdout = Arc::clone(&stdout);
         let kill_tx = kill_tx.clone();
         let reasm = Arc::clone(&reasm);
@@ -552,17 +634,43 @@ pub async fn listen_loop(
                             continue;
                         }
                     };
-                    // Side-effect: NewGroup → adopt the gid; Removed →
-                    // signal the outer loop. Same logic as the inbound
-                    // task; factor later if a third source appears.
+                    // Side-effect: NewGroup → adopt the gid only if that does
+                    // not displace an already-active group, and announce which
+                    // it was (see `adopt_new_group`), then take a membership
+                    // baseline for it; EpochAdvanced → drop whoever left
+                    // (see `prune_departed_recipients`), since a Commit reaches
+                    // us through this channel too; Removed → signal the outer
+                    // loop. Same logic as the inbound task; factor later if a
+                    // third source appears.
                     if let IncomingGroupEvent::NewGroup { id } = &evt {
-                        let mut g = group_id.lock().await;
-                        *g = Some(*id);
+                        let line = adopt_new_group(&group_id, id).await;
+                        seed_roster(&processor, &rosters, id).await;
+                        let mut out = stdout.lock().await;
+                        let _ = out.write_all(line.as_bytes()).await;
+                        let _ = out.write_all(b"\n").await;
+                        let _ = out.flush().await;
+                        continue;
+                    }
+                    let mut pruned = None;
+                    if let IncomingGroupEvent::EpochAdvanced { group_id: evt_gid, .. } = &evt {
+                        let active = *group_id.lock().await;
+                        if active == Some(*evt_gid) {
+                            pruned = prune_departed_recipients(
+                                &processor, evt_gid, &recipients, &rosters,
+                            )
+                            .await;
+                        }
                     }
                     let is_removed = matches!(evt, IncomingGroupEvent::RemovedFromGroup { .. });
                     if let Some(line) = event_to_line(&evt, &reasm).await {
                         let mut out = stdout.lock().await;
                         let _ = out.write_all(line.as_bytes()).await;
+                        let _ = out.write_all(b"\n").await;
+                        let _ = out.flush().await;
+                    }
+                    if let Some(note) = pruned {
+                        let mut out = stdout.lock().await;
+                        let _ = out.write_all(note.as_bytes()).await;
                         let _ = out.write_all(b"\n").await;
                         let _ = out.flush().await;
                     }
@@ -581,6 +689,8 @@ pub async fn listen_loop(
     let inbound = {
         let processor = Arc::clone(&processor);
         let group_id = Arc::clone(&group_id);
+        let recipients = Arc::clone(&recipients);
+        let rosters = Arc::clone(&rosters);
         let kill_tx = kill_tx.clone();
         let stdout = Arc::clone(&stdout);
         let reasm = Arc::clone(&reasm);
@@ -598,11 +708,22 @@ pub async fn listen_loop(
                         continue;
                     }
                 };
-                // Side effects: adopt the gid on join; on self-removal print,
-                // signal the outer loop, and stop.
+                // Side effects: on join adopt the gid unless that would
+                // displace an already-active group, print which it was (see
+                // `adopt_new_group`) and take a membership baseline for it; on
+                // an epoch change drop the recipients that Commit removed (see
+                // `prune_departed_recipients`); on self-removal print, signal
+                // the outer loop, and stop.
+                let mut pruned = None;
                 match &evt {
                     IncomingGroupEvent::NewGroup { id } => {
-                        *group_id.lock().await = Some(*id);
+                        let line = adopt_new_group(&group_id, id).await;
+                        seed_roster(&processor, &rosters, id).await;
+                        let mut out = stdout.lock().await;
+                        let _ = out.write_all(line.as_bytes()).await;
+                        let _ = out.write_all(b"\n").await;
+                        let _ = out.flush().await;
+                        continue;
                     }
                     IncomingGroupEvent::RemovedFromGroup { .. } => {
                         if let Some(line) = event_to_line(&evt, &reasm).await {
@@ -614,11 +735,26 @@ pub async fn listen_loop(
                         let _ = kill_tx.send(()).await;
                         break;
                     }
+                    IncomingGroupEvent::EpochAdvanced { group_id: evt_gid, .. } => {
+                        let active = *group_id.lock().await;
+                        if active == Some(*evt_gid) {
+                            pruned = prune_departed_recipients(
+                                &processor, evt_gid, &recipients, &rosters,
+                            )
+                            .await;
+                        }
+                    }
                     _ => {}
                 }
                 if let Some(line) = event_to_line(&evt, &reasm).await {
                     let mut out = stdout.lock().await;
                     let _ = out.write_all(line.as_bytes()).await;
+                    let _ = out.write_all(b"\n").await;
+                    let _ = out.flush().await;
+                }
+                if let Some(note) = pruned {
+                    let mut out = stdout.lock().await;
+                    let _ = out.write_all(note.as_bytes()).await;
                     let _ = out.write_all(b"\n").await;
                     let _ = out.flush().await;
                 }
@@ -677,6 +813,10 @@ pub async fn listen_loop(
                                     let mut gid = group_id.lock().await;
                                     *gid = Some(g);
                                     drop(gid);
+                                    // Epoch changes for `g` were ignored while
+                                    // it was inactive, so give it a baseline
+                                    // now if it has none.
+                                    seed_roster(&processor, &rosters, &g).await;
                                     say(format!("[listen] active group set to {g}")).await;
                                 }
                                 Err(e) => say(format!("[listen] bad gid: {e}")).await,
@@ -807,6 +947,147 @@ pub async fn listen_loop(
         t.abort();
     }
     Ok(())
+}
+
+/// Decide whether an inbound `NewGroup` may become the listener's active
+/// send target, and render the operator-facing line announcing it.
+///
+/// By the time we get here the Welcome has already been processed, so we are
+/// a member of `id` either way — this governs only *which* group the lines the
+/// operator subsequently types are encrypted to. Adopting unconditionally let
+/// any peer holding one of our published KeyPackages silently re-point the
+/// session: the operator kept typing, every line was encrypted to the
+/// intruder's group instead of the intended one, the REPL still echoed
+/// `[me] …`, and the intended recipients could not read it. So a new gid is
+/// adopted only when no group is active yet, or when the Welcome is for the
+/// group that is already active (a re-add must not read as a refusal).
+/// Otherwise the group is joined but not activated and the operator is told
+/// the `/gid` needed to switch into it deliberately.
+///
+/// `GroupId`'s `Display` is `hex::encode` of its 32 raw bytes, so the
+/// rendered gid carries no peer-controlled text and needs no terminal
+/// sanitising.
+async fn adopt_new_group(
+    group_id: &tokio::sync::Mutex<Option<GroupId>>,
+    id: &GroupId,
+) -> String {
+    let mut active = group_id.lock().await;
+    let adopted = match *active {
+        None => {
+            *active = Some(*id);
+            true
+        }
+        Some(current) => current == *id,
+    };
+    drop(active);
+    if adopted {
+        format!("[joined] {id} (active)")
+    } else {
+        format!("[joined] {id} (not active — /gid {id} to switch)")
+    }
+}
+
+/// The node ids a running loop last saw on a group's roster, per group.
+///
+/// A missing entry means "never looked", which is what makes the first look
+/// able only to record and never to drop: a departure is only visible as the
+/// difference between two observations.
+type RosterSnapshots =
+    std::collections::HashMap<GroupId, std::collections::HashSet<[u8; 32]>>;
+
+/// Record `gid`'s roster as this session's baseline, unless one is held.
+///
+/// Without a baseline the first epoch change for a group can only record, so
+/// the member that Commit evicted would stay addressed until the *next* one.
+/// Seeding at every point a group first becomes reachable by the session
+/// (loop start, `[joined]`, `/gid`) is what keeps that window shut.
+///
+/// An existing baseline is never overwritten: it may predate a `/gid` detour,
+/// and a member who left during the detour is only detectable against the
+/// older set — the epoch change that evicted them was skipped as not-active.
+///
+/// A roster that fails to load leaves no baseline and says nothing: the same
+/// read has already been made and reported by `resolve_recipients` before
+/// either loop starts, and the next epoch change retries it.
+async fn seed_roster(
+    processor: &GroupChatProcessor,
+    rosters: &tokio::sync::Mutex<RosterSnapshots>,
+    gid: &GroupId,
+) {
+    let mut snaps = rosters.lock().await;
+    if snaps.contains_key(gid) {
+        return;
+    }
+    if let Ok(members) = processor.current_member_node_ids(gid) {
+        snaps.insert(*gid, members);
+    }
+}
+
+/// Drop from a running loop's recipient set exactly the peers that have **left**
+/// `gid` since this session last looked, then refresh the baseline. Returns the
+/// operator-facing note, or `None` when nothing was dropped.
+///
+/// The address book is already filtered on read, so no *new* invocation can
+/// resolve an evicted peer — but a chat/listen loop resolves its recipients
+/// once, before the loop starts, and then holds that list for the whole
+/// session. The node that processes the Remove Commit is exactly the node
+/// still holding the removed peer in that list, so without this it keeps
+/// dialling it and leaking ciphertext, timing and size metadata at it until
+/// the operator restarts. Hooked to the inbound event rather than to a timer
+/// or to each send: the epoch changing is the only moment membership can have
+/// changed under a running session.
+///
+/// A departure is measured as a **delta**, never as a roster match. Retaining
+/// only current members instead would delete every address that was never on
+/// this roster: a `--mls-recipient-ticket` or `/peer` address, which
+/// [`resolve_recipients`] deliberately passes through unfiltered, and — since
+/// `listen_loop` shares one recipient list across every group it can address —
+/// the members of all the *other* groups.
+///
+/// The map lock is released before the recipient lock is taken, so the two are
+/// never held together and no ordering between them can arise.
+///
+/// The count is ours and the rest is a static literal, so nothing
+/// peer-influenced reaches the terminal.
+async fn prune_departed_recipients(
+    processor: &GroupChatProcessor,
+    gid: &GroupId,
+    recipients: &tokio::sync::Mutex<Vec<PeerAddr>>,
+    rosters: &tokio::sync::Mutex<RosterSnapshots>,
+) -> Option<String> {
+    let current = match processor.current_member_node_ids(gid) {
+        Ok(c) => c,
+        // Keep both the list and the baseline: a roster that cannot be loaded
+        // fails every send from the same group state anyway, so guessing here
+        // could only remove a still-valid recipient on top of that.
+        Err(e) => {
+            return Some(format!(
+                "[mls] could not re-check recipients against the roster: {}",
+                crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256)
+            ))
+        }
+    };
+    let departed: std::collections::HashSet<[u8; 32]> = {
+        let mut snaps = rosters.lock().await;
+        let seen = snaps.entry(*gid).or_default();
+        let departed = seen.difference(&current).copied().collect();
+        *seen = current;
+        departed
+    };
+    if departed.is_empty() {
+        return None;
+    }
+    let mut rs = recipients.lock().await;
+    let before = rs.len();
+    rs.retain(|a| !departed.contains(a.peer_id.as_bytes()));
+    match before - rs.len() {
+        // Somebody left, but we were not addressing them: say nothing rather
+        // than report a drop that did not happen.
+        0 => None,
+        n => Some(format!(
+            "[mls] dropped {n} recipient(s) removed from this group"
+        )),
+    }
 }
 
 fn parse_gid_hex(hex: &str) -> anyhow::Result<GroupId> {
@@ -1167,6 +1448,252 @@ mod tests {
         let bob_members = list_members(&bob, &gid).await.expect("bob members");
         assert_eq!(alice_members.len(), 2);
         assert_eq!(bob_members.len(), 2);
+    }
+
+    /// An inbound Welcome must never silently re-point the listener's active
+    /// group, and must still adopt when no group is active yet.
+    ///
+    /// Regression: `listen_loop`'s inbound task and its inbox-poll task both
+    /// overwrote the shared active gid on every `NewGroup`, so any peer
+    /// holding one of our published KeyPackages could deliver a Welcome and
+    /// redirect every line the operator typed afterwards into a group it
+    /// controls — overriding even an explicit `--mls-group-id`. Both sinks now
+    /// route the decision through `adopt_new_group`.
+    #[tokio::test]
+    async fn inbound_welcome_never_replaces_the_active_group() {
+        use tokio::sync::Mutex;
+
+        let team = GroupId::new([0x11; 32]);
+        let intruder = GroupId::new([0xaa; 32]);
+
+        // An explicitly-set active group (`--mls-group-id`, or `/gid`)
+        // survives a Welcome for a different group, and the operator is told
+        // exactly what to type to switch.
+        let active = Mutex::new(Some(team));
+        let line = adopt_new_group(&active, &intruder).await;
+        assert_eq!(
+            *active.lock().await,
+            Some(team),
+            "an inbound Welcome must not replace the active group"
+        );
+        assert!(
+            line.contains(&format!("/gid {intruder}")),
+            "non-adoption must surface the /gid needed to switch, got {line:?}"
+        );
+
+        // The honest first-Welcome flow (listener started with no
+        // --mls-group-id) still adopts, with no extra operator step.
+        let active = Mutex::new(None);
+        let line = adopt_new_group(&active, &team).await;
+        assert_eq!(
+            *active.lock().await,
+            Some(team),
+            "the first Welcome must still become the active group"
+        );
+        assert!(
+            !line.contains("/gid "),
+            "an adopted group needs no switch hint, got {line:?}"
+        );
+
+        // A second Welcome, from a different group, does not displace the
+        // group adopted from the first one.
+        let line = adopt_new_group(&active, &intruder).await;
+        assert_eq!(*active.lock().await, Some(team));
+        assert!(line.contains(&format!("/gid {intruder}")), "got {line:?}");
+
+        // A re-add / re-invite for the group that is already active is not a
+        // spurious refusal: it stays active and prints no switch hint.
+        let line = adopt_new_group(&active, &team).await;
+        assert_eq!(*active.lock().await, Some(team));
+        assert!(
+            !line.contains("/gid "),
+            "a re-add of the active group must not read as a refusal, got {line:?}"
+        );
+    }
+
+    /// Poll `buf` until it contains `needle`, or panic after 10 s. The loop
+    /// writes the event line only after it has finished reacting to the event,
+    /// so seeing the line means the reaction is complete — no sleep-and-hope.
+    async fn wait_for_output(buf: &Arc<tokio::sync::Mutex<Vec<u8>>>, needle: &str) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let seen = String::from_utf8_lossy(&buf.lock().await.clone()).into_owned();
+            if seen.contains(needle) {
+                return seen;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {needle:?}; saw: {seen:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A member evicted while a chat session is *running* stops being addressed
+    /// by that session, and the surviving member keeps being addressed.
+    ///
+    /// Regression: `chat_group_loop` resolved its recipients once, before the
+    /// loop started, and held that `Vec` for the rest of the session. The
+    /// address book's roster filter could not help — it is only consulted by a
+    /// *new* invocation, and `accept_next` runs only inside these loops, so the
+    /// node that processes the Remove Commit is exactly the node whose
+    /// recipient list is already frozen. Every later message, Commit and file
+    /// frame kept being dialled at the evicted peer: it cannot decrypt the new
+    /// epoch, but it learns the group is live and reads per-message timing,
+    /// size and sender-address metadata off a connection we keep opening.
+    ///
+    /// Alice evicts Bob and only Carol processes the Commit, so Carol's loop is
+    /// the frozen-list node. Three directions are asserted, because the prune
+    /// has to be exact in both senses:
+    ///
+    /// * Bob, who left, is not dialled at all — the leak itself;
+    /// * Alice, who stayed, still receives — an over-firing prune that emptied
+    ///   the list would show up here;
+    /// * Dave, never a member of this group, still receives. He stands for
+    ///   every address that was never on this roster: a `/peer` or
+    ///   `--mls-recipient-ticket` peer, which `resolve_recipients` passes
+    ///   through unfiltered by design, and (in `listen_loop`, whose one
+    ///   recipient list is shared across groups) the members of every other
+    ///   group. Retaining "current members only" would silently revoke all of
+    ///   them at the first epoch change; only a *departure* may drop an
+    ///   address.
+    #[tokio::test]
+    async fn chat_loop_stops_addressing_a_member_evicted_mid_session() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+        let (dave, _dir_d) = build_test_processor(&net, "dave", 4);
+        let bob = Arc::new(bob);
+        let carol = Arc::new(carol);
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+        let dave_addr = dave.local_addr().await.expect("dave addr");
+
+        // ---- build the 3-member group (Alice, Bob, Carol) ------------------
+        let gid = create_group(&alice, "evict-test").await.expect("create");
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let task = {
+            let bob = Arc::clone(&bob);
+            tokio::spawn(async move { bob.accept_next().await })
+        };
+        alice
+            .send_welcome_to(&bob_addr, &add_bob.welcome)
+            .await
+            .expect("welcome→bob");
+        task.await.expect("bob task").expect("bob accepts welcome");
+
+        let add_carol = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+        let bob_task = {
+            let bob = Arc::clone(&bob);
+            tokio::spawn(async move { bob.accept_next().await })
+        };
+        let carol_task = {
+            let carol = Arc::clone(&carol);
+            tokio::spawn(async move { carol.accept_next().await })
+        };
+        alice
+            .send_welcome_to(&carol_addr, &add_carol.welcome)
+            .await
+            .expect("welcome→carol");
+        alice
+            .broadcast_commit(&add_carol.commit, &[bob_addr.clone()])
+            .await
+            .expect("commit→bob");
+        bob_task.await.expect("bob task").expect("bob accepts commit");
+        carol_task
+            .await
+            .expect("carol task")
+            .expect("carol accepts welcome");
+
+        // ---- Carol starts chatting, addressing all three peers -------------
+        // Dave is in the list without ever being in the group — the state a
+        // `/peer` or `--mls-recipient-ticket` address is in. `fanout_send`
+        // spawns every recipient into one JoinSet and joins them all before
+        // returning, so once any one of them has been delivered the others
+        // have at least been attempted; no ordering assumption is needed.
+        let (mut stdin_tx, stdin_rx) = tokio::io::duplex(4096);
+        let out_buf: Arc<tokio::sync::Mutex<Vec<u8>>> =
+            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let chat = {
+            let carol = Arc::clone(&carol);
+            let out_buf = Arc::clone(&out_buf);
+            let recipients = vec![bob_addr.clone(), dave_addr.clone(), alice_addr.clone()];
+            tokio::spawn(async move {
+                chat_group_loop(carol, gid, recipients, stdin_rx, out_buf).await
+            })
+        };
+
+        // ---- Alice evicts Bob; only the running session learns of it -------
+        // Bob is leaf 1 (added first); pinned by the P6 list_members test.
+        let remove_commit = alice.remove_member(&gid, 1).await.expect("remove bob");
+        alice
+            .broadcast_commit(&remove_commit, &[carol_addr.clone()])
+            .await
+            .expect("remove commit→carol");
+        wait_for_output(&out_buf, "[epoch advanced]").await;
+
+        // ---- the running loop sends its next line --------------------------
+        stdin_tx
+            .write_all(b"after-eviction\n")
+            .await
+            .expect("write stdin");
+
+        // Direction 1: the surviving member is still addressed.
+        let alice_evt = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            alice.accept_next(),
+        )
+        .await
+        .expect("alice timeout")
+        .expect("alice accepts message");
+        match alice_evt {
+            IncomingGroupEvent::Message { body, .. } => assert_eq!(
+                body, b"after-eviction",
+                "the surviving member must still receive the session's messages"
+            ),
+            other => panic!("alice expected Message, got {other:?}"),
+        }
+
+        // Direction 2: the peer who was never a member is still addressed. He
+        // cannot decrypt, so `accept_next` resolves to an error — but it does
+        // resolve, and only bytes on a connection we opened can make it do so.
+        // Timing out here is the regression: the prune reached past the one
+        // node that left and revoked an address the operator chose by hand.
+        let dave_res =
+            tokio::time::timeout(std::time::Duration::from_secs(5), dave.accept_next()).await;
+        assert!(
+            dave_res.is_ok(),
+            "an epoch change must not revoke an explicitly supplied non-member recipient"
+        );
+
+        // Direction 3: the evicted member is not dialled at all. The mock
+        // transport queues an incoming connection the instant `connect`
+        // returns, so by the time the fan-out has reached Alice and Dave, a
+        // send to Bob would already be sitting in his queue and `accept_next`
+        // would return at once instead of blocking.
+        let bob_res =
+            tokio::time::timeout(std::time::Duration::from_secs(2), bob.accept_next()).await;
+        assert!(
+            bob_res.is_err(),
+            "a running session must stop delivering to an evicted member, got {:?}",
+            bob_res.map(|r| r.map(|e| format!("{e:?}"))),
+        );
+
+        // The drop is announced, and the count is exactly the one node that
+        // left — a prune that also took Dave would read "2".
+        let seen = String::from_utf8_lossy(&out_buf.lock().await.clone()).into_owned();
+        assert!(
+            seen.contains("[mls] dropped 1 recipient(s) removed from this group"),
+            "the operator must be told exactly which count of recipients went away, got {seen:?}"
+        );
+
+        drop(stdin_tx);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), chat).await;
     }
 
     /// `print_local_address` round-trips through the Ticket codec.

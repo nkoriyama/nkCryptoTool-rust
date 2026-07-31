@@ -529,6 +529,14 @@ P2P トランスポート Iroh を使用した、PQC 認証付きの安全な通
   `remove_member` Commit により、エポック更新で過去の鍵が無効化される。
   退会したメンバーは新 epoch の Application message を**復号できない**ことを
   PCS テストで pin している (`remove_member_blocks_new_epoch_decrypt`)。
+  さらに、`chat-group` / `listen` の**実行中セッション**は、他メンバーの Commit を
+  受信して epoch が進むたびに roster を読み直し、**直前の roster にはいて今はいない**
+  ノードだけを宛先リストから外す。退会したメンバーは復号できないだけでなく、その場で
+  宛先から外れる (再起動不要) ため、接続の継続や送信タイミング・サイズといった
+  メタデータも渡らない。外れると `[mls] dropped N recipient(s) removed from this group`
+  が表示される。差分での判定なので、`--mls-recipient-ticket` や `/peer` で明示的に
+  指定した roster 外の宛先、および (`listen` は宛先リストを全グループで共有するため)
+  他グループのメンバーは、この処理では外れない。
 
 #### CLI 使用例 (2 人グループ)
 
@@ -587,6 +595,11 @@ GUI は左カラムに Groups リスト + Create / 自分の Ticket、右カラ�
 Members / Messages / 入力欄 / Add Member サブフォーム。すべての操作は CLI と同じ
 `crate::group::cli::*` ハンドラを呼ぶため、CLI と GUI で別永続化スキーマや別実装は
 存在しない。
+
+> **表示上の注**: Messages ペインは直近 1000 行のみ保持し (超過分は古い行から破棄)、
+> 1 メッセージの表示は 256 文字で `…[truncated]` に切られる。CLI 同様、本文中の
+> 制御文字・bidi 文字は空白に置換される。理由は
+> [`docs/security/SECURITY_PROFILE_GUI.md`](./docs/security/SECURITY_PROFILE_GUI.md) §1.12。
 
 > **設計上の注**: ハイブリッド suite (`0xF101`) のみを公開するため、クラシカルピア
 > (RFC 9420 標準スイートのみ実装) とは通信できない。Plan §1 「PQC mandatory」が

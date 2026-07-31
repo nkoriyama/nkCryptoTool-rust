@@ -351,6 +351,37 @@ impl PrekeyStore {
             .map(|(sk, pk)| (HpkeSecretKey::from(sk), HpkePublicKey::from(pk))))
     }
 
+    /// Record that a static-only ([`MODE_STATIC_ONLY`]) envelope has been
+    /// opened, returning `true` if this store had **already** opened it — i.e.
+    /// the delivery service is re-delivering an envelope we decrypted before.
+    /// Call it only after the AEAD tag has verified, for the same reason
+    /// [`delete`](Self::delete) is called only then: otherwise anyone able to
+    /// hand us bytes could fill the cache with junk they never had to seal.
+    ///
+    /// [`MODE_FULL`] envelopes get this single-use property for free — their
+    /// one-time prekey is deleted on the first successful open — but a
+    /// static-only envelope consumes nothing, so it needs its own state. That
+    /// state is kept forever and never evicted: the delivery service can mint
+    /// fresh static-only envelopes for us out of public data, so any eviction
+    /// rule it can drive is a bypass it can drive (see `TBL_PK_SEEN`).
+    ///
+    /// Because it is the one artifact an unauthenticated depositor can grow,
+    /// the cache is kept in a sidecar database — the store path with `.seen`
+    /// appended — and not in the prekey DB, which holds the static identity and
+    /// is fully compacted on every consumed one-time prekey. Deleting the
+    /// sidecar reclaims its space and only re-opens replay.
+    ///
+    /// The tag is `SHA3-256(envelope)`. Every byte of a static-only envelope
+    /// either feeds the key schedule (`enc_static`, `salt`), is the AEAD nonce
+    /// or AAD (`mode`), or is the ciphertext-and-tag itself, so no perturbed
+    /// copy can still open; a re-delivery that decrypts is therefore always
+    /// byte-identical, and re-encrypting the same plaintext under fresh
+    /// randomness needs the plaintext, which the delivery service lacks.
+    pub fn record_static_only_seen(&self, envelope: &[u8]) -> Result<bool> {
+        let tag: [u8; 32] = Sha3_256::digest(envelope).into();
+        Ok(self.store.record_static_only_seen(&tag)?)
+    }
+
     /// The last inbox poll cursor persisted by [`set_inbox_cursor`], or 0 if
     /// `recv` has never run against this store.
     pub fn inbox_cursor(&self) -> Result<u64> {

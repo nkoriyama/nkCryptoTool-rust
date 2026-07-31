@@ -28,6 +28,16 @@ required-features = ["mobile-ffi"]
 
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
+# `PollSender` only, for the GUI stdout writer: `AsyncWrite::poll_write` has to
+# register the caller's waker when the outbound channel is full, and tokio's own
+# `Sender` exposes no poll-based reserve (`send` is async, `try_send` cannot
+# register). Hand-rolling the same state machine would put a boxed
+# `reserve_owned()` future inside a security-baselined file for no gain. The
+# crate is already in the tree via iroh and `tokio_util::sync` sits behind no
+# feature, so `default-features = false` enables nothing that was not already
+# enabled: no crate is added or bumped, and Cargo.lock gains only the edge that
+# records this dependency. Optional + enabled by `gui`, its only consumer.
+tokio-util = { version = "0.7", default-features = false, optional = true }
 openssl = { version = "0.10", optional = true }
 openssl-sys = { version = "0.9", optional = true }
 clap = { version = "4.0", features = ["derive"] }
@@ -167,7 +177,7 @@ slint-build = { version = "1.16", optional = true }
 
 [features]
 default = ["backend-rustcrypto"]
-gui = ["slint", "slint-build", "arboard"]
+gui = ["slint", "slint-build", "arboard", "tokio-util"]
 testing = []
 gui-camera = ["gui", "nokhwa", "rqrr"]
 gui-notifications = ["gui", "notify-rust"]

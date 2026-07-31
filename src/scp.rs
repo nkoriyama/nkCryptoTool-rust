@@ -778,6 +778,71 @@ fn clamp_dir_mode(mode: u32) -> u32 {
     (mode & 0o0777) & !0o022
 }
 
+/// The process umask, sampled once by [`init_process_umask`].
+///
+/// `umask(2)` has no read-only form: reading it means setting it and setting it
+/// back — a process-global read-modify-write that would race every other thread
+/// creating a file. So it is sampled exactly once, before any thread exists,
+/// and only ever read afterwards.
+#[cfg(unix)]
+static PROCESS_UMASK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// Sample the process umask so `clamp_file_mode` can honour it.
+///
+/// Call this from `main` **before the async runtime is built**: while the
+/// process is still single-threaded, which is precisely what makes the
+/// read-modify-write below safe. Repeat calls are ignored (`OnceLock`).
+///
+/// When it is never called at all — a library embedding, or these unit tests —
+/// `clamp_file_mode` falls back to the *most restrictive* umask (`0o077`),
+/// not to "no umask": a caller that has not opted in gets owner-only files,
+/// never world-readable ones.
+pub fn init_process_umask() {
+    #[cfg(unix)]
+    {
+        // SAFETY: `umask` is a plain syscall wrapper with no preconditions. The
+        // only hazard is the brief window in which the whole process' umask is
+        // 0o077; the single-threaded-caller contract above is what closes it.
+        let previous = unsafe { libc::umask(0o077) };
+        unsafe { libc::umask(previous) };
+        // `mode_t` is u32 on Linux/Android but u16 on macOS/the BSDs; widening
+        // through u64 is the one expression that is right on both.
+        let _ = PROCESS_UMASK.set((u64::from(previous) & 0o0777) as u32);
+    }
+}
+
+/// Ceiling applied to a peer-supplied **file** mode, given a umask.
+///
+/// Three ceilings, every one of them downward — the peer's `mode` can narrow
+/// the result but never widen it:
+///
+///   1. `& 0o0777` — setuid / setgid / sticky are always stripped, so a peer
+///      can never plant a privilege-escalation bit.
+///   2. `& !0o022` — never group- or world-*writable*, so no other local user
+///      can substitute the contents of a file we just published. This is the
+///      floor, and it holds even for an operator running with `umask 000`.
+///   3. `& !umask` — never wider than a file this process created itself would
+///      have been. `fchmod` is not filtered by the umask, so without this the
+///      peer alone would decide the group/other **read** bits: a hostile server
+///      answering `--scp-get secret.pem` with `Put{mode: 0o666}` would land the
+///      operator's private key readable by every local user. With this, the
+///      operator's umask decides those bits, exactly as it does for every other
+///      file they create.
+#[cfg(unix)]
+fn clamp_file_mode_under_umask(mode: u32, umask: u32) -> u32 {
+    (mode & 0o0777) & !0o022 & !(umask & 0o0777)
+}
+
+/// [`clamp_file_mode_under_umask`] against this process' umask.
+///
+/// OpenSSH scp makes the same trade: without `-p` it ignores the remote mode
+/// and lets the local umask decide. There is no `-p` here, so the umask always
+/// wins.
+#[cfg(unix)]
+fn clamp_file_mode(mode: u32) -> u32 {
+    clamp_file_mode_under_umask(mode, PROCESS_UMASK.get().copied().unwrap_or(0o077))
+}
+
 // ===========================================================================
 // Staging: write to a hardened temp, commit with an atomic same-dir rename so an
 // interrupted / unauthenticated transfer never leaves bytes at the final path.
@@ -957,9 +1022,14 @@ impl Staged {
     /// via a path lookup after the file is closed: a path-based
     /// `set_permissions(temp)` could be redirected by a local attacker who swaps
     /// the temp for a symlink between close and chmod (TOCTOU), chmod'ing an
-    /// unrelated file. The mode is masked to `0o0777` so **setuid / setgid /
-    /// sticky are stripped** — an uploaded (server) or downloaded (client) file
-    /// can never carry a privilege-escalation bit chosen by the peer.
+    /// unrelated file.
+    ///
+    /// `mode` is a peer-chosen wire field, so it is never applied verbatim: it
+    /// goes through `clamp_file_mode`, which strips setuid/setgid/sticky,
+    /// refuses group/world-write, and caps the result at what this process'
+    /// umask would have allowed. This is the single file-mode sink shared by
+    /// every path (client get, get -r, resume, server put), so the ceiling holds
+    /// for all of them at one point.
     async fn commit(mut self, mode: u32) -> std::io::Result<()> {
         // The wire `mode` is unix permission bits; on windows the staged file
         // keeps the owner-only DACL it was created with (there is no
@@ -972,7 +1042,7 @@ impl Staged {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let perm = std::fs::Permissions::from_mode(mode & 0o0777);
+                let perm = std::fs::Permissions::from_mode(clamp_file_mode(mode));
                 f.set_permissions(perm).await?; // fchmod on the fd, not the path
             }
         }
@@ -1611,6 +1681,21 @@ where
     // existence oracle for paths outside its policy roots (enumerate a directory
     // it may not read). The specific reason is recorded in the audit log only —
     // same rationale as ssh not revealing why an auth attempt failed.
+    //
+    // The reason embeds the *peer-chosen* request path, and it reaches two
+    // different sinks, which need different treatment:
+    //   - the audit log, via `audit_best_effort`. That record is evidence, so it
+    //     keeps the reason VERBATIM and at full length; `audit()` already blanks
+    //     control characters (so a peer cannot forge or erase records) without
+    //     truncating, which is exactly the fidelity an audit trail needs.
+    //   - the returned error, which `p2p::processor::run_listen_loop` prints on
+    //     the operator's terminal. Only that copy is passed through
+    //     `sanitize_for_terminal_bounded`: unfiltered it would let a peer paint
+    //     ANSI/CR sequences over the operator's console (erase or forge lines),
+    //     and the wire cap on a path is ~1 MB, so the length bound keeps a
+    //     hostile path from flooding the scrollback. 256 chars matches the bound
+    //     the frame decoder and `show_path` already use. The untruncated reason
+    //     remains in the audit log.
     macro_rules! deny {
         ($reason:expr) => {{
             let reason: String = $reason;
@@ -1618,7 +1703,10 @@ where
             let _ = send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Err("denied".into())).await;
             // Let the client read the denial before we tear down the stream.
             drain_until_close(&mut reader).await;
-            return Err(CryptoError::Parameter(format!("scp denied: {reason}")));
+            return Err(CryptoError::Parameter(format!(
+                "scp denied: {}",
+                crate::utils::sanitize_for_terminal_bounded(&reason, 256)
+            )));
         }};
     }
 
@@ -1715,7 +1803,18 @@ where
                                     #[cfg(unix)]
                                     {
                                         use std::os::unix::fs::PermissionsExt;
-                                        let _ = dfd.set_permissions(std::fs::Permissions::from_mode(mode & 0o0777));
+                                        // Same rule as the client sink (`recv_tree`), in
+                                        // both halves. (a) Only a directory *this* transfer
+                                        // created is moded — a re-put onto an existing one
+                                        // keeps the mode the operator gave it, so a peer
+                                        // cannot re-mode the write root's own subtree.
+                                        // (b) `clamp_dir_mode` strips group/other write, so
+                                        // a write-granted peer cannot turn a directory it
+                                        // creates under our write root into a drop point
+                                        // every other local user can write to.
+                                        if created {
+                                            let _ = dfd.set_permissions(std::fs::Permissions::from_mode(clamp_dir_mode(mode)));
+                                        }
                                     }
                                     true
                                 } else {
@@ -2172,6 +2271,152 @@ mod tests {
         );
     }
 
+    // ---- F14: the server's MkDir sink must follow the same rule ------------
+
+    /// A write root for a synthetic peer, plus the policy file granting it.
+    /// `write=` roots are canonicalized at policy load, so the root (and the
+    /// paths the peer names) must be the resolved one — /var vs /private/var on
+    /// macOS. The policy lives beside the root, never inside it.
+    #[cfg(unix)]
+    fn scp_server_write_root(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = dir.join("root");
+        std::fs::create_dir(&root).expect("mkdir root");
+        let root = root.canonicalize().expect("canonicalize root");
+        let policy_path = dir.join("scp.policy");
+        std::fs::write(
+            &policy_path,
+            format!("{} write=\"{}\"\n", "11".repeat(32), root.display()),
+        )
+        .expect("write policy");
+        (root, policy_path)
+    }
+
+    /// Drive `run_scp_server` over a synthesized `put` batch and return the
+    /// frames it replied with, so a test can tell an `Ack` from a `Fail`.
+    #[cfg(unix)]
+    async fn run_scp_server_put(policy_path: &Path, frames: &[ScpFrame]) -> Vec<ScpFrame> {
+        let peer_fp = parse_fp_hex(&"11".repeat(32)).expect("fingerprint");
+        let bytes = wire(frames).await;
+        let mut reader = &bytes[..];
+        let mut sink: Vec<u8> = Vec::new();
+        run_scp_server(
+            &mut reader,
+            &mut sink,
+            T_AEAD,
+            &T_KEY,
+            &T_KEY,
+            peer_fp,
+            Some(policy_path.to_str().expect("policy path is utf8")),
+            None,
+        )
+        .await
+        .expect("put batch");
+
+        // Both role keys are T_KEY here, so the server's tx stream decodes with
+        // the same key from counter 0.
+        let mut replies = Vec::new();
+        let mut rd = &sink[..];
+        let mut ctr = 0u64;
+        while let Some(f) = recv(&mut rd, T_AEAD, &T_KEY, &mut ctr)
+            .await
+            .expect("decode server reply")
+        {
+            replies.push(f);
+        }
+        replies
+    }
+
+    /// F14: the same ceiling must hold at the **server's** `MkDir` sink, which a
+    /// client `put -r` drives. Unclamped, an authenticated peer holding a write
+    /// grant could ask for `0o777` and be handed a world-writable drop point
+    /// inside the operator's write root — where any other local user could plant
+    /// files, or replace the ones the peer uploads into it afterwards.
+    ///
+    /// Both directions are asserted: `0o777` loses group/other write, and an
+    /// ordinary request passes through untouched (the clamp is a ceiling, not a
+    /// rewrite) — `0o750` in particular is not the mode `create_dir` would have
+    /// left behind, so it fails if the mode is never applied at all.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_mkdir_clamps_group_and_other_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, policy_path) = scp_server_write_root(dir.path());
+
+        for (asked, want) in [(0o777u32, 0o755u32), (0o755, 0o755), (0o750, 0o750)] {
+            let target = root.join(format!("d{asked:o}"));
+            let replies = run_scp_server_put(
+                &policy_path,
+                &[
+                    ScpFrame::MkDir {
+                        file_id: 1,
+                        path: target.to_string_lossy().into_owned(),
+                        mode: asked,
+                    },
+                    ScpFrame::Done,
+                ],
+            )
+            .await;
+
+            assert_eq!(
+                replies,
+                vec![ScpFrame::Ack { file_id: 1 }],
+                "MkDir {asked:o} was not accepted"
+            );
+            assert_eq!(
+                mode_of(&target),
+                want,
+                "server applied MkDir mode {asked:o} without the clamp"
+            );
+        }
+    }
+
+    /// F14, the other half: the server must not re-mode a directory that
+    /// existed before the transfer, exactly as the client refuses to
+    /// (`mkdir_leaves_pre_existing_directory_mode_alone`). Otherwise a peer
+    /// holding a write grant can widen an operator's private `0o700` directory
+    /// anywhere in the write root to `0o755`, or narrow a shared one to `0o700`
+    /// and lock the operator's own group out.
+    ///
+    /// The entry must still be accepted: a `put -r` re-uploading into a tree
+    /// that is already there succeeds, the mode is simply left alone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_mkdir_leaves_pre_existing_directory_mode_alone() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (root, policy_path) = scp_server_write_root(dir.path());
+
+        // Widening (0o700 → 0o755) and narrowing (0o770 → 0o700) are both
+        // refused; the operator's bits survive either way.
+        for (before, asked) in [(0o700u32, 0o755u32), (0o770, 0o700)] {
+            let existing = root.join(format!("keep{before:o}"));
+            make_dir_with_mode(&existing, before);
+
+            let replies = run_scp_server_put(
+                &policy_path,
+                &[
+                    ScpFrame::MkDir {
+                        file_id: 7,
+                        path: existing.to_string_lossy().into_owned(),
+                        mode: asked,
+                    },
+                    ScpFrame::Done,
+                ],
+            )
+            .await;
+
+            assert_eq!(
+                replies,
+                vec![ScpFrame::Ack { file_id: 7 }],
+                "a re-put onto an existing directory must still be accepted"
+            );
+            assert_eq!(
+                mode_of(&existing),
+                before,
+                "the server re-moded a pre-existing directory to the peer's {asked:o}"
+            );
+        }
+    }
+
     // ---- F1: peer-named paths must not reach the terminal unescaped ---------
 
     /// A `Put` path carrying ANSI control sequences must not survive into the
@@ -2523,8 +2768,73 @@ mod tests {
         staged.write_all(b"#!/bin/sh\n").await.unwrap();
         staged.commit(0o6755).await.unwrap(); // setuid+setgid+rwxr-xr-x
         let mode = std::fs::metadata(&final_path).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o0755, "setuid/setgid must be stripped, got {mode:o}");
+        assert_eq!(
+            mode & 0o7000,
+            0,
+            "setuid/setgid/sticky must be stripped, got {mode:o}"
+        );
+        // These tests never call `init_process_umask`, so the conservative
+        // fallback umask (0o077) applies on top and the r-x bits go too.
+        assert_eq!(mode, 0o0700, "expected the clamped mode, got {mode:o}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn staged_commit_clamps_peer_chosen_mode() {
+        // `mode` is an untrusted wire field of Put/ResumeFrom, and `fchmod` is
+        // not filtered by the umask, so applying it verbatim would let a
+        // hostile server answering `--scp-get secret.pem` with `Put{mode:0o666}`
+        // publish the operator's freshly downloaded private key readable — and
+        // writable — by every other local user. `commit` must clamp it.
+        //
+        // No test calls `init_process_umask`, so the fallback umask (0o077,
+        // the conservative one) is in force: nothing non-owner survives. In
+        // particular 0o666 must NOT land world-readable.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("nkct-scp-mode-{:x}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (asked, want) in [
+            (0o666u32, 0o600u32),
+            (0o777, 0o700),
+            (0o662, 0o600),
+            (0o644, 0o600),
+            (0o600, 0o600), // an already-narrow request is untouched
+        ] {
+            let final_path = dir.join(format!("f{asked:o}.bin"));
+            let staged = Staged::create(final_path.clone()).unwrap();
+            staged.commit(asked).await.unwrap();
+            let got = std::fs::metadata(&final_path).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(got, want, "mode {asked:o} must clamp to {want:o}, got {got:o}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn clamp_file_mode_never_widens_past_the_umask() {
+        // The rule the operator gets in the real binary, where `main` samples
+        // the umask before the runtime starts: the umask — never the peer —
+        // decides the group/other bits, exactly as it does for every other file
+        // the operator creates. And group/world-write is refused unconditionally,
+        // so even `umask 000` cannot yield a file another local user can rewrite.
+        for umask in [0o077u32, 0o027, 0o022, 0o002, 0o000] {
+            for asked in [0o666u32, 0o777, 0o644, 0o755, 0o600, 0o6777] {
+                let got = clamp_file_mode_under_umask(asked, umask);
+                assert_eq!(got & 0o7000, 0, "setuid/setgid/sticky survived {asked:o}");
+                assert_eq!(got & 0o022, 0, "group/world-write survived {asked:o}");
+                assert_eq!(got & umask, 0, "umask {umask:o} widened by {asked:o} -> {got:o}");
+                assert_eq!(got & !(asked & 0o0777), 0, "clamp widened {asked:o} -> {got:o}");
+            }
+        }
+        // Spelled out for the two umasks that matter most.
+        assert_eq!(clamp_file_mode_under_umask(0o666, 0o077), 0o600);
+        assert_eq!(clamp_file_mode_under_umask(0o777, 0o077), 0o700);
+        // umask 022 is the common default; the operator has said group/other may
+        // read, so they may — that is their policy, not the peer's choice.
+        assert_eq!(clamp_file_mode_under_umask(0o666, 0o022), 0o644);
+        // umask 000 still cannot produce a group/world-writable file.
+        assert_eq!(clamp_file_mode_under_umask(0o666, 0o000), 0o644);
     }
 
     #[tokio::test]
