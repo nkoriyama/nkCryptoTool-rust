@@ -323,6 +323,40 @@ pub fn build_file_receive_config(privkey: &str, pubkey: &str) -> crate::config::
     config
 }
 
+/// Build the `CryptoConfig` for the "Connect" button — chat, or the file
+/// *send* side of a transfer — and for the passphrase-retry that re-dials with
+/// the same fields, so a retry cannot differ from the attempt it repeats.
+///
+/// `privkey` / `pubkey` are the raw UI fields; empty means "not supplied" and
+/// must map to `None`, exactly as in [`build_file_receive_config`]. `Some("")`
+/// is not an empty value here, it is a false claim, and both fields are read as
+/// claims before they are read as paths:
+///
+/// * `signing_privkey.is_some()` *is* `has_signing_identity`, which sets
+///   `INITIATOR_SELF_AUTH` in handshake field #5 — after which the initiator
+///   must produce #6 and `sig_I`, so it loads the key and dies reading `""`.
+/// * `signing_pubkey.is_some()` *is* "I hold a responder pin", which sets
+///   `EXPECTS_RESPONDER_AUTH` and commits the pinned fingerprint in #7 — again
+///   read from a path that is not there.
+///
+/// Left `None`, both claims are simply absent, which is the truth, and the
+/// handshake then does the right thing on its own: it connects anonymously to a
+/// responder that accepts that (`--allow-unauth`), and is refused by one that
+/// does not — including this GUI's own receive listener, which sets
+/// `require_initiator_self_auth` precisely so every transfer is attributable.
+///
+/// `chat_mode` and `passphrase` are left at their defaults: they differ per
+/// call site, so the callers set them.
+#[cfg(feature = "gui")]
+fn build_connect_config(ticket: &str, privkey: &str, pubkey: &str) -> crate::config::CryptoConfig {
+    let mut config = crate::config::CryptoConfig::default();
+    config.connect_addr = Some(ticket.to_string());
+    config.signing_privkey = if privkey.is_empty() { None } else { Some(privkey.to_string()) };
+    config.signing_pubkey = if pubkey.is_empty() { None } else { Some(pubkey.to_string()) };
+    config.transport = crate::config::TransportKind::Iroh;
+    config
+}
+
 /// The UI label for the peer identity established by the handshake.
 ///
 /// `crate::shell::fp_hex` is a fixed-width rendering of 32 raw bytes (64
@@ -707,11 +741,7 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         };
 
         tokio::spawn(async move {
-            let mut config = crate::config::CryptoConfig::default();
-            config.connect_addr = Some(ticket.clone());
-            config.signing_privkey = Some(privkey.clone());
-            config.signing_pubkey = Some(pubkey.clone());
-            config.transport = crate::config::TransportKind::Iroh;
+            let mut config = build_connect_config(&ticket, &privkey, &pubkey);
 
             // Branch on transfer mode: Chat reuses GuiIOProvider, FileSend
             // builds a FileIOProvider with the selected file as input.
@@ -1050,12 +1080,8 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     let ui_handle_pass_retry = ui_handle.clone();
     tokio::spawn(async move {
         while let Some((passphrase, ticket, privkey, pubkey)) = pass_rx.recv().await {
-            let mut config = crate::config::CryptoConfig::default();
-            config.connect_addr = Some(ticket);
-            config.signing_privkey = Some(privkey);
-            config.signing_pubkey = Some(pubkey);
+            let mut config = build_connect_config(&ticket, &privkey, &pubkey);
             config.chat_mode = true;
-            config.transport = crate::config::TransportKind::Iroh;
             config.passphrase = Some(passphrase);
             
             let endpoint = match crate::p2p::backend::iroh::IrohEndpoint::new(&config, false).await {
@@ -1111,6 +1137,45 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
 
     ui.run()?;
     Ok(())
+}
+
+#[cfg(all(test, feature = "gui"))]
+mod connect_config_tests {
+    use super::build_connect_config;
+
+    /// An empty key field must reach the config as `None`, not `Some("")`.
+    /// `Some("")` is read as a claim long before it is read as a path:
+    /// `has_signing_identity` is `signing_privkey.is_some()`, so the initiator
+    /// announces `INITIATOR_SELF_AUTH` in handshake field #5 and only then
+    /// tries to load `""` as a key file — which is why a send from a GUI with
+    /// no key configured died locally instead of reaching the handshake at all.
+    /// `signing_pubkey` is the same shape: `Some("")` claims a responder pin
+    /// and so skips the "no pinned identity to verify against" refusal in
+    /// `p2p::processor` that exists to catch exactly this state.
+    #[test]
+    fn connect_config_leaves_empty_key_fields_unset() {
+        let config = build_connect_config("nkct1example", "", "");
+        assert!(
+            config.signing_privkey.is_none(),
+            "an empty key field is no signing identity, and must not claim to be one"
+        );
+        assert!(
+            config.signing_pubkey.is_none(),
+            "an empty expected-peer field is no responder pin, and must not claim to be one"
+        );
+        assert_eq!(config.connect_addr.as_deref(), Some("nkct1example"));
+    }
+
+    /// The honest flow is untouched: a filled-in field reaches the config
+    /// verbatim, so a send with keys configured behaves exactly as before.
+    #[test]
+    fn connect_config_keeps_supplied_key_paths_verbatim() {
+        let config = build_connect_config("nkct1example", "/keys/mine.priv", "/keys/bob.pub");
+        assert_eq!(config.signing_privkey.as_deref(), Some("/keys/mine.priv"));
+        assert_eq!(config.signing_pubkey.as_deref(), Some("/keys/bob.pub"));
+        assert_eq!(config.connect_addr.as_deref(), Some("nkct1example"));
+        assert!(matches!(config.transport, crate::config::TransportKind::Iroh));
+    }
 }
 
 // The tests that lived here exercised `extract_peer_id`'s panic-safety on
