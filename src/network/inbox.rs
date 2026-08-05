@@ -73,14 +73,32 @@
 //!
 //! FETCH is the prekey-*depletion downgrade* attack surface (PQFS_DESIGN.md
 //! §4.1): an attacker who drains the pool forces the recipient down to the
-//! no-FS static-key fallback. The mitigation is a **token-bucket rate limit
-//! keyed by the connecting (sender) NodeId** ([`FETCH_RL_CAPACITY`] /
+//! no-FS static-key fallback. The first mitigation is a **token-bucket rate
+//! limit keyed by the connecting (sender) NodeId** ([`FETCH_RL_CAPACITY`] /
 //! [`FETCH_RL_REFILL_PER_SEC`]). It raises the per-identity cost of
 //! draining; it is not a complete defence (NodeIds are cheap to mint), so
 //! the Strict profile's "refuse on depletion" policy remains the backstop.
 //! `depleted` and `rate limited` are distinct replies so the sender can
 //! tell genuine exhaustion (→ fallback / refuse) from a transient throttle
 //! (→ back off and retry).
+//!
+//! Because that bucket is keyed on a free-to-mint identity it bounds nothing
+//! in aggregate, so a FETCH is additionally gated by a **per-recipient
+//! reserve**. The server records the highest pool level it has ever observed
+//! for a recipient — its *stocking level*; only the recipient can raise it,
+//! since PUBLISH is keyed on the authenticated connection and no wire field
+//! names another identity's slot — and treats the lowest
+//! `1/PREKEY_RESERVE_DIVISOR` of it as a reserve band. **Above the band a draw
+//! is not gated at all**: a healthy pool is served to however many identities
+//! ask, so honest senders never meet the gate. A draw *at or below* the band
+//! also costs a token from a bucket keyed by the **recipient**
+//! ([`RESERVE_RL_CAPACITY`] / [`RESERVE_RL_REFILL_PER_SEC`]), so the
+//! below-floor drain rate is bounded no matter how many NodeIds an attacker
+//! mints. This bounds the rate and keeps real prekeys reachable while an
+//! attack runs, and it disengages the moment the recipient replenishes; it
+//! does **not** prevent the downgrade — a sustained attacker still ends in a
+//! `MODE_STATIC_ONLY` seal under the default profile, and refusing that
+//! remains the Strict profile's job.
 //!
 //! ### COUNT (own prekey pool size)
 //!
@@ -148,6 +166,43 @@ pub const FETCH_RL_REFILL_PER_SEC: f64 = 1.0 / 30.0;
 /// table reaches this, fully-refilled (idle) buckets are pruned, bounding
 /// memory without losing any throttle state for active senders.
 const FETCH_RL_MAX_TRACKED: usize = 4096;
+
+/// Fraction of a recipient's recorded stocking level held in reserve: the
+/// lowest `1/PREKEY_RESERVE_DIVISOR` of the pool is the rate-limited band,
+/// everything above it is drawn freely. A quarter leaves an honest,
+/// default-stocked recipient (`--prekey-count 100`) 75 ungated draws — far
+/// more than ordinary use consumes between two `maintain` runs — while still
+/// reserving a quarter of the pool for delivery at a bounded rate once the
+/// pool has genuinely been drawn down. Integer division, so a pool smaller
+/// than the divisor has a floor of 0 and is never gated: there is nothing
+/// meaningful to reserve out of three keys. Tunable policy, like the
+/// `FETCH_RL_*` pair, but never below 2: the floor must stay *under* the level
+/// it is compared against, or a pool would be gated the first time it is drawn
+/// from.
+pub const PREKEY_RESERVE_DIVISOR: u64 = 4;
+
+/// Reserve-band burst capacity, per **recipient**: this many draws may be
+/// taken back-to-back from a pool that is already inside its reserve band
+/// before the refill rate gates them — by any mix of senders, since the
+/// bucket is keyed on the recipient, not the caller.
+pub const RESERVE_RL_CAPACITY: f64 = 8.0;
+
+/// Reserve-band refill rate (tokens/second), per **recipient**. Deliberately
+/// the same shape as [`FETCH_RL_CAPACITY`] / [`FETCH_RL_REFILL_PER_SEC`]: once
+/// a pool is inside its reserve band, *everyone together* may draw it down no
+/// faster than a single well-behaved sender was already allowed to — which is
+/// the bound minting NodeIds cannot buy its way out of.
+pub const RESERVE_RL_REFILL_PER_SEC: f64 = 1.0 / 30.0;
+
+/// Soft cap on recipients tracked for the prekey reserve. When the table
+/// reaches it, refilled (idle) buckets are pruned, exactly as for the
+/// per-NodeId table: a recipient under active below-floor draw has the
+/// emptiest bucket and survives, so an attacker cannot flush a victim's
+/// stocking mark by flooding the table while draining it. If nothing is
+/// prunable — this many *distinct* pools being drawn below their floors at
+/// once, each at the sustained below-floor cost above — a not-yet-seen
+/// recipient goes untracked, and so ungated, until room appears.
+const RESERVE_MAX_TRACKED: usize = 4096;
 
 /// Upper bound on connections whose per-connection setup + handling run
 /// concurrently. A permit is reserved BEFORE the per-connection task is spawned,
@@ -563,25 +618,37 @@ mod server {
     use std::time::Instant;
     use zeroize::Zeroizing;
 
-    /// A leaky-bucket throttle for one connecting NodeId: `tokens` refills
-    /// at [`FETCH_RL_REFILL_PER_SEC`] up to [`FETCH_RL_CAPACITY`], and each
-    /// FETCH costs one token.
+    /// A leaky-bucket throttle: `tokens` refills at `refill_per_sec` up to
+    /// `capacity`, and each charged operation costs one token. Used twice with
+    /// different keys and rates — once per connecting NodeId
+    /// ([`FETCH_RL_CAPACITY`] / [`FETCH_RL_REFILL_PER_SEC`], keyed on the
+    /// caller) and once per recipient ([`RESERVE_RL_CAPACITY`] /
+    /// [`RESERVE_RL_REFILL_PER_SEC`], keyed on whose pool is being drawn).
     struct TokenBucket {
         tokens: f64,
         last: Instant,
+        capacity: f64,
+        refill_per_sec: f64,
     }
 
     impl TokenBucket {
-        fn new(now: Instant) -> Self {
-            Self { tokens: FETCH_RL_CAPACITY, last: now }
+        fn new(capacity: f64, refill_per_sec: f64, now: Instant) -> Self {
+            Self { tokens: capacity, last: now, capacity, refill_per_sec }
+        }
+
+        /// Tokens this bucket would hold at `now`, without mutating it. The
+        /// refill is lazy — it happens when the bucket is charged — so the
+        /// recorded `tokens` of a bucket nobody has touched still carries the
+        /// level it had when it was last charged.
+        fn tokens_at(&self, now: Instant) -> f64 {
+            let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+            (self.tokens + elapsed * self.refill_per_sec).min(self.capacity)
         }
 
         /// Refill for elapsed time, then take a token if one is available.
         fn try_take(&mut self, now: Instant) -> bool {
-            let elapsed = now.saturating_duration_since(self.last).as_secs_f64();
+            self.tokens = self.tokens_at(now);
             self.last = now;
-            self.tokens =
-                (self.tokens + elapsed * FETCH_RL_REFILL_PER_SEC).min(FETCH_RL_CAPACITY);
             if self.tokens >= 1.0 {
                 self.tokens -= 1.0;
                 true
@@ -591,10 +658,75 @@ mod server {
         }
 
         /// A bucket that has refilled to capacity is indistinguishable from a
-        /// fresh one, so it can be pruned to reclaim memory.
+        /// fresh one, so it can be pruned to reclaim memory. This reads the
+        /// *recorded* level, which is what the per-NodeId table has always
+        /// pruned on.
         fn is_full(&self) -> bool {
-            self.tokens >= FETCH_RL_CAPACITY
+            self.tokens >= self.capacity
         }
+
+        /// As [`Self::is_full`], but counting the refill owed since the bucket
+        /// was last charged. The per-recipient table prunes on this: a bucket
+        /// charged once and then left alone would otherwise never report full,
+        /// and a flood of briefly-charged recipients could pin the table and
+        /// leave every later recipient untracked.
+        fn is_full_at(&self, now: Instant) -> bool {
+            self.tokens_at(now) >= self.capacity
+        }
+    }
+
+    /// Per-recipient reserve state: what that recipient appears to stock, and
+    /// the budget for drawing on the reserve that stock implies.
+    ///
+    /// `stock` is derived from pool levels the server observed itself, inside
+    /// [`InboxServer::draw_prekey`]'s critical section. A fetcher can only ever
+    /// make the level go *down*, and `stock` is a high-water mark, so no
+    /// sequence of FETCHes from any number of minted NodeIds can talk a floor
+    /// down. Raising it needs prekeys in the slot, and only the slot's owner
+    /// can put them there — PUBLISH is keyed on the authenticated connection,
+    /// so a stranger cannot write another identity's slot. The whole table is
+    /// soft state: it is process-local, so a server restart simply re-derives
+    /// every mark from the live pool levels.
+    struct Reserve {
+        /// Highest pool level ever seen for this recipient: the evidence of
+        /// what it stocks, and what the floor is computed from.
+        stock: u64,
+        /// Below-floor draw budget, keyed by the **recipient**.
+        bucket: TokenBucket,
+    }
+
+    impl Reserve {
+        fn new(level: u64, now: Instant) -> Self {
+            Self {
+                stock: level,
+                bucket: TokenBucket::new(RESERVE_RL_CAPACITY, RESERVE_RL_REFILL_PER_SEC, now),
+            }
+        }
+
+        /// Fold in the level observed on this draw. `stock` only ever rises, so
+        /// draining a pool cannot lower its own floor.
+        fn observe(&mut self, level: u64) {
+            self.stock = self.stock.max(level);
+        }
+    }
+
+    /// The reserve floor for a recipient whose recorded stocking level is
+    /// `stock`: draws are ungated while strictly more than this many prekeys
+    /// remain. See [`PREKEY_RESERVE_DIVISOR`].
+    fn reserve_floor(stock: u64) -> u64 {
+        stock / PREKEY_RESERVE_DIVISOR
+    }
+
+    /// Outcome of [`InboxServer::draw_prekey`].
+    enum Draw {
+        /// A popped one-time prekey blob.
+        Prekey(Vec<u8>),
+        /// The recipient's pool is empty.
+        Depleted,
+        /// The pool is inside its reserve band and the recipient's reserve
+        /// budget is spent. Distinct from `Depleted` — prekeys remain, and the
+        /// caller is told to back off rather than that the pool is exhausted.
+        Throttled,
     }
 
     /// Persistent inbox: redb-backed envelope storage + ALPN_INBOX accept loop.
@@ -604,6 +736,12 @@ mod server {
         /// A std mutex, not async: the critical section is a few map ops
         /// with no `.await`, so it never blocks the runtime meaningfully.
         fetch_rl: StdMutex<HashMap<PeerId, TokenBucket>>,
+        /// Per-recipient prekey reserve (the second half of the same
+        /// mitigation), taken **only** by [`Self::draw_prekey`] — no other
+        /// handler touches it. Also the serialization point for count+pop, so
+        /// the critical section spans two synchronous redb calls and, still,
+        /// no `.await`.
+        prekey_reserve: StdMutex<HashMap<PeerId, Reserve>>,
         /// Bounds concurrent per-connection setup + handling (see
         /// [`MAX_CONCURRENT_CONNECTIONS`]).
         conn_sem: Arc<tokio::sync::Semaphore>,
@@ -640,6 +778,7 @@ mod server {
             Ok(Self {
                 store,
                 fetch_rl: StdMutex::new(HashMap::new()),
+                prekey_reserve: StdMutex::new(HashMap::new()),
                 conn_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             })
         }
@@ -662,8 +801,83 @@ mod server {
                 map.retain(|_, b| !b.is_full());
             }
             map.entry(who)
-                .or_insert_with(|| TokenBucket::new(now))
+                .or_insert_with(|| {
+                    TokenBucket::new(FETCH_RL_CAPACITY, FETCH_RL_REFILL_PER_SEC, now)
+                })
                 .try_take(now)
+        }
+
+        /// The single path from a FETCH to [`RedbInboxStore::fetch_prekey`].
+        ///
+        /// Counts the recipient's remaining prekeys and pops one inside **one**
+        /// critical section, so concurrent fetches cannot all observe a healthy
+        /// level and then all pop past the floor.
+        ///
+        /// Above the floor there is no per-recipient check at all — a healthy
+        /// pool is served to however many identities ask, so an honest sender
+        /// never meets the gate. At or below the floor the draw also costs a
+        /// token from a bucket keyed by the **recipient**, which is what bounds
+        /// the aggregate below-floor drain rate: minting fresh NodeIds defeats
+        /// `allow_fetch`, but every one of them draws from the same bucket
+        /// here. The floor itself is a function of the *recipient's own* pool
+        /// (`Reserve::stock`), never of a global constant, so a recipient that
+        /// stocks 100 and one that stocks 256 are each gated only over their
+        /// own drained tail — and a recipient that has never published gets no
+        /// entry at all.
+        fn draw_prekey(&self, recipient: PeerId) -> Result<Draw, InboxError> {
+            let now = Instant::now();
+            // Poison recovery as in `allow_fetch`: throttle bookkeeping must
+            // not take the whole server down for other peers.
+            let mut reserve = self
+                .prekey_reserve
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let level = self.store.count_prekeys(recipient.as_bytes())? as u64;
+            if level == 0 {
+                // Nothing to reserve. Return before touching the table so an
+                // identity that never published — any stranger can name one on
+                // the wire — allocates no state here.
+                return Ok(Draw::Depleted);
+            }
+            let allowed = match reserve.get_mut(&recipient) {
+                Some(r) => {
+                    r.observe(level);
+                    level > reserve_floor(r.stock) || r.bucket.try_take(now)
+                }
+                None => {
+                    // First draw seen for this recipient: `level` is the only
+                    // evidence of what it stocks, and `reserve_floor(level) <
+                    // level` for any non-empty pool, so this draw is above the
+                    // floor and costs no token. Record the level as the
+                    // stocking mark the following draws are measured against.
+                    if reserve.len() >= RESERVE_MAX_TRACKED {
+                        reserve.retain(|_, r| !r.bucket.is_full_at(now));
+                    }
+                    if reserve.len() < RESERVE_MAX_TRACKED {
+                        reserve.insert(recipient, Reserve::new(level, now));
+                    }
+                    true
+                }
+            };
+            if !allowed {
+                return Ok(Draw::Throttled);
+            }
+            // Still under the same lock as the count above, so no other pop can
+            // slip in between "the pool is above its floor" and taking a key.
+            match self.store.fetch_prekey(recipient.as_bytes())? {
+                Some(b) => Ok(Draw::Prekey(b)),
+                None => Ok(Draw::Depleted),
+            }
+        }
+
+        /// Test-only view of the reserve table's size, so the tests can assert
+        /// that an empty slot allocates no per-recipient state.
+        #[cfg(test)]
+        pub(crate) fn tracked_reserves(&self) -> usize {
+            self.prekey_reserve
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len()
         }
 
         /// Run the accept loop. Each accepted stream is dispatched on
@@ -891,7 +1105,9 @@ mod server {
 
             // Rate-limit by the connecting (sender) NodeId — the documented
             // mitigation for the prekey-depletion downgrade (PQFS_DESIGN.md
-            // §4.1). Done before the DB pop so a throttled caller can't drain.
+            // §4.1). Done before the DB pop so a throttled caller can't drain,
+            // and before the reserve below: `allow_fetch` takes and drops its
+            // own lock, so the two throttle locks are never held at once.
             if !self.allow_fetch(fetcher) {
                 write_timed(stream, &[REPLY_RATE_LIMITED], "fetch reply (rate limited)").await?;
                 tokio::time::timeout(IO_TIMEOUT, stream.flush())
@@ -901,18 +1117,26 @@ mod server {
                 return Ok(());
             }
 
-            // Pop the lowest-id prekey atomically (single redb write txn), so
-            // two concurrent FETCHes can never be handed the same one-time key.
-            let blob: Option<Vec<u8>> = self.store.fetch_prekey(recipient.as_bytes())?;
-
-            match blob {
-                Some(b) => {
+            // `recipient` is an unauthenticated wire field: it names *someone
+            // else's* one-time key to consume, and the caller's NodeId is free
+            // to mint, so the bucket charged above bounds nothing in aggregate.
+            // `draw_prekey` therefore counts and pops under one lock and, once
+            // the pool is inside its own reserve band, charges the draw to a
+            // budget keyed on the recipient. It also pops the lowest-id prekey
+            // atomically (single redb write txn), so two concurrent FETCHes can
+            // never be handed the same one-time key.
+            match self.draw_prekey(recipient)? {
+                Draw::Prekey(b) => {
                     write_timed(stream, &[REPLY_OK], "fetch reply (ok)").await?;
                     write_timed(stream, &(b.len() as u32).to_le_bytes(), "fetch len").await?;
                     write_timed(stream, &b, "fetch blob").await?;
                 }
-                None => {
+                Draw::Depleted => {
                     write_timed(stream, &[REPLY_PREKEY_NONE], "fetch reply (none)").await?;
+                }
+                Draw::Throttled => {
+                    write_timed(stream, &[REPLY_RATE_LIMITED], "fetch reply (rate limited)")
+                        .await?;
                 }
             }
             tokio::time::timeout(IO_TIMEOUT, stream.flush())
@@ -1281,6 +1505,182 @@ mod tests {
             fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
             FetchOutcome::RateLimited
         );
+
+        task.abort();
+    }
+
+    /// A never-before-seen fetcher identity. An iroh NodeId is a free-to-mint
+    /// keypair, which is exactly what lets an attacker walk around the
+    /// per-NodeId FETCH bucket — so the reserve tests below spend a fresh one
+    /// on every draw, leaving the per-recipient reserve as the only thing that
+    /// can be measuring them.
+    fn fresh_fetcher(net: &Arc<MockNetwork>, n: u16) -> Arc<dyn P2pEndpoint> {
+        // Shaped so it can never collide with the `pid(b)` = [b; 32] ids.
+        let mut raw = [0u8; 32];
+        raw[0] = 0xA5;
+        raw[1] = (n >> 8) as u8;
+        raw[2] = n as u8;
+        Arc::new(net.register(PeerId::new(raw), vec![P2pProtocol(ALPN_INBOX)]))
+            as Arc<dyn P2pEndpoint>
+    }
+
+    /// The reserve gates the drained tail and nothing else, for a recipient
+    /// that stocked the `--prekey-count` default of 100.
+    ///
+    /// Above the floor (the lowest quarter of what this recipient actually
+    /// stocks) no per-recipient budget is consulted at all, however many fresh
+    /// identities ask — an honest sender never meets the gate. Inside the band
+    /// a draw also costs a recipient-keyed token, and once that burst is spent
+    /// the answer is RateLimited *with prekeys still in the pool*, not
+    /// Depleted: the remaining keys stay there for whoever draws next, and a
+    /// single replenishment disengages the gate again.
+    #[tokio::test]
+    async fn reserve_gates_only_the_drained_tail_of_a_default_pool() {
+        const STOCK: u64 = 100; // the `--prekey-count` default
+        let (net, _server, task, srv, _dir) = spawn_server().await;
+        let bob =
+            Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let batch: Vec<Vec<u8>> = (0..STOCK).map(|i| format!("pk-{i}").into_bytes()).collect();
+        publish_prekeys(bob.as_ref(), &srv, &batch).await.expect("publish");
+
+        let floor = STOCK / PREKEY_RESERVE_DIVISOR; // 25
+        let free = STOCK - floor; // 75 ungated draws
+        let mut minted = Vec::new();
+
+        for i in 0..free {
+            let ep = fresh_fetcher(&net, i as u16);
+            assert!(
+                matches!(
+                    fetch_prekey(ep.as_ref(), &srv, pid(2)).await.unwrap(),
+                    FetchOutcome::Prekey(_)
+                ),
+                "draw {i} is above the floor and must not be gated"
+            );
+            minted.push(ep);
+        }
+        // The pool now sits exactly at its floor. What is left of the reserve
+        // is one burst, shared by every identity rather than granted per one.
+        for i in 0..RESERVE_RL_CAPACITY as u64 {
+            let ep = fresh_fetcher(&net, (free + i) as u16);
+            assert!(
+                matches!(
+                    fetch_prekey(ep.as_ref(), &srv, pid(2)).await.unwrap(),
+                    FetchOutcome::Prekey(_)
+                ),
+                "reserve burst draw {i} must still be served"
+            );
+            minted.push(ep);
+        }
+
+        // Burst spent: a brand-new identity is throttled, and the reply says
+        // *throttled*, not depleted — because prekeys really do remain.
+        let attacker = fresh_fetcher(&net, 9000);
+        assert_eq!(
+            fetch_prekey(attacker.as_ref(), &srv, pid(2)).await.unwrap(),
+            FetchOutcome::RateLimited
+        );
+        let left = count_prekeys(bob.as_ref(), &srv).await.unwrap() as u64;
+        assert_eq!(left, floor - RESERVE_RL_CAPACITY as u64, "the reserve must be held back");
+        assert!(left > 0);
+
+        // A `maintain` run (top back up to the same target) disengages the gate
+        // on the very next draw: the pool is above its floor again, so no token
+        // is consulted even though the reserve bucket is still empty.
+        let refill: Vec<Vec<u8>> = (0..STOCK - left).map(|i| format!("re-{i}").into_bytes()).collect();
+        publish_prekeys(bob.as_ref(), &srv, &refill).await.expect("republish");
+        let after = fresh_fetcher(&net, 9001);
+        assert!(matches!(
+            fetch_prekey(after.as_ref(), &srv, pid(2)).await.unwrap(),
+            FetchOutcome::Prekey(_)
+        ));
+
+        task.abort();
+    }
+
+    /// Minting a fresh NodeId walks around the per-NodeId FETCH bucket but not
+    /// around the recipient's reserve: once a pool is drawn into its band and
+    /// the reserve burst is spent, brand-new identities are throttled on that
+    /// recipient — while the very same brand-new identity draws normally from a
+    /// *different*, healthy recipient, proving it is the recipient's budget
+    /// doing the gating and not the caller's.
+    #[tokio::test]
+    async fn fresh_nodeid_cannot_bypass_the_recipient_reserve() {
+        const STOCK: u64 = 40; // floor 10, so the band outlives the burst
+        let (net, _server, task, srv, _dir) = spawn_server().await;
+        let bob =
+            Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let carol =
+            Arc::new(net.register(pid(3), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let bobs: Vec<Vec<u8>> = (0..STOCK).map(|i| format!("bob-{i}").into_bytes()).collect();
+        publish_prekeys(bob.as_ref(), &srv, &bobs).await.expect("publish bob");
+        let carols: Vec<Vec<u8>> = (0..8u64).map(|i| format!("carol-{i}").into_bytes()).collect();
+        publish_prekeys(carol.as_ref(), &srv, &carols).await.expect("publish carol");
+
+        // Drain bob's pool through its floor with one fresh identity per draw.
+        let mut minted = Vec::new();
+        let drawn = STOCK - STOCK / PREKEY_RESERVE_DIVISOR + RESERVE_RL_CAPACITY as u64;
+        for i in 0..drawn {
+            let ep = fresh_fetcher(&net, i as u16);
+            assert!(matches!(
+                fetch_prekey(ep.as_ref(), &srv, pid(2)).await.unwrap(),
+                FetchOutcome::Prekey(_)
+            ));
+            minted.push(ep);
+        }
+
+        for i in 0..3u16 {
+            let ep = fresh_fetcher(&net, 5000 + i);
+            // Never seen before, its own bucket untouched — still throttled on
+            // bob, because the budget it is spending is bob's.
+            assert_eq!(
+                fetch_prekey(ep.as_ref(), &srv, pid(2)).await.unwrap(),
+                FetchOutcome::RateLimited
+            );
+            // ...and not throttled at all on carol, whose pool is healthy.
+            assert!(matches!(
+                fetch_prekey(ep.as_ref(), &srv, pid(3)).await.unwrap(),
+                FetchOutcome::Prekey(_)
+            ));
+            minted.push(ep);
+        }
+        // Bob's reserve still holds real keys after all of that.
+        assert!(count_prekeys(bob.as_ref(), &srv).await.unwrap() > 0);
+
+        task.abort();
+    }
+
+    /// A recipient that has never published allocates no per-recipient state,
+    /// however often a stranger names it on the wire: the recipient id in a
+    /// FETCH is unauthenticated, so an empty slot must not be a way to make the
+    /// server allocate. Tracking starts at the first draw from a slot that
+    /// actually holds prekeys.
+    #[tokio::test]
+    async fn never_published_recipient_allocates_no_reserve_bucket() {
+        let (net, server, task, srv, _dir) = spawn_server().await;
+        let stranger = fresh_fetcher(&net, 1);
+
+        for _ in 0..5 {
+            assert_eq!(
+                fetch_prekey(stranger.as_ref(), &srv, pid(4)).await.unwrap(),
+                FetchOutcome::Depleted
+            );
+        }
+        assert_eq!(
+            server.tracked_reserves(),
+            0,
+            "an empty slot must not allocate a reserve bucket"
+        );
+
+        // A slot that does hold prekeys is tracked from its first draw — that
+        // record is what the floor is derived from.
+        let bob =
+            Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        publish_prekeys(bob.as_ref(), &srv, &[b"pk-1".to_vec()]).await.expect("publish");
+        assert!(matches!(
+            fetch_prekey(stranger.as_ref(), &srv, pid(2)).await.unwrap(),
+            FetchOutcome::Prekey(_)
+        ));
+        assert_eq!(server.tracked_reserves(), 1);
 
         task.abort();
     }

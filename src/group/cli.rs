@@ -503,9 +503,13 @@ where
                 let _ = out.flush().await;
             }
             Err(e) => {
+                // Carries a hostile recipient's close reason via
+                // `Connect`/`open_bi`, printed into the same prompt the inbound
+                // task writes its `[err]` lines to — sanitize it identically.
+                let msg = crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256);
                 let mut out = stdout.lock().await;
                 let _ = out
-                    .write_all(format!("[send err] {e}\n> ").as_bytes())
+                    .write_all(format!("[send err] {msg}\n> ").as_bytes())
                     .await;
                 let _ = out.flush().await;
             }
@@ -614,9 +618,14 @@ pub async fn listen_loop(
                         env
                     }
                     Err(e) => {
+                        // Remote-influenced the same way `[inbound err]` is: the
+                        // inbox server's QUIC close reason is rendered verbatim
+                        // into this string, and it lands in the same REPL the
+                        // operator reads group events from.
+                        let msg = crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256);
                         let mut out = stdout.lock().await;
                         let _ = out
-                            .write_all(format!("[inbox poll err] {e}\n").as_bytes())
+                            .write_all(format!("[inbox poll err] {msg}\n").as_bytes())
                             .await;
                         let _ = out.flush().await;
                         continue;
@@ -626,9 +635,14 @@ pub async fn listen_loop(
                     let evt = match processor.process_inbox_envelope(&env).await {
                         Ok(evt) => evt,
                         Err(e) => {
+                            // The envelope being dispatched was posted by a
+                            // remote peer, so its rejection reason can echo
+                            // peer-chosen bytes into this REPL. Same gate.
+                            let msg =
+                                crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256);
                             let mut out = stdout.lock().await;
                             let _ = out
-                                .write_all(format!("[inbox dispatch err] {e}\n").as_bytes())
+                                .write_all(format!("[inbox dispatch err] {msg}\n").as_bytes())
                                 .await;
                             let _ = out.flush().await;
                             continue;
@@ -700,9 +714,22 @@ pub async fn listen_loop(
                     Ok(evt) => evt,
                     Err(e) => {
                         // Don't break on transient errors.
+                        //
+                        // The rendered error carries peer-chosen text: an
+                        // unauthenticated dialer's QUIC close reason arrives here
+                        // inside `Transport(Accept("accept_bi: …"))`, and this
+                        // REPL is where the operator reads `[joined]` /
+                        // `[epoch advanced]` / `[removed]` to judge who is in the
+                        // group. Strip the control/bidi characters that would let
+                        // that peer erase or forge those lines, and bound the
+                        // length so a repeated close can't flood the scrollback —
+                        // the same gate `chat_group_loop`'s inbound task applies.
+                        // Truncation only drops attacker-chosen tail: the error's
+                        // own scaffolding is printed first, the peer's bytes last.
+                        let msg = crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256);
                         let mut out = stdout.lock().await;
                         let _ = out
-                            .write_all(format!("[inbound err] {e}\n").as_bytes())
+                            .write_all(format!("[inbound err] {msg}\n").as_bytes())
                             .await;
                         let _ = out.flush().await;
                         continue;
@@ -922,7 +949,17 @@ pub async fn listen_loop(
                                             say(format!("[me] {trimmed}")).await;
                                         }
                                         Err(e) => {
-                                            say(format!("[send err] {e}")).await;
+                                            // A send failure carries the
+                                            // *recipient's* text — its QUIC close
+                                            // reason via `Connect`/`open_bi` —
+                                            // so it needs the same terminal gate
+                                            // as the inbound errors above.
+                                            let msg =
+                                                crate::utils::sanitize_for_terminal_bounded(
+                                                    &e.to_string(),
+                                                    256,
+                                                );
+                                            say(format!("[send err] {msg}")).await;
                                         }
                                     }
                                 }

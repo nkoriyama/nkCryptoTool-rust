@@ -9,6 +9,9 @@
 //! single owner of the model, while tokio tasks own the processor.
 //! Errors surface in the status bar (red) rather than printing to
 //! stderr; the user keeps a usable window even after a backend hiccup.
+//! The exception is the inbound task, whose per-connection errors are
+//! peer-paced: those become `[err]` rows in the message list, which is
+//! bounded and coalesced, and only a closed endpoint stops the task.
 //!
 //! The processor here is built fresh against a sqlite path and an
 //! `Arc<dyn P2pEndpoint>` passed in by `main.rs` so this module is
@@ -112,11 +115,19 @@ pub async fn run_group_gui(
                     push_event_into_ui(&inbound_ui, &inbound_rows, evt);
                 }
                 Err(e) => {
-                    // Transport errors usually mean the endpoint
-                    // closed; report once and exit the loop.
-                    let msg = format!("inbound: {e}");
-                    set_status(&inbound_ui, msg, true);
-                    break;
+                    if inbound_error_is_fatal(&e) {
+                        // The endpoint is gone (shutdown): nothing can ever
+                        // arrive again, so report once and leave the loop. The
+                        // only fatal variant's `Display` is fixed text with no
+                        // peer input in it, so it needs no sanitizing.
+                        set_status(&inbound_ui, format!("inbound: {e}"), true);
+                        break;
+                    }
+                    // Every other error is scoped to the one incoming
+                    // connection that produced it. Surface it and keep
+                    // accepting, exactly as the CLI twin does — see
+                    // `inbound_error_is_fatal`.
+                    push_row_into_ui(&inbound_ui, &inbound_rows, render_inbound_error(&e));
                 }
             }
         }
@@ -170,6 +181,23 @@ fn wire_group_selected(
     ui.on_group_selected(move |row| {
         let proc_clone = Arc::clone(&processor);
         let ui_h = ui_handle.clone();
+        // Resolve the click against the row the user actually saw, here on
+        // the event-loop thread, and carry the *identity* into the worker.
+        // Resolving the index later against a freshly-listed `list_groups`
+        // was a TOCTOU: that list is storage-ordered and a remote peer grows
+        // it unauthenticated — an unsolicited Welcome auto-joins a group
+        // whose 32-byte id the sender chose, so an id sorting below ours
+        // shifts every row and the click lands on the attacker's group,
+        // which then becomes `selected_group_id`, the sole authorization
+        // input to Add Member.
+        let row = row as usize;
+        let gid = match selected_row_group_id(&ui_h, row) {
+            Ok(g) => g,
+            Err(e) => {
+                set_status(&ui_h, e, true);
+                return;
+            }
+        };
         tokio::spawn(async move {
             let groups = match cli::list_groups(&proc_clone).await {
                 Ok(g) => g,
@@ -178,11 +206,13 @@ fn wire_group_selected(
                     return;
                 }
             };
-            let row = row as usize;
-            let Some(gid) = groups.get(row).copied() else {
-                set_status(&ui_h, format!("no group at row {row}"), true);
+            // The row is stale in the other direction too: the group it names
+            // may have been left/removed since the model was populated. Reject
+            // rather than fall through to a neighbouring group.
+            if !groups.contains(&gid) {
+                set_status(&ui_h, format!("group {gid} is no longer available"), true);
                 return;
-            };
+            }
             let members = match cli::list_members(&proc_clone, &gid).await {
                 Ok(m) => m,
                 Err(e) => {
@@ -407,7 +437,15 @@ fn push_event_into_ui(
     rows: &Arc<ChatRowQueue>,
     evt: IncomingGroupEvent,
 ) {
-    let line = render_event(&evt);
+    push_row_into_ui(ui_handle, rows, render_event(&evt));
+}
+
+/// Stage one already-rendered row and post the drain closure if it is owed.
+/// Split out of [`push_event_into_ui`] so the inbound task's error rows reach
+/// the display through the same bounded, coalescing path as its event rows: a
+/// peer paces both, and the queue is what keeps either from growing Slint's
+/// unbounded event-loop queue.
+fn push_row_into_ui(ui_handle: &Weak<GroupChatWindow>, rows: &Arc<ChatRowQueue>, line: String) {
     if !rows.stage(line) {
         // A closure is already queued and will carry this row too; posting
         // another one would only deepen the queue we are trying to bound.
@@ -522,8 +560,68 @@ fn render_event(evt: &IncomingGroupEvent) -> String {
     }
 }
 
+/// Whether an `accept_next` error ends the inbound task.
+///
+/// Only a closed endpoint does — that is the shutdown signal, and after it no
+/// further inbound connection can arrive. Every other error `accept_next`
+/// returns is scoped to the single incoming connection that produced it and is
+/// remote-controlled: an unexpected ALPN, a stalled handshake, a zero or
+/// oversized MLS frame length, an undecodable `MlsMessage`, a SYNC from a
+/// non-member. Treating those as fatal let any peer that can reach this
+/// endpoint — including a member this window later removes — end MLS delivery
+/// for the whole session with one malformed frame, after which the window keeps
+/// looking alive while `[joined]` / `[epoch]` / `[removed]` and application
+/// messages silently stop. Most of all, the user would never learn they had
+/// been evicted, because `RemovedFromGroup` could no longer be delivered.
+///
+/// Same rule as the CLI twin in `group::cli`, deliberately: both drive the same
+/// `accept_next` loop.
+fn inbound_error_is_fatal(e: &crate::group::GroupError) -> bool {
+    matches!(
+        e,
+        crate::group::GroupError::Transport(crate::p2p::P2pError::Closed)
+    )
+}
+
+/// Render a non-fatal inbound error as one display row.
+///
+/// The text can carry peer-chosen bytes — a QUIC close reason arrives here
+/// inside `Transport(Accept("accept_bi: …"))`, and an unexpected ALPN is echoed
+/// back — and it lands in the very list the operator reads `[joined]` /
+/// `[epoch]` / `[removed]` from, so it goes through exactly the sanitizing and
+/// bounding `render_event` applies to a message body, for exactly the reasons
+/// documented there. Bounding is safe: every `GroupError` prints its own
+/// scaffolding (`transport: accept failed: …`) first and the peer's bytes last,
+/// so the cut can only drop attacker-chosen tail. The `[err]` prefix is ours,
+/// not the peer's, so it sits outside the bound.
+fn render_inbound_error(e: &crate::group::GroupError) -> String {
+    let text = crate::utils::sanitize_for_terminal_bounded(&e.to_string(), MAX_CHAT_ROW_CHARS);
+    format!("[err] {text}")
+}
+
 fn upgrade_get_selected_gid(ui_handle: &Weak<GroupChatWindow>) -> Option<String> {
     ui_handle.upgrade().map(|ui| ui.get_selected_group_id().to_string())
+}
+
+/// Read the group id out of the `groups` row the user clicked.
+///
+/// Every row of that model is written as `gid.to_string()` (64 hex chars) by
+/// `refresh_groups_*`, so the row carries the identity of the group it
+/// displays. Reading it here binds the selection to what was on screen; the
+/// row index alone is meaningless the moment the underlying list changes, and
+/// a remote peer can change it by sending a Welcome.
+///
+/// Must be called on the Slint event-loop thread — it touches the model.
+fn selected_row_group_id(
+    ui_handle: &Weak<GroupChatWindow>,
+    row: usize,
+) -> Result<GroupId, String> {
+    let ui = ui_handle.upgrade().ok_or("window is gone")?;
+    let item = ui
+        .get_groups()
+        .row_data(row)
+        .ok_or_else(|| format!("no group at row {row}"))?;
+    parse_group_id(item.text.as_str()).map_err(|e| format!("parse gid: {e}"))
 }
 
 fn parse_group_id(hex: &str) -> Result<GroupId, String> {
@@ -775,6 +873,154 @@ mod tests {
 
         // No lost wakeup: after the drain, the next event schedules again.
         assert!(rows.stage("after".to_string()));
+    }
+
+    /// Only a closed endpoint may end the inbound task. Every other error
+    /// `accept_next` returns is reachable by any peer that knows this node's
+    /// id — a member about to be removed, or anyone handed the ticket — so
+    /// treating one as fatal would let a single malformed frame silence
+    /// `[epoch]` / `[removed]` for the rest of the session.
+    #[test]
+    fn inbound_error_is_fatal_only_for_a_closed_endpoint() {
+        use crate::group::GroupError;
+        use crate::p2p::P2pError;
+
+        assert!(inbound_error_is_fatal(&GroupError::Transport(
+            P2pError::Closed
+        )));
+
+        for e in [
+            // Peer-triggerable, one connection each: bad ALPN, stalled
+            // handshake, empty/oversized frame length, undecodable message,
+            // SYNC for an unknown group or from a non-member.
+            GroupError::Transport(P2pError::Accept(
+                "accept_next: unexpected ALPN [\"bogus\"]".into(),
+            )),
+            GroupError::Transport(P2pError::Accept("read header: handshake timeout".into())),
+            GroupError::Transport(P2pError::Recv("stream reset by peer".into())),
+            GroupError::InvalidWelcome("Empty MLS frame length".into()),
+            GroupError::NotFound,
+            GroupError::NotMember,
+        ] {
+            assert!(
+                !inbound_error_is_fatal(&e),
+                "one connection's error must not end MLS delivery: {e}"
+            );
+        }
+    }
+
+    /// The error row carries peer-chosen text (a QUIC close reason, an echoed
+    /// ALPN), and it lands in the same list as the `[joined]` / `[epoch]` /
+    /// `[removed]` lines the operator trusts — so it must not be able to forge
+    /// them, and must stay bounded.
+    #[test]
+    fn render_inbound_error_neutralizes_peer_text() {
+        use crate::group::GroupError;
+        use crate::p2p::P2pError;
+
+        let render = |detail: &str| {
+            render_inbound_error(&GroupError::Transport(P2pError::Accept(detail.to_string())))
+        };
+
+        // Honest direction: an ordinary diagnostic survives intact and labelled.
+        let plain = render("read header: handshake timeout");
+        assert!(plain.starts_with("[err] "));
+        assert!(plain.ends_with("read header: handshake timeout"));
+        assert!(!plain.contains("truncated"));
+
+        // Hostile: no line structure, so no forged event lines.
+        let forged = render("x\n[removed] 00 by leaf 0\n[epoch] 00 → 99");
+        assert!(
+            !forged.contains('\n') && !forged.contains('\r'),
+            "a peer must not put line structure in a row: {forged}"
+        );
+
+        // Hostile: bidi overrides / isolates and zero-width marks reorder or
+        // hide glyphs inside the row.
+        let bidi = render("x\u{202E}y\u{2066}z\u{200B}w\u{200F}v");
+        for c in ['\u{202E}', '\u{2066}', '\u{200B}', '\u{200F}'] {
+            assert!(!bidi.contains(c), "{c:?} survived into the row: {bidi}");
+        }
+
+        // Hostile: an oversized close reason becomes one visibly clipped row.
+        let huge = render(&"A".repeat(65_000));
+        assert!(huge.ends_with("…[truncated]"));
+        assert!(
+            huge.chars().count() <= MAX_CHAT_ROW_CHARS + "…[truncated]".chars().count() + 128,
+            "row rendered {} chars",
+            huge.chars().count()
+        );
+    }
+
+    /// Error rows must reach the display through the same staging queue as
+    /// events: a peer paces them too, so one event-loop closure each would be
+    /// the unbounded queue growth the staging exists to prevent.
+    #[test]
+    fn push_row_into_ui_coalesces_an_error_burst_through_the_queue() {
+        let ui = group_ui();
+        let handle = ui.as_weak();
+        let rows = Arc::new(ChatRowQueue::new());
+
+        let burst = MAX_CHAT_ROWS * 3;
+        for i in 0..burst {
+            push_row_into_ui(&handle, &rows, format!("[err] transport: accept failed: {i}"));
+        }
+
+        let batch = rows.take();
+        assert_eq!(
+            batch.len(),
+            MAX_CHAT_ROWS,
+            "a burst of {burst} errors must stage a bounded batch, not one closure each"
+        );
+        assert!(batch.last().unwrap().ends_with(&format!("{}", burst - 1)));
+    }
+
+    /// A click must resolve to the group the clicked row *displays*, not to
+    /// whatever now sits at that index in the storage-ordered list.
+    ///
+    /// A remote peer grows that list unauthenticated: an unsolicited Welcome
+    /// auto-joins a group whose 32-byte id its author chose, so an id sorting
+    /// below ours is inserted ahead of every existing row while the `groups`
+    /// model still shows the old order. Re-deriving the id from the index
+    /// then hands the user's admin actions — Add Member is authorized by
+    /// nothing but `selected-group-id` — to the attacker's group.
+    #[test]
+    fn selected_row_resolves_the_displayed_group_not_the_index() {
+        let ui = group_ui();
+        let handle = ui.as_weak();
+
+        let mine = GroupId::new([0x11; 32]);
+        let other = GroupId::new([0x22; 32]);
+        let m = VecModel::<StandardListViewItem>::default();
+        for gid in [mine, other] {
+            m.push(StandardListViewItem::from(SharedString::from(
+                gid.to_string().as_str(),
+            )));
+        }
+        ui.set_groups(ModelRc::new(m));
+
+        // Honest direction: every row resolves to the group it shows.
+        assert_eq!(selected_row_group_id(&handle, 0).unwrap(), mine);
+        assert_eq!(selected_row_group_id(&handle, 1).unwrap(), other);
+
+        // Hostile direction: this is the list storage would hand back after
+        // the injected group is joined. Resolution must not consult it — row 0
+        // is still the group the user saw and clicked.
+        let injected = GroupId::new([0x00; 32]);
+        let storage_order = [injected, mine, other];
+        assert_eq!(
+            selected_row_group_id(&handle, 0).unwrap(),
+            mine,
+            "row 0 must stay the user's group even though storage row 0 is now {injected}"
+        );
+        assert_ne!(
+            selected_row_group_id(&handle, 0).unwrap(),
+            storage_order[0],
+            "the selection must not be re-derived from the shifted list"
+        );
+
+        // A row past the end is rejected rather than coerced to a neighbour.
+        assert!(selected_row_group_id(&handle, 2).is_err());
     }
 
     /// `parse_group_id` accepts 64-hex strings (32 bytes) and rejects

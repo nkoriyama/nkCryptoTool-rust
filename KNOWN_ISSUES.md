@@ -43,9 +43,29 @@ trade-off is explicit rather than forgotten.
    replay of an *evicted* nonce within the same long-lived session would only
    re-display one already-seen line — no key compromise or integrity break.
 3. **FETCH prekey rate-limit vs. fresh NodeIds** (`network/inbox.rs`): the
-   per-NodeId token bucket is bypassable by minting new NodeIds (cheap). This
-   is the documented residual; the `Require Prekey (Strict PQ-FS)` profile is
-   the real backstop against depletion downgrade.
+   per-NodeId token bucket is bypassable by minting new NodeIds (cheap), so a
+   second, recipient-keyed bound was added in 2026-08: the lowest quarter of
+   what a recipient is observed to stock is a reserve band, and a draw inside
+   it also costs a token from a bucket keyed on the **recipient**, which no
+   number of minted NodeIds divides. It bounds the drain rate and disengages
+   the moment the recipient replenishes; it does **not** prevent the
+   downgrade — a sustained attacker still drives a default-profile sender to a
+   static-only seal, and the `Require Prekey (Strict PQ-FS)` profile remains
+   the real backstop. Residuals: the stocking marks are process-local soft
+   state (a server restart re-derives them from the live pools); an attacker
+   holding 4096 *distinct* pools below their floors at once — each at the
+   sustained below-floor cost — keeps the reserve table full, and a recipient
+   first seen while it is full goes untracked, hence ungated until room
+   appears; and forcing a prune while a victim's own reserve bucket has
+   refilled (so ~4 minutes with no below-floor draw on it) drops that victim's
+   mark, which the next draw then re-derives from the drawn-down level. That
+   last one is the sharpest of the three: the re-derived floor is a quarter of
+   the *drawn-down* level `L`, so the attacker immediately regains `L - L/4`
+   ungated draws plus a fresh 8-token burst, against the 8 draws that simply
+   waiting out the same ~4 minutes would have bought — about **3x** at the
+   default `--prekey-count 100` pool (`L` = 25: 19 + 8 draws) and about **7x**
+   at a 256-key pool (`L` = 64: 48 + 8), growing with the pool size. The price
+   is holding that many slots below their floors for the whole window.
 4. **Non-constant-time fingerprint / pinned-key comparison**
    (`p2p/processor.rs`, `network/tcp.rs`): both operands are *public* values
    (a peer public key and its SHA3-256), compared once per connection, so a

@@ -43,8 +43,8 @@
 //! downgraded envelope is accepted at all remains the [`FsProfile`] policy.
 //! The downgrade itself stays the DS's to force, but no longer silently: a
 //! static-only envelope arriving while our *own* pool is stocked means the
-//! DS answered the sender's FETCH "depleted" about a pool that was not, and
-//! [`open`] says so on stderr.
+//! DS answered the sender's FETCH "no prekey" — depleted, or throttled — about
+//! a pool that was not empty, and [`open`] says so on stderr.
 //!
 //! ## Envelope wire format
 //!
@@ -200,6 +200,16 @@ pub fn seal(
 /// Fetch a prekey for `recipient`, verify it against the recipient's
 /// `identity_dsa_pub`, and seal `payload` for full PQ-FS — or apply the
 /// `profile`'s fallback when the prekey pool is depleted/throttled.
+///
+/// Exactly **one** FETCH is issued per call, whatever the answer. A throttle
+/// (the per-NodeId FETCH bucket, or the delivery service's per-recipient prekey
+/// reserve) is transient and a retry would sometimes recover full PQ-FS, but
+/// the server charges the *fetcher's* own bucket before it consults the
+/// recipient's reserve, so retrying would let one throttled recipient drain
+/// this sender's budget and downgrade its later, unrelated messages. A
+/// throttled FETCH therefore takes the same branch as a depleted pool, and the
+/// `profile` decides: [`FsProfile::DefaultFallback`] seals static-only and
+/// sends (availability first), [`FsProfile::StrictPqFs`] aborts.
 ///
 /// `static_pk` is the recipient's long-term X-Wing public key (the caller
 /// supplies it; long-term key management is out of this module's scope).
@@ -370,27 +380,31 @@ pub fn open(
 /// Warn that an accepted static-only envelope contradicts our own prekey pool.
 ///
 /// The sender falls back to static-only only when the delivery service answers
-/// its prekey FETCH with `REPLY_PREKEY_NONE`; if `remaining` of our one-time
-/// prekeys are still sitting in the local store, the pool the DS described as
-/// depleted was not. That makes the forward-secrecy downgrade — which remains
-/// the DS's to force, and which only [`FsProfile::StrictPqFs`] refuses —
-/// locally *detectable* by the one party holding both facts, instead of
-/// silent.
+/// its prekey FETCH `REPLY_PREKEY_NONE` (depleted) or `REPLY_RATE_LIMITED`
+/// (throttled); if `remaining` of our one-time prekeys are still sitting in
+/// the local store, the pool the DS refused to serve from was not empty. That
+/// makes the forward-secrecy
+/// downgrade — which remains the DS's to force, and which only
+/// [`FsProfile::StrictPqFs`] refuses — locally *detectable* by the one party
+/// holding both facts, instead of silent.
 ///
 /// It is a warning and not a refusal because the inference is one-sided: the
 /// same observation is produced benignly when the pool genuinely ran dry, the
-/// sender fell back, and we restocked before polling. Turning it into an error
-/// would drop legitimate mail on that ordinary sequence.
+/// sender fell back, and we restocked before polling — or when the server's
+/// per-recipient reserve throttled the sender precisely *because* the pool had
+/// been drawn down into its reserve band. Turning it into an error would drop
+/// legitimate mail on those ordinary sequences.
 fn warn_static_only_with_stocked_pool(remaining: u64) {
     // Local data only (a count from our own store); no peer-controlled text
     // reaches the terminal here.
     eprintln!(
         "[pqfs] WARNING: accepted a STATIC-ONLY envelope (no post-quantum forward \
          secrecy) while {remaining} One-Time Prekey(s) remain in the local pool. \
-         The delivery service reported a depleted prekey pool that was not in fact \
-         depleted: it either lied to force this downgrade, or the pool was \
-         restocked after the message was sealed. Use --strict-pqfs to refuse \
-         downgraded envelopes outright."
+         The delivery service served no prekey for a pool that was not in fact \
+         empty: it either lied to force this downgrade, or it throttled the \
+         sender while our server-side pool sat in its per-recipient reserve \
+         band, or the pool was restocked after the message was sealed. Use \
+         --strict-pqfs to refuse downgraded envelopes outright."
     );
     #[cfg(test)]
     STOCKED_POOL_WARNINGS.with(|c| c.set(c.get() + 1));
@@ -1015,6 +1029,178 @@ mod tests {
         {
             Err(OneShotError::NoPrekeyStrict) => {}
             other => panic!("strict must refuse, got {other:?}"),
+        }
+
+        task.abort();
+    }
+
+    /// Stock `recipient`'s **server-side** pool with `stock` opaque blobs and
+    /// draw it down until the delivery service answers RateLimited — i.e. the
+    /// pool is inside its per-recipient reserve band and the reserve budget is
+    /// spent, with real prekeys still in the pool.
+    ///
+    /// Every draw spends a *fresh* NodeId, so nothing here is the per-NodeId
+    /// FETCH bucket; and the blobs are opaque because the server stores them
+    /// verbatim and never parses them — the seal under test is throttled, so it
+    /// never receives one.
+    async fn drain_into_spent_reserve(
+        net: &Arc<MockNetwork>,
+        srv: &PeerAddr,
+        recipient_ep: &dyn P2pEndpoint,
+        recipient: PeerId,
+        stock: usize,
+    ) {
+        let blobs: Vec<Vec<u8>> = (0..stock).map(|i| format!("pk-{i}").into_bytes()).collect();
+        inbox::publish_prekeys(recipient_ep, srv, &blobs).await.expect("publish");
+        let mut minted = Vec::new();
+        for i in 0..(stock as u16 * 2) {
+            let mut raw = [0u8; 32];
+            raw[0] = 0xA5;
+            raw[1] = (i >> 8) as u8;
+            raw[2] = i as u8;
+            let ep = Arc::new(net.register(PeerId::new(raw), vec![P2pProtocol(ALPN_INBOX)]))
+                as Arc<dyn P2pEndpoint>;
+            match inbox::fetch_prekey(ep.as_ref(), srv, recipient).await.unwrap() {
+                FetchOutcome::Prekey(_) => minted.push(ep),
+                FetchOutcome::RateLimited => return,
+                FetchOutcome::Depleted => panic!("the reserve must not let the pool reach empty"),
+            }
+        }
+        panic!("pool of {stock} never entered a spent reserve band");
+    }
+
+    /// Under the default profile a sender that meets the per-recipient reserve
+    /// throttle still **sends**: one FETCH, then a static-only seal —
+    /// availability first, exactly as when the pool is genuinely depleted,
+    /// which is the pre-existing behaviour this must not change. The reserve
+    /// costs the forward secrecy of messages sent while the pool is under
+    /// attack; it never costs the user the message.
+    #[tokio::test]
+    async fn throttled_reserve_still_sends_static_only_under_default_profile() {
+        let net = MockNetwork::new();
+        let dir = tempdir().unwrap();
+        let r = make_recipient(dir.path());
+        let (task, srv) = spawn_inbox(&net, dir.path()).await;
+        let recipient_ep =
+            Arc::new(net.register(r.peer_id, vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        drain_into_spent_reserve(&net, &srv, recipient_ep.as_ref(), r.peer_id, 40).await;
+
+        let sender = Arc::new(net.register(PeerId::new([1u8; 32]), vec![P2pProtocol(ALPN_INBOX)]))
+            as Arc<dyn P2pEndpoint>;
+        let msg = b"availability-first payload under a throttle";
+        let sealed = seal_via_inbox(
+            sender.as_ref(),
+            &srv,
+            r.peer_id,
+            &r.dsa_pub,
+            &r.static_pk,
+            msg,
+            FsProfile::DefaultFallback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sealed.mode, MODE_STATIC_ONLY);
+        // The throttle was not depletion: the reserve is still holding keys, so
+        // the next replenishment (or refill token) restores full PQ-FS.
+        assert!(inbox::count_prekeys(recipient_ep.as_ref(), &srv).await.unwrap() > 0);
+
+        task.abort();
+    }
+
+    /// A throttled recipient must not cost the **sender** more than a healthy
+    /// one does. The server charges the fetcher's own per-NodeId bucket
+    /// (`FETCH_RL_CAPACITY` = 8, refill 1/30 s) *before* it consults the
+    /// recipient's reserve, so a send that issued more than one FETCH would let
+    /// a few messages to one throttled victim empty the sender's own budget and
+    /// downgrade its next message to an entirely unrelated, healthy recipient.
+    /// Three sends to the victim below cost three tokens at one FETCH each,
+    /// leaving five — but nine, i.e. an empty bucket, at three each. So the
+    /// fourth send, to a fully stocked third party, must still get full PQ-FS.
+    #[tokio::test]
+    async fn throttled_recipient_does_not_spend_the_senders_budget() {
+        let net = MockNetwork::new();
+        let dir = tempdir().unwrap();
+        let victim = make_recipient(dir.path());
+        let (task, srv) = spawn_inbox(&net, dir.path()).await;
+        let victim_ep = Arc::new(net.register(victim.peer_id, vec![P2pProtocol(ALPN_INBOX)]))
+            as Arc<dyn P2pEndpoint>;
+        drain_into_spent_reserve(&net, &srv, victim_ep.as_ref(), victim.peer_id, 40).await;
+
+        // An unrelated third party, stocked with real signed prekeys. Its own
+        // dir, so it gets its own prekey store.
+        let healthy_dir = tempdir().unwrap();
+        let healthy = make_recipient(healthy_dir.path());
+        let healthy_ep = Arc::new(net.register(healthy.peer_id, vec![P2pProtocol(ALPN_INBOX)]))
+            as Arc<dyn P2pEndpoint>;
+        replenish_to_target(healthy_ep.as_ref(), &srv, &healthy.store, &healthy.dsa_priv, 5)
+            .await
+            .unwrap();
+
+        let sender = Arc::new(net.register(PeerId::new([2u8; 32]), vec![P2pProtocol(ALPN_INBOX)]))
+            as Arc<dyn P2pEndpoint>;
+        for _ in 0..3 {
+            let sealed = seal_via_inbox(
+                sender.as_ref(),
+                &srv,
+                victim.peer_id,
+                &victim.dsa_pub,
+                &victim.static_pk,
+                b"to the throttled recipient",
+                FsProfile::DefaultFallback,
+            )
+            .await
+            .unwrap();
+            assert_eq!(sealed.mode, MODE_STATIC_ONLY);
+        }
+
+        let sealed = seal_via_inbox(
+            sender.as_ref(),
+            &srv,
+            healthy.peer_id,
+            &healthy.dsa_pub,
+            &healthy.static_pk,
+            b"to an unrelated healthy recipient",
+            FsProfile::DefaultFallback,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sealed.mode, MODE_FULL,
+            "sends to a throttled recipient must not downgrade sends to others"
+        );
+
+        task.abort();
+    }
+
+    /// The Strict profile aborts instead of downgrading when the reserve
+    /// throttles it — the same refusal it gives for a depleted pool, so a
+    /// throttle can no more be used to force a no-forward-secrecy envelope on a
+    /// Strict sender than an emptied pool can.
+    #[tokio::test]
+    async fn throttled_reserve_aborts_under_strict_profile() {
+        let net = MockNetwork::new();
+        let dir = tempdir().unwrap();
+        let r = make_recipient(dir.path());
+        let (task, srv) = spawn_inbox(&net, dir.path()).await;
+        let recipient_ep =
+            Arc::new(net.register(r.peer_id, vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        drain_into_spent_reserve(&net, &srv, recipient_ep.as_ref(), r.peer_id, 40).await;
+
+        let sender = Arc::new(net.register(PeerId::new([1u8; 32]), vec![P2pProtocol(ALPN_INBOX)]))
+            as Arc<dyn P2pEndpoint>;
+        match seal_via_inbox(
+            sender.as_ref(),
+            &srv,
+            r.peer_id,
+            &r.dsa_pub,
+            &r.static_pk,
+            b"strict payload under a throttle",
+            FsProfile::StrictPqFs,
+        )
+        .await
+        {
+            Err(OneShotError::NoPrekeyStrict) => {}
+            other => panic!("strict must refuse a throttled seal, got {other:?}"),
         }
 
         task.abort();

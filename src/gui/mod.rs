@@ -374,6 +374,34 @@ pub fn format_peer_identity(peer_fp: Option<[u8; 32]>) -> String {
     }
 }
 
+/// F6: hard ceiling on the peer-influenced part of the `connection-error`
+/// banner, in characters. Same 256 as every other peer-string sink in the tree
+/// (`format_chat_row`, `group_chat::render_event`, `scp`, `forward`).
+#[cfg(feature = "gui")]
+pub const MAX_CONNECTION_ERROR_CHARS: usize = 256;
+
+/// F6: render a transport/backend error as `connection-error` banner text.
+///
+/// A failed transfer's error string is not ours: a peer that reaches the
+/// listener with a valid ALPN and closes the QUIC connection with a chosen
+/// reason phrase has that phrase stringified into `P2pError::Accept` and
+/// wrapped into the `CryptoError` this banner shows. The banner is drawn in the
+/// same panel as `peer-fingerprint` — the one thing the user is told to compare
+/// out of band to decide whether the sender is who they meant — and a Slint
+/// `Text` renders an embedded `\n` as a line break, so unfiltered peer text can
+/// paint extra lines that read like our own identity or success lines. Nothing
+/// bounds the length either.
+///
+/// So the peer's text goes through the same pass every other peer-derived
+/// string in the tree already gets: controls (including `\n`), zero-width and
+/// bidi marks become spaces, and the text is clipped with a visible
+/// `…[truncated]` marker. Prefixes we author (`"Receive failed: "`) stay outside
+/// the bound. Public so the bound can be tested without a peer.
+#[cfg(feature = "gui")]
+pub fn format_connection_error(err: &str) -> String {
+    crate::utils::sanitize_for_terminal_bounded(err, MAX_CONNECTION_ERROR_CHARS)
+}
+
 #[cfg(feature = "gui")]
 pub fn validate_and_apply_save_file_name(ui: &ChatWindow) {
     let name = ui.get_save_file_name().to_string();
@@ -885,9 +913,14 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     });
                 } else {
+                    // F6: the responder chose part of this text (its QUIC close
+                    // reason), so it is sanitized and bounded before it reaches
+                    // the banner. The `passphrase` test above still runs on the
+                    // raw string.
+                    let shown = format_connection_error(&err_str);
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_handle.upgrade() {
-                            ui.set_connection_error(err_str.into());
+                            ui.set_connection_error(shown.into());
                         }
                     });
                 }
@@ -1030,7 +1063,11 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             let ui_handle_end = ui_handle.clone();
             let final_msg = match &res {
                 Ok(_) => format!("File received: {}", recv_path.display()),
-                Err(e) => format!("Receive failed: {}", e),
+                // F6: whoever holds the ticket can reach this listener and pick
+                // the QUIC close reason that ends up inside `e`, and this string
+                // lands in the banner beside the sender fingerprint. The prefix
+                // is ours; everything the peer touched is sanitized and bounded.
+                Err(e) => format!("Receive failed: {}", format_connection_error(&e.to_string())),
             };
             let is_ok = res.is_ok();
             let _ = slint::invoke_from_event_loop(move || {
@@ -1116,7 +1153,8 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             });
 
             if let Err(e) = res {
-                let err_str = e.to_string();
+                // F6: same peer-influenced text as the first connect attempt.
+                let err_str = format_connection_error(&e.to_string());
                 let ui_handle = ui_handle_pass_retry.clone();
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_handle.upgrade() {

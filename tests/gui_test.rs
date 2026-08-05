@@ -807,6 +807,44 @@ mod tests {
         assert!(!hostile.contains('\u{1b}') && !hostile.contains('\u{202E}'));
     }
 
+    /// The connection-error banner shares a panel with the sender fingerprint,
+    /// and the failing peer picks part of its text (the QUIC close reason), so
+    /// that text must not be able to forge lines there — while an ordinary
+    /// local error still reads exactly as before.
+    #[test]
+    fn connection_error_cannot_forge_lines_in_the_identity_panel() {
+        use nk_crypto_tool::gui::{format_connection_error, MAX_CONNECTION_ERROR_CHARS};
+
+        // Honest direction: a real error is shown verbatim.
+        let honest = "Connection setup failed: connection timed out";
+        assert_eq!(format_connection_error(honest), honest);
+
+        // Hostile direction: no newline survives to become a forged line
+        // claiming the sender's identity.
+        let forged = format_connection_error(
+            "closed\nTransfer complete. Sender identity (ML-DSA fingerprint): abcd",
+        );
+        assert!(!forged.contains('\n'), "rendered {forged:?}");
+        assert!(!forged.contains('\r'));
+
+        // Nor a bidi override / zero-width mark reordering or hiding text.
+        let hostile = format_connection_error("x\u{202E}y\u{200B}z\u{1b}[2K");
+        assert!(
+            !hostile.contains('\u{202E}')
+                && !hostile.contains('\u{200B}')
+                && !hostile.contains('\u{1b}')
+        );
+
+        // And the peer cannot choose how much of the window it fills.
+        let huge = format_connection_error(&"A".repeat(65_000));
+        assert!(huge.ends_with("…[truncated]"), "truncation must be visible");
+        assert!(
+            huge.chars().count() <= MAX_CONNECTION_ERROR_CHARS + "…[truncated]".chars().count(),
+            "banner rendered {} chars",
+            huge.chars().count()
+        );
+    }
+
     /// The peer paces the arrival of rows and Slint's event-loop queue is
     /// unbounded, so a burst must collapse into a single pending closure
     /// carrying a bounded batch — while a normally paced conversation still
