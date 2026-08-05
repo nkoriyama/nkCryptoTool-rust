@@ -43,8 +43,12 @@
 //! downgraded envelope is accepted at all remains the [`FsProfile`] policy.
 //! The downgrade itself stays the DS's to force, but no longer silently: a
 //! static-only envelope arriving while our *own* pool is stocked means the
-//! DS answered the sender's FETCH "no prekey" — depleted, or throttled — about
-//! a pool that was not empty, and [`open`] says so on stderr.
+//! DS answered the sender's FETCH "no prekey" — depleted, or throttled —
+//! though we had stocked one, and [`open`] says so on stderr. That is a
+//! signal worth investigating rather than proof of a lie: the server-side
+//! pool also empties without our local keys being consumed whenever a FETCH
+//! is followed by a deposit that fails or is refused, each of which burns a
+//! published prekey and delivers nothing.
 //!
 //! ## Envelope wire format
 //!
@@ -363,12 +367,12 @@ pub fn open(
         if store.record_static_only_seen(envelope)? {
             return Err(OneShotError::StaticOnlyReplay);
         }
-        // We are the only party that can see both halves of the DS's lie: the
-        // sender was told our pool was depleted, and we know what our pool
-        // actually holds. Propagate a `count` failure like every other store
-        // call here rather than swallowing it — the same handle committed the
-        // write above, so a failure now is a broken store the recipient needs
-        // to hear about, not a diagnostic to skip.
+        // We are the only party holding both facts: the sender was told no
+        // prekey was available, and we know what our own pool holds. Propagate a
+        // `count` failure like every other store call here rather than
+        // swallowing it — the same handle committed the write above, so a
+        // failure now is a broken store the recipient needs to hear about, not a
+        // diagnostic to skip.
         let remaining = store.count()?;
         if remaining > 0 {
             warn_static_only_with_stocked_pool(remaining);
@@ -377,33 +381,47 @@ pub fn open(
     Ok(plaintext)
 }
 
-/// Warn that an accepted static-only envelope contradicts our own prekey pool.
+/// Warn that an accepted static-only envelope arrived while our own prekey pool
+/// still holds unused keys.
 ///
-/// The sender falls back to static-only only when the delivery service answers
-/// its prekey FETCH `REPLY_PREKEY_NONE` (depleted) or `REPLY_RATE_LIMITED`
-/// (throttled); if `remaining` of our one-time prekeys are still sitting in
-/// the local store, the pool the DS refused to serve from was not empty. That
-/// makes the forward-secrecy
-/// downgrade — which remains the DS's to force, and which only
-/// [`FsProfile::StrictPqFs`] refuses — locally *detectable* by the one party
-/// holding both facts, instead of silent.
+/// A sender falls back to static-only only when the delivery service answers its
+/// prekey FETCH `REPLY_PREKEY_NONE` (depleted) or `REPLY_RATE_LIMITED`
+/// (throttled), so the two facts together — a downgraded envelope, and
+/// `remaining` unused prekeys of ours — say the DS served no prekey for a pool
+/// we had stocked. That makes the forward-secrecy downgrade — which remains the
+/// DS's to force, and which only [`FsProfile::StrictPqFs`] refuses — *visible*
+/// to the one party holding both facts, instead of silent.
 ///
-/// It is a warning and not a refusal because the inference is one-sided: the
-/// same observation is produced benignly when the pool genuinely ran dry, the
-/// sender fell back, and we restocked before polling — or when the server's
-/// per-recipient reserve throttled the sender precisely *because* the pool had
-/// been drawn down into its reserve band. Turning it into an error would drop
-/// legitimate mail on those ordinary sequences.
+/// It does **not** establish that the DS lied, and deliberately no longer says
+/// so. The pool it draws from is the *server-side* one, and that can empty
+/// while our local secret keys stay untouched: every FETCH hands out a
+/// published prekey before the sender knows its DEPOSIT will be accepted, so
+/// each send whose deposit then fails — a network error, or a deposit the relay
+/// **refused** because the recipient's slot was full or a byte budget was spent
+/// (see [`crate::group::redb_storage::RedbInboxStore::deposit`]) — burns one
+/// prekey and delivers nothing. An attacker holding a victim's slot can drive
+/// exactly that, until the server's pool is genuinely empty and the DS's
+/// `REPLY_PREKEY_NONE` is honest.
+///
+/// A warning and not a refusal, because every reading of it is one an honest
+/// exchange also produces: the pool genuinely ran dry, the sender fell back, and
+/// we restocked before polling; the server's per-recipient reserve throttled the
+/// sender precisely *because* the pool had been drawn into its reserve band; or
+/// the burn-without-delivery above. Turning it into an error would drop
+/// legitimate mail on all of them.
 fn warn_static_only_with_stocked_pool(remaining: u64) {
     // Local data only (a count from our own store); no peer-controlled text
     // reaches the terminal here.
     eprintln!(
         "[pqfs] WARNING: accepted a STATIC-ONLY envelope (no post-quantum forward \
          secrecy) while {remaining} One-Time Prekey(s) remain in the local pool. \
-         The delivery service served no prekey for a pool that was not in fact \
-         empty: it either lied to force this downgrade, or it throttled the \
-         sender while our server-side pool sat in its per-recipient reserve \
-         band, or the pool was restocked after the message was sealed. Use \
+         The delivery service served the sender no prekey though we had stocked \
+         one. It may have lied to force this downgrade; it may have throttled \
+         the sender while our server-side pool sat in its per-recipient reserve \
+         band; the pool may have been restocked after the message was sealed; or \
+         published prekeys may have been drawn by senders whose deposits then \
+         failed or were refused, which empties the server's pool without \
+         consuming ours. Worth investigating, not proof of a lie. Use \
          --strict-pqfs to refuse downgraded envelopes outright."
     );
     #[cfg(test)]

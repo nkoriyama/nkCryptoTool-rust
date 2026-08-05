@@ -23,7 +23,17 @@
 //! Anyone can deposit to anyone — the server intentionally accepts
 //! unauthenticated DEPOSIT so a sender can reach a recipient whose
 //! direct iroh connect failed. Sender's NodeId is recorded in the
-//! sqlite row for abuse tracing but is NOT exposed to the recipient.
+//! stored row for abuse tracing but is NOT exposed to the recipient.
+//!
+//! Because `recipient` is an unauthenticated wire field, a deposit that
+//! does not fit is **refused** (`0xFF`) rather than made to fit: the
+//! store never removes an existing envelope to admit a new one, so no
+//! peer can flush a queue it does not own by depositing into it. The
+//! quotas are a per-recipient row cap
+//! ([`MAX_ENVELOPES_PER_RECIPIENT`]), a per-*depositor* byte budget
+//! keyed on the handshake-authenticated sender, and the store's global
+//! byte budget; space comes back by expiry, not eviction. See
+//! [`crate::group::redb_storage::RedbInboxStore::deposit`].
 //!
 //! ### POLL
 //!
@@ -147,7 +157,14 @@ pub const MAX_PREKEYS_STORED: u64 = 256;
 
 /// Per-recipient cap on stored inbox envelopes. DEPOSIT is unauthenticated
 /// ("anyone can deposit to anyone"), so this — together with the store's global
-/// byte budget — bounds a disk-exhaustion flood; the newest envelopes win.
+/// and per-depositor byte budgets — bounds a disk-exhaustion flood.
+///
+/// A deposit into a slot already holding this many envelopes is **refused**;
+/// the store evicts nothing. Making room by deleting would let any peer that
+/// can name a recipient on the wire flush that recipient's undelivered mail,
+/// and POLL's `id > since_cursor` semantics mean the loss would be silent.
+/// The cost of refusing instead is that an occupied slot stays occupied until
+/// its backlog expires — see the residual recorded in `KNOWN_ISSUES.md`.
 pub const MAX_ENVELOPES_PER_RECIPIENT: u64 = 256;
 
 /// FETCH token-bucket burst capacity, per connecting NodeId: a sender may
@@ -355,6 +372,18 @@ where
 /// returns ok / rejected; sender doesn't get a delivery confirmation
 /// beyond "the bytes are stored". The recipient surfaces them on its
 /// next POLL.
+///
+/// [`InboxError::Rejected`] covers a *refused* deposit as well as a malformed
+/// one: the server turns a deposit away when the recipient's slot is full or a
+/// byte budget is spent, rather than deleting a stored envelope to make room.
+/// Nothing was written, so the caller may retry once the recipient's backlog
+/// expires (`ENVELOPE_TTL_SECS`, 7 days) — the retry reclaims that recipient's
+/// expired rows itself before it counts the slot, so it does not depend on
+/// anything else having run first. POLL does not delete what it returns, so the
+/// recipient draining the slot does not free room sooner. A deposit refused on
+/// the *store's* byte budget is the one case where waiting out the TTL may not
+/// be enough: that budget comes back only as the table-wide sweep walks (see
+/// `KNOWN_ISSUES.md` item 10).
 pub async fn deposit(
     endpoint: &dyn P2pEndpoint,
     server: &PeerAddr,
@@ -611,7 +640,7 @@ pub async fn count_prekeys(
 #[cfg(feature = "mls")]
 mod server {
     use super::*;
-    use crate::group::redb_storage::{CheckpointOutcome, RedbInboxStore};
+    use crate::group::redb_storage::{CheckpointOutcome, RedbInboxStore, RedbStorageError};
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Mutex as StdMutex;
@@ -973,8 +1002,36 @@ mod server {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
-            self.store
-                .deposit(recipient.as_bytes(), sender.as_bytes(), &payload, now)?;
+            // `recipient` is a wire field naming someone else's slot, but
+            // `sender` is the handshake-authenticated NodeId — the store keys
+            // its per-depositor byte budget on that, so no request can forge
+            // which budget it spends.
+            //
+            // The store call is synchronous redb work (a write transaction, the
+            // bounded expiry sweep, and up to MAX_PAYLOAD of AEAD), so it runs
+            // on the blocking pool instead of stalling a runtime worker for the
+            // duration.
+            let store = self.store.clone();
+            let recipient_bytes = *recipient.as_bytes();
+            let sender_bytes = *sender.as_bytes();
+            let stored = tokio::task::spawn_blocking(move || {
+                store.deposit(&recipient_bytes, &sender_bytes, &payload, now)
+            })
+            .await
+            .map_err(|e| InboxError::Storage(format!("deposit task: {e}")))?;
+            if matches!(stored, Err(RedbStorageError::QuotaExceeded(_))) {
+                // Refused, not failed — and refused without deleting anything,
+                // which is the point: a depositor cannot make room in a slot it
+                // does not own. Answer the existing REPLY_FAIL and return `Ok`
+                // so the graceful-close barrier still delivers that byte.
+                write_timed(stream, &[REPLY_FAIL], "deposit reply (refused)").await?;
+                tokio::time::timeout(IO_TIMEOUT, stream.flush())
+                    .await
+                    .map_err(|_| InboxError::Timeout("deposit flush"))??;
+                let _ = stream.shutdown().await;
+                return Ok(());
+            }
+            stored?;
             write_timed(stream, &[REPLY_OK], "deposit reply (ok)").await?;
             tokio::time::timeout(IO_TIMEOUT, stream.flush())
                 .await
@@ -1305,6 +1362,66 @@ mod tests {
             .expect("carol poll");
         assert_eq!(bob_mail, vec![b"for bob".to_vec()]);
         assert_eq!(carol_mail, vec![b"for carol".to_vec()]);
+
+        task.abort();
+    }
+
+    /// Drain every envelope addressed to `who`, following the cursor across the
+    /// [`MAX_POLL_BATCH`] limit.
+    async fn drain(
+        who: &dyn P2pEndpoint,
+        server: &PeerAddr,
+    ) -> Vec<Vec<u8>> {
+        let mut cursor = 0u64;
+        let mut all = Vec::new();
+        loop {
+            let (next, batch) = poll(who, server, cursor).await.expect("poll");
+            let n = batch.len();
+            all.extend(batch);
+            cursor = next;
+            if n < MAX_POLL_BATCH as usize {
+                return all;
+            }
+        }
+    }
+
+    /// F2, over the wire: once a recipient's slot is full, a DEPOSIT to it is
+    /// **refused**, and the envelopes already waiting there are all still
+    /// waiting afterwards.
+    ///
+    /// The recipient field of a DEPOSIT is unauthenticated — any peer that can
+    /// dial the ALPN names whatever slot it likes — so the old "make room by
+    /// evicting the oldest" cap let a stranger flush a victim's undelivered
+    /// queue. POLL only returns ids above the caller's cursor, so the victim
+    /// would never have learned those messages existed.
+    #[tokio::test]
+    async fn deposit_into_a_full_slot_is_refused_and_evicts_nothing() {
+        let (net, _server, task, srv, _dir) = spawn_server().await;
+        let honest =
+            Arc::new(net.register(pid(1), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let victim =
+            Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let attacker =
+            Arc::new(net.register(pid(3), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+
+        // Fill the victim's slot with mail it has not polled yet.
+        for i in 0..MAX_ENVELOPES_PER_RECIPIENT {
+            deposit(honest.as_ref(), &srv, pid(2), format!("mail-{i:03}").as_bytes())
+                .await
+                .unwrap_or_else(|e| panic!("deposit {i}: {e}"));
+        }
+
+        // A stranger cannot buy room in someone else's slot.
+        match deposit(attacker.as_ref(), &srv, pid(2), b"evicts-the-oldest").await {
+            Err(InboxError::Rejected) => {}
+            other => panic!("a full slot must be refused, got {other:?}"),
+        }
+
+        // Nothing was dropped to make room for it, and nothing was stored.
+        let mail = drain(victim.as_ref(), &srv).await;
+        assert_eq!(mail.len(), MAX_ENVELOPES_PER_RECIPIENT as usize);
+        assert_eq!(mail.first().map(|m| m.as_slice()), Some(&b"mail-000"[..]));
+        assert_eq!(mail.last().map(|m| m.as_slice()), Some(&b"mail-255"[..]));
 
         task.abort();
     }
