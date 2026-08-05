@@ -1868,6 +1868,11 @@ impl RedbInboxStore {
 
     /// The body of [`Self::deposit`], inside its write transaction. Split out so
     /// every table handle is dropped before the caller commits.
+    // allow(clippy::too_many_arguments): the seven parameters are the transaction
+    // plus the six values one deposit is priced and keyed on; grouping them in a
+    // struct would only move the same fields behind a name that adds nothing, and
+    // the split exists to bound table-handle lifetimes, not to shape an API.
+    // Future: revisit if deposit gains further inputs (no issue open).
     #[allow(clippy::too_many_arguments)]
     fn deposit_in(
         &self,
