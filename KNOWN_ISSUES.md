@@ -56,16 +56,49 @@ trade-off is explicit rather than forgotten.
    holding 4096 *distinct* pools below their floors at once — each at the
    sustained below-floor cost — keeps the reserve table full, and a recipient
    first seen while it is full goes untracked, hence ungated until room
-   appears; and forcing a prune while a victim's own reserve bucket has
-   refilled (so ~4 minutes with no below-floor draw on it) drops that victim's
-   mark, which the next draw then re-derives from the drawn-down level. That
-   last one is the sharpest of the three: the re-derived floor is a quarter of
-   the *drawn-down* level `L`, so the attacker immediately regains `L - L/4`
-   ungated draws plus a fresh 8-token burst, against the 8 draws that simply
-   waiting out the same ~4 minutes would have bought — about **3x** at the
-   default `--prekey-count 100` pool (`L` = 25: 19 + 8 draws) and about **7x**
-   at a 256-key pool (`L` = 64: 48 + 8), growing with the pool size. The price
-   is holding that many slots below their floors for the whole window.
+   appears; and the prune that keeps that table bounded can be forced, which
+   drops stocking marks. That last one is the sharpest of the three. It was
+   first written up here as costing the attacker a ~4 minute wait and buying a
+   3x–7x advantage; a 2026-08 re-check against the code found both figures
+   wrong and the framing misleading. The corrected account:
+   - **No wait is required.** `TokenBucket::new` starts a bucket *full*, and
+     `level > reserve_floor(r.stock) || r.bucket.try_take(now)` short-circuits,
+     so a draw *above* the floor spends no token at all. An attacker who stops
+     drawing exactly at the floor never charges the victim's bucket, so it
+     stays full from creation and is prunable immediately. The ~4 minutes was
+     the worst case for an attacker who had already spent all 8 tokens —
+     spending one costs 30 s, spending none costs nothing.
+   - **The real price is firing the prune.** `retain` runs only when a
+     not-yet-tracked recipient draws while the table already holds
+     `RESERVE_MAX_TRACKED` = 4096 entries. Because `level == 0` returns before
+     the table is touched, only recipients with a genuinely stocked pool can
+     create entries — but the attacker can supply those itself: PUBLISH writes
+     to the slot of the handshake-authenticated NodeId and never parses the
+     blob, so 4096 minted NodeIds each stocked with junk blobs will do. **No
+     third party's prekeys are consumed**, only the victim's own. One prune
+     costs roughly 4096 FETCH connections and 4096 pops from pools the attacker
+     owns, and the same identities can be reused each round.
+   - **What it buys is not extra keys but the removal of the refill race the
+     reserve exists to win.** After a prune the mark re-derives from the
+     drawn-down level `L` and the floor becomes `L/4`, so the pool can be
+     walked down in ungated stages: 100 → 25 → 6 → 1 → 0 takes three prunes
+     (~12,000 filler draws), 256 → 64 → 16 → 4 → 1 → 0 takes four (~16,000).
+     No token is spent and no waiting occurs at any stage. Without the prune
+     the same pool still empties, but at one key per 30 s once below the floor
+     — ~8.5 minutes for 100 keys, ~28 minutes for 256 — and that window is
+     exactly where a recipient's `maintain` run can replenish and win. Whether
+     ~12,000 connections is in practice faster than 8.5 minutes depends on
+     iroh handshake cost against `MAX_CONCURRENT_CONNECTIONS` = 256 and has
+     **not** been measured.
+   - Two further corrections to the old text. `retain` drops *every* entry
+     whose bucket is full, not just the victim's, so one round's 4096 draws
+     flush the marks of every recipient not currently being drawn below its
+     floor — the cost is per round, not per victim. And "the price is holding
+     that many slots below their floors for the whole window" described the
+     *previous* residual, not this one: here the filler entries may stay full
+     (they are pruned alongside the victim, which is fine for the attacker),
+     one above-floor draw each is enough, and the table need only stand at
+     4096 for the instant of the triggering draw.
 4. **Non-constant-time fingerprint / pinned-key comparison**
    (`p2p/processor.rs`, `network/tcp.rs`): both operands are *public* values
    (a peer public key and its SHA3-256), compared once per connection, so a

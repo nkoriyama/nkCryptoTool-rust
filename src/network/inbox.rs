@@ -267,11 +267,24 @@ pub const RESERVE_RL_REFILL_PER_SEC: f64 = 1.0 / 30.0;
 /// Soft cap on recipients tracked for the prekey reserve. When the table
 /// reaches it, refilled (idle) buckets are pruned, exactly as for the
 /// per-NodeId table: a recipient under active below-floor draw has the
-/// emptiest bucket and survives, so an attacker cannot flush a victim's
-/// stocking mark by flooding the table while draining it. If nothing is
-/// prunable — this many *distinct* pools being drawn below their floors at
-/// once, each at the sustained below-floor cost above — a not-yet-seen
-/// recipient goes untracked, and so ungated, until room appears.
+/// emptiest bucket and survives. If nothing is prunable — this many
+/// *distinct* pools being drawn below their floors at once, each at the
+/// sustained below-floor cost above — a not-yet-seen recipient goes
+/// untracked, and so ungated, until room appears.
+///
+/// **That survival rule does NOT protect a victim's stocking mark, and this
+/// comment used to claim it did.** Surviving requires the victim's bucket to
+/// be non-full, and the bucket is only charged by a draw at or *below* the
+/// floor ([`TokenBucket::new`] starts it full, and the `||` in `draw_prekey`
+/// short-circuits above the floor). An attacker who walks a pool down to
+/// exactly its floor and stops has spent nothing, so the victim's entry is
+/// full, is pruned like any idle one, and the next draw re-derives the mark
+/// from the drawn-down level — no waiting, and repeatable until the pool is
+/// empty. Firing the prune needs 4096 tracked recipients, which the attacker
+/// can mint itself (PUBLISH keys on the connecting NodeId and does not parse
+/// the blob). This is a known accepted residual, not an oversight: see
+/// `KNOWN_ISSUES.md`, "Security Audit Residuals" item 3, which carries the
+/// measured cost and what a fix would have to change.
 const RESERVE_MAX_TRACKED: usize = 4096;
 
 /// Upper bound on connections whose per-connection setup + handling run
