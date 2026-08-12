@@ -32,19 +32,191 @@ fn peer_addr_from_iroh(addr: &iroh::EndpointAddr) -> crate::p2p::PeerAddr {
     }
 }
 
-fn iroh_node_addr_from_peer(addr: &crate::p2p::PeerAddr) -> Result<iroh::EndpointAddr> {
+fn iroh_node_addr_from_peer(
+    addr: &crate::p2p::PeerAddr,
+    configured_relay: Option<&iroh::RelayUrl>,
+) -> Result<iroh::EndpointAddr> {
     let id = iroh::EndpointId::from_bytes(addr.peer_id.as_bytes())
         .map_err(|e| CryptoError::Parameter(format!("Invalid EndpointId: {}", e)))?;
     let mut addrs: Vec<iroh::TransportAddr> = Vec::new();
     if let Some(s) = addr.relay_url.as_ref() {
-        let relay_url = iroh::RelayUrl::from_str(s)
-            .map_err(|e| CryptoError::Parameter(format!("Invalid RelayUrl: {}", e)))?;
+        // The relay URL is a free-text field of a ticket the peer wrote, and
+        // the ticket's CRC is no barrier (the sender computes it). Dialing it
+        // unchecked turns "paste/scan a ticket" into "open a connection to any
+        // host:port the ticket names" — see `validate_peer_relay_url`.
+        let relay_url = validate_peer_relay_url(s, configured_relay)?;
         addrs.push(iroh::TransportAddr::Relay(relay_url));
     }
     for s in &addr.direct_addrs {
         addrs.push(iroh::TransportAddr::Ip(*s));
     }
     Ok(iroh::EndpointAddr::from_parts(id, addrs))
+}
+
+/// Longest slice of a rejected relay URL quoted back to the operator. The
+/// string came out of a ticket body, so it is peer-authored text and goes
+/// through the same sanitize-and-bound filter as every other peer-authored
+/// diagnostic in the tree.
+const MAX_RELAY_URL_CHARS_SHOWN: usize = 128;
+
+fn refuse_relay_url(raw: &str, reason: &str) -> CryptoError {
+    CryptoError::Parameter(format!(
+        "refusing the relay URL in this ticket ({reason}): {}",
+        crate::utils::sanitize_for_terminal_bounded(raw, MAX_RELAY_URL_CHARS_SHOWN)
+    ))
+}
+
+/// Decide whether a relay URL that arrived in a peer's ticket may be dialed.
+///
+/// iroh treats the relay URL as a dial target: `iroh_relay`'s client rewrites
+/// the scheme (`http`/`ws` → `ws`, anything else → `wss`), connects to the
+/// host and port, and sends a WebSocket upgrade. Nothing about that is
+/// authenticated against the ticket's node id first, so an unchecked relay URL
+/// is a "connect anywhere" primitive driven by whoever wrote the ticket — a
+/// blind SSRF / internal-port probe reachable from a scanned QR code, and, on
+/// an `http`/`ws` scheme, one that puts bytes on the wire in the clear.
+///
+/// The policy, in the order applied:
+///
+/// 1. A URL identical to the relay this node was configured with
+///    (`--relay-url`) is accepted whatever it looks like. Self-hosting a relay
+///    is a documented, privacy-motivated workflow (README §"リレー",
+///    `docs/guides/CHAT_USAGE_GUIDE.md`, `docs/reports/ZTNA_AVAILABILITY.md`),
+///    and a LAN or lab relay lives at exactly the kind of address rule 3
+///    refuses. The operator already named this URL on their own command line,
+///    so it is their decision, not the peer's — this is the explicit opt-in
+///    that keeps the local-relay case reachable instead of silently broken.
+/// 2. The scheme must be `https` or `wss`. `http`/`ws` are refused because they
+///    dial in plaintext; everything else is refused because iroh would silently
+///    promote it to `wss` and dial anyway.
+/// 3. A literal IP host must be globally routable, and the name `localhost`
+///    (with or without a trailing dot, and `*.localhost`, which RFC 6761
+///    reserves for the loopback) is refused.
+///
+/// Residual, deliberately not closed here: this checks the *literal* host, and
+/// performs no DNS resolution. A hostname that resolves to 127.0.0.1 or an
+/// RFC1918 address still passes. Resolving instead would mean performing an
+/// attacker-directed DNS lookup during validation and would still be a
+/// time-of-check/time-of-use gap against the resolution iroh performs when it
+/// dials, so it would buy an appearance of safety rather than safety — this is
+/// not a DNS-rebinding-proof check and must not be described as one. Ports are
+/// likewise unrestricted, so a probe of an arbitrary port on a *public* host
+/// remains possible; restricting to 443 would break self-hosted relays on
+/// alternate ports, which rule 1 alone does not cover (a third party's relay
+/// may legitimately be one).
+///
+/// This is *not* a general validator for everything a ticket names, and must
+/// not be read as one: the same ticket's `direct_addrs` are equally
+/// attacker-chosen and are pushed into the `EndpointAddr` above unchecked. That
+/// is a deliberate scope decision, not an oversight. They are `SocketAddr`
+/// targets for iroh's QUIC/UDP holepunching — a weaker primitive than the TCP
+/// connection plus WebSocket upgrade a relay URL buys — and filtering them here
+/// would both exceed the scope of the finding this function answers and break
+/// the loopback smoke tests, which reach a peer over `127.0.0.1` direct
+/// addresses with the relay disabled. If they are to be constrained, it belongs
+/// in its own change, with the test fixtures moved off loopback first.
+fn validate_peer_relay_url(
+    raw: &str,
+    configured_relay: Option<&iroh::RelayUrl>,
+) -> Result<iroh::RelayUrl> {
+    let url = iroh::RelayUrl::from_str(raw)
+        .map_err(|e| CryptoError::Parameter(format!("Invalid RelayUrl: {}", e)))?;
+
+    // (1) The operator's own relay, named on their own command line.
+    // `RelayUrl` compares as the parsed `Url`, so the trailing-slash and
+    // default-port normalisation that separates a typed `--relay-url` from the
+    // form a ticket carries does not cause a spurious mismatch.
+    if configured_relay == Some(&url) {
+        return Ok(url);
+    }
+
+    // (2) Scheme.
+    match url.scheme() {
+        "https" | "wss" => {}
+        "http" | "ws" => {
+            return Err(refuse_relay_url(
+                raw,
+                "plaintext scheme; a relay must be reached over https/wss",
+            ));
+        }
+        _ => {
+            return Err(refuse_relay_url(
+                raw,
+                "unsupported scheme; a relay must be reached over https/wss",
+            ));
+        }
+    }
+
+    // (3) Host.
+    let Some(host) = url.host_str() else {
+        return Err(refuse_relay_url(raw, "no host"));
+    };
+    // `url` brackets IPv6 literals; strip them before parsing.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = std::net::IpAddr::from_str(bare) {
+        if !ip_is_globally_routable(ip) {
+            return Err(refuse_relay_url(
+                raw,
+                "the host is a loopback, private, link-local or otherwise \
+                 non-routable address",
+            ));
+        }
+    } else {
+        let name = host.trim_end_matches('.').to_ascii_lowercase();
+        if name == "localhost" || name.ends_with(".localhost") {
+            return Err(refuse_relay_url(raw, "the host names the loopback"));
+        }
+    }
+
+    Ok(url)
+}
+
+/// Whether `ip` is an address that belongs on the public internet, i.e. not one
+/// that only means something inside the victim's own host or network. Written
+/// out rather than using `IpAddr::is_global` so it does not depend on an
+/// unstable API, and so each refused range is visible next to its reason.
+fn ip_is_globally_routable(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_loopback()            // 127.0.0.0/8
+                || v4.is_private()        // 10/8, 172.16/12, 192.168/16
+                || v4.is_link_local()     // 169.254.0.0/16 (incl. cloud metadata)
+                || v4.is_unspecified()    // 0.0.0.0
+                || v4.is_multicast()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                // 100.64.0.0/10, RFC 6598 carrier-grade NAT: routable inside a
+                // provider or lab network, never globally.
+                || (o[0] == 100 && (o[1] & 0xc0) == 0x40))
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return false;
+            }
+            // ::ffff:a.b.c.d carries an IPv4 address; judge that address, or
+            // `::ffff:127.0.0.1` would walk straight past the checks above.
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_globally_routable(std::net::IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            // ::/96 — the deprecated IPv4-compatible form (`::a.b.c.d`). Never
+            // a legitimate relay, and some stacks still map it onto IPv4.
+            if seg[..6] == [0, 0, 0, 0, 0, 0] {
+                return false;
+            }
+            if (seg[0] & 0xfe00) == 0xfc00 {
+                return false; // fc00::/7 unique local
+            }
+            if (seg[0] & 0xffc0) == 0xfe80 {
+                return false; // fe80::/10 link-local
+            }
+            true
+        }
+    }
 }
 
 /// Load the persistent iroh node secret key from `path`, or create one
@@ -262,6 +434,11 @@ pub struct IrohEndpoint {
     /// ticket. When false (`--no-relay` / test mode) there is no relay to wait
     /// for, so `local_addr` returns as soon as any direct address is known.
     relay_enabled: bool,
+    /// The relay this node was built with via `--relay-url`, if any. Consulted
+    /// only as an allowance in `validate_peer_relay_url`: a ticket naming the
+    /// operator's own (possibly LAN / self-hosted) relay is accepted, while any
+    /// other peer-supplied relay must clear the public-address policy.
+    configured_relay: Option<iroh::RelayUrl>,
     /// Live metrics for the most recent outgoing `connect` (selected-path
     /// relay/direct + RTT), exposed via `last_connect_metrics` for the status bar.
     last_metrics: std::sync::Mutex<Option<std::sync::Arc<dyn crate::p2p::ConnMetrics>>>,
@@ -302,6 +479,10 @@ impl IrohEndpoint {
             // relay may be in use and wait for it (bounded by a timeout). `new`
             // overrides this with the exact relay configuration.
             relay_enabled: true,
+            // No `--relay-url` is known for an endpoint we did not configure, so
+            // no peer-supplied relay gets the operator-trusted exemption. `new`
+            // fills this in when the operator named a relay.
+            configured_relay: None,
             last_metrics: std::sync::Mutex::new(None),
         }
     }
@@ -399,11 +580,16 @@ impl IrohEndpoint {
             builder = builder.secret_key(load_or_create_node_secret(path)?);
         }
 
+        // Remembered so a ticket naming this very relay is accepted even when it
+        // points at a LAN / self-hosted address the peer-relay policy refuses;
+        // see `validate_peer_relay_url`.
+        let mut configured_relay: Option<iroh::RelayUrl> = None;
         if is_test || config.no_relay {
             builder = builder.relay_mode(iroh::RelayMode::Disabled);
         } else if let Some(ref url) = config.relay_url {
             let relay_url = iroh::RelayUrl::from_str(url)
                 .map_err(|e| CryptoError::Parameter(format!("Invalid RelayUrl: {}", e)))?;
+            configured_relay = Some(relay_url.clone());
             builder = builder.relay_mode(iroh::RelayMode::Custom(
                 iroh_relay::RelayMap::from(relay_url),
             ));
@@ -442,6 +628,7 @@ impl IrohEndpoint {
         // Relay is in use unless explicitly disabled (test mode or `--no-relay`).
         // A custom `--relay-url` and the n0 default both count as enabled.
         ep.relay_enabled = !(is_test || config.no_relay);
+        ep.configured_relay = configured_relay;
         Ok(ep)
     }
 
@@ -513,7 +700,7 @@ impl crate::p2p::P2pEndpoint for IrohEndpoint {
         addr: &crate::p2p::PeerAddr,
         protocol: crate::p2p::P2pProtocol,
     ) -> std::result::Result<Box<dyn crate::p2p::P2pStream>, crate::p2p::P2pError> {
-        let node_addr = iroh_node_addr_from_peer(addr)
+        let node_addr = iroh_node_addr_from_peer(addr, self.configured_relay.as_ref())
             .map_err(|e| crate::p2p::P2pError::Backend(e.to_string()))?;
         let connection = self
             .endpoint
@@ -1254,5 +1441,188 @@ mod tests {
             "the listener must be handed the sender's fingerprint so the UI can display it"
         );
         signed_server.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Peer-supplied relay URL policy (`validate_peer_relay_url`).
+    //
+    // The relay URL is free text in a ticket body whose CRC the writer computes,
+    // so each of these is a string an attacker can put in a QR code. Before the
+    // policy existed every one of them was handed to iroh as a dial target.
+    // -----------------------------------------------------------------------
+
+    fn refused(url: &str) -> String {
+        match validate_peer_relay_url(url, None) {
+            Ok(_) => panic!("relay URL {url:?} must be refused, but was accepted for dialing"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn peer_relay_url_refuses_loopback_and_private_literals() {
+        // The blind-SSRF / internal-port-probe core of the finding.
+        for url in [
+            "https://127.0.0.1",
+            "https://127.0.0.1:8080",
+            "https://127.9.9.9:22",
+            "https://0.0.0.0:443",
+            "https://10.0.0.1",
+            "https://192.168.0.5:3340",
+            "https://172.16.4.4",
+            "https://169.254.169.254",   // cloud instance metadata
+            "https://100.64.0.1",        // RFC 6598 CGNAT
+            "https://[::1]:443",
+            "https://[::ffff:127.0.0.1]", // IPv4-mapped loopback
+            "https://[::ffff:192.168.1.1]",
+            "https://[::127.0.0.1]",     // deprecated IPv4-compatible form
+            "https://[fc00::1]",         // unique local
+            "https://[fe80::1]",         // link-local
+        ] {
+            let msg = refused(url);
+            assert!(
+                msg.contains("refusing the relay URL in this ticket"),
+                "{url}: refusal must say what was refused, got {msg:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn peer_relay_url_refuses_localhost_by_name() {
+        for url in [
+            "https://localhost",
+            "https://localhost:9000",
+            "https://LOCALHOST",
+            "https://localhost.",
+            "https://anything.localhost",
+        ] {
+            refused(url);
+        }
+    }
+
+    #[test]
+    fn peer_relay_url_refuses_plaintext_and_exotic_schemes() {
+        // http/ws dial in the clear; anything else iroh silently promotes to
+        // wss and dials anyway, so neither may reach the endpoint.
+        for url in [
+            "http://relay.example.com",
+            "ws://relay.example.com",
+            "ftp://relay.example.com",
+            "file://relay.example.com",
+            "gopher://relay.example.com:70",
+        ] {
+            refused(url);
+        }
+    }
+
+    #[test]
+    fn peer_relay_url_accepts_ordinary_public_relays() {
+        // The honest flow, including the n0 default and a third party's
+        // self-hosted relay on a non-standard port, is untouched.
+        for url in [
+            "https://relay.example.com",
+            "https://use1-1.relay.iroh.network./",
+            "https://relay.example.com:8443",
+            "wss://relay.example.com",
+            "https://93.184.216.34",
+            "https://[2001:db8::1]:443",
+        ] {
+            assert!(
+                validate_peer_relay_url(url, None).is_ok(),
+                "{url} is an ordinary public relay and must still be dialable"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_relay_is_the_operators_opt_in_for_a_private_relay() {
+        // Self-hosting a relay on a LAN is documented (README, CHAT_USAGE_GUIDE,
+        // ZTNA_AVAILABILITY). The operator names it on their own command line;
+        // a ticket pointing at that same relay is then their decision, not the
+        // peer's, so it is accepted where rule 3 would otherwise refuse it.
+        let configured = iroh::RelayUrl::from_str("http://192.168.0.5:3340").unwrap();
+        assert!(
+            validate_peer_relay_url("http://192.168.0.5:3340", Some(&configured)).is_ok(),
+            "a ticket naming the operator's own relay must still work"
+        );
+        // Normalisation must not defeat the match: what a ticket carries comes
+        // out of `RelayUrl::to_string()` (trailing slash), what the operator
+        // typed usually does not have one.
+        assert!(
+            validate_peer_relay_url("http://192.168.0.5:3340/", Some(&configured)).is_ok(),
+            "the trailing-slash form of the same relay must match too"
+        );
+        // The exemption is that one URL and nothing else on the same host.
+        assert!(
+            validate_peer_relay_url("http://192.168.0.5:22", Some(&configured)).is_err(),
+            "a different port on the operator's relay host is still a probe"
+        );
+        assert!(
+            validate_peer_relay_url("http://192.168.0.6:3340", Some(&configured)).is_err(),
+            "a different host is still a probe"
+        );
+    }
+
+    #[test]
+    fn relay_refusal_does_not_carry_peer_control_characters() {
+        // `url` strips raw newlines/tabs while parsing, so the *parsed* URL is
+        // clean but the string the peer wrote is not — and it is that string
+        // which is quoted back to the operator.
+        let hostile = "https://192.168.0.1/\n\u{1b}]0;pwned\u{7}";
+        let msg = refused(hostile);
+        assert!(!msg.contains('\n'), "refusal must not carry a newline: {msg:?}");
+        assert!(!msg.contains('\u{1b}'), "refusal must not carry ESC: {msg:?}");
+        assert!(!msg.contains('\u{7}'), "refusal must not carry BEL: {msg:?}");
+    }
+
+    #[test]
+    fn ticket_relay_url_is_checked_on_the_dial_path() {
+        // End of the actual chain: ticket text -> Ticket -> PeerAddr -> the one
+        // function that turns a PeerAddr into something iroh dials.
+        let node_id = SecretKey::from_bytes(&[7u8; 32]).public();
+        let hostile = Ticket {
+            version: 1,
+            node_id: *node_id.as_bytes(),
+            relay_url: Some("http://127.0.0.1:9200".to_string()),
+            direct_addrs: vec![],
+            pqc_fp_algo: 0,
+            pqc_sign_fp: [0u8; 32],
+            pqc_enc_fp: [0u8; 32],
+        };
+        // Round-trips through the wire form, so this is exactly what a scanned
+        // QR code or a pasted ticket produces.
+        let parsed = Ticket::from_str(&hostile.to_string()).expect("ticket parses");
+        assert!(
+            iroh_node_addr_from_peer(&parsed.peer_addr(), None).is_err(),
+            "a ticket naming a loopback relay must not become a dial target"
+        );
+
+        // …and a ticket that names no relay at all is unaffected.
+        let plain = Ticket {
+            relay_url: None,
+            ..hostile
+        };
+        let parsed = Ticket::from_str(&plain.to_string()).expect("ticket parses");
+        assert!(iroh_node_addr_from_peer(&parsed.peer_addr(), None).is_ok());
+    }
+
+    #[test]
+    fn globally_routable_classification() {
+        use std::net::IpAddr;
+        for ip in ["8.8.8.8", "93.184.216.34", "2001:db8::1", "2606:4700::1111"] {
+            assert!(
+                ip_is_globally_routable(ip.parse::<IpAddr>().unwrap()),
+                "{ip} must count as globally routable"
+            );
+        }
+        for ip in [
+            "127.0.0.1", "10.1.2.3", "192.168.1.1", "172.31.255.255", "169.254.1.1",
+            "0.0.0.0", "255.255.255.255", "224.0.0.1", "100.100.0.1", "192.0.2.1",
+            "::1", "::", "fc00::1", "fd12::1", "fe80::1", "ff02::1", "::ffff:10.0.0.1",
+        ] {
+            assert!(
+                !ip_is_globally_routable(ip.parse::<IpAddr>().unwrap()),
+                "{ip} must not count as globally routable"
+            );
+        }
     }
 }

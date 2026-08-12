@@ -469,6 +469,59 @@ use crate::ticket::Ticket;
 #[cfg(feature = "gui-camera")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// The one slot holding the running file-receive listener, if any.
+///
+/// A `std` mutex, not a `tokio` one, on purpose: both the "Generate Ticket and
+/// Wait" press and the Cancel press arrive on the Slint event-loop thread, and
+/// only a lock they can take *there and then* lets the handle be installed in
+/// the same turn as the press. Storing it from a spawned task instead left a
+/// multi-second window in which a live listener was in nobody's hands. It is
+/// never held across an await.
+#[cfg(feature = "gui")]
+type ListenSlot = std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>;
+
+/// Make `spawn`'s listener *the* listener: abort whatever is already in the
+/// slot, then install the new handle, all under one lock. Returns whether a
+/// previous listener was found and aborted.
+///
+/// The abort is the point. Overwriting the slot without it detached a listener
+/// that was still accepting connections on a ticket already in circulation,
+/// with no UI affordance left to stop it — Cancel can only reach the handle the
+/// slot holds. A listener nobody holds is a listener nobody can revoke.
+#[cfg(feature = "gui")]
+fn install_listener(
+    slot: &ListenSlot,
+    spawn: impl FnOnce() -> tokio::task::JoinHandle<()>,
+) -> bool {
+    // A panic elsewhere must not make the listener unstoppable, so a poisoned
+    // lock is recovered from rather than propagated.
+    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    let replaced = match guard.take() {
+        Some(previous) => {
+            previous.abort();
+            true
+        }
+        None => false,
+    };
+    *guard = Some(spawn());
+    replaced
+}
+
+/// Abort the listener in the slot, if one is there. Returns whether a handle
+/// was taken and aborted; `false` means the listener had already finished on
+/// its own (or never started).
+#[cfg(feature = "gui")]
+fn cancel_listener(slot: &ListenSlot) -> bool {
+    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    match guard.take() {
+        Some(handle) => {
+            handle.abort();
+            true
+        }
+        None => false,
+    }
+}
+
 #[cfg(feature = "gui")]
 pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     let ui = ChatWindow::new()?;
@@ -930,8 +983,7 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
 
     // F2: Listen handler (FileReceive mode)
     let ui_handle_listen = ui_handle.clone();
-    let listen_task: Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
+    let listen_task: Arc<ListenSlot> = Arc::new(std::sync::Mutex::new(None));
     let listen_task_for_press = listen_task.clone();
     ui.on_listen_pressed(move |privkey, pubkey| {
         let ui_handle = ui_handle_listen.clone();
@@ -975,7 +1027,21 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         };
         let recv_path = std::path::PathBuf::from(&save_dir).join(&final_name);
 
-        let task = tokio::spawn(async move {
+        // Mark the UI busy now, synchronously, on the event-loop thread. The
+        // button that reaches this handler sits in a panel gated on
+        // `!listening` (chat.slint `connection-settings-visible`), so this is
+        // what makes a second press impossible during the seconds it takes the
+        // listener to come up and call `on_ticket`. It also puts Cancel on
+        // screen (`listen-display-visible`) for that whole window instead of
+        // only after the ticket appears. Any stale ticket text is cleared with
+        // it: the panel is now visible before a ticket exists, and showing a
+        // previous one there would present a dead ticket as the live one.
+        if let Some(ui) = ui_handle_listen.upgrade() {
+            ui.set_listening(true);
+            ui.set_generated_ticket("".into());
+        }
+
+        install_listener(&listen_task, move || tokio::spawn(async move {
             let config = build_file_receive_config(&privkey, &pubkey);
 
             let file_io = match crate::network::FileIOProvider::new_recv(recv_path.clone()).await {
@@ -985,6 +1051,11 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                     let msg = format!("Cannot create receive file: {}", e);
                     let _ = slint::invoke_from_event_loop(move || {
                         if let Some(ui) = ui_handle.upgrade() {
+                            // `listening` was set by the press; this listener
+                            // never came up, so hand the controls back rather
+                            // than leaving the user in a "waiting" panel with
+                            // nothing behind it.
+                            ui.set_listening(false);
                             ui.set_connection_error(msg.into());
                         }
                     });
@@ -1000,6 +1071,9 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(ep) => Arc::new(ep),
                 Err(e) => {
                     ui_handle.upgrade_in_event_loop(move |ui| {
+                        // Same as above: no listener came up, so `listening`
+                        // must not stay set.
+                        ui.set_listening(false);
                         ui.set_connection_error(format!("Endpoint init: {}", e).into());
                     }).ok();
                     return;
@@ -1016,6 +1090,9 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                 let msg = format!("Keyring allowlist: {}", e);
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_handle.upgrade() {
+                        // Same as above: no listener came up, so `listening`
+                        // must not stay set.
+                        ui.set_listening(false);
                         ui.set_connection_error(msg.into());
                     }
                 });
@@ -1094,34 +1171,24 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             });
-        });
-
-        let listen_task_clone = listen_task.clone();
-        tokio::spawn(async move {
-            let mut guard = listen_task_clone.lock().await;
-            *guard = Some(task);
-        });
+        }));
     });
 
     let listen_task_for_cancel = listen_task.clone();
     let ui_handle_cancel = ui_handle.clone();
     ui.on_listen_cancel(move || {
-        let listen_task = listen_task_for_cancel.clone();
-        let ui_handle = ui_handle_cancel.clone();
-        tokio::spawn(async move {
-            let mut guard = listen_task.lock().await;
-            if let Some(handle) = guard.take() {
-                handle.abort();
-            }
-            drop(guard);
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(ui) = ui_handle.upgrade() {
-                    ui.set_listening(false);
-                    ui.set_generated_ticket("".into());
-                    ui.set_connection_error("Listen cancelled.".into());
-                }
-            });
-        });
+        // Abort first, then report — and both on the event-loop thread, so the
+        // listener is dead before the UI claims it is. `install_listener` put
+        // the handle in the slot in the same event-loop turn as the press that
+        // set `listening`, so there is no turn in which Cancel is reachable and
+        // the slot is empty: `false` here means the listener had already
+        // finished by itself, not that one is still running unheld.
+        let _aborted = cancel_listener(&listen_task_for_cancel);
+        if let Some(ui) = ui_handle_cancel.upgrade() {
+            ui.set_listening(false);
+            ui.set_generated_ticket("".into());
+            ui.set_connection_error("Listen cancelled.".into());
+        }
     });
 
     let gp_pass = gui_provider.clone();
@@ -1224,6 +1291,147 @@ mod connect_config_tests {
         assert_eq!(config.signing_pubkey.as_deref(), Some("/keys/bob.pub"));
         assert_eq!(config.connect_addr.as_deref(), Some("nkct1example"));
         assert!(matches!(config.transport, crate::config::TransportKind::Iroh));
+    }
+}
+
+/// Discipline of the single file-receive listener slot: a listener must never
+/// outlive the handle that can stop it.
+///
+/// These drive `install_listener` / `cancel_listener` — the two functions the
+/// "Generate Ticket and Wait" and "Cancel" handlers are made of — because the
+/// handlers themselves need a Slint event loop. A never-ending task stands in
+/// for a listener that is still accepting connections on a circulated ticket;
+/// aborting it drops its future, which is what the witness records.
+#[cfg(all(test, feature = "gui"))]
+mod listen_slot_tests {
+    use super::{ListenSlot, cancel_listener, install_listener};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    /// Set when the task it lives in is dropped — i.e. when the task was
+    /// aborted (these tasks never finish on their own).
+    struct AbortWitness(Arc<AtomicBool>);
+
+    impl Drop for AbortWitness {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn listener_that_never_ends(aborted: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+        // The witness is built here, not inside the body, so it is owned by the
+        // future from the moment the future exists: a task aborted before its
+        // first poll must count as aborted too.
+        let witness = AbortWitness(aborted);
+        tokio::spawn(async move {
+            let _witness = witness;
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+    }
+
+    async fn became_true(flag: &Arc<AtomicBool>) -> bool {
+        for _ in 0..200 {
+            if flag.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        flag.load(Ordering::SeqCst)
+    }
+
+    /// The finding: pressing "Generate Ticket and Wait" a second time used to
+    /// overwrite the slot, detaching the first listener — still live, still
+    /// holding a valid ticket, and no longer reachable from Cancel.
+    #[tokio::test]
+    async fn a_second_press_aborts_the_listener_already_in_the_slot() {
+        let slot: ListenSlot = std::sync::Mutex::new(None);
+        let first_aborted = Arc::new(AtomicBool::new(false));
+
+        let witness = first_aborted.clone();
+        assert!(
+            !install_listener(&slot, move || listener_that_never_ends(witness)),
+            "the first press has no predecessor to abort"
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            !first_aborted.load(Ordering::SeqCst),
+            "the first listener must be running before the second press"
+        );
+
+        let second_aborted = Arc::new(AtomicBool::new(false));
+        let witness = second_aborted.clone();
+        assert!(
+            install_listener(&slot, move || listener_that_never_ends(witness)),
+            "the second press must find the first listener and report aborting it"
+        );
+        assert!(
+            became_true(&first_aborted).await,
+            "the first listener must be aborted, not orphaned: it would otherwise keep \
+             accepting transfers on a ticket the user believes is dead"
+        );
+    }
+
+    /// Cancel must be total: after the double press above, no listener at all
+    /// survives it.
+    #[tokio::test]
+    async fn cancel_after_a_second_press_leaves_no_live_listener() {
+        let slot: ListenSlot = std::sync::Mutex::new(None);
+        let first_aborted = Arc::new(AtomicBool::new(false));
+        let second_aborted = Arc::new(AtomicBool::new(false));
+
+        let witness = first_aborted.clone();
+        install_listener(&slot, move || listener_that_never_ends(witness));
+        let witness = second_aborted.clone();
+        install_listener(&slot, move || listener_that_never_ends(witness));
+        // Let both actually get running, as a real listener would be.
+        tokio::task::yield_now().await;
+
+        assert!(
+            cancel_listener(&slot),
+            "Cancel must find a handle to abort"
+        );
+        assert!(became_true(&first_aborted).await, "first listener still live after Cancel");
+        assert!(became_true(&second_aborted).await, "second listener still live after Cancel");
+    }
+
+    /// Cancel empties the slot, so a later Cancel has nothing to take — and
+    /// says so, rather than claiming to have stopped something.
+    #[tokio::test]
+    async fn cancel_is_idempotent_and_reports_an_empty_slot() {
+        let slot: ListenSlot = std::sync::Mutex::new(None);
+        assert!(!cancel_listener(&slot), "nothing to cancel before any press");
+
+        let aborted = Arc::new(AtomicBool::new(false));
+        let witness = aborted.clone();
+        install_listener(&slot, move || listener_that_never_ends(witness));
+
+        assert!(cancel_listener(&slot));
+        assert!(became_true(&aborted).await, "the listener must be aborted");
+        assert!(!cancel_listener(&slot), "the slot must be empty after a cancel");
+    }
+
+    /// A poisoned lock must not turn into an unstoppable listener.
+    #[tokio::test]
+    async fn a_poisoned_slot_can_still_be_cancelled() {
+        let slot: Arc<ListenSlot> = Arc::new(std::sync::Mutex::new(None));
+        let aborted = Arc::new(AtomicBool::new(false));
+        let witness = aborted.clone();
+        install_listener(&slot, move || listener_that_never_ends(witness));
+
+        let poisoner = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the listener slot");
+        })
+        .join();
+        assert!(slot.is_poisoned());
+
+        assert!(cancel_listener(&slot), "a poisoned slot must still yield its handle");
+        assert!(became_true(&aborted).await, "the listener must be aborted");
     }
 }
 
