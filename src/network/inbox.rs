@@ -101,6 +101,14 @@
 //! [`FETCH_RL_REFILL_PER_SEC`]). It raises the per-identity cost of
 //! draining; it is not a complete defence (NodeIds are cheap to mint), so
 //! the Strict profile's "refuse on depletion" policy remains the backstop.
+//! Because that key is free to mint, the table holding the buckets is itself
+//! hard-bounded (`FETCH_RL_MAX_TRACKED`): idle buckets are pruned, and a
+//! caller arriving when there is no room is served *untracked* rather than
+//! refused. Failing open there gives away nothing — the flood that fills the
+//! table is made of fresh NodeIds, which this bucket never restrained anyway —
+//! while refusing would throttle the honest sender, whose idle bucket is the
+//! one that gets pruned. The aggregate bound is the per-recipient reserve
+//! described next.
 //! `depleted` and `rate limited` are distinct replies so the sender can
 //! tell genuine exhaustion (→ fallback / refuse) from a transient throttle
 //! (→ back off and retry).
@@ -195,10 +203,39 @@ pub const FETCH_RL_CAPACITY: f64 = 8.0;
 /// conspicuous. Tunable policy; see the FETCH note in the module docs.
 pub const FETCH_RL_REFILL_PER_SEC: f64 = 1.0 / 30.0;
 
-/// Soft cap on distinct NodeIds tracked for FETCH rate limiting. When the
+/// Hard cap on distinct NodeIds tracked for FETCH rate limiting. When the
 /// table reaches this, fully-refilled (idle) buckets are pruned, bounding
-/// memory without losing any throttle state for active senders.
+/// memory without losing any throttle state for active senders. Pruning is
+/// best-effort, so the cap is also enforced on admission: a caller that
+/// arrives when the table is full of *active* buckets is served **without
+/// being tracked**, exactly as [`RESERVE_MAX_TRACKED`] does for the reserve
+/// table. The table therefore cannot grow past this under any flood.
+///
+/// Failing open costs nothing here, because this bucket is keyed on the
+/// connecting NodeId and a NodeId is free to mint. The caller who can fill
+/// the table is precisely the caller a per-identity throttle never restrained
+/// — a fresh NodeId per request draws a fresh full bucket, cap or no cap — so
+/// there is no adversary that refusing untracked callers would hold back.
+/// Refusing would only reach honest senders: one FETCH per message leaves a
+/// bucket idle, and idle means pruned within
+/// `FETCH_RL_CAPACITY / FETCH_RL_REFILL_PER_SEC`, so an honest sender is
+/// routinely the one *without* an entry. It would also be a downgrade lever
+/// rather than a throttle: [`REPLY_RATE_LIMITED`] is not a retry signal to the
+/// in-tree client — [`crate::one_shot`] handles it in the same arm as
+/// depletion, sealing STATIC-ONLY (no PQ forward secrecy) under the default
+/// profile and refusing to send under Strict. What bounds prekey drain in
+/// aggregate is the per-recipient reserve in `InboxServer::draw_prekey`,
+/// keyed on a recipient rather than on anything an attacker can mint.
 const FETCH_RL_MAX_TRACKED: usize = 4096;
+
+/// Shortest interval between two prunes of the FETCH table. The prune is O(n)
+/// over the table, so paying it on every request once the table sits at
+/// [`FETCH_RL_MAX_TRACKED`] would make the FETCH path quadratic in the number
+/// of requests served — work an attacker buys cheaply, since FETCH is
+/// unauthenticated. Amortizing it bounds that to one pass per second whatever
+/// the request rate, and idle buckets are worth reclaiming no more often than
+/// that: a bucket needs minutes to refill at [`FETCH_RL_REFILL_PER_SEC`].
+const FETCH_RL_PRUNE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Fraction of a recipient's recorded stocking level held in reserve: the
 /// lowest `1/PREKEY_RESERVE_DIVISOR` of the pool is the rate-limited band,
@@ -244,6 +281,15 @@ const RESERVE_MAX_TRACKED: usize = 4096;
 /// to serialize honest clients (DEPOSIT / POLL are brief); bounded enough to cap
 /// concurrent resource use under an accept flood.
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+
+/// Shortest interval between two accept-failure lines on the operator's
+/// stderr. A failed accept is remotely triggerable, so logging each one would
+/// hand any peer an unbounded write to the operator's log; logging only the
+/// first would instead leave a permanently broken socket (fd exhaustion, a
+/// dead endpoint) silent forever, now that such a failure no longer ends
+/// `run()`. One line per interval, carrying the number suppressed since the
+/// previous line, keeps both bounded and still visible.
+const ACCEPT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default per-frame idle timeout. Generous enough to absorb iroh
 /// hole-punching latency; short enough to bound retry cost.
@@ -709,20 +755,41 @@ mod server {
         }
 
         /// A bucket that has refilled to capacity is indistinguishable from a
-        /// fresh one, so it can be pruned to reclaim memory. This reads the
-        /// *recorded* level, which is what the per-NodeId table has always
-        /// pruned on.
-        fn is_full(&self) -> bool {
-            self.tokens >= self.capacity
-        }
-
-        /// As [`Self::is_full`], but counting the refill owed since the bucket
-        /// was last charged. The per-recipient table prunes on this: a bucket
-        /// charged once and then left alone would otherwise never report full,
-        /// and a flood of briefly-charged recipients could pin the table and
-        /// leave every later recipient untracked.
+        /// fresh one, so it can be pruned to reclaim memory. Both throttle
+        /// tables prune on this.
+        ///
+        /// Counting the refill owed since the bucket was last charged is the
+        /// whole point: `try_take` always leaves the *recorded* level at
+        /// `capacity - 1` or below, so a predicate reading `self.tokens`
+        /// directly would call no bucket that has ever been charged idle, and
+        /// a prune built on it would free nothing, ever.
         fn is_full_at(&self, now: Instant) -> bool {
             self.tokens_at(now) >= self.capacity
+        }
+    }
+
+    /// The FETCH throttle table and the state that keeps it bounded.
+    ///
+    /// Its key is the connecting NodeId, which is free to mint, so the prune
+    /// of idle buckets has to be amortized rather than paid per request — see
+    /// [`FETCH_RL_MAX_TRACKED`] and [`FETCH_RL_PRUNE_INTERVAL`].
+    struct FetchLimiter {
+        /// One bucket per tracked NodeId. Never larger than
+        /// [`FETCH_RL_MAX_TRACKED`].
+        buckets: HashMap<PeerId, TokenBucket>,
+        /// When `buckets` was last pruned, to keep the O(n) pass off the
+        /// per-request path.
+        last_prune: Instant,
+    }
+
+    impl FetchLimiter {
+        fn new(now: Instant) -> Self {
+            Self {
+                buckets: HashMap::new(),
+                // Backdated so the first prune is not itself gated by the
+                // interval: a flood can reach the cap within a second of start.
+                last_prune: now.checked_sub(FETCH_RL_PRUNE_INTERVAL).unwrap_or(now),
+            }
         }
     }
 
@@ -768,6 +835,22 @@ mod server {
         stock / PREKEY_RESERVE_DIVISOR
     }
 
+    /// The line [`InboxServer::run`] logs for a failed `accept()`, reporting
+    /// how many failures went unlogged since the previous line (see
+    /// [`ACCEPT_ERROR_LOG_INTERVAL`]).
+    ///
+    /// Split out so a test can assert what reaches the operator's terminal: a
+    /// backend error message can quote peer-supplied bytes — an unknown ALPN,
+    /// a rejected token — so it goes through the shared terminal sanitizer
+    /// rather than to stderr raw.
+    pub(super) fn accept_error_line(e: &P2pError, suppressed: u64) -> String {
+        format!(
+            "[inbox] accept error (continuing to serve; {suppressed} suppressed \
+             since the previous line): {}",
+            crate::utils::sanitize_for_terminal(&e.to_string())
+        )
+    }
+
     /// Outcome of [`InboxServer::draw_prekey`].
     enum Draw {
         /// A popped one-time prekey blob.
@@ -785,8 +868,10 @@ mod server {
         store: RedbInboxStore,
         /// Per-NodeId FETCH rate limiters (prekey-depletion mitigation).
         /// A std mutex, not async: the critical section is a few map ops
-        /// with no `.await`, so it never blocks the runtime meaningfully.
-        fetch_rl: StdMutex<HashMap<PeerId, TokenBucket>>,
+        /// with no `.await`, so it never blocks the runtime meaningfully —
+        /// which is also why the O(n) prune inside it is amortized (see
+        /// [`FETCH_RL_PRUNE_INTERVAL`]) instead of running per request.
+        fetch_rl: StdMutex<FetchLimiter>,
         /// Per-recipient prekey reserve (the second half of the same
         /// mitigation), taken **only** by [`Self::draw_prekey`] — no other
         /// handler touches it. Also the serialization point for count+pop, so
@@ -828,34 +913,70 @@ mod server {
             )?;
             Ok(Self {
                 store,
-                fetch_rl: StdMutex::new(HashMap::new()),
+                fetch_rl: StdMutex::new(FetchLimiter::new(Instant::now())),
                 prekey_reserve: StdMutex::new(HashMap::new()),
                 conn_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             })
         }
 
         /// Charge one FETCH token against the connecting NodeId's bucket,
-        /// returning `true` if the request is within the rate limit. Prunes
-        /// idle (fully-refilled) buckets when the table grows past
-        /// [`FETCH_RL_MAX_TRACKED`] so the map can't grow without bound under
-        /// a stream of distinct NodeIds.
+        /// returning `true` if the request is within the rate limit.
         fn allow_fetch(&self, who: PeerId) -> bool {
-            let now = Instant::now();
+            self.allow_fetch_at(who, Instant::now())
+        }
+
+        /// [`Self::allow_fetch`] with the clock passed in, so a test can place
+        /// two calls minutes apart without waiting for them.
+        ///
+        /// FETCH is unauthenticated and its key here is a free-to-mint NodeId,
+        /// so this table has to stay bounded against a caller that never
+        /// repeats itself. Two rules do that:
+        ///
+        /// * At [`FETCH_RL_MAX_TRACKED`] entries, buckets that have refilled
+        ///   to capacity are pruned — they hold no throttle state a fresh
+        ///   bucket would not. The test is [`TokenBucket::is_full_at`], on the
+        ///   *refilled* level: `try_take` always leaves the recorded level
+        ///   below capacity, so a prune reading that would free nothing and
+        ///   the table would grow without bound. The pass is O(n), so it runs
+        ///   at most once per [`FETCH_RL_PRUNE_INTERVAL`] and only for a
+        ///   caller not already tracked — an established sender never pays for
+        ///   the size of the table.
+        /// * A caller that still finds no room is **served untracked** rather
+        ///   than inserted, so the table is capped even when nothing is
+        ///   prunable. See [`FETCH_RL_MAX_TRACKED`] for why failing open there
+        ///   gives an attacker nothing it did not already have, and why
+        ///   refusing instead would only reach honest senders. This is the
+        ///   same admission rule `draw_prekey` applies at
+        ///   [`RESERVE_MAX_TRACKED`].
+        fn allow_fetch_at(&self, who: PeerId, now: Instant) -> bool {
             // Recover from a poisoned lock rather than propagating the panic:
             // a throttle table is not security-critical state, and the server
             // must keep serving other peers.
-            let mut map = self
+            let mut rl = self
                 .fetch_rl
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if map.len() >= FETCH_RL_MAX_TRACKED {
-                map.retain(|_, b| !b.is_full());
+            if let Some(bucket) = rl.buckets.get_mut(&who) {
+                return bucket.try_take(now);
             }
-            map.entry(who)
-                .or_insert_with(|| {
-                    TokenBucket::new(FETCH_RL_CAPACITY, FETCH_RL_REFILL_PER_SEC, now)
-                })
-                .try_take(now)
+            if rl.buckets.len() >= FETCH_RL_MAX_TRACKED
+                && now.saturating_duration_since(rl.last_prune) >= FETCH_RL_PRUNE_INTERVAL
+            {
+                rl.buckets.retain(|_, b| !b.is_full_at(now));
+                rl.last_prune = now;
+            }
+            if rl.buckets.len() < FETCH_RL_MAX_TRACKED {
+                let mut bucket = TokenBucket::new(FETCH_RL_CAPACITY, FETCH_RL_REFILL_PER_SEC, now);
+                let allowed = bucket.try_take(now);
+                rl.buckets.insert(who, bucket);
+                allowed
+            } else {
+                // No room to track this caller, so it goes ungated rather than
+                // refused: a fresh NodeId was never gated by this table in the
+                // first place, and refusing would throttle only the honest
+                // sender whose idle bucket has been pruned.
+                true
+            }
         }
 
         /// The single path from a FETCH to [`RedbInboxStore::fetch_prekey`].
@@ -931,6 +1052,25 @@ mod server {
                 .len()
         }
 
+        /// Test-only view of the FETCH throttle table's size, so the tests can
+        /// assert that a stream of minted NodeIds cannot grow it without bound.
+        #[cfg(test)]
+        pub(crate) fn tracked_fetchers(&self) -> usize {
+            self.fetch_rl
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .buckets
+                .len()
+        }
+
+        /// Test-only door onto [`Self::allow_fetch_at`]. The throttle is
+        /// otherwise reachable only over a connection, and its bounds need
+        /// thousands of callers and a clock that moves by minutes.
+        #[cfg(test)]
+        pub(crate) fn allow_fetch_at_for_test(&self, who: PeerId, now: Instant) -> bool {
+            self.allow_fetch_at(who, now)
+        }
+
         /// Run the accept loop. Each accepted stream is dispatched on
         /// its own task; the server is fully concurrent for both
         /// DEPOSIT and POLL.
@@ -938,13 +1078,50 @@ mod server {
             self: Arc<Self>,
             endpoint: Arc<dyn P2pEndpoint>,
         ) -> Result<(), InboxError> {
+            // Accept-failure log state: when the last line was written, and how
+            // many failures went unreported since. See `ACCEPT_ERROR_LOG_INTERVAL`.
+            let mut last_error_log: Option<Instant> = None;
+            let mut suppressed_errors: u64 = 0;
             loop {
                 // `accept()` is cheap: it does NOT run the per-connection setup
                 // (ALPN negotiation + stream open), so a peer that stalls the
                 // handshake can no longer block new accepts. Setup runs in the
                 // spawned task below, bounded by `P2P_SETUP_TIMEOUT` (the H2
                 // head-of-line fix).
-                let pending = endpoint.accept().await.map_err(InboxError::Transport)?;
+                //
+                // A failure here is per-connection — a malformed or unsupported
+                // QUIC initial, a peer that vanished between the datagram and
+                // the accept — and anyone can send the datagram that causes one.
+                // It must NOT end store-and-forward for every user of this
+                // relay, so only a closed endpoint leaves the loop. (This was
+                // `?`, so one stray packet exited `run()` and stopped DEPOSIT,
+                // POLL, PUBLISH and FETCH until an operator restarted the
+                // process.) Same shape as `NetworkProcessor::run_listen_loop`,
+                // including the cooperative-yield-only recovery: see the
+                // serial-accept note there for why no delay is added on error.
+                let pending = match endpoint.accept().await {
+                    Ok(p) => p,
+                    // Endpoint shut down (close / ctrl-c). Unchanged from
+                    // before: still the error this returned, so a supervisor
+                    // sees the same exit status it always did.
+                    Err(e @ P2pError::Closed) => return Err(InboxError::Transport(e)),
+                    Err(e) => {
+                        let now = Instant::now();
+                        let due = last_error_log
+                            .is_none_or(|t| {
+                                now.saturating_duration_since(t) >= ACCEPT_ERROR_LOG_INTERVAL
+                            });
+                        if due {
+                            eprintln!("{}", accept_error_line(&e, suppressed_errors));
+                            last_error_log = Some(now);
+                            suppressed_errors = 0;
+                        } else {
+                            suppressed_errors = suppressed_errors.saturating_add(1);
+                        }
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                };
                 // Reserve a slot BEFORE spawning so an accept flood cannot spawn
                 // unbounded setup tasks; a stalling peer's `establish` times out
                 // and frees the slot.
@@ -1911,5 +2088,207 @@ mod tests {
         assert_eq!(count_prekeys(alice.as_ref(), &srv).await.unwrap(), 0);
 
         task.abort();
+    }
+
+    /// The per-NodeId FETCH throttle table stays bounded under a flood of
+    /// minted identities, and its prune really does reclaim.
+    ///
+    /// FETCH is unauthenticated and the bucket key is a free-to-mint NodeId, so
+    /// a stranger can present a new one on every request. Three properties:
+    /// the table never exceeds `FETCH_RL_MAX_TRACKED` however many identities
+    /// call (the prune used to test the *recorded* token level, which
+    /// `try_take` always leaves below capacity — so it removed nothing, the
+    /// insert was unconditional, and the map grew forever while every later
+    /// FETCH paid for a full scan of it); an honest sender is served
+    /// throughout a *sustained* flood, because a caller the full table cannot
+    /// track is served rather than refused (refusing would be a PQ-FS
+    /// downgrade lever, since `one_shot` treats `RateLimited` like depletion);
+    /// and once the flood's buckets have refilled they are reclaimed, so the
+    /// table returns to tracking callers individually.
+    #[tokio::test]
+    async fn fetch_throttle_table_is_bounded_and_reclaims_idle_buckets() {
+        let dir = tempdir().expect("tempdir");
+        let server =
+            InboxServer::open(dir.path().join("inbox.db"), &test_passphrase()).expect("open");
+
+        fn minted(i: usize) -> PeerId {
+            let mut raw = [0u8; 32];
+            raw[..8].copy_from_slice(&(i as u64).to_le_bytes());
+            PeerId::new(raw)
+        }
+
+        // One FETCH from each of far more identities than the table may hold,
+        // all at the same instant so no bucket refills mid-flood.
+        let t0 = std::time::Instant::now();
+        let flood = FETCH_RL_MAX_TRACKED + 5_000;
+        for i in 0..flood {
+            let _ = server.allow_fetch_at_for_test(minted(i), t0);
+        }
+        assert!(
+            server.tracked_fetchers() <= FETCH_RL_MAX_TRACKED,
+            "the FETCH throttle table must stay bounded: {} entries after {flood} callers",
+            server.tracked_fetchers()
+        );
+
+        // Now keep the flood running and interleave an honest sender's FETCHes
+        // with it, at the same instant, so nothing is prunable and the sender
+        // never gets an entry of its own. Every one of its requests must still
+        // be served: a REPLY_RATE_LIMITED here is not a retry signal but a
+        // static-only downgrade (see `one_shot::seal_for_recipient`), so an
+        // unauthenticated flood must not be able to provoke one for a stranger.
+        let honest = pid(7);
+        for i in flood..flood + 500 {
+            let _ = server.allow_fetch_at_for_test(minted(i), t0);
+            assert!(
+                server.allow_fetch_at_for_test(honest, t0),
+                "an honest sender must be served through a sustained flood \
+                 (iteration {i}); refusing untracked callers is a downgrade lever"
+            );
+        }
+        assert!(server.tracked_fetchers() <= FETCH_RL_MAX_TRACKED);
+
+        // Well past a full refill (capacity / FETCH_RL_REFILL_PER_SEC = 240 s),
+        // every flood bucket is idle: the next new caller prunes them all and is
+        // tracked in its own right again.
+        let later = t0 + Duration::from_secs(600);
+        assert!(server.allow_fetch_at_for_test(minted(usize::MAX - 1), later));
+        assert_eq!(
+            server.tracked_fetchers(),
+            1,
+            "idle buckets must be reclaimed once they have refilled"
+        );
+    }
+
+    /// An endpoint whose first `remaining_failures` `accept()` calls fail before
+    /// it delegates to the mock. Models the per-connection transport failure any
+    /// stranger can provoke with one malformed QUIC initial: the iroh backend
+    /// reports it as `P2pError::Accept`, never `Closed`.
+    struct FlakyAcceptEndpoint {
+        inner: Arc<dyn P2pEndpoint>,
+        remaining_failures: std::sync::atomic::AtomicUsize,
+    }
+
+    /// The backend message [`FlakyAcceptEndpoint`] reports. It embeds an ESC
+    /// because a real backend error quotes peer-supplied bytes (an unknown
+    /// ALPN), which is what the log line has to neutralize.
+    const FLAKY_ACCEPT_MSG: &str = "malformed initial \u{1b}[2J from peer";
+
+    #[async_trait::async_trait]
+    impl P2pEndpoint for FlakyAcceptEndpoint {
+        fn local_id(&self) -> PeerId {
+            self.inner.local_id()
+        }
+
+        async fn local_addr(&self) -> Result<PeerAddr, P2pError> {
+            self.inner.local_addr().await
+        }
+
+        async fn connect(
+            &self,
+            addr: &PeerAddr,
+            protocol: P2pProtocol,
+        ) -> Result<Box<dyn crate::p2p::P2pStream>, P2pError> {
+            self.inner.connect(addr, protocol).await
+        }
+
+        async fn accept(&self) -> Result<Box<dyn crate::p2p::P2pPending>, P2pError> {
+            use std::sync::atomic::Ordering;
+            if self
+                .remaining_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(P2pError::Accept(FLAKY_ACCEPT_MSG.to_string()));
+            }
+            self.inner.accept().await
+        }
+
+        async fn close(&self) -> Result<(), P2pError> {
+            self.inner.close().await
+        }
+    }
+
+    /// A failed `accept()` must not end the relay. Any datagram reaching the
+    /// QUIC socket can provoke one, and `accept()` used to be `?`-propagated, so
+    /// a single unauthenticated packet stopped DEPOSIT, POLL, PUBLISH and FETCH
+    /// for every user of the relay until an operator restarted the process.
+    #[tokio::test]
+    async fn accept_error_does_not_end_the_relay() {
+        let net = MockNetwork::new();
+        let alice =
+            Arc::new(net.register(pid(1), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let bob =
+            Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let server_ep = Arc::new(FlakyAcceptEndpoint {
+            inner: Arc::new(net.register(pid(99), vec![P2pProtocol(ALPN_INBOX)])),
+            remaining_failures: std::sync::atomic::AtomicUsize::new(3),
+        }) as Arc<dyn P2pEndpoint>;
+
+        let dir = tempdir().expect("tempdir");
+        let server = Arc::new(
+            InboxServer::open(dir.path().join("inbox.db"), &test_passphrase()).expect("open"),
+        );
+        let task = tokio::spawn(async move {
+            let _ = server.run(server_ep).await;
+        });
+        let srv = PeerAddr::new(pid(99));
+
+        // Bounded, because the failure mode is a relay that no longer answers:
+        // without the fix this hangs to the 30 s frame timeout instead.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            deposit(alice.as_ref(), &srv, pid(2), b"still serving")
+                .await
+                .expect("deposit after accept errors");
+            let (_cursor, envelopes) = poll(bob.as_ref(), &srv, 0).await.expect("poll");
+            assert_eq!(envelopes, vec![b"still serving".to_vec()]);
+        })
+        .await
+        .expect("the relay must keep serving after a transient accept error");
+
+        assert!(!task.is_finished(), "the accept loop must still be running");
+        task.abort();
+
+        // What those failures put on the operator's terminal: peer-supplied
+        // bytes are neutralized, and the line accounts for what it swallowed.
+        let line = super::server::accept_error_line(
+            &P2pError::Accept(FLAKY_ACCEPT_MSG.to_string()),
+            41,
+        );
+        assert!(
+            !line.contains('\u{1b}'),
+            "the accept error log must be sanitized: {line:?}"
+        );
+        assert!(line.contains("malformed initial"), "{line:?}");
+        assert!(line.contains("41 suppressed"), "{line:?}");
+    }
+
+    /// A closed endpoint — and nothing else — ends the accept loop, so shutdown
+    /// neither hangs nor spins on a socket that will never accept again, and it
+    /// still reports the transport error the caller has always seen.
+    #[tokio::test]
+    async fn closed_endpoint_ends_the_accept_loop() {
+        let net = MockNetwork::new();
+        let server_ep =
+            Arc::new(net.register(pid(99), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let dir = tempdir().expect("tempdir");
+        let server = Arc::new(
+            InboxServer::open(dir.path().join("inbox.db"), &test_passphrase()).expect("open"),
+        );
+        let task = {
+            let ep = Arc::clone(&server_ep);
+            tokio::spawn(async move { server.run(ep).await })
+        };
+
+        server_ep.close().await.expect("close");
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("run() must return once the endpoint is closed")
+            .expect("the accept loop task must not panic");
+        assert!(
+            matches!(outcome, Err(InboxError::Transport(P2pError::Closed))),
+            "a closed endpoint must still surface the transport error \
+             `run()` has always returned, so a supervisor's exit status is \
+             unchanged; got {outcome:?}"
+        );
     }
 }
