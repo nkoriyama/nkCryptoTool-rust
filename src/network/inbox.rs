@@ -52,6 +52,19 @@
 //! largest returned cursor on subsequent calls to receive only new
 //! envelopes. `max` is clamped server-side to [`MAX_POLL_BATCH`].
 //!
+//! A reply is bounded by **bytes as well as rows**
+//! ([`crate::group::redb_storage::MAX_POLL_BYTES`]), so a batch may be short
+//! while envelopes are still waiting: `max` counts rows, and 64 rows of
+//! [`MAX_PAYLOAD`] would be ~1 GiB of relay memory bought with one 13-byte
+//! request. **The signal that a slot is drained is therefore `count == 0`, not
+//! `count < MAX_POLL_BATCH`.** A client that stops on the latter stops early
+//! rather than losing mail — nothing is deleted by POLL and the cursor it
+//! keeps is the last row it actually received, so its next poll picks up
+//! exactly where it left off. Both in-tree clients already work that way: they
+//! re-poll from the returned cursor (on a timer, or on the next `recv`).
+//! At least one envelope is always returned when any is waiting, so a poll
+//! that returns nothing really does mean nothing is waiting.
+//!
 //! ### PUBLISH (One-Time Prekeys)
 //!
 //! ```text
@@ -139,8 +152,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 /// transport's frame cap so any MLS frame fits.
 pub const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
 
-/// Server-imposed upper bound on envelopes returned per POLL. Clients
-/// repeat polls until they get a count < this cap to fully drain.
+/// Server-imposed upper bound on envelopes returned per POLL. It is a *row*
+/// cap only: the reply is separately bounded by
+/// [`crate::group::redb_storage::MAX_POLL_BYTES`], so a batch can be shorter
+/// than this while more envelopes wait. Clients repeat polls, following the
+/// returned cursor, until a poll returns **nothing**.
 pub const MAX_POLL_BATCH: u32 = 64;
 
 /// Largest single serialized prekey blob accepted by PUBLISH/FETCH. A
@@ -417,9 +433,15 @@ pub async fn deposit(
 /// Poll the inbox `server` for envelopes addressed to us (identified
 /// implicitly by the QUIC handshake's NodeId). Returns the new cursor
 /// to pass on the next poll, and the raw payload bytes of every
-/// envelope. The caller decides how to dispatch each payload — for the
-/// MLS use case, feed each into [`crate::group::transport::recv_mls_message`]
-/// — equivalent framing.
+/// envelope **in this batch**. The caller decides how to dispatch each
+/// payload — for the MLS use case, feed each into
+/// [`crate::group::transport::recv_mls_message`] — equivalent framing.
+///
+/// One call is one batch, bounded by rows *and* by bytes (see the POLL
+/// section of the module docs), so a non-empty result never means "that
+/// was everything". Keep polling from the returned cursor until a poll
+/// returns no envelopes; nothing is dropped in between, because POLL does
+/// not delete and the cursor only advances past rows actually delivered.
 pub async fn poll(
     endpoint: &dyn P2pEndpoint,
     server: &PeerAddr,
@@ -1058,7 +1080,21 @@ mod server {
             // The recipient is the handshake-authenticated NodeId, so no peer
             // can read someone else's inbox even by crafting the request (there
             // is no recipient field on the wire to override).
-            let rows: Vec<(u64, Vec<u8>)> = self.store.poll(recipient.as_bytes(), since, max)?;
+            //
+            // The store call is synchronous redb work (a read transaction plus
+            // an AEAD open per envelope), so it runs on the blocking pool
+            // instead of stalling a runtime worker, exactly as `handle_deposit`
+            // does. What it may return is bounded by
+            // [`crate::group::redb_storage::MAX_POLL_BYTES`] as well as by
+            // `max`, so this `Vec` — held across the writes below while the
+            // peer may be refusing to read — cannot grow to `max` x
+            // [`MAX_PAYLOAD`].
+            let store = self.store.clone();
+            let recipient_bytes = *recipient.as_bytes();
+            let rows: Vec<(u64, Vec<u8>)> =
+                tokio::task::spawn_blocking(move || store.poll(&recipient_bytes, since, max))
+                    .await
+                    .map_err(|e| InboxError::Storage(format!("poll task: {e}")))??;
             let count = rows.len() as u32;
             write_timed(stream, &count.to_le_bytes(), "poll count").await?;
             for (id, payload) in &rows {
@@ -1367,7 +1403,13 @@ mod tests {
     }
 
     /// Drain every envelope addressed to `who`, following the cursor across the
-    /// [`MAX_POLL_BATCH`] limit.
+    /// [`MAX_POLL_BATCH`] row limit *and* the
+    /// [`crate::group::redb_storage::MAX_POLL_BYTES`] byte limit.
+    ///
+    /// Stops on an **empty** batch, not on a short one: a batch stops early once
+    /// its bytes reach the budget, so a short batch does not mean the slot is
+    /// drained. Terminating is still guaranteed — a poll always returns at least
+    /// one row while any row matches, so the cursor advances every round.
     async fn drain(
         who: &dyn P2pEndpoint,
         server: &PeerAddr,
@@ -1376,13 +1418,49 @@ mod tests {
         let mut all = Vec::new();
         loop {
             let (next, batch) = poll(who, server, cursor).await.expect("poll");
-            let n = batch.len();
-            all.extend(batch);
-            cursor = next;
-            if n < MAX_POLL_BATCH as usize {
+            if batch.is_empty() {
                 return all;
             }
+            all.extend(batch);
+            cursor = next;
         }
+    }
+
+    /// Over the wire: one POLL cannot be made to materialise a whole slot. The
+    /// reply stops at [`crate::group::redb_storage::MAX_POLL_BYTES`] even
+    /// though the row cap would have admitted every envelope — and following
+    /// the cursor still drains the slot completely, so the bound costs a round
+    /// trip and not a message.
+    #[tokio::test]
+    async fn poll_reply_is_byte_bounded_and_still_drains() {
+        let (net, _server, task, srv, _dir) = spawn_server().await;
+        let alice =
+            Arc::new(net.register(pid(1), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let bob =
+            Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+
+        // 6 MiB in six envelopes: over the byte budget, far under the 64-row
+        // cap the client asks for, so only the byte bound can shorten a reply.
+        const N: usize = 6;
+        const EACH: usize = 1024 * 1024;
+        for i in 0..N {
+            deposit(alice.as_ref(), &srv, pid(2), &vec![i as u8; EACH])
+                .await
+                .unwrap_or_else(|e| panic!("deposit {i}: {e}"));
+        }
+
+        let (cursor, first) = poll(bob.as_ref(), &srv, 0).await.expect("first poll");
+        assert!(!first.is_empty(), "a poll with mail waiting must return some");
+        assert!(first.len() < N, "one reply carried the whole {N}-envelope slot");
+        assert!(cursor > 0, "cursor must advance past what was delivered");
+
+        let mail = drain(bob.as_ref(), &srv).await;
+        assert_eq!(mail.len(), N, "envelopes stranded or duplicated by a short batch");
+        for (i, m) in mail.iter().enumerate() {
+            assert_eq!(m, &vec![i as u8; EACH], "envelope {i} altered or reordered");
+        }
+
+        task.abort();
     }
 
     /// F2, over the wire: once a recipient's slot is full, a DEPOSIT to it is

@@ -172,7 +172,18 @@ trade-off is explicit rather than forgotten.
     - **What it does *not* do**: nothing stored is destroyed — refusal never
       deletes, which is the whole of the F2 fix — and POLL, FETCH, PUBLISH and
       CHECKPOINT are unaffected, so recipients keep draining mail already
-      waiting. Availability of *new* deposits only.
+      waiting. Availability of *new* deposits only. Read "unaffected" as *this
+      budget does not gate them*, not as *they cost the relay nothing*: POLL
+      used to have no bound of its own beyond a 64-**row** cap, which let one
+      13-byte request make the relay decrypt and hold up to ~1 GiB — bytes an
+      unauthenticated depositor uploaded once and could have re-served on every
+      poll, per connection. A reply is now capped at `MAX_POLL_BYTES` (4 MiB)
+      as well, leaving a per-connection floor of one `MAX_PAYLOAD` envelope
+      (16 MiB, the same amount DEPOSIT already buffers) times
+      `MAX_CONCURRENT_CONNECTIONS`. The visible consequence is that a slot is
+      drained when a poll returns **nothing**, not when it returns fewer than
+      64 rows; a large backlog takes more round trips, and none of it is lost,
+      since the cursor only advances past rows actually delivered.
     - **How it lapses — later than one TTL window**: the flood's bytes are
       given back to the *global* ledger by the table-wide sweep
       (`sweep_expired`), which resumes from one shared wrapping cursor,

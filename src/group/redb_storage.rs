@@ -1454,6 +1454,31 @@ const MAX_ENVELOPE_BYTES_PER_SENDER: u64 = MAX_TOTAL_ENVELOPE_BYTES / 16; // 64 
 /// nothing.
 const MAX_ENVELOPE_BYTES_PER_SENDER_CONGESTED: u64 = MAX_TOTAL_ENVELOPE_BYTES / 1024; // 1 MiB
 
+/// Cap on the bytes one [`RedbInboxStore::poll`] materialises, applied on top of
+/// the row cap the caller passes.
+///
+/// The row cap alone bounds nothing in memory: a POLL asks for up to
+/// [`crate::network::inbox::MAX_POLL_BATCH`] (64) envelopes and each may be a
+/// whole [`crate::network::inbox::MAX_PAYLOAD`] (16 MiB), so one 13-byte request
+/// could make the relay decrypt and hold ~1 GiB — once per concurrent
+/// connection. Nothing in that request is authenticated beyond the handshake
+/// NodeId, which is free to mint, and POLL deletes nothing, so the same stored
+/// bytes can be re-materialised on every poll for as long as they live.
+///
+/// The batch therefore stops *before* the row that would take it past this
+/// budget. **One row is always returned whenever any row matches**, however
+/// large it is: truncating to nothing would leave an envelope bigger than the
+/// budget permanently undeliverable, with the recipient's cursor stuck in front
+/// of it. So the real per-poll bound is `max(MAX_POLL_BYTES, one MAX_PAYLOAD
+/// envelope)` — the same per-connection floor DEPOSIT already has, since it
+/// buffers its payload whole.
+///
+/// A truncated batch is not a lost one: every returned row carries its cursor,
+/// so the next poll resumes immediately after the last row delivered. What it
+/// costs a client is a further round trip; see the POLL section of
+/// [`crate::network::inbox`].
+pub const MAX_POLL_BYTES: usize = 4 * 1024 * 1024; // 4 MiB
+
 /// How long an undelivered envelope is kept before a sweep may reclaim it.
 /// Reclamation *is* expiry now that a full slot refuses instead of evicting, so
 /// this is the only thing that frees space: a week is long enough for a
@@ -2320,6 +2345,13 @@ impl RedbInboxStore {
 
     /// POLL: return up to `max` envelopes for `recipient` with id > `since`,
     /// oldest first, as `(cursor, payload)`.
+    ///
+    /// Bounded by [`MAX_POLL_BYTES`] as well as by `max`, so no caller — however
+    /// large a `max` it passes, and whatever an unauthenticated depositor put in
+    /// the slot — can make one call materialise more than that budget, plus the
+    /// single oversized envelope the forward-progress rule always admits. The
+    /// caller resumes from the largest cursor returned; nothing is skipped and
+    /// nothing is deleted.
     pub fn poll(
         &self,
         recipient: &[u8; 32],
@@ -2341,11 +2373,26 @@ impl RedbInboxStore {
             .range::<&[u8]>((Bound::Excluded(lo.as_slice()), Bound::Included(hi.as_slice())))
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         let mut out = Vec::new();
+        let mut spent = 0usize;
         for entry in range.take(max) {
             let (k, v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let stored = v.value();
+            // Charge the *stored* size, decided before any AEAD work: the sealed
+            // record is the payload plus a fixed frame, so it is a strict upper
+            // bound on what this row would add to `out` — and reading it costs
+            // no decryption for a row we are about to leave for the next poll.
+            //
+            // `out.is_empty()` is the forward-progress rule: the first matching
+            // row goes out whatever it weighs, so an envelope larger than the
+            // budget is still delivered (alone) instead of pinning the
+            // recipient's cursor in front of it forever.
+            if !out.is_empty() && spent.saturating_add(stored.len()) > MAX_POLL_BYTES {
+                break;
+            }
+            spent = spent.saturating_add(stored.len());
             let id = id_from_key(k.value())?;
             let key = composite_key(&bi, id);
-            let pt = self.b.open_record(TID_ENVELOPE, &key, v.value())?;
+            let pt = self.b.open_record(TID_ENVELOPE, &key, stored)?;
             if pt.len() < ENV_HEADER_LEN {
                 return Err(RedbStorageError::Malformed("envelope too short".into()));
             }
@@ -4303,6 +4350,78 @@ mod tests {
 
         // A different recipient sees nothing.
         assert!(s.poll(&[0x00; 32], 0, 10).expect("poll other").is_empty());
+    }
+
+    /// One POLL must not materialise a whole slot. `max` is a *row* cap and an
+    /// unauthenticated depositor picks the rows' size, so 64 rows of
+    /// `MAX_PAYLOAD` would be ~1 GiB of relay heap bought with one 13-byte
+    /// request — per concurrent connection, and repeatable for as long as the
+    /// bytes live, because POLL deletes nothing. The batch stops at
+    /// [`MAX_POLL_BYTES`] instead; the rest waits for the next poll.
+    #[test]
+    fn inbox_poll_is_bounded_by_bytes_not_only_rows() {
+        let (_d, s) = inbox(100);
+        let rcpt = [0xa7u8; 32];
+        let sender = [0xb8u8; 32];
+        // Six equal envelopes, 6 MiB in all: well over the byte budget, well
+        // under the row cap the caller passes.
+        const N: usize = 6;
+        const EACH: usize = 1024 * 1024;
+        for i in 0..N {
+            s.deposit(&rcpt, &sender, &vec![i as u8; EACH], 100 + i as i64)
+                .unwrap_or_else(|e| panic!("deposit {i}: {e}"));
+        }
+
+        let batch = s.poll(&rcpt, 0, 64).expect("poll");
+        let bytes: usize = batch.iter().map(|(_, p)| p.len()).sum();
+        assert!(!batch.is_empty(), "a poll with rows waiting must return one");
+        assert!(
+            batch.len() < N,
+            "the row cap alone admitted all {N} envelopes ({bytes} B) into one batch"
+        );
+        assert!(
+            bytes <= MAX_POLL_BYTES,
+            "batch of {bytes} B is over the {MAX_POLL_BYTES} B budget"
+        );
+
+        // A short batch is not a lost one: following the cursor delivers every
+        // envelope, once each, in order.
+        let mut all = batch;
+        loop {
+            let cursor = all.last().map(|(id, _)| *id).expect("non-empty");
+            let more = s.poll(&rcpt, cursor, 64).expect("poll again");
+            if more.is_empty() {
+                break;
+            }
+            all.extend(more);
+        }
+        assert_eq!(all.len(), N, "envelopes stranded or duplicated");
+        for (i, (_, payload)) in all.iter().enumerate() {
+            assert_eq!(payload, &vec![i as u8; EACH], "envelope {i} altered or reordered");
+        }
+    }
+
+    /// The byte budget must never make an envelope undeliverable. One larger
+    /// than the whole budget is returned **alone**: returning an empty batch
+    /// instead would leave the recipient's cursor parked in front of it for
+    /// ever, turning a memory bug into silent, permanent non-delivery.
+    #[test]
+    fn inbox_poll_returns_an_over_budget_envelope_alone() {
+        let (_d, s) = inbox(100);
+        let rcpt = [0xa9u8; 32];
+        let sender = [0xbau8; 32];
+        s.deposit(&rcpt, &sender, &vec![0x5au8; MAX_POLL_BYTES + 1], 100)
+            .expect("deposit oversized");
+        s.deposit(&rcpt, &sender, b"after", 101).expect("deposit next");
+
+        let first = s.poll(&rcpt, 0, 64).expect("poll");
+        assert_eq!(first.len(), 1, "the oversized envelope must come out alone");
+        assert_eq!(first[0].1.len(), MAX_POLL_BYTES + 1);
+
+        // And the cursor moved past it, so the next envelope follows.
+        let rest = s.poll(&rcpt, first[0].0, 64).expect("poll rest");
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].1, b"after".to_vec());
     }
 
     #[test]
