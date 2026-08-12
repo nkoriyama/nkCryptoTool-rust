@@ -1474,7 +1474,7 @@ where
                             send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Put { file_id, path: e.remote.clone(), mode: e.mode, size: e.size }).await?;
                             let mut f = tokio::fs::File::open(path)
                                 .await
-                                .map_err(|er| CryptoError::Parameter(format!("open {}: {er}", path.display())))?;
+                                .map_err(|er| CryptoError::Parameter(format!("open {}: {er}", show_path(path))))?;
                             stream_bytes(&mut writer, aead_name, tx_key, &mut tx, file_id, &mut f).await?;
                         }
                     }
@@ -1492,7 +1492,17 @@ where
                             }
                         }
                         Some(ScpFrame::Fail { msg, .. }) => {
-                            eprintln!("[nkct] skipped {}: {msg}", e.remote);
+                            // `msg` is already gated at decode; `e.remote` was
+                            // not, and it is not ours either. It comes from
+                            // `walk_tree` over the local tree, and a hostile scp
+                            // *server* names those files verbatim during an
+                            // earlier `--scp-get -r` (`safe_join` rejects
+                            // traversal, not ESC or CR). Same gate as every
+                            // other path this file shows the operator.
+                            eprintln!(
+                                "[nkct] skipped {}: {msg}",
+                                show_path(Path::new(&e.remote))
+                            );
                         }
                         Some(ScpFrame::Err(m)) => return Err(CryptoError::Parameter(format!("scp put refused: {m}"))),
                         other => return Err(CryptoError::Parameter(format!("scp put: unexpected reply {other:?}"))),
@@ -2711,6 +2721,31 @@ mod tests {
         assert!(safe_join(base, "../etc/passwd").is_err());
         assert!(safe_join(base, "/etc/passwd").is_err());
         assert!(safe_join(base, "a/../../x").is_err());
+    }
+
+    /// `safe_join` stops a hostile server writing *outside* the destination —
+    /// it does not stop it choosing a filename made of ESC, CR or bidi marks.
+    /// Those names come back off disk on the next `--scp-put -r` and land in
+    /// the `skipped` line and the `open` error, so both go through the same
+    /// gate every other path in this file uses.
+    #[test]
+    fn shown_paths_cannot_repaint_the_transfer_log() {
+        let hostile = "ok.bin\u{1b}[2K\rtransfer complete\u{202E}\u{2028}\u{E0001}";
+        let shown = show_path(Path::new(hostile));
+        for c in ['\u{1b}', '\r', '\u{202E}', '\u{2028}', '\u{E0001}'] {
+            assert!(!shown.contains(c), "U+{:04X} survived: {shown:?}", c as u32);
+        }
+        assert!(shown.starts_with("ok.bin"));
+
+        // An honest name — including a non-ASCII one — reads exactly as it is
+        // on disk.
+        for name in ["docs/設計.md", "a b/c-d_e.tar.gz"] {
+            assert_eq!(show_path(Path::new(name)), name);
+        }
+
+        // A peer cannot choose how much scrollback one name consumes.
+        let huge = show_path(Path::new(&"n".repeat(9999)));
+        assert!(huge.ends_with("…[truncated]"), "truncation must be visible");
     }
 
     #[test]

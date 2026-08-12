@@ -285,19 +285,33 @@ pub async fn add_member(
         .broadcast_commit(&added.commit, existing_members)
         .await;
 
+    // Both halves failed against a *peer*, so both error strings can carry text
+    // that peer chose (its QUIC close reason arrives inside `Connect(..)`).
+    // These messages are the ones the operator reads to decide whether the new
+    // member actually joined, and this error is printed raw by `main`'s
+    // top-level handler on the one-shot `--mls-cmd add-member` path as well as
+    // by the REPL, so the peer's text is gated here — once, where it enters the
+    // message — instead of at each of those printers.
+    let show = |e: &dyn std::fmt::Display| {
+        crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256)
+    };
     match (welcome_res, commit_res) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(we), Ok(())) => Err(anyhow!(
-            "send Welcome reported {we} but Commit broadcast succeeded; \
-             new member may have joined regardless — verify on their side"
+            "send Welcome reported {} but Commit broadcast succeeded; \
+             new member may have joined regardless — verify on their side",
+            show(&we)
         )),
         (Ok(()), Err(ce)) => Err(anyhow!(
-            "broadcast Commit failed: {ce} (Welcome was delivered; existing \
-             members are now out-of-sync with the new epoch)"
+            "broadcast Commit failed: {} (Welcome was delivered; existing \
+             members are now out-of-sync with the new epoch)",
+            show(&ce)
         )),
-        (Err(we), Err(ce)) => {
-            Err(anyhow!("send Welcome AND broadcast Commit failed: welcome={we}; commit={ce}"))
-        }
+        (Err(we), Err(ce)) => Err(anyhow!(
+            "send Welcome AND broadcast Commit failed: welcome={}; commit={}",
+            show(&we),
+            show(&ce)
+        )),
     }
 }
 
@@ -794,11 +808,22 @@ pub async fn listen_loop(
     let stdin = tokio::io::stdin();
     let mut lines = BufReader::new(stdin).lines();
     // Helper to atomically print a line via the shared writer.
+    // Every `say` is exactly one REPL line — the function appends the `\n`
+    // itself — and this REPL is where the operator reads `[joined]` /
+    // `[epoch advanced]` / `[removed]` to judge who is in the group. Several
+    // arms interpolate text a peer chose (a QUIC close reason surfaces inside
+    // `Transport(Accept(..))` / `Connect(..)`), so the gate belongs *here*,
+    // where the line is rendered, rather than in each arm: `/add failed` was
+    // the one arm that had forgotten it, and a future arm would be one more
+    // chance to forget. Arms that also bound the length keep doing so — this
+    // pass is deliberately unbounded, because operator-authored lines here can
+    // legitimately be long (a ticket is longer than any peer-text bound).
     let say = |s: String| {
         let stdout = Arc::clone(&stdout);
         async move {
+            let line = crate::utils::sanitize_for_terminal(&s);
             let mut out = stdout.lock().await;
-            let _ = out.write_all(s.as_bytes()).await;
+            let _ = out.write_all(line.as_bytes()).await;
             let _ = out.write_all(b"\n").await;
             let _ = out.flush().await;
         }
@@ -916,7 +941,18 @@ pub async fn listen_loop(
                                     drop(rs);
                                     say(format!("[listen] /add ok — recipients now {n}")).await;
                                 }
-                                Err(e) => say(format!("[listen] /add failed: {e}")).await,
+                                // Bounded like every sibling error arm: the
+                                // peer's close reason lands at the tail of this
+                                // string, so the cut can only drop attacker-
+                                // chosen text, never the `[listen] /add failed:`
+                                // scaffolding the operator needs.
+                                Err(e) => {
+                                    let msg = crate::utils::sanitize_for_terminal_bounded(
+                                        &e.to_string(),
+                                        256,
+                                    );
+                                    say(format!("[listen] /add failed: {msg}")).await
+                                }
                             }
                         } else if trimmed.starts_with('/') {
                             say(format!(

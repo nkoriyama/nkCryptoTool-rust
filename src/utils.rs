@@ -19,25 +19,127 @@ use std::sync::OnceLock;
 /// remote-supplied bytes (a peer's chat body, an error string a peer
 /// influenced, a filename or handle a peer chose).
 ///
-/// Control characters and the bidi/zero-width marks are replaced with a space.
-/// Everything printable is preserved, so this is safe to apply to text the
-/// operator is meant to read; it only removes the characters that let a peer
-/// erase, overwrite or reorder lines the operator relies on to make trust
-/// decisions.
+/// Control characters, the format (`Cf`) category — bidi controls, zero-width
+/// marks, the tag block — the line/paragraph separators and the invisible
+/// Hangul fillers are replaced with a space; see [`TERMINAL_UNSAFE_RANGES`] for
+/// the exact set and the reasoning. Everything printable is preserved, so this
+/// is safe to apply to text the operator is meant to read; it only removes the
+/// characters that let a peer erase, overwrite or reorder lines the operator
+/// relies on to make trust decisions.
+///
+/// A replaced character becomes a space rather than vanishing, so the operator
+/// can see that something was there.
 ///
 /// Note this replaces `\n` and `\t` as well: every call site here prints a
 /// single-line status or event, so an embedded newline is itself a forged-line
 /// primitive. Callers that intend to render multi-line text need a variant that
 /// keeps `\n`, not this one.
 pub fn sanitize_for_terminal(msg: &str) -> String {
-    let unsafe_char = |c: char| {
-        c.is_control()
-            || ('\u{200B}'..='\u{200F}').contains(&c) // zero-width + bidi marks
-            || ('\u{202A}'..='\u{202E}').contains(&c) // bidi embed/override
-            || ('\u{2066}'..='\u{2069}').contains(&c) // bidi isolates
-    };
     msg.chars()
-        .map(|c| if unsafe_char(c) { ' ' } else { c })
+        .map(|c| if is_terminal_unsafe(c) { ' ' } else { c })
+        .collect()
+}
+
+/// Code point ranges neutralized by [`is_terminal_unsafe`] on top of the
+/// control characters. **This is the one table in the tree**; no call site may
+/// re-derive it — the one that did (the chat body in `network::chat_loop`) had
+/// drifted away from it, and is now routed back through here.
+///
+/// It is the whole `Cf` (format) general category, not a hand-picked subset of
+/// it — picking individual code points is exactly what drifted before, leaving
+/// U+061C, U+180E, U+2060..U+2064, U+FEFF and the tag block behind. Where
+/// Unicode has reserved a run for *future* format characters the range covers
+/// the whole run (U+2065, U+FFF0..U+FFF8, the tail of the tag block), so a new
+/// assignment there needs no edit here.
+///
+/// Three additions are not `Cf`, and a category rule alone would miss them:
+///
+/// * U+2028 LINE SEPARATOR / U+2029 PARAGRAPH SEPARATOR are `Zl`/`Zp`. They are
+///   UAX#14 class BK, and the GUI lays text out with `unicode-linebreak`, so in
+///   a Slint `Text` they forge a line exactly as `\n` does on a terminal —
+///   next to the fingerprint the user is told to compare out of band. These two
+///   are the entire membership of `Zl` and `Zp` and always will be.
+/// * The Hangul/halfwidth fillers U+115F, U+1160, U+3164 and U+FFA0 are `Lo`,
+///   yet render as nothing: they pad a name or a path invisibly.
+///
+/// Deliberately *not* here: the variation selectors U+FE00..U+FE0F and U+E0100
+/// onward, and U+034F COMBINING GRAPHEME JOINER. They are invisible too, but
+/// they cannot forge, hide or reorder a line — and dropping them would visibly
+/// mangle honest text (`⚠️` is U+26A0 U+FE0F), which is a cost with no matching
+/// benefit for the threat this filter exists to stop.
+const TERMINAL_UNSAFE_RANGES: &[(char, char)] = &[
+    ('\u{00AD}', '\u{00AD}'),   // Cf SOFT HYPHEN
+    ('\u{0600}', '\u{0605}'),   // Cf Arabic number signs (span following digits)
+    ('\u{061C}', '\u{061C}'),   // Cf ARABIC LETTER MARK — an implicit bidi control
+    ('\u{06DD}', '\u{06DD}'),   // Cf ARABIC END OF AYAH
+    ('\u{070F}', '\u{070F}'),   // Cf SYRIAC ABBREVIATION MARK
+    ('\u{0890}', '\u{0891}'),   // Cf Arabic pound/piastre mark above
+    ('\u{08E2}', '\u{08E2}'),   // Cf ARABIC DISPUTED END OF AYAH
+    ('\u{115F}', '\u{1160}'),   // Lo Hangul choseong/jungseong filler (invisible)
+    ('\u{180E}', '\u{180E}'),   // Cf MONGOLIAN VOWEL SEPARATOR
+    ('\u{200B}', '\u{200F}'),   // Cf zero-width marks + LRM/RLM
+    ('\u{2028}', '\u{2029}'),   // Zl/Zp line + paragraph separator
+    ('\u{202A}', '\u{202E}'),   // Cf bidi embeddings/overrides
+    ('\u{2060}', '\u{206F}'),   // Cf word joiner..nominal digit shapes, isolates,
+    //                             and the reserved-ignorable U+2065
+    ('\u{3164}', '\u{3164}'),   // Lo HANGUL FILLER (invisible)
+    ('\u{FEFF}', '\u{FEFF}'),   // Cf ZERO WIDTH NO-BREAK SPACE / BOM
+    ('\u{FFA0}', '\u{FFA0}'),   // Lo HALFWIDTH HANGUL FILLER (invisible)
+    ('\u{FFF0}', '\u{FFFB}'),   // reserved-ignorable + Cf interlinear annotation
+    ('\u{110BD}', '\u{110BD}'), // Cf KAITHI NUMBER SIGN
+    ('\u{110CD}', '\u{110CD}'), // Cf KAITHI NUMBER SIGN ABOVE
+    ('\u{13430}', '\u{1343F}'), // Cf Egyptian hieroglyph format controls
+    ('\u{1BCA0}', '\u{1BCA3}'), // Cf shorthand format controls
+    ('\u{1D173}', '\u{1D17A}'), // Cf musical symbol beam/phrase controls
+    ('\u{E0000}', '\u{E00FF}'), // Cf tag block (U+E0001, U+E0020..U+E007F) + the
+    //                             reserved tail U+E0080..U+E00FF. Stops short of
+    //                             U+E0100: those are the variation selectors
+    //                             excluded above, not format characters.
+];
+
+/// The single predicate behind [`sanitize_for_terminal`]: true when `c` must
+/// not reach a terminal or a single-line UI label verbatim.
+///
+/// Two classes, and why each is here:
+///
+/// * `Cc`, via `char::is_control()` — ESC drives every cursor-motion and colour
+///   escape, and CR / `\n` start a line, which is the forged-line primitive
+///   itself.
+/// * Everything in [`TERMINAL_UNSAFE_RANGES`] — text that renders as something
+///   other than the bytes it is made of: reordered (bidi), hidden (zero-width,
+///   tags), or split onto another line (U+2028/U+2029).
+fn is_terminal_unsafe(c: char) -> bool {
+    if c.is_control() {
+        return true;
+    }
+    // Everything below U+00AD — all of ASCII — is safe once the controls are
+    // out, which is the overwhelmingly common case.
+    if c < '\u{00AD}' {
+        return false;
+    }
+    TERMINAL_UNSAFE_RANGES
+        .iter()
+        .any(|&(lo, hi)| c >= lo && c <= hi)
+}
+
+/// [`sanitize_for_terminal`], except that `\t` survives.
+///
+/// For the one sink that renders a peer's *own words* rather than a
+/// diagnostic: the chat body in `NetworkProcessor::chat_loop`. A tab only
+/// advances the cursor within the line — it cannot erase, overwrite or open a
+/// line — and an honest sender can type one, so removing it would corrupt
+/// legitimate messages for no gain. Everything else, `\n` included, is
+/// neutralized exactly as above: the same [`is_terminal_unsafe`] predicate
+/// decides, so this variant cannot drift away from the main one.
+pub fn sanitize_for_terminal_keep_tabs(msg: &str) -> String {
+    msg.chars()
+        .map(|c| {
+            if c != '\t' && is_terminal_unsafe(c) {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -867,11 +969,101 @@ mod terminal_sanitizer_tests {
         }
     }
 
+    /// The classes the `is_control()`-plus-three-ranges predicate used to miss.
+    /// Each one renders as nothing (or reorders what follows), so each one lets
+    /// a peer make a line read as text it is not made of.
+    #[test]
+    fn strips_the_format_and_invisible_classes() {
+        for (c, what) in [
+            ('\u{061C}', "ARABIC LETTER MARK (implicit bidi control)"),
+            ('\u{180E}', "MONGOLIAN VOWEL SEPARATOR"),
+            ('\u{2060}', "WORD JOINER"),
+            ('\u{2064}', "INVISIBLE PLUS"),
+            ('\u{2065}', "reserved inside the ignorable run"),
+            ('\u{FEFF}', "ZERO WIDTH NO-BREAK SPACE"),
+            ('\u{E0000}', "tag block, first"),
+            ('\u{E0001}', "LANGUAGE TAG"),
+            ('\u{E007F}', "CANCEL TAG"),
+            ('\u{2028}', "LINE SEPARATOR (Zl)"),
+            ('\u{2029}', "PARAGRAPH SEPARATOR (Zp)"),
+            ('\u{200E}', "LEFT-TO-RIGHT MARK"),
+            ('\u{200F}', "RIGHT-TO-LEFT MARK"),
+            ('\u{115F}', "HANGUL CHOSEONG FILLER"),
+            ('\u{1160}', "HANGUL JUNGSEONG FILLER"),
+            ('\u{3164}', "HANGUL FILLER"),
+            ('\u{FFA0}', "HALFWIDTH HANGUL FILLER"),
+            ('\u{00AD}', "SOFT HYPHEN"),
+        ] {
+            let clean = sanitize_for_terminal(&format!("a{c}b"));
+            assert_eq!(clean, "a b", "{what} (U+{:04X}) survived", c as u32);
+        }
+    }
+
+    /// A forged line in the GUI banner does not need `\n`: the Slint text
+    /// layout breaks on U+2028/U+2029 too, right above the fingerprint the
+    /// user compares out of band.
+    #[test]
+    fn line_and_paragraph_separators_cannot_forge_a_line() {
+        let forged =
+            "closed\u{2028}Sender identity (ML-DSA fingerprint): abcd\u{2029}verified";
+        let clean = sanitize_for_terminal(forged);
+        assert!(!clean.contains('\u{2028}') && !clean.contains('\u{2029}'), "{clean:?}");
+    }
+
+    /// The filter must not become a reason to distrust what it prints: an
+    /// honest one-line diagnostic, including a non-ASCII one, comes out byte
+    /// for byte. Variation selectors are kept on purpose — they cannot forge a
+    /// line, and dropping them would mangle ordinary emoji.
+    #[test]
+    fn honest_diagnostics_pass_through_unchanged() {
+        for s in [
+            "connect attempt 2/5 failed (open_bi: connection lost); retrying…",
+            "[nkct] skipped docs/設計.md: permission denied",
+            "scp put refused: no write policy for /srv/pub",
+            "⚠️ 警告: peer fingerprint changed",
+        ] {
+            assert_eq!(sanitize_for_terminal(s), s, "honest text was altered");
+        }
+    }
+
+    /// Ideographic Variation Sequences are how kanji glyph variants in real
+    /// Japanese personal and place names are encoded: a base character followed
+    /// by one of the 240 variation selectors U+E0100..U+E01EF. Those sit
+    /// directly above the tag block, so a tag-block range drawn one nibble too
+    /// wide swallows them and silently rewrites the name — in a filename, in a
+    /// chat body, and in the shell audit log, which is the only server-side
+    /// record of what a peer asked for. They cannot forge, hide or reorder a
+    /// line, so they come out byte for byte, exactly as the table documents.
+    #[test]
+    fn ideographic_variation_sequences_pass_through_unchanged() {
+        for s in ["葛\u{E0100}飾区", "辻\u{E0101}", "葛\u{E01EF}"] {
+            assert_eq!(sanitize_for_terminal(s), s, "an IVS kanji was mangled");
+        }
+        // The tag block itself is still neutralized; the range stops at U+E00FF.
+        assert_eq!(sanitize_for_terminal("a\u{E007F}b"), "a b");
+    }
+
     #[test]
     fn newline_and_tab_are_also_neutralized() {
         // These call sites all print one line; an embedded newline is itself a
         // forged-line primitive, so it must not survive either.
         assert_eq!(sanitize_for_terminal("a\nb\tc"), "a b c");
+    }
+
+    /// The tab-keeping variant must differ from the main one in the tab and
+    /// nothing else — that is the whole point of deriving both from one
+    /// predicate.
+    #[test]
+    fn keep_tabs_variant_differs_only_in_the_tab() {
+        assert_eq!(sanitize_for_terminal_keep_tabs("a\tb\nc"), "a\tb c");
+        for c in [
+            '\u{1b}', '\r', '\u{200F}', '\u{202E}', '\u{2028}', '\u{2029}', '\u{FEFF}',
+            '\u{E0001}', '\u{061C}', '\u{2060}',
+        ] {
+            let s = format!("a{c}b");
+            assert_eq!(sanitize_for_terminal_keep_tabs(&s), "a b", "{c:?} survived");
+            assert_eq!(sanitize_for_terminal_keep_tabs(&s), sanitize_for_terminal(&s));
+        }
     }
 
     #[test]

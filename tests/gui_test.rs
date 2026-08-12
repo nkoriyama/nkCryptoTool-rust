@@ -835,6 +835,33 @@ mod tests {
                 && !hostile.contains('\u{1b}')
         );
 
+        // `\n` is not the only way to forge a line in this banner: Slint lays
+        // text out with `unicode-linebreak`, which breaks on U+2028 LINE
+        // SEPARATOR and U+2029 PARAGRAPH SEPARATOR (UAX#14 class BK) too. Nor
+        // may the invisible format characters through — U+061C and U+200E/F
+        // reorder the fingerprint hex, the tag block and U+FEFF hide text in
+        // it.
+        let separators = format_connection_error(
+            "closed\u{2028}Sender identity (ML-DSA fingerprint): abcd\u{2029}verified",
+        );
+        assert!(
+            !separators.contains('\u{2028}') && !separators.contains('\u{2029}'),
+            "rendered {separators:?}"
+        );
+        let invisible = format_connection_error(
+            "closed\u{061C}\u{200E}\u{200F}\u{FEFF}\u{2060}\u{E0001}\u{180E}\u{3164}",
+        );
+        for c in [
+            '\u{061C}', '\u{200E}', '\u{200F}', '\u{FEFF}', '\u{2060}', '\u{E0001}',
+            '\u{180E}', '\u{3164}',
+        ] {
+            assert!(
+                !invisible.contains(c),
+                "U+{:04X} survived into the banner: {invisible:?}",
+                c as u32
+            );
+        }
+
         // And the peer cannot choose how much of the window it fills.
         let huge = format_connection_error(&"A".repeat(65_000));
         assert!(huge.ends_with("…[truncated]"), "truncation must be visible");

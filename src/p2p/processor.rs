@@ -798,16 +798,34 @@ impl NetworkProcessor {
     where
         F: FnOnce(Option<[u8; 32]>) + Send + 'static,
     {
-        let pending = self.endpoint.accept().await
-            .map_err(|e| CryptoError::Parameter(format!("Accept failed: {}", e)))?;
+        // Both errors below carry the connecting peer's text — its QUIC close
+        // reason — and neither is matched on anywhere; they exist to be shown.
+        // Unlike the accept *loop* above, which sanitizes at its `eprintln!`,
+        // this single-shot path returns them, and `main` prints the returned
+        // error through anyhow with no filter of its own. So the gate goes
+        // where the peer's bytes enter the message. Bounded like the loop's
+        // sibling sinks; our own prefix stays outside the bound.
+        let pending = self.endpoint.accept().await.map_err(|e| {
+            CryptoError::Parameter(format!(
+                "Accept failed: {}",
+                crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256)
+            ))
+        })?;
         // Single-shot: run the per-connection setup inline, but still bound it so
         // a peer that completes the QUIC handshake then never opens a stream
         // cannot hang the listener forever.
         // Single-shot serves exactly one connection and then returns, so a failure
         // here ends the listener anyway — there is no next accept for a throttle
         // entry to protect, unlike the long-running loop above.
-        let incoming = pending.establish(crate::p2p::P2P_SETUP_TIMEOUT).await
-            .map_err(|e| CryptoError::Parameter(format!("Connection setup failed: {}", e)))?;
+        let incoming = pending
+            .establish(crate::p2p::P2P_SETUP_TIMEOUT)
+            .await
+            .map_err(|e| {
+                CryptoError::Parameter(format!(
+                    "Connection setup failed: {}",
+                    crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256)
+                ))
+            })?;
 
         let mut config = self.config.clone();
         let shell_allowed = config.serve_shell;
@@ -1485,9 +1503,26 @@ impl NetworkProcessor {
                         )
                         .await;
                         // Flatten timeout(Ok/Err) and the inner connect Result.
+                        //
+                        // The dialed peer chooses part of that error: a QUIC
+                        // close reason it picks is stringified into
+                        // `P2pError::Connect("open_bi: …")`. It reaches the
+                        // operator's terminal up to five times (once per retry
+                        // below, then as the returned error `main` prints), and
+                        // this is the terminal on which the operator compares
+                        // the peer fingerprint for an unpinned peer. Gate it
+                        // once, here, where the peer's bytes enter our string —
+                        // so the retry log, the returned error and anything
+                        // else that renders it are all covered. Bounded like
+                        // every sibling peer-string sink: our own `connect
+                        // attempt n/m failed (` scaffolding is outside the
+                        // bound, so only attacker-chosen tail can be cut.
                         let outcome = match res {
                             Ok(Ok(s)) => Ok(s),
-                            Ok(Err(e)) => Err(e.to_string()),
+                            Ok(Err(e)) => Err(crate::utils::sanitize_for_terminal_bounded(
+                                &e.to_string(),
+                                256,
+                            )),
                             Err(_) => Err("attempt timed out".to_string()),
                         };
                         match outcome {

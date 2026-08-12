@@ -629,6 +629,30 @@ impl NetworkProcessor {
         }
     }
 
+    /// Render a decrypted peer chat body as the ONE line `chat_loop` prints
+    /// after its `[Peer]: ` prefix.
+    ///
+    /// An embedded newline here is a forged-line primitive: it lets the peer
+    /// emit an unprefixed line that looks exactly like the `[System]: ` notices
+    /// that loop prints itself. No honest sender can produce one —
+    /// `read_line_secure` ends the outbound line at the first `\n`. The same
+    /// goes for the bidi and zero-width classes.
+    ///
+    /// This used to be a hand-written character list here, and it had drifted
+    /// from the shared filter (it missed U+200E/U+200F, which the shared filter
+    /// blocks and the GUI's own regression test demands). It now *is* the
+    /// shared filter, via the one variant that keeps `\t` — a tab is the one
+    /// character an honest sender may type that the plain filter would replace,
+    /// and it cannot forge a line. Everything else is decided by the single
+    /// `is_terminal_unsafe` predicate, so this sink can no longer drift.
+    /// Kept as a named function so the rule can be tested without a peer.
+    ///
+    /// The CLI writes the result straight to the terminal (`DefaultIOProvider`
+    /// applies no second filter), so this is the only gate on that path.
+    fn render_peer_chat_body(body: &str) -> Zeroizing<String> {
+        Zeroizing::new(crate::utils::sanitize_for_terminal_keep_tabs(body))
+    }
+
     pub async fn read_line_secure<R: AsyncReadExt + Unpin>(
         reader: &mut R,
         buf: &mut Vec<u8>,
@@ -1031,36 +1055,7 @@ impl NetworkProcessor {
                     let msg_content: Zeroizing<String> = Zeroizing::new(
                         String::from_utf8_lossy(&pt).into_owned(),
                     );
-                    let msg = Zeroizing::new(
-                        msg_content
-                            .chars()
-                            // A peer's body is rendered as ONE line, after the
-                            // `[Peer]: ` prefix below, so an embedded newline is
-                            // a forged-line primitive: it lets the peer emit an
-                            // unprefixed line that looks exactly like the
-                            // `[System]: ` notices this loop prints itself. No
-                            // honest sender can produce one — `read_line_secure`
-                            // ends the outbound line at the first `\n` — so the
-                            // newline is collapsed to a space, the same
-                            // substitution `crate::utils::sanitize_for_terminal`
-                            // (and the MLS group REPL) makes for the same
-                            // reason. `\t` stays: it only advances the cursor
-                            // within the line, and an honest sender CAN type it.
-                            .map(|c| if c == '\n' { ' ' } else { c })
-                            .filter(|c| {
-                                let is_dangerous = match *c {
-                                    '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => true,
-                                    '\u{200B}'..='\u{200D}' | '\u{FEFF}' => true,
-                                    '\u{061C}' => true,
-                                    '\u{180E}' => true,
-                                    '\u{E0000}'..='\u{E007F}' => true,
-                                    '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' => true,
-                                    _ => false,
-                                };
-                                (!c.is_control() || *c == '\t') && !is_dangerous
-                            })
-                            .collect::<String>(),
-                    );
+                    let msg = Self::render_peer_chat_body(&msg_content);
                     {
                         let mut out = stdout_rx.lock().await;
                         let _ = out.write_all(b"\r[Peer]: ").await;
@@ -1170,6 +1165,44 @@ impl NetworkProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The peer's chat body is printed straight to the operator's terminal by
+    /// `DefaultIOProvider`, with no second filter. The list that used to live
+    /// inline here had drifted from the shared one — it missed U+200E/U+200F,
+    /// which the shared filter blocks and the GUI's own row test demands — so
+    /// pin that the body now goes through the shared gate, whole.
+    #[test]
+    fn peer_chat_body_cannot_forge_a_line_or_reorder_one() {
+        let hostile = "hi\u{200E}\u{200F}\u{202E}\u{2066}\u{200B}\u{061C}\u{FEFF}\
+                       \u{2060}\u{E0001}\u{2028}\u{2029}\u{180E}\u{3164}\u{1b}[2K\r\n\
+                       [System]: peer verified";
+        let out = NetworkProcessor::render_peer_chat_body(hostile);
+        for c in [
+            '\u{200E}', '\u{200F}', '\u{202E}', '\u{2066}', '\u{200B}', '\u{061C}',
+            '\u{FEFF}', '\u{2060}', '\u{E0001}', '\u{2028}', '\u{2029}', '\u{180E}',
+            '\u{3164}', '\u{1b}', '\r', '\n',
+        ] {
+            assert!(
+                !out.contains(c),
+                "U+{:04X} survived into the printed line: {out:?}",
+                c as u32
+            );
+        }
+        // The readable text is still there — this filter must not silently eat
+        // the message it is protecting.
+        assert!(out.starts_with("hi"));
+        assert!(out.contains("[System]: peer verified"));
+    }
+
+    /// An ordinary message is untouched, including non-ASCII and the tab an
+    /// honest sender may type: nothing about this gate should make the operator
+    /// doubt what a peer actually typed.
+    #[test]
+    fn honest_chat_body_is_unchanged() {
+        for s in ["hello there", "hello\tbob", "こんにちは、元気ですか？", "3 < 4 && 5 > 2"] {
+            assert_eq!(&*NetworkProcessor::render_peer_chat_body(s), s);
+        }
+    }
 
     #[tokio::test]
     async fn test_read_line_secure_eof() {
