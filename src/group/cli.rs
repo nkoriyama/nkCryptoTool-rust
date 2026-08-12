@@ -1188,9 +1188,20 @@ async fn event_to_line(
             // frame can only extend/finish a transfer opened by the same sender.
             let g: [u8; 32] = *group_id.as_bytes();
             return match reasm.lock().await.ingest(&g, *sender_index, body) {
-                Some(FileStatus::Started { name, size }) => Some(format!(
-                    "[file ⇩ {sender_index}@{group_id}] receiving {name:?} ({size} bytes)…"
-                )),
+                Some(FileStatus::Started { name, size, cancelled }) => Some(match cancelled {
+                    None => format!(
+                        "[file ⇩ {sender_index}@{group_id}] receiving {name:?} ({size} bytes)…"
+                    ),
+                    // This sender hit its own concurrency cap, so its oldest
+                    // receipt was cancelled to make room. Say so: the operator
+                    // was told that file was arriving. Both names come from the
+                    // sender's START frames.
+                    Some(old) => format!(
+                        "[file ⇩ {sender_index}@{group_id}] receiving {name:?} ({size} bytes)… \
+                         (cancelled earlier receipt of {} from this sender: too many at once)",
+                        crate::utils::sanitize_for_terminal(&format!("{old:?}"))
+                    ),
+                }),
                 Some(FileStatus::Progress { .. }) => None,
                 // The destination basename comes from the sender's START frame
                 // (`safe_name` rejects only separators, NUL, `.` and `..`), so

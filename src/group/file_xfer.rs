@@ -48,10 +48,23 @@ const T_END: u8 = 3;
 
 const ID_LEN: usize = 16;
 
-/// Upper bound on simultaneously in-progress inbound transfers, so a peer that
-/// opens many `START`s without ever finishing them cannot exhaust memory / temp
-/// files. New `START`s beyond this are rejected until existing ones complete.
+/// Aggregate upper bound on simultaneously in-progress inbound transfers across
+/// every group and sender, so a peer that opens many `START`s without ever
+/// finishing them cannot exhaust memory / open staging files. Reaching this cap
+/// *refuses* the new `START`: making room by discarding an in-progress transfer
+/// would mean one sender destroying another sender's (or another group's)
+/// receipt, which is exactly the cross-principal reach this cap must not have.
 const MAX_CONCURRENT_TRANSFERS: usize = 16;
+
+/// Per-principal bound: how many transfers one authenticated `(group, sender)`
+/// may have in progress at once. A sender that reaches its own cap and opens a
+/// genuinely new transfer discards *its own* oldest one — self-healing, so a
+/// sender whose earlier transfers died mid-stream (crash, dropped link) is never
+/// permanently locked out, and self-inflicted, so it can never reach another
+/// principal's state. `MAX_CONCURRENT_TRANSFERS / MAX_TRANSFERS_PER_SENDER`
+/// distinct authenticated principals are therefore needed before the aggregate
+/// cap starts refusing anyone.
+const MAX_TRANSFERS_PER_SENDER: usize = 4;
 
 /// Reassembly key: a transfer is owned by the authenticated `(group, sender)`
 /// that opened it, not just by the on-the-wire `id`. MLS authenticates the
@@ -240,7 +253,16 @@ impl OutgoingFile {
 /// Status surfaced to the UI as file frames are reassembled.
 #[derive(Debug, PartialEq, Eq)]
 pub enum FileStatus {
-    Started { name: String, size: u64 },
+    Started {
+        name: String,
+        size: u64,
+        /// Set when accepting this `START` discarded an in-progress transfer of
+        /// the *same* authenticated sender to stay within
+        /// [`MAX_TRANSFERS_PER_SENDER`] — the name of the receipt that was
+        /// cancelled, so the operator is told rather than left waiting for a
+        /// file that will never arrive. Sender-controlled text.
+        cancelled: Option<String>,
+    },
     Progress { name: String, received: u64, total: u64 },
     Completed { name: String, path: PathBuf },
     Error(String),
@@ -335,20 +357,6 @@ impl Reassembler {
         if payload.len() < 10 {
             return FileStatus::Error("malformed START".into());
         }
-        // Bound concurrent transfers. A re-START of an existing key just
-        // replaces it; a genuinely new transfer at the cap evicts the *oldest*
-        // in-progress one (rather than refusing forever), so a peer that opens
-        // STARTs and abandons them cannot permanently block new file receipts.
-        if !self.partial.contains_key(&key) && self.partial.len() >= MAX_CONCURRENT_TRANSFERS {
-            if let Some(oldest) = self
-                .partial
-                .iter()
-                .min_by_key(|(_, p)| p.started)
-                .map(|(k, _)| *k)
-            {
-                self.abort(&oldest);
-            }
-        }
         let total_size = u64::from_be_bytes(payload[0..8].try_into().unwrap());
         if total_size > MAX_FILE_SIZE {
             return FileStatus::Error("START declares oversize file".into());
@@ -365,6 +373,40 @@ impl Reassembler {
             Some(n) => n,
             None => return FileStatus::Error("START name unsafe".into()),
         };
+        // Bound concurrent transfers — *after* every check above, so a malformed
+        // or oversize START can never cost anyone an in-progress transfer.
+        //
+        // A re-START of an existing key just replaces that key's own transfer
+        // (below) and does not grow the map, so only a genuinely new key is
+        // capped. The map is shared across all groups and senders, so the choice
+        // of what gives way decides whose data one sender can destroy:
+        //   * over this sender's *own* cap → discard this sender's own oldest
+        //     transfer. Self-healing (abandoned transfers of this sender are
+        //     reclaimed by its next START) and it cannot touch anybody else.
+        //   * otherwise, at the aggregate cap → refuse this START. The only
+        //     transfers left to discard belong to other principals, and taking
+        //     one would let any single group member silently destroy the
+        //     receipts of other members — including members of a different MLS
+        //     group, a boundary MLS otherwise keeps separate.
+        // The actual discard is deferred until the new staging file exists, so a
+        // failed create cannot destroy a transfer either.
+        let mut evict: Option<TransferKey> = None;
+        if !self.partial.contains_key(&key) {
+            let mine = self.partial.keys().filter(|(g, s, _)| *g == key.0 && *s == key.1).count();
+            if mine >= MAX_TRANSFERS_PER_SENDER {
+                evict = self
+                    .partial
+                    .iter()
+                    .filter(|((g, s, _), _)| *g == key.0 && *s == key.1)
+                    .min_by_key(|(_, p)| p.started)
+                    .map(|(k, _)| *k);
+            } else if self.partial.len() >= MAX_CONCURRENT_TRANSFERS {
+                return FileStatus::Error(format!(
+                    "too many transfers in progress ({MAX_CONCURRENT_TRANSFERS}); \
+                     refusing START of {name:?}"
+                ));
+            }
+        }
         // Stage to a sibling temp created exclusively (no clobber / symlink
         // follow), mirroring the at-rest temp-file pattern.
         let tmp_path = self.dir.join(format!(".{}.{}.part", name, hex16(&id)));
@@ -372,6 +414,15 @@ impl Reassembler {
             Ok(f) => f,
             Err(e) => return FileStatus::Error(format!("stage {tmp_path:?}: {e}")),
         };
+        // The staging file exists now, so the deferred per-sender discard can be
+        // carried out: it only ever names a transfer of this same authenticated
+        // `(group, sender)` (chosen above), and the cancelled name is reported
+        // back so the operator learns that receipt is not coming.
+        let cancelled = evict.and_then(|old| {
+            let name = self.partial.get(&old).map(|p| p.name.clone());
+            self.abort(&old);
+            name
+        });
         // A re-START under the same key supersedes any transfer already open on
         // it, and `Partial` has no `Drop`, so the superseded staging file has to
         // be unlinked here or it is orphaned in the receive directory forever.
@@ -416,7 +467,7 @@ impl Reassembler {
                 started,
             },
         );
-        FileStatus::Started { name, size: total_size }
+        FileStatus::Started { name, size: total_size, cancelled }
     }
 
     fn on_data(&mut self, key: TransferKey, payload: &[u8]) -> FileStatus {
@@ -632,6 +683,172 @@ mod tests {
         assert!(matches!(r.ingest(&g, 2, &frames[1]), Some(FileStatus::Error(_))));
         // Alice's own DATA still applies.
         assert!(matches!(r.ingest(&g, 1, &frames[1]), Some(FileStatus::Progress { .. })));
+    }
+
+    fn count_parts(dir: &Path) -> usize {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+            .count()
+    }
+
+    /// Fill `r`'s shared table to the aggregate cap with in-progress transfers
+    /// in `group`, spread over just enough senders that none of them exceeds its
+    /// own per-sender cap. Returns `(sender, id)` of the *oldest* entry — the
+    /// one a global "evict the oldest" policy would sacrifice.
+    fn fill_to_cap(r: &mut Reassembler, group: &[u8; 32]) -> (u32, [u8; ID_LEN]) {
+        let senders = (MAX_CONCURRENT_TRANSFERS / MAX_TRANSFERS_PER_SENDER) as u32;
+        let mut oldest = None;
+        for s in 0..senders {
+            for k in 0..MAX_TRANSFERS_PER_SENDER as u32 {
+                let mut id = [0u8; ID_LEN];
+                id[0] = s as u8;
+                id[1] = k as u8;
+                let name = format!("victim{s}_{k}.bin");
+                assert!(matches!(
+                    r.ingest(group, s, &encode_start(&id, 4096, &name)),
+                    Some(FileStatus::Started { .. })
+                ));
+                assert!(matches!(
+                    r.ingest(group, s, &encode_data(&id, 0, &[1u8; 64])),
+                    Some(FileStatus::Progress { .. })
+                ));
+                oldest.get_or_insert((s, id));
+            }
+        }
+        assert_eq!(r.partial.len(), MAX_CONCURRENT_TRANSFERS);
+        oldest.unwrap()
+    }
+
+    #[test]
+    fn a_sender_in_one_group_cannot_evict_another_groups_transfer() {
+        // The reassembly table is shared across every group this node is in. A
+        // member of group A must not be able to make room for itself by
+        // discarding a receipt belonging to group B — MLS keeps those groups
+        // apart, and this table must not join them back together.
+        let recv = tempdir().unwrap();
+        let mut r = Reassembler::new(recv.path().to_path_buf());
+        let victim_group = [0xbbu8; 32];
+        let (v_sender, v_id) = fill_to_cap(&mut r, &victim_group);
+        assert_eq!(count_parts(recv.path()), MAX_CONCURRENT_TRANSFERS);
+
+        let attacker_group = [0xaau8; 32];
+        let atk_id = [0xffu8; ID_LEN];
+        match r.ingest(&attacker_group, 9, &encode_start(&atk_id, 4096, "evil.bin")) {
+            Some(FileStatus::Error(e)) => {
+                assert!(e.contains("too many transfers in progress"), "unexpected error: {e}")
+            }
+            other => panic!("a START at the aggregate cap must be refused, got {other:?}"),
+        }
+
+        // Nothing of the victim group's was destroyed: same number of staging
+        // files, and the oldest transfer still accepts its next chunk.
+        assert_eq!(count_parts(recv.path()), MAX_CONCURRENT_TRANSFERS);
+        assert_eq!(r.partial.len(), MAX_CONCURRENT_TRANSFERS);
+        assert!(matches!(
+            r.ingest(&victim_group, v_sender, &encode_data(&v_id, 1, &[2u8; 64])),
+            Some(FileStatus::Progress { .. })
+        ));
+        // Repeating the attack cannot wear the table down either.
+        for i in 0..8u8 {
+            let id = [i; ID_LEN];
+            assert!(matches!(
+                r.ingest(&attacker_group, 9, &encode_start(&id, 4096, "evil.bin")),
+                Some(FileStatus::Error(_))
+            ));
+        }
+        assert_eq!(r.partial.len(), MAX_CONCURRENT_TRANSFERS);
+    }
+
+    #[test]
+    fn per_sender_cap_discards_only_that_senders_own_oldest_and_reports_it() {
+        // Over its own cap a sender gives up *its own* oldest transfer, so the
+        // cap is self-healing (a sender whose transfers died mid-stream is never
+        // locked out) without reaching another sender's state. The operator was
+        // told that file was arriving, so the cancellation is surfaced.
+        let recv = tempdir().unwrap();
+        let mut r = Reassembler::new(recv.path().to_path_buf());
+        let g = [7u8; 32];
+
+        // A bystander in the same group, opened first so it is the globally
+        // oldest entry — the one the old policy would have taken.
+        let other_id = [0xeeu8; ID_LEN];
+        assert!(matches!(
+            r.ingest(&g, 2, &encode_start(&other_id, 4096, "bystander.bin")),
+            Some(FileStatus::Started { .. })
+        ));
+
+        for k in 0..MAX_TRANSFERS_PER_SENDER as u8 {
+            let id = [k; ID_LEN];
+            assert!(matches!(
+                r.ingest(&g, 1, &encode_start(&id, 4096, &format!("mine{k}.bin"))),
+                Some(FileStatus::Started { cancelled: None, .. })
+            ));
+        }
+
+        let new_id = [0x99u8; ID_LEN];
+        match r.ingest(&g, 1, &encode_start(&new_id, 4096, "newest.bin")) {
+            Some(FileStatus::Started { name, cancelled, .. }) => {
+                assert_eq!(name, "newest.bin");
+                assert_eq!(
+                    cancelled.as_deref(),
+                    Some("mine0.bin"),
+                    "the sender's own oldest must be the one cancelled, and reported"
+                );
+            }
+            other => panic!("a sender's own cap must discard its own oldest, got {other:?}"),
+        }
+
+        // Its own oldest is gone, staging file and all …
+        assert!(!recv.path().join(format!(".mine0.bin.{}.part", hex16(&[0u8; ID_LEN]))).exists());
+        assert!(matches!(
+            r.ingest(&g, 1, &encode_data(&[0u8; ID_LEN], 0, &[3u8; 16])),
+            Some(FileStatus::Error(_))
+        ));
+        // … while the bystander's older transfer is untouched.
+        assert!(matches!(
+            r.ingest(&g, 2, &encode_data(&other_id, 0, &[4u8; 16])),
+            Some(FileStatus::Progress { .. })
+        ));
+    }
+
+    #[test]
+    fn a_malformed_start_at_the_cap_destroys_no_transfer() {
+        // Capacity accounting happens only after a START has fully validated, so
+        // a frame that is rejected outright cannot cost anybody a transfer.
+        let recv = tempdir().unwrap();
+        let mut r = Reassembler::new(recv.path().to_path_buf());
+        let victim_group = [0xbbu8; 32];
+        let (v_sender, v_id) = fill_to_cap(&mut r, &victim_group);
+
+        let attacker_group = [0xaau8; 32];
+        let id = [0xfeu8; ID_LEN];
+        // Oversize declaration.
+        assert!(matches!(
+            r.ingest(&attacker_group, 9, &encode_start(&id, MAX_FILE_SIZE + 1, "big.bin")),
+            Some(FileStatus::Error(_))
+        ));
+        // Unsafe name.
+        assert!(matches!(
+            r.ingest(&attacker_group, 9, &encode_start(&id, 4096, "..")),
+            Some(FileStatus::Error(_))
+        ));
+        // name_len running past the frame.
+        let mut truncated = encode_start(&id, 4096, "x.bin");
+        let off = FILE_MAGIC.len() + 1 + ID_LEN + 8;
+        truncated[off..off + 2].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(
+            r.ingest(&attacker_group, 9, &truncated),
+            Some(FileStatus::Error(_))
+        ));
+
+        assert_eq!(r.partial.len(), MAX_CONCURRENT_TRANSFERS);
+        assert_eq!(count_parts(recv.path()), MAX_CONCURRENT_TRANSFERS);
+        assert!(matches!(
+            r.ingest(&victim_group, v_sender, &encode_data(&v_id, 1, &[2u8; 64])),
+            Some(FileStatus::Progress { .. })
+        ));
     }
 
     #[test]
