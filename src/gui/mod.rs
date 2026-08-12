@@ -991,6 +991,10 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
             };
+            // Kept so the completion path can ask whether a file was actually
+            // published at `recv_path`, instead of inferring it from a listener
+            // result that says only "the session ended cleanly".
+            let recv_state = file_io.clone();
 
             let endpoint = match crate::p2p::backend::iroh::IrohEndpoint::new(&config, false).await {
                 Ok(ep) => Arc::new(ep),
@@ -1061,15 +1065,22 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             progress_pump.abort();
 
             let ui_handle_end = ui_handle.clone();
+            // A receipt is claimed only when `finalize_recv(true)` actually
+            // published the transfer at `recv_path`. `res` being Ok means the
+            // session ended cleanly, which is not the same thing — and naming a
+            // path that already held a file would present stale content as the
+            // file just received.
+            let committed = recv_state.recv_committed();
             let final_msg = match &res {
-                Ok(_) => format!("File received: {}", recv_path.display()),
+                Ok(_) if committed => format!("File received: {}", recv_path.display()),
+                Ok(_) => "Receive failed: the peer did not send a file".to_string(),
                 // F6: whoever holds the ticket can reach this listener and pick
                 // the QUIC close reason that ends up inside `e`, and this string
                 // lands in the banner beside the sender fingerprint. The prefix
                 // is ours; everything the peer touched is sanitized and bounded.
                 Err(e) => format!("Receive failed: {}", format_connection_error(&e.to_string())),
             };
-            let is_ok = res.is_ok();
+            let is_ok = res.is_ok() && committed;
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_handle_end.upgrade() {
                     ui.set_listening(false);

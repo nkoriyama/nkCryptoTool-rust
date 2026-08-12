@@ -99,15 +99,42 @@ pub static CHAT_ACTIVE: Lazy<std::sync::atomic::AtomicBool> =
 pub static PEER_COOLDOWNS: Lazy<Mutex<std::collections::HashMap<PeerId, std::time::Instant>>> =
     Lazy::new(|| Mutex::new(std::collections::HashMap::new()));
 
+/// RAII holder of the process-global chat slot ([`CHAT_ACTIVE`]).
+///
+/// Acquisition and release are paired inside this one type — [`Self::acquire`]
+/// is the only place the flag is raised and [`Drop`] the only place it is
+/// cleared — so a live guard and a raised flag mean the same thing, and the
+/// slot is released exactly once per session. That pairing is the invariant:
+/// a session that also cleared the flag itself, before its guard dropped,
+/// admitted a second peer in that window and then had *its* flag cleared under
+/// it by the departing guard, so two peers ended up bound to the one
+/// stdin/stdout the flag exists to arbitrate.
 pub struct ChatActiveGuard {
-    pub peer_id: PeerId,
-    pub _start_time: std::time::Instant,
+    peer_id: PeerId,
+    _start_time: std::time::Instant,
+}
+
+impl ChatActiveGuard {
+    /// Claim the chat slot for `peer_id`, or `None` when a session already
+    /// holds it. The slot is released when the returned guard drops.
+    pub fn acquire(peer_id: PeerId) -> Option<Self> {
+        CHAT_ACTIVE
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .ok()?;
+        Some(Self { peer_id, _start_time: std::time::Instant::now() })
+    }
 }
 
 impl Drop for ChatActiveGuard {
     fn drop(&mut self) {
         let mut cooldowns = PEER_COOLDOWNS.lock();
         cooldowns.insert(self.peer_id.clone(), std::time::Instant::now());
+        // The single release point for the slot claimed by `acquire`.
         CHAT_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
     }
 }
@@ -484,6 +511,14 @@ pub struct FileIOProvider {
     // destination path. `None` for send-only providers.
     recv_temp: Option<std::path::PathBuf>,
     recv_final: Option<std::path::PathBuf>,
+    /// Set once `finalize_recv(true)` has published the staged plaintext at
+    /// `recv_final`. A caller that reports "file received" must consult this
+    /// rather than infer receipt from a session that merely ended cleanly: a
+    /// listener returns `Ok` for any service it served, so without this a
+    /// session that delivered no file at all reads as a successful transfer —
+    /// and if something already sits at the destination path, the user is
+    /// pointed at that stale content as if it were the new file.
+    recv_committed: std::sync::atomic::AtomicBool,
 }
 
 impl FileIOProvider {
@@ -494,6 +529,7 @@ impl FileIOProvider {
             recv_file: parking_lot::Mutex::new(None),
             recv_temp: None,
             recv_final: None,
+            recv_committed: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -523,7 +559,14 @@ impl FileIOProvider {
             recv_file: parking_lot::Mutex::new(Some(file)),
             recv_temp: Some(temp),
             recv_final: Some(path),
+            recv_committed: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// True only once `finalize_recv(true)` has actually published a received
+    /// file at the destination path (see the `recv_committed` field docs).
+    pub fn recv_committed(&self) -> bool {
+        self.recv_committed.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -553,7 +596,11 @@ impl IOProvider for FileIOProvider {
         };
         if committed {
             // Atomic same-directory rename publishes the verified plaintext.
-            std::fs::rename(temp, final_path)
+            std::fs::rename(temp, final_path)?;
+            // Only now is "a file was received" a true statement about this
+            // provider's destination path.
+            self.recv_committed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         } else {
             // Discard unauthenticated bytes; tolerate an already-absent temp.
             match std::fs::remove_file(temp) {
@@ -1457,6 +1504,97 @@ mod tests {
         // subsystems), so they are intentionally NOT bumped by this flag-day.
         assert_eq!(ALPN_MLS, b"nkct/mls/1", "MLS ALPN is intentionally unbumped");
         assert_eq!(ALPN_INBOX, b"nkct/inbox/1", "inbox ALPN is intentionally unbumped");
+    }
+
+    /// [`CHAT_ACTIVE`] is the sole arbiter of the one stdin/stdout a chat
+    /// session binds to a remote peer, so the slot must be claimed and released
+    /// exactly once per session. This pins the contract [`ChatActiveGuard`] now
+    /// enforces by owning both ends: while a session holds the slot a second
+    /// peer cannot be admitted, only the guard's drop gives it back, and the
+    /// slot is reusable afterwards — a release that never happens would wedge
+    /// chat for the life of the process just as surely as a release that
+    /// happens twice hands the process's terminal to two peers at once.
+    #[test]
+    #[serial_test::serial]
+    fn chat_slot_is_claimed_once_and_released_only_by_its_guard() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        CHAT_ACTIVE.store(false, SeqCst);
+        PEER_COOLDOWNS.lock().clear();
+
+        let live = ChatActiveGuard::acquire(PeerId::Node([0xA1; 32]))
+            .expect("an idle process must admit the first chat session");
+        assert!(CHAT_ACTIVE.load(SeqCst), "claiming the slot must raise the flag");
+
+        assert!(
+            ChatActiveGuard::acquire(PeerId::Node([0xA2; 32])).is_none(),
+            "a second peer must not be admitted while a session holds the chat slot"
+        );
+        assert!(
+            CHAT_ACTIVE.load(SeqCst),
+            "a refused peer must leave the live session's flag alone"
+        );
+
+        drop(live);
+        assert!(
+            !CHAT_ACTIVE.load(SeqCst),
+            "dropping the guard is the one and only release point"
+        );
+        assert!(
+            PEER_COOLDOWNS.lock().contains_key(&PeerId::Node([0xA1; 32])),
+            "the released session must leave its peer cooldown behind"
+        );
+
+        let reused = ChatActiveGuard::acquire(PeerId::Node([0xA3; 32]))
+            .expect("the slot must be reusable once released");
+        drop(reused);
+
+        CHAT_ACTIVE.store(false, SeqCst);
+        PEER_COOLDOWNS.lock().clear();
+    }
+
+    /// A transfer counts as received only once `finalize_recv(true)` has
+    /// published the staged plaintext at the destination. A session that
+    /// delivered no file (a peer that dialled some other service), or one whose
+    /// AEAD tag never verified, must leave the flag false — otherwise a caller
+    /// reports a receipt for a file it does not have, and whatever already sat
+    /// at that path is what the user is pointed at.
+    #[tokio::test]
+    async fn recv_is_only_committed_when_finalize_publishes_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // 1. Nothing delivered at all: the provider was built, the session ended.
+        let stale = dir.path().join("stale.bin");
+        std::fs::write(&stale, b"content that was already at the destination").unwrap();
+        let never = FileIOProvider::new_recv(stale.clone()).await.unwrap();
+        assert!(
+            !never.recv_committed(),
+            "a session that delivered no file must never read as a receipt"
+        );
+
+        // 2. Delivered but rejected: staged bytes are discarded, still no receipt.
+        let discarded = dir.path().join("discarded.bin");
+        let bad = FileIOProvider::new_recv(discarded.clone()).await.unwrap();
+        {
+            let mut w = bad.stdout();
+            w.write_all(b"unverified plaintext").await.unwrap();
+            w.flush().await.unwrap();
+        }
+        bad.finalize_recv(false).expect("finalize_recv(false)");
+        assert!(!bad.recv_committed(), "a discarded transfer is not a receipt");
+        assert!(!discarded.exists(), "unauthenticated bytes must not be published");
+
+        // 3. The real thing: published, and only then does it count.
+        let good = dir.path().join("received.bin");
+        let ok = FileIOProvider::new_recv(good.clone()).await.unwrap();
+        {
+            let mut w = ok.stdout();
+            w.write_all(b"payload").await.unwrap();
+            w.flush().await.unwrap();
+        }
+        ok.finalize_recv(true).expect("finalize_recv(true)");
+        assert!(ok.recv_committed(), "a published transfer is a receipt");
+        assert_eq!(std::fs::read(&good).unwrap(), b"payload");
     }
 
     // A full GUI stdout channel must be a pause, never a stop. The peer paces

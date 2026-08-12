@@ -8,7 +8,7 @@ use crate::backend;
 use crate::config::CryptoConfig;
 use crate::error::{CryptoError, Result};
 use crate::network::{
-    NetworkProcessor as CommonProcessor, PeerId, CHAT_ACTIVE, PEER_COOLDOWNS, ChatActiveGuard,
+    NetworkProcessor as CommonProcessor, PeerId, PEER_COOLDOWNS, ChatActiveGuard,
     ALPN_CHAT, ALPN_FILE, IOProvider,
 };
 use crate::p2p::{P2pEndpoint, P2pProtocol, PeerId as P2pPeerId, P2pStream};
@@ -658,6 +658,15 @@ impl NetworkProcessor {
                 let scp_allowed = config.serve_scp;
                 let pairing_allowed = config.serve_pairing;
                 let chat_allowed = config.serve_chat;
+                // Which of the two chat/file services this node was actually
+                // opened for: `--chat` (or its absence) on the server command
+                // line, `chat_mode = false` for the GUI's receive listener.
+                // `serve_chat` only says the node serves that pair at all; on
+                // its own it leaves the *choice between them* to the peer's
+                // ALPN, which turns a file receiver into a chat session
+                // reading this process's stdin (and a chat session into a file
+                // dump on its stdout). Serve the one that was asked for.
+                let chat_requested = config.chat_mode;
                 config.shell_mode = false;
                 config.chat_mode = false;
                 config.file_mode = false;
@@ -674,12 +683,20 @@ impl NetworkProcessor {
                         eprintln!("Rejecting nkct/chat/2: this node is not a chat server");
                         return;
                     }
+                    if !chat_requested {
+                        eprintln!("Rejecting nkct/chat/2: this node was started to receive a file, not to chat");
+                        return;
+                    }
                     config.chat_mode = true;
                 } else if incoming.protocol.0 == ALPN_FILE {
                     // Same gate: the file-receive arm writes up to MAX_FILE_SIZE
                     // of peer-chosen bytes to this process's stdout.
                     if !chat_allowed {
                         eprintln!("Rejecting nkct/file/1: this node is not a chat/file server");
+                        return;
+                    }
+                    if chat_requested {
+                        eprintln!("Rejecting nkct/file/1: this node was started to chat, not to receive a file");
                         return;
                     }
                     config.file_mode = true;
@@ -833,6 +850,12 @@ impl NetworkProcessor {
         let scp_allowed = config.serve_scp;
         let pairing_allowed = config.serve_pairing;
         let chat_allowed = config.serve_chat;
+        // See `run_listen_loop`: the service this single-shot listener was
+        // opened for. It matters most here — this is the path the GUI's
+        // "Generate Ticket and Wait" receive button uses, and it serves exactly
+        // one connection, so a peer that dials the other ALPN both consumes the
+        // listener and gets a service the user never opened.
+        let chat_requested = config.chat_mode;
         config.shell_mode = false;
         config.chat_mode = false;
         config.file_mode = false;
@@ -850,11 +873,23 @@ impl NetworkProcessor {
                     "chat (nkct/chat/2) is not enabled on this node".to_string(),
                 ));
             }
+            if !chat_requested {
+                return Err(CryptoError::Parameter(
+                    "chat (nkct/chat/2) was dialled, but this listener was opened to receive a file"
+                        .to_string(),
+                ));
+            }
             config.chat_mode = true;
         } else if incoming.protocol.0 == ALPN_FILE {
             if !chat_allowed {
                 return Err(CryptoError::Parameter(
                     "file receive (nkct/file/1) is not enabled on this node".to_string(),
+                ));
+            }
+            if chat_requested {
+                return Err(CryptoError::Parameter(
+                    "file receive (nkct/file/1) was dialled, but this listener was opened for chat"
+                        .to_string(),
                 ));
             }
             config.file_mode = true;
@@ -1291,19 +1326,12 @@ impl NetworkProcessor {
             }
             drop(cooldowns);
 
-            if std::sync::atomic::AtomicBool::compare_exchange(
-                &CHAT_ACTIVE,
-                false,
-                true,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            ).is_err() {
-                return Err(CryptoError::Parameter("Chat session already active".to_string()));
-            }
-            Some(ChatActiveGuard {
-                peer_id,
-                _start_time: std::time::Instant::now(),
-            })
+            // Claim + release are paired inside the guard: it holds the slot for
+            // exactly as long as this connection's chat session runs, and its
+            // drop is the only thing that gives the slot back.
+            Some(ChatActiveGuard::acquire(peer_id).ok_or_else(|| {
+                CryptoError::Parameter("Chat session already active".to_string())
+            })?)
         } else {
             None
         };
@@ -1378,9 +1406,12 @@ impl NetworkProcessor {
             let stdin = io_provider.stdin();
             let stdout = Arc::new(tokio::sync::Mutex::new(io_provider.stdout()));
 
-            let res = CommonProcessor::chat_loop(reader, writer, stdin, stdout, &config.aead_algo, &s2c_key, &c2s_key, true).await;
-            CHAT_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-            res?;
+            // No explicit release here: `_chat_guard` above owns the chat slot
+            // and gives it back when this function returns. Clearing the flag
+            // as soon as the loop ended freed the slot while this session was
+            // still bound to stdin/stdout, so a peer admitted in that window
+            // had its own flag cleared under it when the guard finally dropped.
+            CommonProcessor::chat_loop(reader, writer, stdin, stdout, &config.aead_algo, &s2c_key, &c2s_key, true).await?;
         } else {
             let recv_res = tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
                 CommonProcessor::receive_file_with_progress(
@@ -1916,9 +1947,11 @@ impl NetworkProcessor {
                     let stdin = self.io_provider.stdin();
                     let stdout = Arc::new(tokio::sync::Mutex::new(self.io_provider.stdout()));
 
-                    let res = CommonProcessor::chat_loop(reader, writer, stdin, stdout, &config.aead_algo, &s2c_key, &c2s_key, false).await;
-                    CHAT_ACTIVE.store(false, std::sync::atomic::Ordering::SeqCst);
-                    res
+                    // The client side never claims the chat slot (only an
+                    // accepted inbound session does), so it must not release it
+                    // either: clearing the flag here cleared it for whatever
+                    // session in this process actually held it.
+                    CommonProcessor::chat_loop(reader, writer, stdin, stdout, &config.aead_algo, &s2c_key, &c2s_key, false).await
                 } else {
                     tokio::time::timeout(crate::network::CUMULATIVE_TIMEOUT, async {
                         CommonProcessor::send_file_with_progress(
@@ -2390,6 +2423,116 @@ mod tests {
         assert!(
             format!("{:?}", server_res.unwrap_err()).contains("not enabled on this node"),
             "the refusal must name the missing role"
+        );
+        assert!(
+            client_res.is_err(),
+            "the client must not complete a session the server refused"
+        );
+    }
+
+    /// `serve_chat` says the node serves the chat/file pair; it does not say
+    /// which of the two a given listener was opened for. The peer picks the
+    /// ALPN, so without a second check the peer picks the *service*. A listener
+    /// opened to receive a file — the GUI's "Generate Ticket and Wait" button
+    /// (`gui::build_file_receive_config`, `chat_mode == false`), or a CLI
+    /// `--serve-chat` without `--chat` — must refuse `nkct/chat/2`: serving it
+    /// consumes the single-shot listener (denying the transfer the user is
+    /// waiting for) and binds the peer to this process's stdin/stdout instead.
+    #[tokio::test]
+    async fn file_receive_listener_refuses_a_peer_that_dials_chat() {
+        let net = MockNetwork::new();
+        let server_id = P2pPeerId::new([5; 32]);
+        let client_id = P2pPeerId::new([6; 32]);
+
+        let proto_chat = P2pProtocol(ALPN_CHAT);
+        let proto_file = P2pProtocol(ALPN_FILE);
+        let server_ep = Arc::new(net.register(server_id, vec![proto_chat, proto_file]));
+        let client_ep = Arc::new(net.register(client_id, vec![proto_chat, proto_file]));
+
+        let mut server_config = CryptoConfig::default();
+        // The receive-listener shape: serves the pair, opened for file receive.
+        server_config.serve_chat = true;
+        server_config.chat_mode = false;
+        server_config.allow_unauth = true;
+        server_config.handshake_timeout = 2;
+
+        // ...and a peer that dials the other ALPN of the pair.
+        let mut client_config = CryptoConfig::default();
+        client_config.chat_mode = true;
+        client_config.allow_unauth = true;
+        client_config.handshake_timeout = 2;
+
+        let server_addr = server_ep.local_addr().await.unwrap();
+        client_config.connect_addr = Some(Ticket::new(server_addr, None, None).to_string());
+
+        let server_proc = NetworkProcessor::new(server_config, server_ep, Arc::new(TestIOProvider));
+        let client_proc = NetworkProcessor::new(client_config, client_ep, Arc::new(TestIOProvider));
+
+        let server_task = tokio::spawn(async move {
+            server_proc.run_listen_once_with_progress(|_| {}, |_| {}, None).await
+        });
+        let client_res = client_proc.run_connect().await;
+
+        let server_res = server_task.await.unwrap();
+        assert!(
+            server_res.is_err(),
+            "a listener opened to receive a file served the peer a chat session instead"
+        );
+        assert!(
+            format!("{:?}", server_res.unwrap_err()).contains("opened to receive a file"),
+            "the refusal must name the service the listener was actually opened for"
+        );
+        assert!(
+            client_res.is_err(),
+            "the client must not complete a session the server refused"
+        );
+    }
+
+    /// The mirror image, on the CLI side: a node started `--serve-chat --chat`
+    /// is sitting in an interactive session against the operator's terminal, so
+    /// a peer that dials `nkct/file/3` must not be able to turn it into a file
+    /// dump on that terminal's stdout.
+    #[tokio::test]
+    async fn chat_listener_refuses_a_peer_that_dials_file_receive() {
+        let net = MockNetwork::new();
+        let server_id = P2pPeerId::new([7; 32]);
+        let client_id = P2pPeerId::new([8; 32]);
+
+        let proto_chat = P2pProtocol(ALPN_CHAT);
+        let proto_file = P2pProtocol(ALPN_FILE);
+        let server_ep = Arc::new(net.register(server_id, vec![proto_chat, proto_file]));
+        let client_ep = Arc::new(net.register(client_id, vec![proto_chat, proto_file]));
+
+        let mut server_config = CryptoConfig::default();
+        server_config.serve_chat = true;
+        server_config.chat_mode = true; // `--serve-chat --chat`
+        server_config.allow_unauth = true;
+        server_config.handshake_timeout = 2;
+
+        let mut client_config = CryptoConfig::default();
+        client_config.chat_mode = false; // dials ALPN_FILE
+        client_config.allow_unauth = true;
+        client_config.handshake_timeout = 2;
+
+        let server_addr = server_ep.local_addr().await.unwrap();
+        client_config.connect_addr = Some(Ticket::new(server_addr, None, None).to_string());
+
+        let server_proc = NetworkProcessor::new(server_config, server_ep, Arc::new(TestIOProvider));
+        let client_proc = NetworkProcessor::new(client_config, client_ep, Arc::new(TestIOProvider));
+
+        let server_task = tokio::spawn(async move {
+            server_proc.run_listen_once_with_progress(|_| {}, |_| {}, None).await
+        });
+        let client_res = client_proc.run_connect().await;
+
+        let server_res = server_task.await.unwrap();
+        assert!(
+            server_res.is_err(),
+            "a listener opened for chat accepted a file transfer onto its stdout"
+        );
+        assert!(
+            format!("{:?}", server_res.unwrap_err()).contains("opened for chat"),
+            "the refusal must name the service the listener was actually opened for"
         );
         assert!(
             client_res.is_err(),

@@ -159,6 +159,12 @@ pub struct CryptoConfig {
     pub is_recursive: bool,
 
     pub connect_addr: Option<String>,
+    /// Chat rather than file transfer. On a *connection's* config this is set
+    /// per-connection by the ALPN dispatch; on a *node's* config it is the
+    /// operator's request (`--chat`, or `false` for a file-receive listener),
+    /// which the dispatch checks so the peer cannot pick the other service of
+    /// the `serve_chat` pair. Do not set it on a node's config to mean
+    /// anything else.
     pub chat_mode: bool,
     /// Inbound file-receive mode (ALPN_FILE). Set per-connection by the ALPN
     /// dispatch, like `chat_mode`; exists so authorization can name the service
