@@ -1422,6 +1422,10 @@ const META_SENDER_PREFIX: &[u8] = b"sb:";
 /// One past the last key of the `META_SENDER_PREFIX` range (`b"sb;"`), for
 /// prefix scans over the ledger rows.
 const META_SENDER_PREFIX_END: &[u8] = b"sb;";
+/// Prefix of a per-recipient **prekey stocking mark**: `b"pm:" ‖
+/// blind_index(recipient)`. Sorts clear of the `b"sb:"` ledger range, so the
+/// prefix scans over that range are unaffected. See [`prekey_mark_key`].
+const META_PREKEY_MARK_PREFIX: &[u8] = b"pm:";
 const INBOX_SCHEMA_VERSION: u64 = 2;
 
 /// Global cap on the total ledger cost of stored envelopes. DEPOSIT is
@@ -1682,6 +1686,60 @@ fn sender_ledger_key(sender_bi: &[u8; BLIND_INDEX_LEN]) -> Vec<u8> {
     let mut k = Vec::with_capacity(META_SENDER_PREFIX.len() + BLIND_INDEX_LEN);
     k.extend_from_slice(META_SENDER_PREFIX);
     k.extend_from_slice(sender_bi);
+    k
+}
+
+/// Key of one recipient's prekey **stocking mark**: `b"pm:" ‖
+/// blind_index(recipient)` → the pool level (u64 BE) that recipient's own most
+/// recent PUBLISH left in its slot.
+///
+/// This is the number the FETCH reserve floor is computed from
+/// (`crate::network::inbox`), and it lives here rather than in the relay's
+/// memory for two reasons. It must not be **droppable**: the in-memory reserve
+/// table is capped and prunes idle entries, and a mark held only there could be
+/// flushed on demand by an unauthenticated peer, after which the floor
+/// re-derived from the already-drained pool — the PQ-FS downgrade recorded as
+/// `KNOWN_ISSUES.md` item 3. And it must not be **process-local**: a restart
+/// would otherwise re-derive every mark from whatever the live pools had been
+/// drawn down to.
+///
+/// [`RedbInboxStore::publish_prekeys`] is the only writer that can **change**
+/// it, and PUBLISH is keyed on the handshake-authenticated NodeId, so the only
+/// party that can move a recipient's mark is that recipient.
+/// [`RedbInboxStore::prekey_level_and_mark`] also writes, but only to *create*
+/// a missing one (see there): it never overwrites, so a fetcher reaching that
+/// path cannot talk a floor down.
+///
+/// Stored unencrypted, like the byte ledgers beside it. While the pool is
+/// non-empty this adds no disclosure at all — the value is a row count for a
+/// blind index whose *current* row count is readable straight off the cleartext
+/// [`TBL_PREKEY`] keys.
+///
+/// **It does add a residue once the pool empties.** This row outlives every
+/// prekey row, so a stolen file records that some blind index published at all,
+/// and to what level, where previously that fact vanished with the last row.
+/// Judged acceptable rather than absent: the key is `blind_index` under a
+/// DEK-derived HMAC key, so it names no identity to anyone without the DEK, and
+/// [`TBL_CHECKPOINT`] already leaves exactly the same permanent "this blind
+/// index existed" residue for any peer that ever checkpointed. What is genuinely
+/// new is the plaintext *level* beside it, where a checkpoint's value is sealed
+/// — a coarse activity signal about an unnamed index, which is why this is worth
+/// stating rather than worth encrypting.
+///
+/// Row cost: 35 B of key + 8 B of value per recipient that has ever published,
+/// never removed. Uncounted by any budget, like [`sender_ledger_key`]'s rows.
+/// **Do not read a floor into the PUBLISH that creates one**: the server never
+/// parses a prekey blob, and `handle_publish` accepts any blob of `1..=`
+/// [`crate::network::inbox::MAX_PREKEY_BLOB`] bytes, so the real minimum is one
+/// tiny row — which the publisher can then FETCH away, leaving this row behind.
+/// It is bounded by comparison instead: [`TBL_CHECKPOINT`] already gives a
+/// freely minted NodeId a permanent, equally uncharged row for a 9-byte frame
+/// and no stored bytes at all, so this is the strictly more expensive of the two
+/// ways to leave one uncounted row per identity.
+fn prekey_mark_key(recipient_bi: &[u8; BLIND_INDEX_LEN]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(META_PREKEY_MARK_PREFIX.len() + BLIND_INDEX_LEN);
+    k.extend_from_slice(META_PREKEY_MARK_PREFIX);
+    k.extend_from_slice(recipient_bi);
     k
 }
 
@@ -2467,6 +2525,27 @@ impl RedbInboxStore {
 
     /// PUBLISH: append signed prekey `blobs` to `recipient`'s pool, then evict
     /// the oldest so at most `max_prekeys` remain (newest win).
+    ///
+    /// Also records the pool level this call leaves in the slot as the
+    /// recipient's **stocking mark** ([`prekey_mark_key`]), which is what the
+    /// FETCH reserve floor is computed from. The count is taken inside this
+    /// transaction, so a FETCH cannot interleave between the last insert and
+    /// the count and be reflected in the mark.
+    ///
+    /// The rule is **replace, not high-water**: the mark becomes what this
+    /// PUBLISH left, even when that is less than the recipient stocked before.
+    /// A mark that only ever rose would hold a floor against a pool the
+    /// recipient no longer keeps — a peer that drops from 256 prekeys to 10
+    /// would sit permanently under a floor of 64, so *every* draw would be
+    /// inside the reserve band and honest senders would be throttled to one
+    /// prekey per `RESERVE_RL_REFILL_PER_SEC` forever. Replacing keeps the
+    /// invariant that matters instead: right after a PUBLISH the level equals
+    /// the mark, so at least `1 - 1/PREKEY_RESERVE_DIVISOR` of the freshly
+    /// stocked pool is drawn ungated.
+    ///
+    /// Replacing costs nothing against the attack this defends, because a
+    /// fetcher cannot reach this path at all: the slot — and therefore the
+    /// mark — is keyed on the handshake-authenticated NodeId.
     pub fn publish_prekeys(
         &self,
         recipient: &[u8; 32],
@@ -2493,6 +2572,7 @@ impl RedbInboxStore {
                 .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         }
         // Evict oldest beyond the cap.
+        let stocked: u64;
         {
             let mut t = wtx
                 .open_table(TBL_PREKEY)
@@ -2516,6 +2596,15 @@ impl RedbInboxStore {
                         .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
                 }
             }
+            // What this PUBLISH leaves in the slot: the rows just counted, less
+            // whatever the cap evicted.
+            stocked = keys.len().min(self.max_prekeys) as u64;
+        }
+        {
+            let mut meta = wtx
+                .open_table(TBL_META)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            meta_write_u64(&mut meta, &prekey_mark_key(&bi), stocked)?;
         }
         wtx.commit()
             .map_err(|e| RedbStorageError::Backend(e.to_string()))
@@ -2568,6 +2657,140 @@ impl RedbInboxStore {
         wtx.commit()
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         Ok(result)
+    }
+
+    /// The two numbers the FETCH reserve gate needs about `recipient`: how many
+    /// prekeys its pool holds now, and the stocking mark the floor is computed
+    /// from ([`prekey_mark_key`]).
+    ///
+    /// Both come out of **one** transaction so they cannot straddle a
+    /// concurrent PUBLISH: reading them separately could pair a level from
+    /// before a replenishment with a mark from after it, and gate an honest
+    /// sender on a pool that had just been topped up.
+    ///
+    /// **This writes** when it meets a pool that holds prekeys but carries no
+    /// mark — the on-disk shape of every pool in a database that predates the
+    /// mark. It records the level standing *now*, before this draw pops
+    /// anything, which is exactly the anchor the previous implementation
+    /// derived on a first draw. Nothing therefore fails closed on upgrade and
+    /// no honest sender is turned away; what changes is that the anchor is
+    /// **durable** from that instant, where before it lived in the relay's
+    /// bounded, prunable reserve table and an unauthenticated peer could force
+    /// a prune and have the next draw re-derive it from the drawn-down level.
+    /// That is `KNOWN_ISSUES.md` item 3, and leaving unmarked pools on the old
+    /// path left the whole of it standing for every pool at upgrade.
+    ///
+    /// Seeding cannot be steered by a fetcher. The recorded value is counted in
+    /// the same write transaction that stores it and before
+    /// [`Self::fetch_prekey`] pops anything, so a draw is never counted into
+    /// its own anchor; and it happens once — from then on only PUBLISH moves
+    /// the mark, so no repetition can walk the anchor down. The one thing it
+    /// cannot do is recover information that was never on disk: a pool already
+    /// drained before the upgrade is anchored at what it was drained *to*. That
+    /// is a one-time consequence of the old mark being process-local, is no
+    /// worse than what a restart did then, and is corrected by the owner's next
+    /// PUBLISH.
+    ///
+    /// Returns a mark of 0 for an empty slot, which allocates nothing: with no
+    /// prekeys there is nothing to reserve, and the caller returns "depleted"
+    /// before consulting the floor.
+    pub fn prekey_level_and_mark(
+        &self,
+        recipient: &[u8; 32],
+    ) -> Result<(usize, u64), RedbStorageError> {
+        let bi = self.b.blind_index(recipient);
+        let lo = composite_key(&bi, 0);
+        let hi = composite_key(&bi, u64::MAX);
+        let mark_key = prekey_mark_key(&bi);
+        // Fast path: a marked pool — every pool that has been published to
+        // since this record existed — is read-only here.
+        {
+            let rtx = self
+                .b
+                .db
+                .begin_read()
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let level = {
+                let table = rtx
+                    .open_table(TBL_PREKEY)
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                table
+                    .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+                    .count()
+            };
+            let mark = {
+                let meta = rtx
+                    .open_table(TBL_META)
+                    .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                meta_read_u64(&meta, &mark_key)?
+            };
+            match mark {
+                Some(m) => return Ok((level, m)),
+                // Nothing to anchor, and nothing to allocate for a slot any
+                // stranger can name on the wire.
+                None if level == 0 => return Ok((0, 0)),
+                None => {}
+            }
+        }
+        // Unmarked pool holding prekeys: anchor it, counting inside the same
+        // transaction that writes so the two cannot disagree.
+        let wtx = self
+            .b
+            .db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let level = {
+            let table = wtx
+                .open_table(TBL_PREKEY)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            table
+                .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?
+                .count()
+        };
+        let mark = {
+            let mut meta = wtx
+                .open_table(TBL_META)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            match meta_read_u64(&meta, &mark_key)? {
+                // A PUBLISH landed between the read above and this write. Its
+                // mark is the owner's own statement, so it wins over the seed.
+                Some(m) => m,
+                None => {
+                    meta_write_u64(&mut meta, &mark_key, level as u64)?;
+                    level as u64
+                }
+            }
+        };
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        Ok((level, mark))
+    }
+
+    /// Drop `recipient`'s stocking mark, leaving its prekey rows in place —
+    /// the on-disk shape of a pool published before marks were kept. Test-only
+    /// door, so the upgrade path can be exercised without a fixture database.
+    #[cfg(test)]
+    pub(crate) fn forget_prekey_mark_for_test(
+        &self,
+        recipient: &[u8; 32],
+    ) -> Result<(), RedbStorageError> {
+        let bi = self.b.blind_index(recipient);
+        let wtx = self
+            .b
+            .db
+            .begin_write()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        {
+            let mut meta = wtx
+                .open_table(TBL_META)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            meta.remove(prekey_mark_key(&bi).as_slice())
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        }
+        wtx.commit()
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))
     }
 
     /// COUNT: number of prekeys remaining in `recipient`'s pool.
@@ -4474,6 +4697,99 @@ mod tests {
         assert_eq!(s.fetch_prekey(&rcpt).expect("f3"), Some(vec![4u8; 4]));
         assert_eq!(s.fetch_prekey(&rcpt).expect("f4"), None);
         assert_eq!(s.count_prekeys(&rcpt).expect("count0"), 0);
+    }
+
+    /// The stocking mark the FETCH reserve floor is computed from
+    /// (`crate::network::inbox`). Four properties, in order:
+    ///
+    /// * PUBLISH records what it *left in the slot*, not what it was handed —
+    ///   the cap evicted two of the five blobs above, and a mark of 5 would put
+    ///   the floor above a pool that can never reach it.
+    /// * FETCH does not move it. Draining is what an attacker does, and if a
+    ///   drain could lower the mark it would lower its own floor.
+    /// * It is replaced, not raised, so a recipient can stock less than it used
+    ///   to without being gated on a pool it no longer keeps.
+    /// * It is per recipient, keyed on the same blind index as the pool.
+    #[test]
+    fn inbox_prekey_stocking_mark_is_written_only_by_publish() {
+        let (_d, s) = inbox(3); // cap = 3
+        let rcpt = [0xd4u8; 32];
+        let other = [0xd5u8; 32];
+        let mark_row = |r: &[u8; 32]| meta_of(&s, &prekey_mark_key(&s.b.blind_index(r)));
+
+        assert_eq!(
+            s.prekey_level_and_mark(&rcpt).expect("mark"),
+            (0, 0),
+            "a slot nobody has published to has no pool to anchor"
+        );
+        assert_eq!(
+            mark_row(&rcpt),
+            None,
+            "and reading an empty slot must not create a row — any stranger \
+             can name one on the wire"
+        );
+
+        let blobs: Vec<Vec<u8>> = (0u8..5).map(|i| vec![i; 4]).collect();
+        s.publish_prekeys(&rcpt, &blobs, 10).expect("publish");
+        assert_eq!(
+            s.prekey_level_and_mark(&rcpt).expect("mark"),
+            (3, 3),
+            "the mark is the level the PUBLISH left, after the cap evicted"
+        );
+
+        s.fetch_prekey(&rcpt).expect("fetch");
+        s.fetch_prekey(&rcpt).expect("fetch");
+        assert_eq!(
+            s.prekey_level_and_mark(&rcpt).expect("mark"),
+            (1, 3),
+            "a FETCH lowers the level and must not touch the mark"
+        );
+
+        // The owner republishes a smaller pool: the mark follows it down.
+        s.fetch_prekey(&rcpt).expect("fetch");
+        s.publish_prekeys(&rcpt, &[vec![9u8; 4]], 11).expect("republish");
+        assert_eq!(s.prekey_level_and_mark(&rcpt).expect("mark"), (1, 1));
+
+        // Another recipient's slot is untouched throughout.
+        assert_eq!(s.prekey_level_and_mark(&other).expect("mark"), (0, 0));
+        assert_eq!(mark_row(&other), None);
+    }
+
+    /// A pool that holds prekeys but carries no mark — the on-disk shape of a
+    /// database written before the mark existed — is **anchored on the spot**,
+    /// at the level standing before anything is popped.
+    ///
+    /// Leaving such a pool to a memory-held fallback is what left the whole of
+    /// `KNOWN_ISSUES.md` item 3 standing for every pool at upgrade: the
+    /// relay's reserve table is prunable on demand, so a fallback kept there is
+    /// resettable on demand. Recording it here makes the anchor durable while
+    /// keeping the value identical to the one the old code derived, so nothing
+    /// fails closed.
+    #[test]
+    fn inbox_prekey_pool_without_a_mark_is_anchored_on_first_read() {
+        let (_d, s) = inbox(256);
+        let rcpt = [0xd6u8; 32];
+        let mark_row = || meta_of(&s, &prekey_mark_key(&s.b.blind_index(&rcpt)));
+
+        let blobs: Vec<Vec<u8>> = (0u8..10).map(|i| vec![i; 4]).collect();
+        s.publish_prekeys(&rcpt, &blobs, 10).expect("publish");
+        s.forget_prekey_mark_for_test(&rcpt).expect("forget");
+        assert_eq!(mark_row(), None, "the pre-record shape: rows but no mark");
+
+        assert_eq!(
+            s.prekey_level_and_mark(&rcpt).expect("mark"),
+            (10, 10),
+            "an unmarked pool is anchored at the level standing now"
+        );
+        assert_eq!(mark_row(), Some(10), "and that anchor is written down");
+
+        // Draining cannot walk the anchor down: the mark is set once, and from
+        // then on only PUBLISH moves it.
+        for _ in 0..7 {
+            s.fetch_prekey(&rcpt).expect("fetch");
+        }
+        assert_eq!(s.prekey_level_and_mark(&rcpt).expect("mark"), (3, 10));
+        assert_eq!(mark_row(), Some(10));
     }
 
     /// Sorted table names of a redb file, opened raw (no store handle, so the

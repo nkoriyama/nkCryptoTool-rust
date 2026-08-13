@@ -42,63 +42,106 @@ trade-off is explicit rather than forgotten.
    the per-session seen-nonce set is bounded (memory-safety/DoS trade-off); a
    replay of an *evicted* nonce within the same long-lived session would only
    re-display one already-seen line — no key compromise or integrity break.
-3. **FETCH prekey rate-limit vs. fresh NodeIds** (`network/inbox.rs`): the
-   per-NodeId token bucket is bypassable by minting new NodeIds (cheap), so a
-   second, recipient-keyed bound was added in 2026-08: the lowest quarter of
-   what a recipient is observed to stock is a reserve band, and a draw inside
-   it also costs a token from a bucket keyed on the **recipient**, which no
-   number of minted NodeIds divides. It bounds the drain rate and disengages
-   the moment the recipient replenishes; it does **not** prevent the
+3. **FETCH prekey rate-limit vs. fresh NodeIds** (`network/inbox.rs`,
+   `group/redb_storage.rs`): the per-NodeId token bucket is bypassable by
+   minting new NodeIds (cheap), so a second, recipient-keyed bound was added in
+   2026-08: the lowest quarter of what a recipient stocks is a reserve band, and
+   a draw inside it also costs a token from a bucket keyed on the **recipient**,
+   which no number of minted NodeIds divides. It bounds the drain rate and
+   disengages the moment the recipient replenishes; it does **not** prevent the
    downgrade — a sustained attacker still drives a default-profile sender to a
    static-only seal, and the `Require Prekey (Strict PQ-FS)` profile remains
-   the real backstop. Residuals: the stocking marks are process-local soft
-   state (a server restart re-derives them from the live pools); an attacker
-   holding 4096 *distinct* pools below their floors at once — each at the
-   sustained below-floor cost — keeps the reserve table full, and a recipient
-   first seen while it is full goes untracked, hence ungated until room
-   appears; and the prune that keeps that table bounded can be forced, which
-   drops stocking marks. That last one is the sharpest of the three. It was
-   first written up here as costing the attacker a ~4 minute wait and buying a
-   3x–7x advantage; a 2026-08 re-check against the code found both figures
-   wrong and the framing misleading. The corrected account:
-   - **No wait is required.** `TokenBucket::new` starts a bucket *full*, and
-     `level > reserve_floor(r.stock) || r.bucket.try_take(now)` short-circuits,
-     so a draw *above* the floor spends no token at all. An attacker who stops
-     drawing exactly at the floor never charges the victim's bucket, so it
-     stays full from creation and is prunable immediately. The ~4 minutes was
-     the worst case for an attacker who had already spent all 8 tokens —
-     spending one costs 30 s, spending none costs nothing.
-   - **The real price is firing the prune.** `retain` runs only when a
+   the real backstop.
+
+   **The stocking level the floor is computed from is now written by PUBLISH and
+   persisted** (`b"pm:" ‖ blind_index(recipient)` in the inbox store's meta
+   table, `prekey_mark_key`), replacing the process-local high-water mark the
+   draw path used to derive. The first version of this defence kept that mark in
+   the same bounded, prunable table as the token buckets, and **the prune was an
+   attack**:
+   - **No wait was required.** `TokenBucket::new` starts a bucket *full*, and
+     `level > reserve_floor(..) || r.bucket.try_take(now)` short-circuits, so a
+     draw *above* the floor spends no token at all. An attacker who stopped
+     drawing exactly at the floor never charged the victim's bucket, so it
+     stayed full from creation and was prunable immediately.
+   - **The price was firing the prune.** `retain` runs only when a
      not-yet-tracked recipient draws while the table already holds
      `RESERVE_MAX_TRACKED` = 4096 entries. Because `level == 0` returns before
-     the table is touched, only recipients with a genuinely stocked pool can
-     create entries — but the attacker can supply those itself: PUBLISH writes
-     to the slot of the handshake-authenticated NodeId and never parses the
-     blob, so 4096 minted NodeIds each stocked with junk blobs will do. **No
-     third party's prekeys are consumed**, only the victim's own. One prune
-     costs roughly 4096 FETCH connections and 4096 pops from pools the attacker
-     owns, and the same identities can be reused each round.
-   - **What it buys is not extra keys but the removal of the refill race the
-     reserve exists to win.** After a prune the mark re-derives from the
-     drawn-down level `L` and the floor becomes `L/4`, so the pool can be
-     walked down in ungated stages: 100 → 25 → 6 → 1 → 0 takes three prunes
-     (~12,000 filler draws), 256 → 64 → 16 → 4 → 1 → 0 takes four (~16,000).
-     No token is spent and no waiting occurs at any stage. Without the prune
-     the same pool still empties, but at one key per 30 s once below the floor
-     — ~8.5 minutes for 100 keys, ~28 minutes for 256 — and that window is
-     exactly where a recipient's `maintain` run can replenish and win. Whether
-     ~12,000 connections is in practice faster than 8.5 minutes depends on
-     iroh handshake cost against `MAX_CONCURRENT_CONNECTIONS` = 256 and has
-     **not** been measured.
-   - Two further corrections to the old text. `retain` drops *every* entry
-     whose bucket is full, not just the victim's, so one round's 4096 draws
-     flush the marks of every recipient not currently being drawn below its
-     floor — the cost is per round, not per victim. And "the price is holding
-     that many slots below their floors for the whole window" described the
-     *previous* residual, not this one: here the filler entries may stay full
-     (they are pruned alongside the victim, which is fine for the attacker),
-     one above-floor draw each is enough, and the table need only stand at
-     4096 for the instant of the triggering draw.
+     the table is touched, only recipients with a genuinely stocked pool create
+     entries — but the attacker can supply those itself: PUBLISH writes to the
+     slot of the handshake-authenticated NodeId and never parses the blob, so
+     4096 minted NodeIds each stocked with junk blobs will do. **No third
+     party's prekeys are consumed**, only the victim's own.
+   - **What it bought was the removal of the refill race the reserve exists to
+     win.** After a prune the mark re-derived from the drawn-down level `L` and
+     the floor became `L/4`, so the pool could be walked down in ungated stages:
+     100 → 25 → 6 → 1 → 0 in three prunes, 256 → 64 → 16 → 4 → 1 → 0 in four.
+     No token spent and no waiting at any stage. `retain` also drops *every*
+     full-bucket entry, not just the victim's, so one round flushed the marks of
+     every recipient not currently being drawn below its floor.
+
+   With the mark in the store, a prune cannot reach it, and pruning a *bucket*
+   buys an attacker nothing at all: the prune's test is `is_full_at`, and a full
+   bucket holds exactly the eight tokens the fresh bucket replacing it would,
+   while a bucket with tokens spent is not full and so cannot be pruned before
+   the refill it is enforcing has already elapsed.
+
+   **A pool that predates the record is anchored on its first draw**, at the
+   level standing before that draw pops anything
+   (`RedbInboxStore::prekey_level_and_mark`). This is not a nicety — without it
+   the fix would have covered nothing on the day a relay upgrades: every
+   existing pool would have carried no mark, fallen back to a level held in the
+   prunable table, and the whole attack above would have stood untouched until
+   each owner happened to republish, which is an operator-scheduled `maintain`
+   run and so unbounded in practice. The anchored value is exactly the one the
+   old code derived on a first draw, so no honest sender is turned away; what
+   changed is that it is now durable, and only PUBLISH can move it afterwards.
+
+   Regression tests: `a_forced_prune_cannot_collapse_a_victims_reserve_floor`
+   runs the whole sequence (drain to the floor, flood the table with 4096
+   attacker-stocked recipients, draw again) against a marked pool,
+   `a_forced_prune_cannot_collapse_an_unmarked_pools_floor` runs it against the
+   pre-record shape, and `a_restart_does_not_re_anchor_the_floor_to_a_drained_pool`
+   plus `an_anchored_pool_keeps_its_floor_across_a_restart_and_a_republish`
+   cover the process-local half.
+
+   The update rule is **replace, not high-water**: the mark becomes whatever the
+   PUBLISH left in the slot, counted inside the same write transaction. A mark
+   that only rose would hold a floor against a pool the recipient no longer
+   keeps — a peer dropping from 256 prekeys to 10 would sit permanently under a
+   floor of 64, with every draw inside the band and honest senders throttled to
+   one prekey per 30 s forever. Replacing keeps the invariant that matters: right
+   after a PUBLISH the level equals the mark, so three quarters of the freshly
+   stocked pool is always drawn ungated. It concedes nothing to the attacker,
+   because a fetcher cannot *change* the mark — the slot is keyed on the
+   handshake-authenticated NodeId, and the draw path's one write only ever
+   creates a mark that is absent, never overwrites one that is there.
+
+   Four residuals stand:
+   - **An attacker holding 4096 *distinct* pools below their floors at once**
+     — each at the sustained below-floor cost — keeps the reserve table full,
+     and a recipient first drawn from while it is full goes untracked, hence
+     ungated, until room appears. Unchanged by the persistence fix: the floor is
+     known for such a recipient, but there is nowhere to put the bucket that
+     would charge it, and the admission rule fails **open** deliberately
+     (`REPLY_RATE_LIMITED` is a downgrade lever to `one_shot`, not a retry
+     signal, so refusing untracked callers would be worse than serving them).
+   - **A pool anchored on its first draw is anchored at whatever it then holds.**
+     If it had already been drawn down before the relay upgraded, the anchor is
+     the drained level rather than what its owner stocked — that information was
+     process-local and did not survive. One-time and not repeatable (the mark is
+     created once, and only PUBLISH moves it afterwards), no worse than what a
+     restart did under the old code, and corrected by the owner's next PUBLISH.
+   - **A drain that lands inside the window between a recipient's COUNT and its
+     PUBLISH lowers the mark that PUBLISH records**, since the recipient tops up
+     by the deficit COUNT reported. It buys little: the attacker must draw those
+     keys at the ungated rate it already had, the effect is `mark = target - d`
+     for `d` keys drawn in that window, it does not accumulate across rounds
+     (the next clean replenishment restores the mark), and unlike the prune it
+     cannot be fired on demand.
+   - **~43 B of meta row per recipient that has ever published**, never removed.
+     Uncounted by any budget, like the per-depositor ledger rows beside it, and
+     dwarfed by the ~4.5 KB prekey blob a PUBLISH must store to create one.
 4. **Non-constant-time fingerprint / pinned-key comparison**
    (`p2p/processor.rs`, `network/tcp.rs`): both operands are *public* values
    (a peer public key and its SHA3-256), compared once per connection, so a
@@ -251,7 +294,7 @@ trade-off is explicit rather than forgotten.
       `MAX_PAYLOAD` envelope. Large transfers fail while the store is above its
       soft limit, whoever sends them.
 
-    Two growth vectors the budgets deliberately do not count, listed so a
+    Three growth vectors the budgets deliberately do not count, listed so a
     capacity plan does not miss them:
     - **~90 B per envelope on upgrade**: `EnvTs::cost` charges an
       upgrade-stamped row only for the envelope that was already there, not for
@@ -264,6 +307,11 @@ trade-off is explicit rather than forgotten.
       `TBL_META` (35 B key + 8 B value) are themselves uncharged. Bounded by the
       number of depositors holding a live backlog, and a row is dropped as soon
       as its balance reaches zero.
+    - **~43 B per recipient that has ever published a prekey**: the stocking
+      marks in the same table (item 3). Unlike the ledger rows these are never
+      removed, so they are bounded by identities rather than by live state — but
+      creating one requires storing at least one prekey blob (~4.5 KB), so they
+      cannot be the cheapest way to grow this file.
 
 11. **MLS Commits and Proposals are sent in the clear — including to the
     store-and-forward relay** (`group/processor.rs`, `group/transport.rs`,

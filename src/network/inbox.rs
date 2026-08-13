@@ -96,6 +96,19 @@
 //! job, against the recipient's ML-DSA identity). A per-recipient cap of
 //! [`MAX_PREKEYS_STORED`] bounds storage abuse: the newest prekeys win.
 //!
+//! PUBLISH is also where the reserve below gets its anchor: the pool level this
+//! call leaves in the slot is recorded as the recipient's *stocking level*, in
+//! the same transaction, and the FETCH reserve floor is computed from it. It is
+//! **replaced**, not raised, on every PUBLISH — a recipient that chooses to
+//! stock fewer prekeys must be able to say so, or a stale high mark would gate
+//! every draw against a pool it no longer keeps.
+//!
+//! A pool stocked before that record existed carries none, so the *draw* path
+//! anchors it instead, at the level standing before its own pop. That is the
+//! only circumstance in which anything but a PUBLISH writes the level, it
+//! happens once per pool, and it can only *create* a level, never move one — so
+//! a fetcher still cannot talk a floor down. See `RESERVE_MAX_TRACKED`.
+//!
 //! ### FETCH (One-Time Prekey)
 //!
 //! ```text
@@ -130,11 +143,16 @@
 //!
 //! Because that bucket is keyed on a free-to-mint identity it bounds nothing
 //! in aggregate, so a FETCH is additionally gated by a **per-recipient
-//! reserve**. The server records the highest pool level it has ever observed
-//! for a recipient — its *stocking level*; only the recipient can raise it,
-//! since PUBLISH is keyed on the authenticated connection and no wire field
-//! names another identity's slot — and treats the lowest
-//! `1/PREKEY_RESERVE_DIVISOR` of it as a reserve band. **Above the band a draw
+//! reserve**. Each PUBLISH records the pool level it leaves in the slot as that
+//! recipient's *stocking level*, persisted in the store beside the pool itself
+//! and keyed on the same blind index. **No fetcher can move that level**: only
+//! the recipient can set it, since PUBLISH is keyed on the authenticated
+//! connection and no wire field names another identity's slot, and the one
+//! write the draw path makes — anchoring a pool that has no level yet, at the
+//! level standing before its own pop — cannot change one that is already
+//! there. The server
+//! treats the lowest `1/PREKEY_RESERVE_DIVISOR` of that level as a reserve
+//! band. **Above the band a draw
 //! is not gated at all**: a healthy pool is served to however many identities
 //! ask, so honest senders never meet the gate. A draw *at or below* the band
 //! also costs a token from a bucket keyed by the **recipient**
@@ -287,19 +305,38 @@ pub const RESERVE_RL_REFILL_PER_SEC: f64 = 1.0 / 30.0;
 /// sustained below-floor cost above — a not-yet-seen recipient goes
 /// untracked, and so ungated, until room appears.
 ///
-/// **That survival rule does NOT protect a victim's stocking mark, and this
-/// comment used to claim it did.** Surviving requires the victim's bucket to
-/// be non-full, and the bucket is only charged by a draw at or *below* the
-/// floor ([`TokenBucket::new`] starts it full, and the `||` in `draw_prekey`
-/// short-circuits above the floor). An attacker who walks a pool down to
-/// exactly its floor and stops has spent nothing, so the victim's entry is
-/// full, is pruned like any idle one, and the next draw re-derives the mark
-/// from the drawn-down level — no waiting, and repeatable until the pool is
-/// empty. Firing the prune needs 4096 tracked recipients, which the attacker
-/// can mint itself (PUBLISH keys on the connecting NodeId and does not parse
-/// the blob). This is a known accepted residual, not an oversight: see
-/// `KNOWN_ISSUES.md`, "Security Audit Residuals" item 3, which carries the
-/// measured cost and what a fix would have to change.
+/// **This table no longer holds anything a prune can destroy.** It used to
+/// carry each recipient's stocking mark, and that made the prune an attack:
+/// the mark is only charged against a bucket by a draw at or *below* the floor
+/// ([`TokenBucket::new`] starts a bucket full, and the `||` in `draw_prekey`
+/// short-circuits above the floor), so an attacker that walked a pool down to
+/// exactly its floor and stopped left the victim's entry full and prunable at
+/// once — and the next draw re-derived the mark from the drawn-down level,
+/// collapsing the floor in stages until the pool was empty. Firing the prune
+/// needs this many tracked recipients, which an attacker can mint itself
+/// (PUBLISH keys on the connecting NodeId and does not parse the blob), so the
+/// whole sequence was repeatable on demand.
+///
+/// The stocking level now comes from the store
+/// (`RedbInboxStore::prekey_level_and_mark`), so a prune cannot reach it —
+/// written there by the recipient's own PUBLISH, and anchored there on the
+/// first draw for a pool that predates the record. **Both halves are needed.**
+/// Anchoring only at PUBLISH would have left every pool in an upgraded
+/// deployment on a memory-held fallback, i.e. left the attack above standing
+/// in full until each owner happened to republish.
+///
+/// What is left in the table is the token bucket, and pruning one buys an
+/// attacker exactly nothing: the prune's test is [`TokenBucket::is_full_at`],
+/// and a bucket that is full holds the same eight tokens the fresh bucket
+/// replacing it would. A bucket with tokens spent is not full, so it cannot be
+/// pruned before the refill it is enforcing has already elapsed.
+///
+/// One residual stands, recorded in `KNOWN_ISSUES.md` item 3: an attacker
+/// holding this many *distinct* pools below their floors at once keeps the
+/// table full, and a recipient first drawn from while it is full goes untracked
+/// — hence ungated — until room appears. Its floor is known; there is simply no
+/// room for the bucket that would charge it, and the admission rule fails open
+/// deliberately (see [`FETCH_RL_MAX_TRACKED`]).
 const RESERVE_MAX_TRACKED: usize = 4096;
 
 /// Upper bound on connections whose per-connection setup + handling run
@@ -821,38 +858,33 @@ mod server {
         }
     }
 
-    /// Per-recipient reserve state: what that recipient appears to stock, and
-    /// the budget for drawing on the reserve that stock implies.
+    /// Per-recipient reserve state: the below-floor draw budget, and nothing
+    /// else.
     ///
-    /// `stock` is derived from pool levels the server observed itself, inside
-    /// [`InboxServer::draw_prekey`]'s critical section. A fetcher can only ever
-    /// make the level go *down*, and `stock` is a high-water mark, so no
-    /// sequence of FETCHes from any number of minted NodeIds can talk a floor
-    /// down. Raising it needs prekeys in the slot, and only the slot's owner
-    /// can put them there — PUBLISH is keyed on the authenticated connection,
-    /// so a stranger cannot write another identity's slot. The whole table is
-    /// soft state: it is process-local, so a server restart simply re-derives
-    /// every mark from the live pool levels.
+    /// **The stocking level is not kept here, and no fallback for it is kept
+    /// here either.** It lives in the store, where a PUBLISH writes it and
+    /// where `RedbInboxStore::prekey_level_and_mark` anchors any pool that
+    /// still lacks one. This table is bounded and prunable, so anything held in
+    /// it can be dropped on demand by an unauthenticated peer that fills it —
+    /// which is precisely how a mark kept here was reset, letting the floor
+    /// re-derive from an already-drained pool. See [`RESERVE_MAX_TRACKED`].
+    ///
+    /// What is left here is soft state that can be dropped without consequence.
+    /// A pruned entry costs the attacker nothing and gains it nothing: the
+    /// prune only removes buckets that are *full* ([`TokenBucket::is_full_at`]),
+    /// and a full bucket is by definition indistinguishable from the fresh one
+    /// that replaces it. A bucket with tokens spent is not full, so it is not
+    /// prunable until the refill it is throttling on has already happened.
     struct Reserve {
-        /// Highest pool level ever seen for this recipient: the evidence of
-        /// what it stocks, and what the floor is computed from.
-        stock: u64,
         /// Below-floor draw budget, keyed by the **recipient**.
         bucket: TokenBucket,
     }
 
     impl Reserve {
-        fn new(level: u64, now: Instant) -> Self {
+        fn new(now: Instant) -> Self {
             Self {
-                stock: level,
                 bucket: TokenBucket::new(RESERVE_RL_CAPACITY, RESERVE_RL_REFILL_PER_SEC, now),
             }
-        }
-
-        /// Fold in the level observed on this draw. `stock` only ever rises, so
-        /// draining a pool cannot lower its own floor.
-        fn observe(&mut self, level: u64) {
-            self.stock = self.stock.max(level);
         }
     }
 
@@ -1024,6 +1056,14 @@ mod server {
         /// stocks 100 and one that stocks 256 are each gated only over their
         /// own drained tail — and a recipient that has never published gets no
         /// entry at all.
+        ///
+        /// The stocking level that floor is computed from is read from the
+        /// store — written there by the recipient's own PUBLISH, or anchored
+        /// there on the first draw of a pool that predates the record — never
+        /// from this process's memory: memory here is capped and prunable, and
+        /// a prune is something an unauthenticated peer can provoke. Only the
+        /// token bucket lives in the table now, and losing one of those to a
+        /// prune is free in both directions (see [`Reserve`]).
         fn draw_prekey(&self, recipient: PeerId) -> Result<Draw, InboxError> {
             let now = Instant::now();
             // Poison recovery as in `allow_fetch`: throttle bookkeeping must
@@ -1032,7 +1072,13 @@ mod server {
                 .prekey_reserve
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let level = self.store.count_prekeys(recipient.as_bytes())? as u64;
+            // One transaction, so the level and the mark it is measured against
+            // cannot straddle a concurrent PUBLISH. This also *writes* the mark
+            // for a pool that has none yet, at the level standing before the
+            // pop below — see `prekey_level_and_mark`. Both happen under this
+            // mutex, so the anchor is settled before any key leaves the pool.
+            let (level, stock) = self.store.prekey_level_and_mark(recipient.as_bytes())?;
+            let level = level as u64;
             if level == 0 {
                 // Nothing to reserve. Return before touching the table so an
                 // identity that never published — any stranger can name one on
@@ -1040,23 +1086,34 @@ mod server {
                 return Ok(Draw::Depleted);
             }
             let allowed = match reserve.get_mut(&recipient) {
-                Some(r) => {
-                    r.observe(level);
-                    level > reserve_floor(r.stock) || r.bucket.try_take(now)
-                }
+                Some(r) => level > reserve_floor(stock) || r.bucket.try_take(now),
                 None => {
-                    // First draw seen for this recipient: `level` is the only
-                    // evidence of what it stocks, and `reserve_floor(level) <
-                    // level` for any non-empty pool, so this draw is above the
-                    // floor and costs no token. Record the level as the
-                    // stocking mark the following draws are measured against.
+                    // No bucket for this recipient — either its first draw, or
+                    // its entry was pruned. Either way the floor is whatever
+                    // the recipient's own record says, so unlike before this is
+                    // *not* an automatically free draw: a pool already inside
+                    // its band is charged from the first draw on. The charge
+                    // still lands (a fresh bucket is full), so nothing an
+                    // honest sender does changes; what changes is that the
+                    // entry is no longer left full, and therefore immediately
+                    // prunable, by an attacker that stopped at the floor.
                     if reserve.len() >= RESERVE_MAX_TRACKED {
                         reserve.retain(|_, r| !r.bucket.is_full_at(now));
                     }
                     if reserve.len() < RESERVE_MAX_TRACKED {
-                        reserve.insert(recipient, Reserve::new(level, now));
+                        let mut fresh = Reserve::new(now);
+                        let allowed =
+                            level > reserve_floor(stock) || fresh.bucket.try_take(now);
+                        reserve.insert(recipient, fresh);
+                        allowed
+                    } else {
+                        // No room to track this recipient. Served rather than
+                        // refused, for the reason [`FETCH_RL_MAX_TRACKED`]
+                        // gives: `REPLY_RATE_LIMITED` is a downgrade lever, not
+                        // a retry signal. Unchanged by this fix, and still a
+                        // residual — see [`RESERVE_MAX_TRACKED`].
+                        true
                     }
-                    true
                 }
             };
             if !allowed {
@@ -1097,6 +1154,61 @@ mod server {
         #[cfg(test)]
         pub(crate) fn allow_fetch_at_for_test(&self, who: PeerId, now: Instant) -> bool {
             self.allow_fetch_at(who, now)
+        }
+
+        /// Test-only door onto [`Self::draw_prekey`] and the PUBLISH slot,
+        /// reporting the FETCH reply byte a draw would produce.
+        ///
+        /// The reserve's bound is `RESERVE_MAX_TRACKED` = 4096 *recipients*, so
+        /// a test that forces its prune has to stock and draw from thousands of
+        /// slots; over the mock network that is thousands of connections for
+        /// one assertion. These skip the transport and nothing else — the
+        /// handler does exactly `store.publish_prekeys(<authenticated NodeId>,
+        /// ..)` and `draw_prekey(<wire recipient>)` around them. The one thing
+        /// left out is `allow_fetch`, the per-connecting-NodeId bucket, which is
+        /// the part an attacker walks around for free by minting a NodeId per
+        /// request.
+        #[cfg(test)]
+        pub(crate) fn draw_prekey_reply_for_test(
+            &self,
+            recipient: PeerId,
+        ) -> Result<u8, InboxError> {
+            Ok(match self.draw_prekey(recipient)? {
+                Draw::Prekey(_) => REPLY_OK,
+                Draw::Depleted => REPLY_PREKEY_NONE,
+                Draw::Throttled => REPLY_RATE_LIMITED,
+            })
+        }
+
+        /// Test-only door onto the PUBLISH store call. See
+        /// [`Self::draw_prekey_reply_for_test`].
+        #[cfg(test)]
+        pub(crate) fn publish_for_test(
+            &self,
+            recipient: PeerId,
+            blobs: &[Vec<u8>],
+        ) -> Result<(), InboxError> {
+            self.store.publish_prekeys(recipient.as_bytes(), blobs, 0)?;
+            Ok(())
+        }
+
+        /// Test-only view of a slot's pool level, for asserting what a drain
+        /// left behind without a COUNT round trip.
+        #[cfg(test)]
+        pub(crate) fn pool_level_for_test(&self, recipient: PeerId) -> usize {
+            self.store
+                .count_prekeys(recipient.as_bytes())
+                .expect("count prekeys")
+        }
+
+        /// Test-only door onto the store's mark-forgetting helper, so a test
+        /// can build the on-disk shape of a pool published before stocking
+        /// marks were kept.
+        #[cfg(test)]
+        pub(crate) fn forget_prekey_mark_for_test(&self, recipient: PeerId) {
+            self.store
+                .forget_prekey_mark_for_test(recipient.as_bytes())
+                .expect("forget prekey mark");
         }
 
         /// Run the accept loop. Each accepted stream is dispatched on
@@ -2047,6 +2159,322 @@ mod tests {
         assert!(count_prekeys(bob.as_ref(), &srv).await.unwrap() > 0);
 
         task.abort();
+    }
+
+    /// A relay with no network in front of it, for the reserve tests that need
+    /// thousands of draws. See [`InboxServer::draw_prekey_reply_for_test`].
+    fn bare_server(dir: &std::path::Path) -> InboxServer {
+        InboxServer::open(dir.join("inbox.db"), &test_passphrase()).expect("open")
+    }
+
+    /// One of the attacker's own filler recipients: an identity it minted and
+    /// stocked itself, purely to occupy a slot in the reserve table.
+    fn filler(i: usize) -> PeerId {
+        // Shaped so it can never collide with the `pid(b)` = [b; 32] ids.
+        let mut raw = [0xF1u8; 32];
+        raw[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        PeerId::new(raw)
+    }
+
+    /// Drive `server`'s reserve table to its cap and force the prune, using
+    /// recipients the attacker minted and stocked itself. Returns once a draw
+    /// has been taken for [`RESERVE_MAX_TRACKED`] distinct recipients.
+    ///
+    /// Nothing here needs a victim's cooperation: PUBLISH writes to the slot of
+    /// the handshake-authenticated NodeId and never parses the blob, so a junk
+    /// byte string per minted identity is a stocked pool as far as the relay is
+    /// concerned, and no third party's prekeys are consumed.
+    fn flood_reserve_table(server: &InboxServer) {
+        for i in 0..RESERVE_MAX_TRACKED {
+            server
+                .publish_for_test(filler(i), &[b"junk".to_vec()])
+                .expect("publish filler");
+            assert_eq!(
+                server.draw_prekey_reply_for_test(filler(i)).expect("draw filler"),
+                REPLY_OK,
+                "a filler's own freshly stocked pool is above its floor"
+            );
+        }
+    }
+
+    /// The attack `KNOWN_ISSUES.md` item 3 describes, run end to end.
+    ///
+    /// An attacker walks a victim's pool down to *exactly* its floor and stops.
+    /// Every one of those draws is above the floor, so the `||` in
+    /// `draw_prekey` short-circuits and the victim's reserve bucket is never
+    /// charged — it stays full from creation, and a full bucket is what the
+    /// prune removes. The attacker then fills the reserve table with 4096
+    /// recipients it minted and stocked itself, which fires that prune, and
+    /// draws the victim again.
+    ///
+    /// While the stocking level lived in the pruned table this bought the
+    /// attacker the whole remaining quarter of the pool: the mark re-derived
+    /// from the drawn-down level (25, floor 6), so 19 more keys came out
+    /// ungated, no token spent and no waiting, repeatable until the pool was
+    /// empty. The level now comes from the victim's own PUBLISH record in the
+    /// store, which no prune can reach, so past the floor the attacker gets one
+    /// reserve burst and is then told to back off — with real prekeys still in
+    /// the pool for an honest sender to draw.
+    #[test]
+    fn a_forced_prune_cannot_collapse_a_victims_reserve_floor() {
+        const STOCK: u64 = 100; // the `--prekey-count` default
+        let dir = tempdir().expect("tempdir");
+        let server = bare_server(dir.path());
+        let victim = pid(2);
+
+        let batch: Vec<Vec<u8>> = (0..STOCK).map(|i| format!("pk-{i}").into_bytes()).collect();
+        server.publish_for_test(victim, &batch).expect("publish");
+
+        // Walk the pool down to exactly its floor, spending nothing.
+        let floor = STOCK / PREKEY_RESERVE_DIVISOR; // 25
+        for i in 0..(STOCK - floor) {
+            assert_eq!(
+                server.draw_prekey_reply_for_test(victim).expect("draw"),
+                REPLY_OK,
+                "draw {i} is above the floor and must not be gated"
+            );
+        }
+        assert_eq!(server.pool_level_for_test(victim) as u64, floor);
+
+        flood_reserve_table(&server);
+        assert_eq!(
+            server.tracked_reserves(),
+            1,
+            "the flood must actually fire the prune, and the prune takes every \
+             full bucket — the victim's among them. That is the attack's \
+             precondition: without it there is nothing to re-derive."
+        );
+
+        // The pool sits at its floor, so every draw from here is inside the
+        // band and costs a token. One fresh burst is served; after that the
+        // reply is a throttle, not another key.
+        let mut served = 0u64;
+        for _ in 0..(floor + 1) {
+            match server.draw_prekey_reply_for_test(victim).expect("draw") {
+                REPLY_OK => served += 1,
+                REPLY_RATE_LIMITED => break,
+                other => panic!("unexpected reply {other:#x} with prekeys still in the pool"),
+            }
+        }
+        assert_eq!(
+            served,
+            RESERVE_RL_CAPACITY as u64,
+            "a forced prune must not re-anchor the floor to the drawn-down level: \
+             {served} draws were served below a floor of {floor}"
+        );
+        assert_eq!(
+            server.pool_level_for_test(victim) as u64,
+            floor - RESERVE_RL_CAPACITY as u64,
+            "the reserve must still be held back after the prune"
+        );
+    }
+
+    /// The stocking level survives a relay restart, so a pool that was drawn
+    /// down while the process was gone is not re-anchored to what it was
+    /// drained to. This was the second residual of the process-local table: a
+    /// restart re-derived every mark from the live pool levels.
+    #[test]
+    fn a_restart_does_not_re_anchor_the_floor_to_a_drained_pool() {
+        const STOCK: u64 = 100;
+        let dir = tempdir().expect("tempdir");
+        let victim = pid(2);
+        let floor = STOCK / PREKEY_RESERVE_DIVISOR; // 25
+
+        {
+            let server = bare_server(dir.path());
+            let batch: Vec<Vec<u8>> =
+                (0..STOCK).map(|i| format!("pk-{i}").into_bytes()).collect();
+            server.publish_for_test(victim, &batch).expect("publish");
+            for _ in 0..(STOCK - floor) {
+                assert_eq!(
+                    server.draw_prekey_reply_for_test(victim).expect("draw"),
+                    REPLY_OK
+                );
+            }
+            // Dropped here: redb's file lock has to go before the reopen.
+        }
+
+        let server = bare_server(dir.path());
+        let mut served = 0u64;
+        for _ in 0..(floor + 1) {
+            match server.draw_prekey_reply_for_test(victim).expect("draw") {
+                REPLY_OK => served += 1,
+                REPLY_RATE_LIMITED => break,
+                other => panic!("unexpected reply {other:#x}"),
+            }
+        }
+        assert_eq!(
+            served,
+            RESERVE_RL_CAPACITY as u64,
+            "a restart must not re-derive the floor from the drained level"
+        );
+    }
+
+    /// The same forced-prune attack, against a pool that carries **no** mark —
+    /// the on-disk shape of every pool in a database that predates the record,
+    /// and so of every pool in a deployment on the day it upgrades.
+    ///
+    /// This is where the first attempt at this fix was still broken: unmarked
+    /// pools fell back to a high-water level kept in the reserve table, the
+    /// prune destroyed that, and the next draw re-seeded it from the
+    /// drawn-down level — the whole of the original attack, untouched, for
+    /// every pool until its owner next published. A pool is now anchored in the
+    /// store on its **first draw**, at the level standing before that draw
+    /// pops, so there is no window in which the floor is resettable.
+    ///
+    /// Asserts both halves: the ungated draws an honest sender expects are
+    /// served exactly as before (nothing fails closed on upgrade), *and* the
+    /// floor survives the prune.
+    #[test]
+    fn a_forced_prune_cannot_collapse_an_unmarked_pools_floor() {
+        const STOCK: u64 = 100;
+        let dir = tempdir().expect("tempdir");
+        let server = bare_server(dir.path());
+        let victim = pid(2);
+
+        let batch: Vec<Vec<u8>> = (0..STOCK).map(|i| format!("pk-{i}").into_bytes()).collect();
+        server.publish_for_test(victim, &batch).expect("publish");
+        // The on-disk shape of a pool stocked by the previous version.
+        server.forget_prekey_mark_for_test(victim);
+
+        // Unchanged for an honest sender: the whole ungated run is served.
+        let floor = STOCK / PREKEY_RESERVE_DIVISOR; // 25
+        for i in 0..(STOCK - floor) {
+            assert_eq!(
+                server.draw_prekey_reply_for_test(victim).expect("draw"),
+                REPLY_OK,
+                "an unmarked pool must still serve its ungated draws (draw {i})"
+            );
+        }
+        assert_eq!(server.pool_level_for_test(victim) as u64, floor);
+
+        flood_reserve_table(&server);
+        assert_eq!(
+            server.tracked_reserves(),
+            1,
+            "the flood must actually fire the prune, taking the victim's \
+             full bucket with it — the attack's precondition"
+        );
+
+        let mut served = 0u64;
+        for _ in 0..(floor + 1) {
+            match server.draw_prekey_reply_for_test(victim).expect("draw") {
+                REPLY_OK => served += 1,
+                REPLY_RATE_LIMITED => break,
+                other => panic!("unexpected reply {other:#x} with prekeys still in the pool"),
+            }
+        }
+        assert_eq!(
+            served,
+            RESERVE_RL_CAPACITY as u64,
+            "a pool with no mark of its own must still be anchored durably: \
+             {served} draws were served below a floor of {floor}"
+        );
+        assert_eq!(
+            server.pool_level_for_test(victim) as u64,
+            floor - RESERVE_RL_CAPACITY as u64,
+            "the reserve must still be held back"
+        );
+    }
+
+    /// The anchor an unmarked pool is given survives a restart, and the
+    /// recipient's own PUBLISH still replaces it afterwards.
+    #[test]
+    fn an_anchored_pool_keeps_its_floor_across_a_restart_and_a_republish() {
+        const STOCK: u64 = 100;
+        let dir = tempdir().expect("tempdir");
+        let bob = pid(2);
+        let floor = STOCK / PREKEY_RESERVE_DIVISOR; // 25
+
+        {
+            let server = bare_server(dir.path());
+            let batch: Vec<Vec<u8>> =
+                (0..STOCK).map(|i| format!("pk-{i}").into_bytes()).collect();
+            server.publish_for_test(bob, &batch).expect("publish");
+            server.forget_prekey_mark_for_test(bob);
+            // One draw is all it takes to anchor the pool at 100.
+            assert_eq!(server.draw_prekey_reply_for_test(bob).expect("draw"), REPLY_OK);
+            for _ in 1..(STOCK - floor) {
+                assert_eq!(server.draw_prekey_reply_for_test(bob).expect("draw"), REPLY_OK);
+            }
+        }
+
+        let server = bare_server(dir.path());
+        let mut served = 0u64;
+        for _ in 0..(floor + 1) {
+            match server.draw_prekey_reply_for_test(bob).expect("draw") {
+                REPLY_OK => served += 1,
+                REPLY_RATE_LIMITED => break,
+                other => panic!("unexpected reply {other:#x}"),
+            }
+        }
+        assert_eq!(
+            served,
+            RESERVE_RL_CAPACITY as u64,
+            "the anchor written on the first draw must outlive the process"
+        );
+
+        // And the owner still governs it: republishing to the full target puts
+        // the pool back above its floor and disengages the gate at once.
+        let refill: Vec<Vec<u8>> = (0..(STOCK - server.pool_level_for_test(bob) as u64))
+            .map(|i| format!("re-{i}").into_bytes())
+            .collect();
+        server.publish_for_test(bob, &refill).expect("republish");
+        assert_eq!(server.pool_level_for_test(bob) as u64, STOCK);
+        assert_eq!(
+            server.draw_prekey_reply_for_test(bob).expect("draw"),
+            REPLY_OK,
+            "a replenished pool is above its floor, so no token is consulted"
+        );
+    }
+
+    /// A recipient may lower its own stocking level. The mark is *replaced* by
+    /// each PUBLISH rather than raised to a high-water mark, because a peer
+    /// that drops from 40 prekeys to 8 would otherwise sit forever under a
+    /// floor of 10: every draw inside the reserve band, honest senders
+    /// throttled to one prekey per `RESERVE_RL_REFILL_PER_SEC`, on a pool it
+    /// deliberately keeps small.
+    ///
+    /// This costs nothing against the attack, because the only party that can
+    /// *change* the mark is the slot's own owner — PUBLISH is keyed on the
+    /// handshake-authenticated NodeId, and the draw path's one write only ever
+    /// creates a mark that is missing.
+    #[test]
+    fn a_recipient_may_lower_its_own_stocking_level() {
+        const STOCK: u64 = 40; // floor 10
+        let dir = tempdir().expect("tempdir");
+        let server = bare_server(dir.path());
+        let bob = pid(2);
+
+        let batch: Vec<Vec<u8>> = (0..STOCK).map(|i| format!("pk-{i}").into_bytes()).collect();
+        server.publish_for_test(bob, &batch).expect("publish");
+        let floor = STOCK / PREKEY_RESERVE_DIVISOR; // 10
+        for _ in 0..(STOCK - floor + RESERVE_RL_CAPACITY as u64) {
+            assert_eq!(server.draw_prekey_reply_for_test(bob).expect("draw"), REPLY_OK);
+        }
+        // Budget spent, pool inside the old band.
+        assert_eq!(
+            server.draw_prekey_reply_for_test(bob).expect("draw"),
+            REPLY_RATE_LIMITED
+        );
+        let left = server.pool_level_for_test(bob) as u64; // 2
+
+        // bob now stocks 8 rather than 40. The reserve bucket is still empty,
+        // so a gated draw would answer RATE_LIMITED — the new level being above
+        // the new floor is the only thing that can serve this.
+        let small: Vec<Vec<u8>> = (0..8u64.saturating_sub(left))
+            .map(|i| format!("sm-{i}").into_bytes())
+            .collect();
+        server.publish_for_test(bob, &small).expect("republish small");
+        assert_eq!(server.pool_level_for_test(bob), 8);
+        for i in 0..(8 - 8 / PREKEY_RESERVE_DIVISOR) {
+            assert_eq!(
+                server.draw_prekey_reply_for_test(bob).expect("draw"),
+                REPLY_OK,
+                "draw {i} is above the *current* stocking level's floor; a \
+                 high-water mark would gate the whole pool"
+            );
+        }
     }
 
     /// A recipient that has never published allocates no per-recipient state,
