@@ -415,6 +415,88 @@ trade-off is explicit rather than forgotten.
       new one, and vice versa — so it is a flag day, scheduled separately and
       deliberately **not** taken here.
 
+12. **A group member can synthesise a departure and silently drop a recipient
+    from a running session** (`group/cli.rs`, `group/processor.rs`, 2026-08): a
+    chat/listen session prunes its in-memory recipient list when a group's epoch
+    advances, by diffing the roster it last saw against the current one
+    (`prune_departed_recipients`). Both sides of that diff are transport node
+    ids read straight out of each member's own credential by
+    `peer_id_from_credential`, and **nothing ties that field to the node key it
+    names**: `verify_binding` covers `peer_id` with the member's own MLS and
+    ML-DSA-65 signatures, which proves possession of those two keys and not of
+    the iroh node key being claimed, so a self-consistent credential naming any
+    32-byte id verifies. `current_member_node_ids` does not even check the
+    binding, and checking it would not close this. A current member of a group
+    the session tracks can therefore Add a leaf whose NKCB credential claims an
+    arbitrary node id and then Remove it: the session watches that id join the
+    roster and leave it, and drops the matching address from the list it is
+    delivering to.
+    - **What it costs the victim**: silent, targeted loss of delivery for the
+      rest of the session, chosen by the attacker. The REPL keeps echoing
+      `[me] …` because a fan-out to a shortened list returns `Ok`, and the only
+      notice is a `[mls] dropped N recipient(s) …` line carrying a count, not an
+      identity. It ends at the next restart, which re-resolves the list from the
+      address book; nothing on disk is changed.
+    - **What it still reaches, and who the realistic victims are**: every
+      address that no operator-selected group carries. That is precisely the
+      **operator-typed `/peer` and `--mls-recipient-ticket` addresses**, which
+      `resolve_recipients` passes through unfiltered by design and which no
+      roster lists at all — they can be dropped by a Commit in a group they have
+      nothing to do with. A peer that shares exactly one group with the session
+      is equally exposed, though there the attacker is a fellow member who could
+      usually have removed that peer outright.
+    - **What bounds it**: the prune is scoped to the group whose epoch advanced
+      (2026-08), so an address that another group **the operator selected** —
+      `--mls-group-id`, `chat-group`'s gid, or a `/gid` typed into the REPL —
+      still lists on its live roster is kept instead of dropped. Groups the
+      session merely joined may not vouch: `join_group_from_welcome` authorizes
+      no sender and is reachable unauthenticated over `nkct/mls/1`, so allowing
+      them would let any peer holding this node's ticket pin an address of its
+      choosing against an authenticated Remove. The attacker must also be a
+      member of the group that is the session's **active** send target, since
+      the prune runs only for the active gid. One path does open that position
+      to a stranger: `adopt_new_group` adopts an inbound Welcome's group when
+      the session has no active group yet, which makes that Welcome's author a
+      fellow member of the then-active group. A session started with
+      `--mls-group-id`, or one that has already adopted, refuses the
+      displacement and is not reachable that way.
+    - **The mirror image, and inseparable from the bound above**: the same
+      unauthenticated `peer_id` makes the *keep* direction forgeable too. A
+      member of a group the operator selected can Add a leaf whose credential
+      claims an arbitrary node id and simply leave it on the roster; that id is
+      then exempt from every later prune, so its address stays in the session's
+      recipient list against an authenticated Remove Commit in another group,
+      for as long as the session runs. The party who can do that is narrower
+      than the drop direction's — not any peer holding this node's ticket, since
+      a group that merely arrived by Welcome may not vouch, but a current member
+      of a group whose id the operator typed, someone the operator already
+      addresses and already delivers that group's traffic to. It is not an
+      oversight in the scope fix; it is the cost of having one. Keeping an
+      address means *some* selected group still lists it — and that is checked
+      afresh on every later epoch change of the group the peer left, because a
+      kept id stays in that group's baseline as a departure candidate instead of
+      being written out of it. So the keep lasts until the vouching group stops
+      listing the leaf **and** the group the peer left next changes epoch; that
+      second condition may not arrive at all in a session whose active group is
+      quiet, though the peer can neither cause nor suppress it once she is out of
+      that group. What no roster can do is prove the node id it lists, which is
+      the whole of this item. It ends where the drop direction does: at restart,
+      which re-resolves the list.
+    - **Why it is not fixed here**: the prune site has no authenticated identity
+      to key on. A `PeerAddr` — the only thing the recipient list holds — carries
+      a node id and nothing else, and every ticket on the MLS path is minted as
+      `Ticket::new(addr, None, None)` (`cli::print_local_address`, `ffi.rs`), so
+      the `pqc_sign_fp` field is zero and there is nothing for a roster
+      fingerprint to be compared against. Keying the prune on the transport
+      fingerprint, the way `projected_member_fingerprints` keys the shell /
+      port-forward allowlist — where the binding really does prove possession of
+      the key being fingerprinted — therefore needs one of two larger changes:
+      binding `peer_id` in the credential so it cannot be self-asserted (a
+      credential-format change with the same flag-day migration as item 11's
+      control-message encryption), or plumbing fingerprints through `PeerAddr`
+      and every ticket producer and consumer. Both were judged larger than this
+      finding and are deliberately not taken here.
+
 (Several other audit findings — the ECDSA verify bug, network-receive release
 of unverified plaintext, the `Ticket::from_str` DoS, plaintext ECC keys, and
 the weak PBKDF2 iteration count — were fixed; see the git history.)

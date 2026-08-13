@@ -1757,6 +1757,16 @@ impl GroupChatProcessor {
     /// `known_member_addrs`: it resolves its recipients once and then holds
     /// that `Vec`, so it needs the roster itself to tell which of the peers it
     /// already holds have since left (see `cli::prune_departed_recipients`).
+    ///
+    /// **Not an authenticated identity.** These ids are *self-asserted*: the
+    /// credential is written by the member it describes, and a verified NKCB
+    /// binding proves only possession of the two keys it names — nothing ties
+    /// `peer_id` to the node key it claims, so any member can seat a leaf
+    /// bearing any node id. Callers may use this to decide *delivery hints*
+    /// (which address to stop dialling), never to authorize a peer: the
+    /// authenticated member identity is the transport fingerprint
+    /// [`projected_member_fingerprints`](Self::projected_member_fingerprints)
+    /// derives from a verified binding.
     pub(crate) fn current_member_node_ids(
         &self,
         gid: &GroupId,

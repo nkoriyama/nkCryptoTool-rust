@@ -396,7 +396,9 @@ where
     // rather than shared. Seeded before the task can observe an event, so the
     // very first Commit is already a measurable delta.
     let rosters = tokio::sync::Mutex::new(RosterSnapshots::new());
-    seed_roster(&processor, &rosters, &group_id).await;
+    // Operator-selected: this loop addresses the gid its caller was given on the
+    // command line. It is also the only key here, so nothing ever vouches.
+    seed_roster(&processor, &rosters, &group_id, true).await;
 
     // Inbound task: run accept_next forever, push decoded events to
     // stdout via the shared writer.
@@ -594,7 +596,8 @@ pub async fn listen_loop(
     // becomes reachable later (`[joined]`, `/gid`).
     let rosters = Arc::new(Mutex::new(RosterSnapshots::new()));
     if let Some(gid) = initial_group_id {
-        seed_roster(&processor, &rosters, &gid).await;
+        // `--mls-group-id`: named by the operator, so it may vouch.
+        seed_roster(&processor, &rosters, &gid, true).await;
     }
 
     // Channel: inbound task signals "we were removed; please stop".
@@ -672,7 +675,11 @@ pub async fn listen_loop(
                     // third source appears.
                     if let IncomingGroupEvent::NewGroup { id } = &evt {
                         let line = adopt_new_group(&group_id, id).await;
-                        seed_roster(&processor, &rosters, id).await;
+                        // Welcome-derived: the sender chose this group and was
+                        // never authorized, so it is seeded (it may become the
+                        // active send target) but may not vouch for a recipient
+                        // another group's Commit removed.
+                        seed_roster(&processor, &rosters, id, false).await;
                         let mut out = stdout.lock().await;
                         let _ = out.write_all(line.as_bytes()).await;
                         let _ = out.write_all(b"\n").await;
@@ -759,7 +766,9 @@ pub async fn listen_loop(
                 match &evt {
                     IncomingGroupEvent::NewGroup { id } => {
                         let line = adopt_new_group(&group_id, id).await;
-                        seed_roster(&processor, &rosters, id).await;
+                        // Welcome-derived, exactly as in the inbox task above:
+                        // seeded, but not allowed to vouch.
+                        seed_roster(&processor, &rosters, id, false).await;
                         let mut out = stdout.lock().await;
                         let _ = out.write_all(line.as_bytes()).await;
                         let _ = out.write_all(b"\n").await;
@@ -867,8 +876,10 @@ pub async fn listen_loop(
                                     drop(gid);
                                     // Epoch changes for `g` were ignored while
                                     // it was inactive, so give it a baseline
-                                    // now if it has none.
-                                    seed_roster(&processor, &rosters, &g).await;
+                                    // now if it has none. Typing the gid is the
+                                    // operator act that lets `g` vouch, whether
+                                    // it arrived by Welcome or not.
+                                    seed_roster(&processor, &rosters, &g, true).await;
                                     say(format!("[listen] active group set to {g}")).await;
                                 }
                                 Err(e) => say(format!("[listen] bad gid: {e}")).await,
@@ -1060,15 +1071,37 @@ async fn adopt_new_group(
     }
 }
 
-/// The node ids a running loop last saw on a group's roster, per group.
+/// What a running loop last saw of one group: the node ids on its roster, and
+/// whether the **operator** named that group.
 ///
-/// A missing entry means "never looked", which is what makes the first look
-/// able only to record and never to drop: a departure is only visible as the
-/// difference between two observations.
-type RosterSnapshots =
-    std::collections::HashMap<GroupId, std::collections::HashSet<[u8; 32]>>;
+/// A missing entry — or one whose `members` is still `None` — means "never
+/// looked", which is what makes the first look able only to record and never to
+/// drop: a departure is only visible as the difference between two
+/// observations. The two fields are deliberately independent: a group can be
+/// selected before it can be read (see [`seed_roster`]).
+#[derive(Default, Debug)]
+struct RosterSnapshot {
+    /// The node ids this session last saw on the group's roster, or `None` when
+    /// no baseline has been taken yet — the group was named before it was
+    /// joined, or its roster failed to load.
+    members: Option<std::collections::HashSet<[u8; 32]>>,
+    /// The operator named this group by its id: `--mls-group-id`, the
+    /// `chat-group` positional gid, or a `/gid` typed into the REPL. **False**
+    /// for a group this session knows only because a Welcome created it —
+    /// `join_group_from_welcome` is reachable unauthenticated over
+    /// `nkct/mls/1` and authorizes no sender, so any peer holding this node's
+    /// ticket can put a group of its own choosing into this map. The flag is
+    /// what keeps such a group out of `prune_departed_recipients`' vouching
+    /// population; it never gates anything else, and a Welcome group that the
+    /// operator later types a `/gid` for is upgraded to `true` at that point.
+    operator_selected: bool,
+}
 
-/// Record `gid`'s roster as this session's baseline, unless one is held.
+/// Per-group snapshots for one running loop.
+type RosterSnapshots = std::collections::HashMap<GroupId, RosterSnapshot>;
+
+/// Record `gid`'s roster as this session's baseline, unless one is held, and
+/// note whether the operator named it (see [`RosterSnapshot::operator_selected`]).
 ///
 /// Without a baseline the first epoch change for a group can only record, so
 /// the member that Commit evicted would stay addressed until the *next* one.
@@ -1079,20 +1112,57 @@ type RosterSnapshots =
 /// and a member who left during the detour is only detectable against the
 /// older set — the epoch change that evicted them was skipped as not-active.
 ///
-/// A roster that fails to load leaves no baseline and says nothing: the same
-/// read has already been made and reported by `resolve_recipients` before
-/// either loop starts, and the next epoch change retries it.
+/// **The selection and the baseline are recorded independently**, and that
+/// separation is load-bearing rather than tidiness. `--mls-group-id G` is an
+/// operator act performed at a moment when G may not be joined yet, so its
+/// roster read fails; recording the selection only alongside a successful read
+/// dropped it, and the `[joined]` seeding that arrived with G's Welcome — which
+/// passes `false` — then fixed G as non-vouching for the whole session, exactly
+/// where an operator who typed the gid would expect the opposite. So the flag is
+/// taken on every call and the baseline is taken on the first call that can read
+/// one. The two rules compose without opening a path from an inbound event to a
+/// `true`: the flag only ever moves up (`|=`), and it moves at all only for a
+/// caller that passes `true`, which is only the three sites where the gid came
+/// from the operator (`--mls-group-id`, `chat-group`'s positional gid, `/gid`).
+/// Both `[joined]` sites pass `false` and can therefore create an entry, or fill
+/// in a missing baseline, but never grant vouching rights.
+///
+/// **New call sites**: a group this session learns of from the network — a
+/// Welcome, or one discovered through a resync — is inbound-derived and must be
+/// seeded `false`. Passing `true` there would hand the vouching population back
+/// to whoever authored that message, which is the whole of what
+/// [`RosterSnapshot::operator_selected`] exists to prevent. `true` is for a gid
+/// the operator named, and nothing else.
+///
+/// A roster that fails to load leaves the selection but no baseline, and says
+/// nothing: the same read has already been made and reported by
+/// `resolve_recipients` before either loop starts, and the next `seed_roster`
+/// or epoch change retries it.
+///
+/// One consequence is worth knowing before it puzzles someone. A mistyped `/gid`
+/// — a syntactically valid 32-byte id for a group we are not in — leaves a
+/// selected entry whose roster can never be read, since nothing will ever join
+/// that group. It is harmless in direction: an unreadable group vouches for
+/// nobody, so it can only cost an address, never keep one. It is visible,
+/// though, as one failing `load_group` per prune and a "could not be read"
+/// clause appended to every drop notice for as long as the session runs. That
+/// is operator-caused and self-inflicted; `/gid` with the right id replaces
+/// nothing, so the cure is to restart the session.
 async fn seed_roster(
     processor: &GroupChatProcessor,
     rosters: &tokio::sync::Mutex<RosterSnapshots>,
     gid: &GroupId,
+    operator_selected: bool,
 ) {
     let mut snaps = rosters.lock().await;
-    if snaps.contains_key(gid) {
+    let held = snaps.entry(*gid).or_default();
+    // Monotonic, and independent of whether the read below succeeds.
+    held.operator_selected |= operator_selected;
+    if held.members.is_some() {
         return;
     }
     if let Ok(members) = processor.current_member_node_ids(gid) {
-        snaps.insert(*gid, members);
+        held.members = Some(members);
     }
 }
 
@@ -1117,50 +1187,239 @@ async fn seed_roster(
 /// `listen_loop` shares one recipient list across every group it can address —
 /// the members of all the *other* groups.
 ///
-/// The map lock is released before the recipient lock is taken, so the two are
-/// never held together and no ordering between them can arise.
+/// A departure from `gid` also speaks **only for `gid`**. The delta alone does
+/// not give that: `listen_loop`'s single recipient list is shared across every
+/// group the session can address, so a peer who is a member of both this group
+/// and another one appears in the list once and was, until this scope check,
+/// dropped from it wholesale the moment *anyone* in this group removed them —
+/// silently revoking delivery for the other group, which never asked for it and
+/// whose members had no say in it. So an address whose node is still on the
+/// **live** roster of another group **the operator selected** is kept: that
+/// group still vouches for it as a delivery path, and one group's Commit must
+/// not revoke another's. Those groups are re-read rather than taken from their
+/// snapshots, which only advance when *their* epoch changes and would otherwise
+/// vouch for a peer already gone from them; a group whose state cannot be read
+/// vouches for nobody, so an unreadable group can only lose an address
+/// (today's behaviour), never keep a departed one.
 ///
-/// The count is ours and the rest is a static literal, so nothing
-/// peer-influenced reaches the terminal.
+/// **A keep is provisional, and that is what makes "some group still lists it"
+/// true.** The vouch is read at one instant, and the vouching group can drop the
+/// peer straight afterwards — silently, since a group that is not the active one
+/// is never pruned. So a kept id is written back into `gid`'s baseline
+/// alongside the live roster: it stays a *departure candidate*, and every later
+/// epoch change of `gid` re-reads the vouch and drops it the first time no
+/// selected group answers for it. Without that, one keep was permanent — the
+/// baseline moved past the id, `departed` could never contain it again, and the
+/// session would have gone on dialling a peer that had since left both groups
+/// for as long as it ran.
+///
+/// The re-check is **not prompt, and "not prompt" includes "never"**: it happens
+/// on `gid`'s next epoch change, whatever that change is, because the vouching
+/// group's own Remove reaches this session as an event it deliberately does not
+/// act on. A session whose active group goes quiet therefore keeps a kept
+/// address for the rest of the session. That window is not steerable by the
+/// peer it benefits: once she is out of `gid` she can neither cause an epoch
+/// change there nor suppress one, so she cannot lengthen it — she can only be
+/// lucky in how quiet the group is. Restarting re-resolves the list, which is
+/// the operator's lever if the wait matters.
+///
+/// **Why only operator-selected groups may vouch.** Keeping an address is a
+/// decision *against* an authenticated Remove Commit, so the population that
+/// can make it has to be one an attacker cannot seat. Every group in the map is
+/// not that population: `seed_roster` also runs on `[joined]`, and
+/// `join_group_from_welcome` authorizes no sender and is reachable
+/// unauthenticated over `nkct/mls/1` — so any peer that knows this node's
+/// ticket could otherwise send a Welcome for a group of its own containing a
+/// leaf claiming any node id, and that id would be exempt from every later
+/// prune, re-opening exactly the leak this function exists to close. Requiring
+/// [`RosterSnapshot::operator_selected`] answers "who can add to the vouching
+/// population, and what did they pass to do it": a current member of a group
+/// whose id the operator typed — someone the operator already addresses and
+/// already delivers that group's traffic to — and not any peer holding our
+/// ticket. It does not make the vouch *unforgeable*: such a member can still
+/// seat a leaf claiming an arbitrary node id (see below) and thereby hold an
+/// address in the list; that is a keep, by a party the operator chose, and it
+/// is the narrower of the two directions.
+///
+/// **What Route 1 therefore covers.** Cross-group revocation is closed for a
+/// peer that another *operator-selected* group still lists. An address vouched
+/// for only by a group this session merely joined — a Welcome we accepted and
+/// never typed a `/gid` for — is prunable again by a different group's Commit,
+/// deliberately: it is the same address an unauthenticated peer could otherwise
+/// pin. Typing `/gid <that group>` promotes it and restores the protection.
+///
+/// **What this cannot decide.** Both sides of the comparison are transport node
+/// ids, and the roster's copy is *self-asserted*: `current_member_node_ids`
+/// reads `peer_id` out of the member's own credential — it does not check the
+/// binding at all, and checking it would not help, because `verify_binding`
+/// covers that field with the member's own two signatures rather than proving
+/// control of the node key it names, so a self-consistent credential claiming
+/// any node id verifies. A member of `gid` can therefore seat a leaf claiming
+/// an arbitrary node id and remove it to synthesise a departure. Keying this on
+/// the transport fingerprint instead — as `projected_member_fingerprints` does
+/// for the shell/forward allowlist, where the binding does prove possession of
+/// the key being fingerprinted — is not expressible here: a [`PeerAddr`]
+/// carries only a node id, and every ticket on the MLS path is minted by
+/// [`print_local_address`] as `Ticket::new(addr, None, None)`, with no
+/// `pqc_sign_fp` for a roster fingerprint to be compared against. That residual
+/// is accepted and recorded in `KNOWN_ISSUES.md` (Security Audit Residuals,
+/// item 12); what the group scope bounds is only its reach, not its existence —
+/// a synthesised departure still drops any address no operator-selected group
+/// carries, including the `/peer` and `--mls-recipient-ticket` addresses that
+/// have no group to vouch for them at all.
+///
+/// **Locks.** One acquisition covers the whole read-modify-write: this group's
+/// live roster, the baseline it is diffed against, the other groups' vouches,
+/// and the baseline write — with no await inside, because two tasks can run this
+/// concurrently for the same gid and a lost update makes a departed member
+/// permanently undroppable. Every roster read sits inside that section
+/// deliberately: they reach MLS state through a synchronous call, not through
+/// this map. The guard is then dropped *before* the recipient lock is taken, so
+/// the two are never held together, and rosters-then-recipients is the only
+/// order in which they ever appear anywhere in this file.
+///
+/// **The note repeats on purpose.** A kept address is reported again on each
+/// later epoch change of `gid` for as long as it is kept, and the line reads
+/// "left group {gid}" each time — the same departure still under review, not a
+/// new one. Saying it repeatedly was judged better than saying it once and
+/// leaving an address in the list the operator has no further sign of; the
+/// repetition is exactly the re-check happening.
+///
+/// The counts are ours, `GroupId`'s `Display` is `hex::encode` of its 32 raw
+/// bytes, and the rest is a static literal, so nothing peer-influenced reaches
+/// the terminal.
 async fn prune_departed_recipients(
     processor: &GroupChatProcessor,
     gid: &GroupId,
     recipients: &tokio::sync::Mutex<Vec<PeerAddr>>,
     rosters: &tokio::sync::Mutex<RosterSnapshots>,
 ) -> Option<String> {
-    let current = match processor.current_member_node_ids(gid) {
-        Ok(c) => c,
-        // Keep both the list and the baseline: a roster that cannot be loaded
-        // fails every send from the same group state anyway, so guessing here
-        // could only remove a still-valid recipient on top of that.
-        Err(e) => {
-            return Some(format!(
-                "[mls] could not re-check recipients against the roster: {}",
-                crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256)
-            ))
-        }
-    };
-    let departed: std::collections::HashSet<[u8; 32]> = {
+    // ONE critical section on the map, covering all four steps of the
+    // read-modify-write: the live roster read, the baseline read it is diffed
+    // against, the vouch re-reads, and the baseline write.
+    //
+    // It has to be atomic in all four. `listen_loop` hands `rosters` to both the
+    // inbound task and the inbox-poll task with nothing serialising their event
+    // handling, so two prunes for the same gid can overlap, and the write is
+    // last-writer-wins. If either roster read sits outside, the two tasks
+    // capture different instants and the loser's older view is written back:
+    // a member added by the commit one task is handling vanishes from the
+    // baseline, and since `departed` is a difference *against* the baseline he
+    // can never be pruned again however many times he is later removed. That
+    // hole predates this patch — the base read the live roster outside the lock
+    // too — but it was a narrow one; putting N synchronous `load_group` calls
+    // between the read and the write would have widened it by orders of
+    // magnitude, which is what made closing it properly the only option.
+    //
+    // Nothing inside this block awaits. The roster reads go to MLS state through
+    // a synchronous `&self` call, not through this map (`seed_roster` already
+    // calls it under this same lock), so the section cannot be interleaved at
+    // all rather than merely being unlikely to be.
+    let (departed, vouched, unreadable) = {
         let mut snaps = rosters.lock().await;
-        let seen = snaps.entry(*gid).or_default();
-        let departed = seen.difference(&current).copied().collect();
-        *seen = current;
-        departed
+        let current = match processor.current_member_node_ids(gid) {
+            Ok(c) => c,
+            // Keep both the list and the baseline: a roster that cannot be
+            // loaded fails every send from the same group state anyway, so
+            // guessing here could only remove a still-valid recipient on top of
+            // that. The guard is dropped by the return.
+            Err(e) => {
+                return Some(format!(
+                    "[mls] could not re-check recipients against the roster: {}",
+                    crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256)
+                ))
+            }
+        };
+        let vouching: Vec<GroupId> = snaps
+            .iter()
+            .filter(|(g, snap)| *g != gid && snap.operator_selected)
+            .map(|(g, _)| *g)
+            .collect();
+        // No baseline yet — never looked, or the seeding read failed while the
+        // group was still unjoined. Record only; a departure is measurable
+        // against the next epoch change, not this one.
+        let departed: std::collections::HashSet<[u8; 32]> =
+            match snaps.get(gid).and_then(|snap| snap.members.as_ref()) {
+                Some(prev) => prev.difference(&current).copied().collect(),
+                None => std::collections::HashSet::new(),
+            };
+        // Which of the departures another operator-selected group still vouches
+        // for. Skipped entirely when nothing departed, which is the common case
+        // (every Add), so the usual epoch change still costs one roster read.
+        let mut vouched: std::collections::HashSet<[u8; 32]> =
+            std::collections::HashSet::new();
+        let mut unreadable = 0usize;
+        if !departed.is_empty() {
+            for g in &vouching {
+                match processor.current_member_node_ids(g) {
+                    Ok(members) => vouched.extend(departed.intersection(&members).copied()),
+                    Err(_) => unreadable += 1,
+                }
+            }
+        }
+        // The new baseline is the live roster **plus every id kept on another
+        // group's word**. A kept id has not finished departing: writing only the
+        // live roster would erase it from this group's snapshot, and since
+        // `departed` is a difference against that snapshot it could never be a
+        // candidate for this group again — the vouch, though re-read here, would
+        // never be re-read *for it*. The vouching group's own Remove produces no
+        // event this session acts on (both dispatch sites prune only for the
+        // active gid), so `gid`'s next epoch change is the only trigger there
+        // is, and this is what keeps it eligible for it. An id that is later
+        // re-added to `gid` comes back inside `current` and simply stops being a
+        // departure, which is why this is recorded as roster state rather than
+        // as a pending-departure list that would have to be cleaned up.
+        let mut next = current;
+        next.extend(vouched.iter().copied());
+        snaps.entry(*gid).or_default().members = Some(next);
+        (departed, vouched, unreadable)
     };
     if departed.is_empty() {
         return None;
     }
+    // The map guard is dropped above, before this is taken: the two locks are
+    // never held together and only ever appear in this order.
     let mut rs = recipients.lock().await;
     let before = rs.len();
-    rs.retain(|a| !departed.contains(a.peer_id.as_bytes()));
-    match before - rs.len() {
+    rs.retain(|a| {
+        let id = a.peer_id.as_bytes();
+        !departed.contains(id) || vouched.contains(id)
+    });
+    let dropped = before - rs.len();
+    // Every vouched id that is in the list was in `departed` and survived the
+    // retain, so this counts exactly the addresses this group's Commit would
+    // have dropped and the scope check kept.
+    let kept = rs
+        .iter()
+        .filter(|a| vouched.contains(a.peer_id.as_bytes()))
+        .count();
+    drop(rs);
+    let note = match (dropped, kept) {
         // Somebody left, but we were not addressing them: say nothing rather
         // than report a drop that did not happen.
-        0 => None,
-        n => Some(format!(
-            "[mls] dropped {n} recipient(s) removed from this group"
-        )),
+        (0, 0) => return None,
+        // Say it even though nothing changed: a cross-group address that is not
+        // pruned must not look pruned, and the operator is the one who can
+        // decide whether that peer should still be addressed here.
+        (0, k) => format!(
+            "[mls] {k} recipient(s) left group {gid} but are still members of another \
+             group selected in this session — keeping their address(es)"
+        ),
+        (n, 0) => format!("[mls] dropped {n} recipient(s) removed from group {gid}"),
+        (n, k) => format!(
+            "[mls] dropped {n} recipient(s) removed from group {gid}; kept {k} that \
+             are still members of another group selected in this session"
+        ),
+    };
+    if dropped > 0 && unreadable > 0 {
+        // A group we could not read vouched for nobody, so a drop above may
+        // have been decided on an incomplete answer. Never silent.
+        return Some(format!(
+            "{note} ({unreadable} other group(s) could not be read, so their members \
+             could not be vouched for)"
+        ));
     }
+    Some(note)
 }
 
 fn parse_gid_hex(hex: &str) -> anyhow::Result<GroupId> {
@@ -1768,16 +2027,611 @@ mod tests {
             bob_res.map(|r| r.map(|e| format!("{e:?}"))),
         );
 
-        // The drop is announced, and the count is exactly the one node that
-        // left — a prune that also took Dave would read "2".
+        // The drop is announced, names the group whose roster changed, and the
+        // count is exactly the one node that left — a prune that also took Dave
+        // would read "2".
         let seen = String::from_utf8_lossy(&out_buf.lock().await.clone()).into_owned();
         assert!(
-            seen.contains("[mls] dropped 1 recipient(s) removed from this group"),
-            "the operator must be told exactly which count of recipients went away, got {seen:?}"
+            seen.contains(&format!("[mls] dropped 1 recipient(s) removed from group {gid}")),
+            "the operator must be told exactly which count of recipients went away, \
+             and from which group, got {seen:?}"
         );
 
         drop(stdin_tx);
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), chat).await;
+    }
+
+    /// A Remove Commit in one group must not revoke a delivery address that
+    /// belongs to another group the same session addresses.
+    ///
+    /// Regression: `departed` is derived from a *single* group's roster delta —
+    /// an event authored by a remote member of that group — but it was applied
+    /// with `retain` to `listen_loop`'s one recipient list, which is
+    /// deliberately shared across every group the session can address. A member
+    /// of group A could therefore drop the victim's delivery address for a peer
+    /// whose relationship is group B, and nobody in B had any say in it: the
+    /// victim kept typing, the REPL still echoed `[me] …` (a fan-out to a
+    /// shortened list returns `Ok`), and the only notice was a `[mls] dropped …`
+    /// line stating the wrong reason.
+    ///
+    /// The scope does **not** bound a squatted node id to the attacker's own
+    /// group: a leaf claiming any node id still synthesises a departure that
+    /// drops every address no operator-selected group carries — `/peer` and
+    /// `--mls-recipient-ticket` destinations included, which is `KNOWN_ISSUES.md`
+    /// residual 12. What it bounds is which group's Commit may speak for an
+    /// address another selected group still lists.
+    ///
+    /// Driven at `prune_departed_recipients` because `listen_loop` is the only
+    /// loop with a multi-group recipient list and it reads the process's real
+    /// stdin, so it cannot be driven from a test. The three cases below differ
+    /// *only* in what the session holds for group B.
+    #[tokio::test]
+    async fn one_groups_removal_cannot_prune_another_groups_recipient() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+        let carol = Arc::new(carol);
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+
+        // ---- group A: alice, bob, carol ------------------------------------
+        // Only carol's view matters (she is the session that holds the shared
+        // recipient list and processes the Commit), so bob's Welcome is never
+        // delivered — alice's Add still seats him on the roster carol joins on.
+        let gid_a = create_group(&alice, "group-a").await.expect("create A");
+        let bob_kp_a = bob.export_key_package().await.expect("bob kp A");
+        alice
+            .add_member(&gid_a, &bob_kp_a)
+            .await
+            .expect("add bob to A");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+        let add_carol = alice
+            .add_member(&gid_a, &carol_kp)
+            .await
+            .expect("add carol to A");
+        let carol_task = {
+            let carol = Arc::clone(&carol);
+            tokio::spawn(async move { carol.accept_next().await })
+        };
+        alice
+            .send_welcome_to(&carol_addr, &add_carol.welcome)
+            .await
+            .expect("welcome→carol");
+        carol_task
+            .await
+            .expect("carol task")
+            .expect("carol accepts welcome");
+
+        // ---- group B: carol and bob, a relationship group A knows nothing of
+        let gid_b = create_group(&carol, "group-b").await.expect("create B");
+        let bob_kp_b = bob.export_key_package().await.expect("bob kp B");
+        carol
+            .add_member(&gid_b, &bob_kp_b)
+            .await
+            .expect("add bob to B");
+
+        // Carol's session baselines, taken while bob is still on both rosters.
+        let a_before = carol
+            .current_member_node_ids(&gid_a)
+            .expect("carol roster A");
+        let b_before = carol
+            .current_member_node_ids(&gid_b)
+            .expect("carol roster B");
+        assert!(
+            a_before.contains(bob_addr.peer_id.as_bytes())
+                && b_before.contains(bob_addr.peer_id.as_bytes()),
+            "the test needs bob on both rosters before the removal"
+        );
+
+        // ---- alice evicts bob from A; carol's session processes the Commit --
+        // Bob is leaf 1 (added first); pinned by the P6 list_members test.
+        let remove = alice
+            .remove_member(&gid_a, 1)
+            .await
+            .expect("remove bob from A");
+        let carol_task = {
+            let carol = Arc::clone(&carol);
+            tokio::spawn(async move { carol.accept_next().await })
+        };
+        alice
+            .broadcast_commit(&remove, std::slice::from_ref(&carol_addr))
+            .await
+            .expect("remove commit→carol");
+        carol_task
+            .await
+            .expect("carol task")
+            .expect("carol applies the remove Commit");
+        assert!(
+            !carol
+                .current_member_node_ids(&gid_a)
+                .expect("carol roster A after")
+                .contains(bob_addr.peer_id.as_bytes()),
+            "bob must be off group A's roster for the prune to see a departure"
+        );
+
+        let snapshot = |members: &std::collections::HashSet<[u8; 32]>, selected: bool| {
+            RosterSnapshot {
+                members: Some(members.clone()),
+                operator_selected: selected,
+            }
+        };
+
+        // ---- case 1: the operator selected group B — bob's address survives -
+        let rosters = tokio::sync::Mutex::new(RosterSnapshots::from([
+            (gid_a, snapshot(&a_before, true)),
+            (gid_b, snapshot(&b_before, true)),
+        ]));
+        let recipients =
+            tokio::sync::Mutex::new(vec![bob_addr.clone(), alice_addr.clone()]);
+        let note = prune_departed_recipients(&carol, &gid_a, &recipients, &rosters).await;
+        let held = recipients.lock().await.clone();
+        assert!(
+            held.iter().any(|a| a.peer_id == bob_addr.peer_id),
+            "group A's Remove must not revoke a peer group B still vouches for"
+        );
+        assert!(
+            held.iter().any(|a| a.peer_id == alice_addr.peer_id),
+            "the scope check must not disturb the untouched recipients"
+        );
+        // Not silent, and not dressed up as a drop: the operator has to be able
+        // to tell a kept cross-group address from a pruned one.
+        let note = note.expect("a cross-group retention must be reported");
+        assert!(
+            !note.contains("dropped") && note.contains("another group"),
+            "a retention must not read as a drop, got {note:?}"
+        );
+
+        // ---- case 2: group B arrived by Welcome and was never selected ------
+        // The keep decision is a decision against an authenticated Remove
+        // Commit, so a group any peer holding our ticket could have created —
+        // `join_group_from_welcome` authorizes no sender — must not be able to
+        // make it. Otherwise one unauthenticated Welcome seating a leaf that
+        // claims bob's node id would pin his address in the list for good.
+        let rosters = tokio::sync::Mutex::new(RosterSnapshots::from([
+            (gid_a, snapshot(&a_before, true)),
+            (gid_b, snapshot(&b_before, false)),
+        ]));
+        let recipients =
+            tokio::sync::Mutex::new(vec![bob_addr.clone(), alice_addr.clone()]);
+        let note = prune_departed_recipients(&carol, &gid_a, &recipients, &rosters).await;
+        let held = recipients.lock().await.clone();
+        assert!(
+            !held.iter().any(|a| a.peer_id == bob_addr.peer_id),
+            "a group the operator never selected must not exempt a departed peer"
+        );
+        assert_eq!(
+            note,
+            Some(format!(
+                "[mls] dropped 1 recipient(s) removed from group {gid_a}"
+            )),
+            "an unselected group must not even be reported as vouching"
+        );
+
+        // ---- case 3: control — the session holds nothing for B at all -------
+        // Bob is then vouched for by nothing, so the prune still fires: the fix
+        // is a scope, not a blanket exemption.
+        let rosters = tokio::sync::Mutex::new(RosterSnapshots::from([(
+            gid_a,
+            snapshot(&a_before, true),
+        )]));
+        let recipients =
+            tokio::sync::Mutex::new(vec![bob_addr.clone(), alice_addr.clone()]);
+        let note = prune_departed_recipients(&carol, &gid_a, &recipients, &rosters).await;
+        let held = recipients.lock().await.clone();
+        assert!(
+            !held.iter().any(|a| a.peer_id == bob_addr.peer_id),
+            "a departure no other group vouches for must still be pruned"
+        );
+        assert!(
+            held.iter().any(|a| a.peer_id == alice_addr.peer_id),
+            "the surviving member must keep being addressed"
+        );
+        assert_eq!(
+            note,
+            Some(format!(
+                "[mls] dropped 1 recipient(s) removed from group {gid_a}"
+            )),
+            "the drop must name its count and the group whose roster changed"
+        );
+    }
+
+    /// A group that arrived by Welcome may not vouch, and typing `/gid` for it
+    /// is what promotes it — while nothing an inbound event does can demote a
+    /// group the operator selected.
+    ///
+    /// This pins `seed_roster`'s half of the rule the case-2 assertion above
+    /// depends on: the flag is set from the call site, an existing baseline is
+    /// never overwritten, and the promotion moves in one direction only.
+    #[tokio::test]
+    async fn only_an_operator_typed_gid_promotes_a_welcome_group_to_vouching() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let gid = create_group(&alice, "seeded").await.expect("create");
+        let rosters = tokio::sync::Mutex::new(RosterSnapshots::new());
+
+        // The `[joined]` path: seeded so a later Commit is a measurable delta,
+        // but not trusted to override one.
+        seed_roster(&alice, &rosters, &gid, false).await;
+        {
+            let snaps = rosters.lock().await;
+            let held = snaps.get(&gid).expect("a baseline was taken");
+            assert!(
+                !held.operator_selected,
+                "a Welcome-derived group must not start out vouching"
+            );
+            assert!(
+                held
+                    .members
+                    .as_ref()
+                    .expect("a baseline was taken")
+                    .contains(alice_addr.peer_id.as_bytes()),
+                "the baseline must be the group's actual roster"
+            );
+        }
+
+        // `/gid <hex>`: the operator names it, so it may vouch from now on.
+        seed_roster(&alice, &rosters, &gid, true).await;
+        assert!(
+            rosters.lock().await[&gid].operator_selected,
+            "typing /gid must promote a group the session only joined"
+        );
+
+        // A second Welcome for the same group cannot take that back.
+        seed_roster(&alice, &rosters, &gid, false).await;
+        assert!(
+            rosters.lock().await[&gid].operator_selected,
+            "an inbound event must not demote a group the operator selected"
+        );
+    }
+
+    /// A member added while the session is running enters the baseline, so his
+    /// later removal is still a measurable departure and still prunes.
+    ///
+    /// This pins the invariant a lost update on the baseline violated: the
+    /// baseline write must record the live roster on **every** epoch change,
+    /// including the ones where nothing departed, because `departed` is a
+    /// difference against it and a member missing from it can never be pruned
+    /// however many times he is removed afterwards. It does **not** reproduce
+    /// the interleaving that caused that — two prunes for one gid racing between
+    /// a separated read and write — which cannot be made deterministic here
+    /// without a scheduling hook in the function itself; what rules that out now
+    /// is structural, the read, the vouch re-reads and the write sharing one
+    /// `rosters` acquisition with no await inside it.
+    #[tokio::test]
+    async fn an_added_member_enters_the_baseline_so_a_later_removal_prunes() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+        let (dave, _dir_d) = build_test_processor(&net, "dave", 4);
+        let carol = Arc::new(carol);
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+        let dave_addr = dave.local_addr().await.expect("dave addr");
+
+        let gid = create_group(&alice, "growing").await.expect("create");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+        let add_carol = alice
+            .add_member(&gid, &carol_kp)
+            .await
+            .expect("add carol");
+        let task = {
+            let carol = Arc::clone(&carol);
+            tokio::spawn(async move { carol.accept_next().await })
+        };
+        alice
+            .send_welcome_to(&carol_addr, &add_carol.welcome)
+            .await
+            .expect("welcome→carol");
+        task.await.expect("task").expect("carol accepts welcome");
+
+        let rosters = tokio::sync::Mutex::new(RosterSnapshots::from([(
+            gid,
+            RosterSnapshot {
+                members: Some(carol.current_member_node_ids(&gid).expect("roster")),
+                operator_selected: true,
+            },
+        )]));
+        let recipients =
+            tokio::sync::Mutex::new(vec![dave_addr.clone(), alice_addr.clone()]);
+
+        // An epoch change that *adds*: nothing departs, and the baseline must
+        // still take the new roster.
+        let add_dave = alice
+            .add_member(&gid, &dave.export_key_package().await.expect("dave kp"))
+            .await
+            .expect("add dave");
+        let task = {
+            let carol = Arc::clone(&carol);
+            tokio::spawn(async move { carol.accept_next().await })
+        };
+        alice
+            .broadcast_commit(&add_dave.commit, std::slice::from_ref(&carol_addr))
+            .await
+            .expect("add commit→carol");
+        task.await.expect("task").expect("carol applies the add");
+        let note = prune_departed_recipients(&carol, &gid, &recipients, &rosters).await;
+        assert_eq!(note, None, "an Add drops nobody and says nothing");
+        assert!(
+            rosters.lock().await[&gid]
+                .members
+                .as_ref()
+                .expect("baseline")
+                .contains(dave_addr.peer_id.as_bytes()),
+            "a member added mid-session must enter the baseline"
+        );
+
+        // Now remove him: this is only a departure if the baseline recorded him.
+        let remove = alice
+            .remove_member(&gid, 2)
+            .await
+            .expect("remove dave");
+        let task = {
+            let carol = Arc::clone(&carol);
+            tokio::spawn(async move { carol.accept_next().await })
+        };
+        alice
+            .broadcast_commit(&remove, std::slice::from_ref(&carol_addr))
+            .await
+            .expect("remove commit→carol");
+        task.await.expect("task").expect("carol applies the remove");
+        let note = prune_departed_recipients(&carol, &gid, &recipients, &rosters).await;
+        let held = recipients.lock().await.clone();
+        assert!(
+            !held.iter().any(|a| a.peer_id == dave_addr.peer_id),
+            "a member who joined and then left mid-session must still be pruned"
+        );
+        assert_eq!(
+            note,
+            Some(format!("[mls] dropped 1 recipient(s) removed from group {gid}")),
+            "the drop must be reported exactly once"
+        );
+    }
+
+    /// A recipient kept because another group vouched for it is re-checked when
+    /// that vouch lapses, and dropped then.
+    ///
+    /// Regression: a keep was permanent. The baseline was rewritten to the
+    /// post-removal roster, so the kept id left group A's snapshot and could
+    /// never appear in `departed` for A again; the vouch was re-read on every
+    /// later epoch change but never again *for that id*. Group B's own Remove
+    /// produces no event the session acts on — both dispatch sites prune only
+    /// for the active gid — so nothing else would have caught it either. The
+    /// session went on dialling a peer that had since left both groups, feeding
+    /// it the cleartext `group_id` and epoch in every `PrivateMessage` header
+    /// plus size and timing, for as long as it ran. No forgery and no continued
+    /// membership: the ordering alone decided it, since removing the peer from
+    /// B *first* made the live re-read fail to vouch and dropped her correctly.
+    ///
+    /// The sequence below is that one: A evicts her (kept), then B evicts her
+    /// with no prune running for B, then A advances again for an unrelated
+    /// reason — an Add, so the second advance is not a removal and the re-check
+    /// cannot be conditional on A's roster shrinking.
+    #[tokio::test]
+    async fn a_kept_recipient_is_dropped_once_its_vouching_group_lets_it_go() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+        let (dave, _dir_d) = build_test_processor(&net, "dave", 4);
+        let carol = Arc::new(carol);
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+
+        // ---- group A: alice, bob, carol; group B: carol, bob ---------------
+        let gid_a = create_group(&alice, "group-a").await.expect("create A");
+        let bob_kp_a = bob.export_key_package().await.expect("bob kp A");
+        alice
+            .add_member(&gid_a, &bob_kp_a)
+            .await
+            .expect("add bob to A");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+        let add_carol = alice
+            .add_member(&gid_a, &carol_kp)
+            .await
+            .expect("add carol to A");
+        let carol_task = {
+            let carol = Arc::clone(&carol);
+            tokio::spawn(async move { carol.accept_next().await })
+        };
+        alice
+            .send_welcome_to(&carol_addr, &add_carol.welcome)
+            .await
+            .expect("welcome→carol");
+        carol_task
+            .await
+            .expect("carol task")
+            .expect("carol accepts welcome");
+        let gid_b = create_group(&carol, "group-b").await.expect("create B");
+        let bob_kp_b = bob.export_key_package().await.expect("bob kp B");
+        carol
+            .add_member(&gid_b, &bob_kp_b)
+            .await
+            .expect("add bob to B");
+
+        // The session addresses both groups and holds both baselines.
+        let rosters = tokio::sync::Mutex::new(RosterSnapshots::from([
+            (
+                gid_a,
+                RosterSnapshot {
+                    members: Some(carol.current_member_node_ids(&gid_a).expect("roster A")),
+                    operator_selected: true,
+                },
+            ),
+            (
+                gid_b,
+                RosterSnapshot {
+                    members: Some(carol.current_member_node_ids(&gid_b).expect("roster B")),
+                    operator_selected: true,
+                },
+            ),
+        ]));
+        let recipients =
+            tokio::sync::Mutex::new(vec![bob_addr.clone(), alice_addr.clone()]);
+
+        // ---- 1. A evicts bob. B vouches, so his address is kept ------------
+        let remove = alice
+            .remove_member(&gid_a, 1)
+            .await
+            .expect("remove bob from A");
+        let carol_task = {
+            let carol = Arc::clone(&carol);
+            tokio::spawn(async move { carol.accept_next().await })
+        };
+        alice
+            .broadcast_commit(&remove, std::slice::from_ref(&carol_addr))
+            .await
+            .expect("remove commit→carol");
+        carol_task
+            .await
+            .expect("carol task")
+            .expect("carol applies the remove Commit");
+        prune_departed_recipients(&carol, &gid_a, &recipients, &rosters).await;
+        assert!(
+            recipients
+                .lock()
+                .await
+                .iter()
+                .any(|a| a.peer_id == bob_addr.peer_id),
+            "the vouch must keep bob's address at the first eviction"
+        );
+        // The mechanism that makes the keep provisional: he is still in group
+        // A's baseline, so he is still a departure candidate there. It is roster
+        // state, not a pending-departure list, which is why a re-add to A would
+        // simply stop being a departure instead of sticking.
+        assert!(
+            rosters.lock().await[&gid_a]
+                .members
+                .as_ref()
+                .expect("baseline")
+                .contains(bob_addr.peer_id.as_bytes()),
+            "a kept id must stay a candidate for the group it left"
+        );
+
+        // ---- 2. B evicts bob too. B is not the active group, so no prune ---
+        // runs for it and the session is told nothing.
+        carol
+            .remove_member(&gid_b, 1)
+            .await
+            .expect("remove bob from B");
+        assert!(
+            recipients
+                .lock()
+                .await
+                .iter()
+                .any(|a| a.peer_id == bob_addr.peer_id),
+            "the test needs bob still addressed at this point"
+        );
+
+        // ---- 3. A advances again, for an unrelated reason (an Add) ---------
+        let dave_kp = dave.export_key_package().await.expect("dave kp");
+        let add_dave = alice
+            .add_member(&gid_a, &dave_kp)
+            .await
+            .expect("add dave to A");
+        let carol_task = {
+            let carol = Arc::clone(&carol);
+            tokio::spawn(async move { carol.accept_next().await })
+        };
+        alice
+            .broadcast_commit(&add_dave.commit, std::slice::from_ref(&carol_addr))
+            .await
+            .expect("add commit→carol");
+        carol_task
+            .await
+            .expect("carol task")
+            .expect("carol applies the add Commit");
+        let note = prune_departed_recipients(&carol, &gid_a, &recipients, &rosters).await;
+
+        let held = recipients.lock().await.clone();
+        assert!(
+            !held.iter().any(|a| a.peer_id == bob_addr.peer_id),
+            "a kept address must be dropped once no selected group vouches for it"
+        );
+        assert!(
+            held.iter().any(|a| a.peer_id == alice_addr.peer_id),
+            "re-checking a kept id must not prune anything else"
+        );
+        assert_eq!(
+            note,
+            Some(format!(
+                "[mls] dropped 1 recipient(s) removed from group {gid_a}"
+            )),
+            "the delayed drop must be counted exactly once"
+        );
+
+        // A drop is final: bob is out of A's baseline too, so a further epoch
+        // change reports nothing rather than re-announcing him.
+        assert!(
+            !rosters.lock().await[&gid_a]
+                .members
+                .as_ref()
+                .expect("baseline")
+                .contains(bob_addr.peer_id.as_bytes()),
+            "a dropped id must not stay a candidate"
+        );
+    }
+
+    /// `--mls-group-id G` selects G even when G has not been joined yet, and the
+    /// `[joined]` seeding that arrives with G's Welcome fills in the baseline
+    /// without taking the selection away.
+    ///
+    /// Regression: the selection was recorded only alongside a successful roster
+    /// read, so naming a group before joining it recorded *nothing* — not even
+    /// the flag. The `[joined]` path then seeded G with `false`, and G was
+    /// non-vouching for the rest of the session: an address only G carried was
+    /// prunable by another group's Commit, with Route 1's protection silently
+    /// absent in precisely the configuration an operator who passes
+    /// `--mls-group-id` is asking for.
+    ///
+    /// The only thing that distinguishes "not joined yet" from "joined" at
+    /// `seed_roster` is whether `current_member_node_ids` succeeds, so the two
+    /// states are modelled here by seeding from a processor that is not a member
+    /// and then from one that is.
+    #[tokio::test]
+    async fn a_selection_made_before_the_group_arrives_is_not_lost() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (stranger, _dir_s) = build_test_processor(&net, "stranger", 9);
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let gid = create_group(&alice, "named-early").await.expect("create");
+        let rosters = tokio::sync::Mutex::new(RosterSnapshots::new());
+
+        // `--mls-group-id G`, typed while G is still unknown to us: the roster
+        // read fails, and the operator's selection must survive it.
+        seed_roster(&stranger, &rosters, &gid, true).await;
+        {
+            let snaps = rosters.lock().await;
+            let held = snaps.get(&gid).expect("the selection must be recorded");
+            assert!(
+                held.operator_selected,
+                "a selection made before the group arrived must be kept"
+            );
+            assert!(
+                held.members.is_none(),
+                "a failed read must leave no baseline to diff against"
+            );
+        }
+
+        // G's Welcome lands: the `[joined]` path seeds with `false`. It may fill
+        // the baseline it could not take before, and may not undo the selection.
+        seed_roster(&alice, &rosters, &gid, false).await;
+        let snaps = rosters.lock().await;
+        let held = snaps.get(&gid).expect("entry");
+        assert!(
+            held.operator_selected,
+            "the [joined] seeding must not demote a group the operator named"
+        );
+        assert!(
+            held.members
+                .as_ref()
+                .expect("the baseline is taken once the group can be read")
+                .contains(alice_addr.peer_id.as_bytes()),
+            "the later seeding must supply the baseline the failed read could not"
+        );
     }
 
     /// `print_local_address` round-trips through the Ticket codec.
