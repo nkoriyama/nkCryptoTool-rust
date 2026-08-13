@@ -276,6 +276,35 @@ const DIRECT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// Deposit failures are reported as `FramingError::Io` so callers
 /// can distinguish "we tried both paths and both failed" from
 /// "direct failed and we had no fallback".
+///
+/// ## What the relay can read
+///
+/// **Every** wire format takes this fallback, including cleartext
+/// control frames. Application messages are `PrivateMessage` (AEAD-sealed
+/// under the epoch key schedule), a `Welcome`'s GroupSecrets are
+/// HPKE-encrypted to the joiner's KeyPackage init key, and a `KeyPackage`
+/// is publishable material by construction — none of those is readable by
+/// the relay. Commits and standalone Proposals are a different matter: our
+/// `Client::builder()` chain does not call `.mls_rules(..)`, so mls-rs's
+/// `EncryptionOptions::default()` applies with
+/// `encrypt_control_messages = false` and they go out as `PublicMessage`
+/// — signed, but **not** encrypted. An inbox operator that keeps what it
+/// stores therefore reads the group id, the epoch, the committer's leaf
+/// index and the whole membership change (an Add carries the joining
+/// member's KeyPackage, including its NKCB credential with the iroh
+/// NodeId and ML-DSA-65 transport key).
+///
+/// **That exposure is real and unmitigated today.** Refusing to deposit
+/// `PublicMessage` frames was tried here and withdrawn: it is the only
+/// automatic delivery path for a Commit that missed the direct window, so
+/// refusing it silently left a *revocation* undelivered to any peer that
+/// was offline at broadcast time — that peer keeps the removed member on
+/// its roster and keeps encrypting to an epoch she can read. The fix that
+/// closes the exposure without that cost is
+/// `encrypt_control_messages = true`, which makes these frames
+/// `PrivateMessage` and safe to relay; it is a wire-format change every
+/// peer must adopt at once. See `KNOWN_ISSUES.md` "Security Audit
+/// Residuals" item 11.
 pub async fn send_one_with_inbox(
     endpoint: &dyn P2pEndpoint,
     addr: &PeerAddr,

@@ -210,6 +210,75 @@ impl GroupStorage {
             .forget_member_addr(group_id, node_id)
             .map_err(|e| GroupError::Storage(format!("forget_member_addr: {e}")))
     }
+
+    /// Application-KV key for a member's witnessed join epoch. Hex on both
+    /// halves so the `:` separator cannot appear inside either field.
+    fn member_join_epoch_key(group_id: &[u8], node_id: &[u8; 32]) -> String {
+        format!(
+            "mls:joined:{}:{}",
+            hex::encode(group_id),
+            hex::encode(node_id)
+        )
+    }
+
+    /// Record that `node_id` joined `group_id` at `epoch` — i.e. that *we*
+    /// applied the Add commit which produced `epoch` and saw that member appear
+    /// on the roster for the first time.
+    ///
+    /// This is what lets the SYNC responder clamp a requester's `claimed_epoch`
+    /// to its own admission, so a member cannot be streamed commit history from
+    /// before it was in the group. It rides on the existing application-data KV
+    /// (same AEAD sealing, same table) rather than a new table, so an existing
+    /// database gains the records the first time it witnesses an Add and needs
+    /// no migration.
+    ///
+    /// Re-recording overwrites: a member removed and later re-added has the
+    /// *later* epoch, which is the conservative bound (its current state starts
+    /// there, so it needs nothing older).
+    pub fn put_member_join_epoch(
+        &self,
+        group_id: &[u8],
+        node_id: &[u8; 32],
+        epoch: u64,
+    ) -> Result<(), GroupError> {
+        self.backend
+            .application_data_storage()
+            .insert(
+                &Self::member_join_epoch_key(group_id, node_id),
+                &epoch.to_be_bytes(),
+            )
+            .map_err(|e| GroupError::Storage(format!("put_member_join_epoch: {e}")))
+    }
+
+    /// The epoch at which we witnessed `node_id` joining `group_id`, if we
+    /// witnessed it.
+    ///
+    /// `None` means "not known", not "epoch 0", and is the normal answer in
+    /// three cases: a database written before this record existed, a member
+    /// that was already on the roster when *we* joined (we were handed a
+    /// Welcome, not their Add commit), and a group whose adds we have simply
+    /// never applied. Callers must treat `None` as *no clamp* — failing closed
+    /// would break legitimate delta resync for every member of every group that
+    /// predates this record.
+    ///
+    /// A malformed value (not exactly 8 bytes) is reported as `None` for the
+    /// same reason.
+    pub fn member_join_epoch(
+        &self,
+        group_id: &[u8],
+        node_id: &[u8; 32],
+    ) -> Result<Option<u64>, GroupError> {
+        let raw = self
+            .backend
+            .application_data_storage()
+            .get(&Self::member_join_epoch_key(group_id, node_id))
+            .map_err(|e| GroupError::Storage(format!("member_join_epoch: {e}")))?;
+        Ok(raw.and_then(|v| {
+            <[u8; 8]>::try_from(v.as_slice())
+                .ok()
+                .map(u64::from_be_bytes)
+        }))
+    }
 }
 
 /// Derive a 256-bit value key from a passphrase for the convenience
@@ -313,6 +382,53 @@ mod tests {
         drop(GroupStorage::open_at_with_raw_key(&path, &dek).expect("first open"));
         let storage = GroupStorage::open_at_with_raw_key(&path, &dek).expect("second open");
         assert!(storage.list_group_ids().expect("list").is_empty());
+    }
+
+    /// The join-epoch record round-trips, is scoped per (group, member), and —
+    /// the property the SYNC clamp depends on for backward compatibility — is
+    /// `None` rather than `0` for a member we never witnessed joining, which is
+    /// what every database written before this record contains.
+    #[test]
+    fn member_join_epoch_roundtrips_and_defaults_to_unknown() {
+        let dir = tempdir().expect("tempdir");
+        let storage =
+            GroupStorage::open_at(dir.path().join("groups.redb"), test_pass()).expect("open");
+        let gid = [7u8; 32];
+        let member = [9u8; 32];
+        let other = [8u8; 32];
+
+        assert_eq!(
+            storage.member_join_epoch(&gid, &member).expect("get"),
+            None,
+            "an unrecorded member must read as unknown, never as epoch 0"
+        );
+
+        storage
+            .put_member_join_epoch(&gid, &member, 42)
+            .expect("put");
+        assert_eq!(
+            storage.member_join_epoch(&gid, &member).expect("get"),
+            Some(42)
+        );
+        assert_eq!(
+            storage.member_join_epoch(&gid, &other).expect("get"),
+            None,
+            "records are per member"
+        );
+        assert_eq!(
+            storage.member_join_epoch(&[1u8; 32], &member).expect("get"),
+            None,
+            "records are per group"
+        );
+
+        // Re-add: the later epoch wins (the member's state starts there).
+        storage
+            .put_member_join_epoch(&gid, &member, 77)
+            .expect("re-put");
+        assert_eq!(
+            storage.member_join_epoch(&gid, &member).expect("get"),
+            Some(77)
+        );
     }
 
     #[test]

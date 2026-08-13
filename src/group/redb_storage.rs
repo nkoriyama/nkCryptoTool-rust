@@ -108,9 +108,16 @@ pub const DEFAULT_COMMIT_RETENTION: u64 = 100;
 /// Per-group member *delivery hints* (an address book), keyed by
 /// `group_member_key` = `gid_len ‖ gid ‖ node_id(32)`. The value is the peer's
 /// ticket string. These are only hints used to default the recipient set when
-/// the user does not pass `--mls-recipient-ticket`; MLS still authenticates and
-/// encrypts every message, so a stale or wrong hint can at worst fail to deliver
-/// (it cannot leak plaintext to the wrong node).
+/// the user does not pass `--mls-recipient-ticket`; MLS authenticates every
+/// message, and encrypts application messages (`PrivateMessage`) and a
+/// `Welcome`'s GroupSecrets, so a stale or wrong hint sends those to a node that
+/// cannot read them. That is **not** true of Commits and Proposals: the client
+/// is built with mls-rs's default MlsRules, so those go out as
+/// signed-but-cleartext `PublicMessage`, and a wrong hint therefore discloses
+/// the group id, epoch and the membership change to whoever holds that node id.
+/// A hint is only written for a node id that matches an actual current member
+/// (`GroupChatProcessor::remember_member_tickets`), which is what bounds this;
+/// see `KNOWN_ISSUES.md` "Security Audit Residuals" item 11.
 const TBL_MEMBER_ADDR: TableDefinition<&[u8], &[u8]> =
     TableDefinition::new("mls_member_addr");
 

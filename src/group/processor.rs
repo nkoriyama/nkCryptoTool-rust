@@ -460,9 +460,24 @@ impl GroupChatProcessor {
     }
 
     /// Configure (or remove) the inbox store-and-forward server. When
-    /// set, every outbound send falls back to `inbox::deposit` if the
-    /// direct connect fails — providing offline-capable delivery via
-    /// an untrusted relay (the inbox never reads payloads).
+    /// set, an outbound send falls back to `inbox::deposit` if the
+    /// direct connect fails — providing offline-capable delivery via an
+    /// untrusted relay.
+    ///
+    /// "Untrusted" is a statement about what the relay is *given*, not a
+    /// promise about its behaviour: the operator holds the bytes and can
+    /// read whatever is not encrypted. Application messages
+    /// (`PrivateMessage`) and a `Welcome`'s GroupSecrets are encrypted,
+    /// so it learns only their size and timing. Commits and Proposals are
+    /// **not** — our client uses mls-rs's default MlsRules, which emit
+    /// them as signed-but-cleartext `PublicMessage` — and they are
+    /// deposited like anything else. **Setting an inbox therefore gives
+    /// its operator the group's membership graph and every member's
+    /// transport identity**, for every roster change that takes the
+    /// fallback. This is unmitigated today; `encrypt_control_messages`
+    /// (the scheduled wire-format flag day) is what closes it. See
+    /// `KNOWN_ISSUES.md` "Security Audit Residuals" item 11 — including
+    /// why refusing to relay those frames is *not* the answer.
     pub fn set_inbox(&mut self, inbox: Option<PeerAddr>) {
         self.inbox = inbox;
     }
@@ -638,6 +653,10 @@ impl GroupChatProcessor {
             }
         })?;
 
+        // Roster before the Add, so the member(s) this commit introduces can be
+        // identified below and their join epoch recorded.
+        let roster_before = Self::roster_peer_ids(&group);
+
         let commit_output = group
             .commit_builder()
             .add_member(key_package)
@@ -680,6 +699,12 @@ impl GroupChatProcessor {
             // Welcome instead of a delta. Never silent.
             eprintln!("[mls] failed to persist commit history (epoch advanced): {e}");
         }
+        self.record_witnessed_joins(
+            group.group_id(),
+            group.current_epoch(),
+            &roster_before,
+            &Self::roster_peer_ids(&group),
+        );
 
         Ok(AddMemberOutput {
             welcome: Zeroizing::new(welcome_bytes),
@@ -989,9 +1014,25 @@ impl GroupChatProcessor {
         let msg = MlsMessage::from_bytes(commit_bytes).map_err(|e| {
             GroupError::InvalidWelcome(format!("Commit decode for broadcast: {e}"))
         })?;
-        // We accept either PublicMessage or PrivateMessage Commits.
-        // mls-rs defaults to PrivateMessage; PublicMessage is opt-in.
-        // We don't restrict here — recipients will revalidate.
+        // We accept either PublicMessage or PrivateMessage Commits and do not
+        // restrict here — recipients revalidate.
+        //
+        // Which one we *emit* is not a choice we have made: mls-rs defaults to
+        // **PublicMessage**, and PrivateMessage is the opt-in. `Client::builder()`
+        // in `new` does not call `.mls_rules(..)`, so `EncryptionOptions::default()`
+        // applies with `encrypt_control_messages = false`, and mls-rs's
+        // `control_wire_format` returns `PrivateMessage` only when that flag is
+        // true (mls-rs 0.55.2, `group/mls_rules.rs`). Every Commit this function
+        // broadcasts is therefore signed but sent in the clear: the group id,
+        // epoch, committer leaf index and the membership change itself — an Add
+        // carries the joining member's whole KeyPackage — are readable by anyone
+        // who holds the frame. Directly that is a current group member over an
+        // authenticated QUIC channel, but a recipient we cannot reach in time
+        // falls back to the store-and-forward relay (`send_one_with_inbox`), and
+        // the relay operator is not a member and reads all of it. Making the
+        // frames private needs `encrypt_control_messages = true`, a wire-format
+        // change every peer must adopt at once; until then the exposure stands —
+        // see `KNOWN_ISSUES.md` "Security Audit Residuals" item 11.
         //
         // Parallel fan-out: a Welcome+Commit for member N reaches N-1
         // existing members. Sequential `connect()`s dominated setup
@@ -1148,6 +1189,39 @@ impl GroupChatProcessor {
                 )));
             }
 
+            // Current-roster membership is not by itself authorization for the
+            // *whole* retained history: `claimed_epoch` is 8 bytes the requester
+            // chose, and a member admitted at epoch N that claims the oldest
+            // retained epoch would be streamed up to DEFAULT_COMMIT_RETENTION
+            // epochs of Commits predating its own admission — in the clear, so
+            // it would learn the identities and transport fingerprints of
+            // members evicted before it arrived, which is exactly the
+            // membership history MLS's joiner model withholds. Clamp the floor
+            // to the requester's own admission where we witnessed it.
+            //
+            // `None` (unknown) deliberately does NOT clamp. It means this node
+            // never applied the Add commit for that member: an existing
+            // database written before this record existed, or — the common case
+            // — a member that was already on the roster when *we* joined. The
+            // latter cannot leak anything, because our own history starts at our
+            // own join, which is at or after theirs. The former keeps today's
+            // behaviour for members admitted before the upgrade rather than
+            // cutting off delta resync for everyone already in a group.
+            let requester_join_epoch = match self
+                .storage
+                .member_join_epoch(&gid_bytes, peer_id.as_bytes())
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("[mls] sync: join-epoch lookup failed, serving unclamped: {e}");
+                    None
+                }
+            };
+            let effective_floor = match requester_join_epoch {
+                Some(joined) => claimed_epoch.max(joined),
+                None => claimed_epoch,
+            };
+
             // Case B: Delta resync. Bound the *entire* response (the OK marker
             // plus every commit frame) by a single HANDSHAKE_TIMEOUT deadline.
             // A per-write timeout alone does not bound the loop's total time — a
@@ -1156,8 +1230,14 @@ impl GroupChatProcessor {
             // the serialized accept loop for N x timeout (head-of-line DoS). The
             // disk read (load_commits) happens before the deadline; only the
             // network send is timed.
-            let commits = if claimed_epoch < local_epoch {
-                self.storage.load_commits(&gid_bytes, claimed_epoch, local_epoch)?
+            // `load_commits` treats its lower bound as *exclusive*, so passing
+            // the join epoch serves the commits after the Add that admitted the
+            // requester — never the Add itself, which it received as a Welcome.
+            // The `oldest_retained_epoch` floor above still applies and is not
+            // replaced by this one: it answers "your epoch is unrecoverable,
+            // take a Welcome", which is about pruning, not about entitlement.
+            let commits = if effective_floor < local_epoch {
+                self.storage.load_commits(&gid_bytes, effective_floor, local_epoch)?
             } else {
                 Vec::new()
             };
@@ -1342,6 +1422,12 @@ impl GroupChatProcessor {
                 GroupError::Backend(format!("load_group during SYNC: {e}"))
             })?;
 
+            // Same roster diff as the direct-receive path: commits replayed
+            // during a catch-up are just as much a witnessed Add, and skipping
+            // them here would leave us holding history from before a member
+            // joined with no record of when that was.
+            let roster_before = Self::roster_peer_ids(&group);
+
             let received = group.process_incoming_message(msg).map_err(|e| {
                 GroupError::Backend(format!("SYNC process commit: {e}"))
             })?;
@@ -1370,6 +1456,12 @@ impl GroupChatProcessor {
             // Welcome instead of a delta. Never silent.
             eprintln!("[mls] failed to persist commit history (epoch advanced): {e}");
         }
+            self.record_witnessed_joins(
+                group.group_id(),
+                group.current_epoch(),
+                &roster_before,
+                &Self::roster_peer_ids(&group),
+            );
             applied_any = true;
         }
 
@@ -1438,6 +1530,13 @@ impl GroupChatProcessor {
                     }
                 })?;
 
+                // Roster before processing: if this turns out to be a Commit
+                // that adds members, the difference names them and the epoch it
+                // produces is their join epoch. Taken unconditionally because
+                // the message type is only known after processing; a roster
+                // walk is cheap next to the MLS decrypt that follows.
+                let roster_before = Self::roster_peer_ids(&group);
+
                 let received = group
                     .process_incoming_message(msg)
                     .map_err(|e| GroupError::Backend(format!("process_incoming_message: {e}")))?;
@@ -1468,6 +1567,12 @@ impl GroupChatProcessor {
                                 "[mls] failed to persist commit history (epoch advanced): {e}"
                             );
                         }
+                        self.record_witnessed_joins(
+                            group.group_id(),
+                            group.current_epoch(),
+                            &roster_before,
+                            &Self::roster_peer_ids(&group),
+                        );
 
                         match desc.effect {
                             CommitEffect::Removed { remover, .. } => {
@@ -1551,6 +1656,49 @@ impl GroupChatProcessor {
         }
     }
 
+    /// The transport peer ids currently on `group`'s roster, as far as their
+    /// credentials identify one. Used to diff the roster across a commit we
+    /// apply, which is how a member's join epoch is witnessed.
+    fn roster_peer_ids(group: &mls_rs::Group<MlsConfig>) -> std::collections::HashSet<PeerId> {
+        group
+            .roster()
+            .members_iter()
+            .filter_map(|m| Self::peer_id_from_credential(&m.signing_identity.credential))
+            .collect()
+    }
+
+    /// Persist `epoch` as the join epoch of every peer that is on the roster in
+    /// `after` but was not in `before` — i.e. every member this commit added.
+    ///
+    /// Call it immediately after a commit has been applied *and* persisted, with
+    /// `epoch = group.current_epoch()`. That is the epoch whose Add commit the
+    /// new member never receives (it gets a Welcome instead), so it is exactly
+    /// the exclusive floor the SYNC responder may serve that member from.
+    ///
+    /// Best-effort, like the commit-history write next to it: a failure here
+    /// costs the clamp for that member (it falls back to today's behaviour of
+    /// serving from the requester's `claimed_epoch`), which must not fail a
+    /// group operation that has already advanced the epoch on disk. Never
+    /// silent.
+    fn record_witnessed_joins(
+        &self,
+        group_id: &[u8],
+        epoch: u64,
+        before: &std::collections::HashSet<PeerId>,
+        after: &std::collections::HashSet<PeerId>,
+    ) {
+        for pid in after.difference(before) {
+            if let Err(e) = self
+                .storage
+                .put_member_join_epoch(group_id, pid.as_bytes(), epoch)
+            {
+                eprintln!(
+                    "[mls] failed to record a member's join epoch (sync history for that \
+                     member will not be clamped): {e}"
+                );
+            }
+        }
+    }
 
     /// Return this processor's own reachable address — typically what
     /// a peer would need to call [`send_welcome_to`] back to us.
@@ -3420,6 +3568,137 @@ mod tests {
         assert_eq!(bob_group.current_epoch(), 1);
         assert_eq!(bob_group.roster().members_iter().count(), 2);
         assert_eq!(bob_group.group_id(), alice_group.group_id());
+    }
+
+    /// The SYNC responder clamps `claimed_epoch` to the requester's own
+    /// admission, and to nothing more than that.
+    ///
+    /// `claimed_epoch` is 8 bytes the requester chooses, and the only floor it
+    /// had was the oldest *retained* epoch. Carol is admitted at epoch 3, so
+    /// the epoch-2 Commit — the Add that carries Erin's KeyPackage, i.e. her
+    /// NKCB credential, iroh NodeId and ML-DSA-65 transport key, in the clear —
+    /// is history from before Carol was in the group and must not be served
+    /// however low she claims. The epoch-4 delta she genuinely missed must
+    /// still be, and Bob (admitted at epoch 1) must still get every commit
+    /// after his own: a clamp that starves legitimate resync would be a worse
+    /// bug than the leak.
+    #[tokio::test]
+    async fn sync_does_not_serve_history_from_before_the_requester_joined() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Split a SYNC response body (after the 4-byte marker) into its
+        /// length-prefixed commit frames.
+        fn frames_of(rest: &[u8]) -> Vec<Vec<u8>> {
+            let mut out = Vec::new();
+            let mut off = 0usize;
+            while off + 4 <= rest.len() {
+                let len = u32::from_le_bytes(rest[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                assert!(off + len <= rest.len(), "truncated commit frame");
+                out.push(rest[off..off + len].to_vec());
+                off += len;
+            }
+            assert_eq!(off, rest.len(), "trailing bytes after the last commit frame");
+            out
+        }
+
+        /// Issue a raw SYNC request as `requester` and return the commit frames
+        /// the responder streamed back.
+        async fn sync_as(
+            requester: &GroupChatProcessor,
+            responder_addr: &PeerAddr,
+            gid: &GroupId,
+            claimed_epoch: u64,
+        ) -> Vec<Vec<u8>> {
+            let mut stream = requester
+                .endpoint_ref()
+                .connect(responder_addr, crate::group::transport::ALPN_MLS_PROTOCOL)
+                .await
+                .expect("connect for SYNC");
+            stream.write_all(b"SYNC").await.expect("write SYNC header");
+            let mut req = [0u8; 40];
+            req[0..32].copy_from_slice(gid.as_bytes());
+            req[32..40].copy_from_slice(&claimed_epoch.to_le_bytes());
+            stream.write_all(&req).await.expect("write SYNC request");
+
+            let mut marker = [0u8; 4];
+            stream.read_exact(&mut marker).await.expect("read marker");
+            assert_eq!(&marker, b"OK\x00\x00", "responder refused the request");
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).await.expect("read response");
+            frames_of(&rest)
+        }
+
+        let net = MockNetwork::new();
+        let (alice, _da) = build_proc_on_net(&net, "alice", 1);
+        let (bob, _db) = build_proc_on_net(&net, "bob", 2);
+        let (carol, _dc) = build_proc_on_net(&net, "carol", 3);
+        let (dave, _dd) = build_proc_on_net(&net, "dave", 4);
+        let (erin, _de) = build_proc_on_net(&net, "erin", 5);
+
+        let alice_addr = alice.local_addr().await.unwrap();
+
+        let bob_kp = bob.export_key_package().await.unwrap();
+        let carol_kp = carol.export_key_package().await.unwrap();
+        let dave_kp = dave.export_key_package().await.unwrap();
+        let erin_kp = erin.export_key_package().await.unwrap();
+
+        // Alice builds the group. Welcomes are not delivered — this test is
+        // about what the *responder* will serve, and the requesters' identities
+        // are on her roster either way.
+        let gid = alice.create_group().await.unwrap();
+        let add_bob = alice.add_member(&gid, &bob_kp).await.unwrap(); // epoch 1
+        let add_erin = alice.add_member(&gid, &erin_kp).await.unwrap(); // epoch 2
+        let add_carol = alice.add_member(&gid, &carol_kp).await.unwrap(); // epoch 3
+        let add_dave = alice.add_member(&gid, &dave_kp).await.unwrap(); // epoch 4
+        assert_eq!(alice.load_group_summary(&gid).await.unwrap().epoch, 4);
+
+        // Carol claims epoch 1 — above the oldest retained epoch, so the
+        // pruning floor lets it through, but below her own admission.
+        let alice = {
+            let task = tokio::spawn(async move {
+                alice.accept_next().await.expect("alice serves carol's SYNC");
+                alice
+            });
+            let frames = sync_as(&carol, &alice_addr, &gid, 1).await;
+            let alice = task.await.unwrap();
+
+            assert_eq!(
+                frames.len(),
+                1,
+                "Carol joined at epoch 3: she may be served the epoch-4 delta and \
+                 nothing older, whatever she claims"
+            );
+            assert_eq!(frames[0], *add_dave.commit);
+            assert!(
+                !frames
+                    .iter()
+                    .any(|f| f == &*add_erin.commit || f == &*add_carol.commit),
+                "commits from before Carol's admission were disclosed"
+            );
+            alice
+        };
+
+        // Bob, admitted at epoch 1, is not starved: he still gets every commit
+        // that followed his admission.
+        let _alice = {
+            let task = tokio::spawn(async move {
+                alice.accept_next().await.expect("alice serves bob's SYNC");
+                alice
+            });
+            let frames = sync_as(&bob, &alice_addr, &gid, 1).await;
+            let alice = task.await.unwrap();
+
+            assert_eq!(frames.len(), 3, "Bob's legitimate delta must still be served");
+            assert_eq!(frames[0], *add_erin.commit);
+            assert_eq!(frames[1], *add_carol.commit);
+            assert_eq!(frames[2], *add_dave.commit);
+            assert!(
+                !frames.iter().any(|f| f == &*add_bob.commit),
+                "the floor stays exclusive: Bob's own Add is not replayed to him"
+            );
+            alice
+        };
     }
 
     #[tokio::test]

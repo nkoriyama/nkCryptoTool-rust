@@ -265,6 +265,108 @@ trade-off is explicit rather than forgotten.
       number of depositors holding a live backlog, and a row is dropped as soon
       as its balance reaches zero.
 
+11. **MLS Commits and Proposals are sent in the clear — including to the
+    store-and-forward relay** (`group/processor.rs`, `group/transport.rs`,
+    2026-08): `Client::builder()`
+    in `GroupChatProcessor::new` does not call `.mls_rules(..)`, so mls-rs
+    applies `EncryptionOptions::default()` with `encrypt_control_messages =
+    false`, and its `control_wire_format` returns `PrivateMessage` only when
+    that flag is true (mls-rs 0.55.2, `group/mls_rules.rs`). **Every Commit and
+    standalone Proposal this project emits is therefore a
+    `WireFormat::PublicMessage` — signed, authenticated, and not encrypted.**
+    Application messages are unaffected: those are `PrivateMessage`, AEAD-sealed
+    under the epoch key schedule, as is a `Welcome`'s HPKE-wrapped GroupSecrets.
+    - **What a control frame discloses**: the group id, the epoch, the
+      committer's leaf index, and the membership change itself. An Add carries
+      the joining member's entire KeyPackage inline — the NKCB credential with
+      its iroh NodeId, ML-DSA-65 transport public key and display name, plus the
+      hybrid signature key. A Remove carries the evicted leaf index. Those
+      transport keys are exactly what `projected_member_fingerprints` turns into
+      shell and port-forward authorization policy, so a party that collects
+      these frames reads the team's access list and its complete
+      membership-change timeline.
+    - **Who receives one.** Two parties. The first is a peer we reach directly
+      over authenticated QUIC, which is a *current group member* — already
+      entitled to the current roster and every later epoch's membership data.
+      That half is mild: what a member gains is the roster history back to its
+      own admission in a form it can parse without any group secret, rather
+      than only what the key schedule would grant.
+      The second is **the inbox relay operator, who is not a member**. When a
+      recipient is not reachable inside `DIRECT_CONNECT_TIMEOUT` (5 s),
+      `send_one_with_inbox` deposits the frame at the operator-configured
+      relay, cleartext Commits included. An operator that keeps what it stores
+      reconstructs the group's whole membership graph, every member's iroh
+      NodeId and ML-DSA-65 transport key, and the timeline of who joined and
+      who was evicted. **This is the sharp end of this item and it is
+      unmitigated.** Configuring `--inbox-url` is what enables it; running
+      without a relay confines control frames to member-to-member QUIC.
+    - **What *is* mitigated**: only the pull side. The SYNC commit-history
+      responder clamps a requester's `claimed_epoch` to the epoch at which this
+      node witnessed that member being added, so a member cannot ask a peer for
+      retained history predating its own admission. That closes a member's
+      *reach back*; it does nothing about the relay, which is handed the frames
+      unasked.
+    - **A refusal was tried here and withdrawn — do not re-propose it without
+      reading this.** The obvious mitigation is for `send_one_with_inbox` to
+      refuse to deposit a `PublicMessage`. It was implemented, then removed,
+      because it converts a confidentiality leak into a **revocation that never
+      lands**. The inbox deposit is the *only* automatic delivery path for a
+      Commit that missed the 5 s direct window: `load_commits` has exactly one
+      non-test reader (the SYNC responder), there is no re-broadcast and no
+      retry queue, and the delta-resync protocol that could pull it is a pull —
+      the removing node cannot push later at all — with, today, no
+      operator-reachable caller (see the next bullet). So with
+      the refusal in place: Alice removes Mallory; Bob happens to be
+      unreachable for those five seconds; Bob stays at epoch N with Mallory on
+      his roster, keeps dialling her, keeps encrypting application messages
+      under a key schedule she can still open, still answers SYNC treating her
+      as a member, and still emits her fingerprint from
+      `projected_member_fingerprints` into shell/forward policy — indefinitely,
+      where before the refusal it lasted until his next 2 s inbox poll. No
+      special capability is needed to trigger that: "a peer was offline when
+      the roster changed" is precisely the case the relay exists for, and
+      anyone who can disturb one peer's path for five seconds can make an
+      eviction permanently invisible to it. Silent revocation failure is worse
+      than metadata disclosure to a relay the operator chose, and the flag day
+      below fixes both at once — once control frames are `PrivateMessage`,
+      relaying them is safe and the automatic path is safe with them.
+    - **How a member that missed a Commit gets it, as of this change.** Almost
+      always automatically, and only automatically: the relay holds the
+      deposited frame and the recipient's inbox poll (2 s) applies it on its
+      next run. That covers the ordinary "offline for a moment" case and is
+      why the refusal above was withdrawn. What it does **not** cover is a
+      deployment with no `--inbox-url` configured at all, a deposit that was
+      itself refused (a full slot — item 9), or an absence longer than the
+      relay's 7-day envelope TTL. In those cases the member is stuck at its old
+      epoch and **there is no way to ask**: `GroupChatProcessor::request_resync`
+      implements the pull and the responder side is live, but nothing outside
+      the test suite calls it — no CLI subcommand, REPL command, GUI action or
+      FFI method — so recovery is re-admission (a fresh Welcome). Wiring that
+      pull to an operator-visible command is a separate follow-on change and is
+      deliberately not part of this patch; until it lands, treat the relay as
+      load-bearing for roster convergence.
+    - **What the SYNC clamp does not cover.** A join epoch is recorded only when
+      this node applies the Add commit itself (`record_witnessed_joins`, on the
+      commit-build, direct-receive and resync-apply paths), stored per
+      (group, member) in the existing application-data KV. `None` means
+      "unknown" and deliberately does **not** clamp, because failing closed
+      there would cut off legitimate resync. Unknown arises in two ways. For a
+      member that was already on the roster when *we* joined, it is harmless: our
+      own commit history starts at our own join, which is at or after theirs, so
+      there is nothing older to leak. For a **database written before this
+      release**, it is a real gap: members admitted before the upgrade have no
+      record, so they keep being served from whatever epoch they claim, down to
+      the oldest retained one, for as long as that history survives
+      `DEFAULT_COMMIT_RETENTION` (100 epochs). No migration can fix that — the
+      information was never recorded. It ages out as those epochs prune, and
+      applies from admission onward for everyone added afterwards.
+    - **What a real fix requires**: `encrypt_control_messages = true` via
+      `.mls_rules(..)`, which changes the wire format of every Commit and
+      Proposal. Every peer in a group must adopt it simultaneously — a peer on
+      the old build cannot process a `PrivateMessage` Commit from a peer on the
+      new one, and vice versa — so it is a flag day, scheduled separately and
+      deliberately **not** taken here.
+
 (Several other audit findings — the ECDSA verify bug, network-receive release
 of unverified plaintext, the `Ticket::from_str` DoS, plaintext ECC keys, and
 the weak PBKDF2 iteration count — were fixed; see the git history.)

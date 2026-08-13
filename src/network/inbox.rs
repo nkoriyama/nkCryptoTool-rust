@@ -2,10 +2,25 @@
 //!
 //! Designed as an untrusted Delivery Service in the sense of RFC 9420 §3:
 //! the server stores envelopes keyed by recipient PeerId and returns
-//! them on demand to the matching peer, but it never reads, decrypts, or
-//! interprets the payload bytes. Combined with the MLS layer in
-//! [`crate::group`], this provides asynchronous (offline-capable)
-//! delivery without weakening the end-to-end cryptographic guarantees.
+//! them on demand to the matching peer, and this implementation never
+//! reads, decrypts, or interprets the payload bytes.
+//!
+//! That is a property of *this code*, not a guarantee about the operator,
+//! who holds the bytes and can read anything in them that is not
+//! encrypted. Whether store-and-forward costs the end-to-end guarantees
+//! is therefore decided by what the depositor hands over, not here — and
+//! for the MLS layer in [`crate::group`] today, **it does cost them**.
+//! Application messages (`PrivateMessage`), `Welcome`s (GroupSecrets
+//! HPKE-encrypted to the joiner) and KeyPackages (publishable by
+//! construction) are all opaque to this server. Commits and Proposals are
+//! not: mls-rs's default MlsRules emit them as `PublicMessage`, signed but
+//! unencrypted, and
+//! [`crate::group::transport::send_one_with_inbox`] deposits them like
+//! anything else — so an operator that keeps what it stores can
+//! reconstruct the group's membership graph and every member's transport
+//! identity. Unmitigated today; the fix is the `encrypt_control_messages`
+//! wire-format flag day. See `KNOWN_ISSUES.md` "Security Audit Residuals"
+//! item 11.
 //!
 //! ## Wire protocol
 //!
