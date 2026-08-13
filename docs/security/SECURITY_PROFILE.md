@@ -393,11 +393,32 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
   `NK_ROLLBACK_POLICY` で制御。`off`(既定) は従来通り KEK version `0x02`、挙動
   不変。`permissive`/`strict` は per-DB の単調カウンタ値を KEK の HPKE `info` に
   暗号的にバインド (KEK version `0x03` = `bound_info || counter(u64 BE)`)。カウンタ
-  は rekey 時に advance。古い `(groups.db, groups.db.kek)` スナップショットに書き
-  戻されても、現行カウンタとの `info` 不一致で HPKE AEAD 復号が失敗し**巻き戻しを
-  検知**する。カウンタ更新と DB 再暗号化の 2 リソース整合は既存の `.pending`
-  ステージング + `resolve_kek_to_dek` の 3 パターン復旧でクラッシュ安全。設計の
-  全体像は `docs/design/ATREST_ANTIROLLBACK_DESIGN.md`。
+  は **rekey 時にのみ** advance。古い `(groups.db, groups.db.kek)` スナップショットに
+  書き戻された場合、**そのスナップショット以降に rekey を挟んでいれば**現行カウンタとの
+  `info` 不一致で HPKE AEAD 復号が失敗し**巻き戻しを検知**する。カウンタ更新と DB
+  再暗号化の 2 リソース整合は既存の `.pending` ステージング + `resolve_kek_to_dek` の
+  3 パターン復旧でクラッシュ安全。設計の全体像は
+  `docs/design/ATREST_ANTIROLLBACK_DESIGN.md`。
+  - **⚠ 検知範囲の限界（2026-08 の再確認で判明。それ以前の本節は「古い
+    `(groups.db, groups.db.kek)` の組に戻されても検知する」と無条件に書いており、
+    誤りだった）**: カウンタが暗号的に束縛されるのは **KEK ファイルだけ**で、
+    セキュリティ状態の実体である `groups.db` 自体は一切束縛されていない。
+    `resolve_kek_to_dek` は live KEK が現行カウンタで decapsulate できた時点で DEK を
+    返し（`src/group/at_rest.rs:706`）、**DB を一度も検査しない**。したがって:
+    - **現行の KEK をそのまま残して `groups.db` だけ古い版に差し替える攻撃は、どの
+      ポリシー（`permissive` / `strict` / TPM）でも検知されない。** 削除したメンバーの
+      復活、削除済みレコードの復活、ratchet の巻き戻しが、警告なしに成立する。storage
+      dir へ書ける攻撃者にとっては、`(db, kek)` を対で戻すより容易で確実な経路である。
+    - 対で戻す場合も、検知できるのは **rekey 境界をまたいだときだけ**。カウンタは
+      `nkct mls --mls-cmd rekey` でしか進まないため、最後の rekey 以降のスナップショット
+      はカウンタが同値で `info` が一致し、普通に開く。
+    - `current_rollback_epoch` も同じ rekey 回数を返すため、オンラインの inbox
+      CHECKPOINT アンカー（フェーズ3）もこの差し替えを検知しない。
+    実装で塞ぐには KEK ではなく **DB 側の鮮度**を束縛する必要がある — コミット済み DB
+    状態が進むたびにカウンタ（または安価なソフトウェア随伴カウンタ）を進め、期待値を
+    暗号化 DB の内側に保存し、開封時に stored-vs-current を比較して退行なら fail closed
+    にする。**未実装**。現状の anti-rollback は「rekey をまたぐ巻き戻し」に対する保護と
+    理解すること。
   - **`permissive` (フェーズ1)**: software カウンタ (`SoftwareCounter`、
     `$XDG_STATE_HOME/nkct/rollback/<hash>.ctr` — ストレージ dir 外)。state ファイル
     ごと過去スナップショットに戻されると検知できない (case D 限界)。
