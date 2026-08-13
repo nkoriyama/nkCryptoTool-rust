@@ -522,21 +522,140 @@ fn cancel_listener(slot: &ListenSlot) -> bool {
     }
 }
 
+/// One outbound connect, and the channel carrying this user's typed plaintext
+/// into *that* session and no other.
+///
+/// `id` is what makes a late cleanup harmless: a task that finishes after the
+/// slot has moved on names its own session when it closes, so it cannot take
+/// down a successor's channel.
+#[cfg(feature = "gui")]
+struct ChatSession {
+    id: u64,
+    stdin_tx: mpsc::Sender<Vec<u8>>,
+}
+
+/// The one slot holding the connect in flight, if any.
+///
+/// A `std` mutex, not a `tokio` one, for the same reason as [`ListenSlot`]:
+/// the press that claims it and the send that reads it both arrive on the
+/// Slint event-loop thread, and the claim has to happen in the same turn as
+/// the press. It is never held across an await.
+#[cfg(feature = "gui")]
+type ChatSessionSlot = std::sync::Mutex<Option<ChatSession>>;
+
+/// Session ids are only ever compared for equality, never ordered or shown, so
+/// a plain counter is enough. It is process-wide because the slot is.
+#[cfg(feature = "gui")]
+static NEXT_CHAT_SESSION_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+/// Claim the connect slot for a new session, handing back its id and the IO
+/// provider that reads *its* stdin channel. `None` means a connect is already
+/// in flight and this one must be refused.
+///
+/// The freshly created channel is the point. One process-wide channel, whose
+/// single receiver every `GuiStdin` shared, bound a typed line to no session at
+/// all: whichever session happened to poll first encrypted it, so a line meant
+/// for the peer the user believed they were talking to could be sent to another
+/// peer entirely. A channel created here, reachable only through the provider
+/// returned here, cannot be read by any other session.
+#[cfg(feature = "gui")]
+fn open_connect_session(
+    slot: &ChatSessionSlot,
+    stdout_tx: &mpsc::Sender<Vec<u8>>,
+) -> Option<(u64, Arc<GuiIOProvider>)> {
+    // A panic elsewhere must not wedge the connect button forever, so a
+    // poisoned lock is recovered from rather than propagated.
+    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    if guard.is_some() {
+        return None;
+    }
+    let id = NEXT_CHAT_SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (stdin_tx, stdin_rx) = mpsc::channel(100);
+    *guard = Some(ChatSession { id, stdin_tx });
+    // The transcript sender is shared on purpose: peer text from any session
+    // lands in the one message list, exactly as before.
+    let provider = Arc::new(GuiIOProvider {
+        stdin_rx: Arc::new(tokio::sync::Mutex::new(stdin_rx)),
+        stdout_tx: stdout_tx.clone(),
+    });
+    Some((id, provider))
+}
+
+/// Close session `id`: take it out of the slot and drop its sender, so the
+/// session's reader sees EOF and nothing typed later can reach it. Returns
+/// whether this call closed it; `false` means the slot was empty or had
+/// already moved on to another session, which must not be disturbed.
+#[cfg(feature = "gui")]
+fn end_connect_session(slot: &ChatSessionSlot, id: u64) -> bool {
+    let mut guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    match guard.as_ref() {
+        Some(session) if session.id == id => {
+            *guard = None;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The sender of the session that is live *now*, or `None` when none is.
+///
+/// `None` means the line is dropped. Queueing it instead — the old behaviour of
+/// the process-wide channel — is precisely the bug: text typed with no session
+/// live would sit in the channel until some later session, with some other
+/// peer, read and encrypted it.
+#[cfg(feature = "gui")]
+fn current_chat_sender(slot: &ChatSessionSlot) -> Option<mpsc::Sender<Vec<u8>>> {
+    let guard = slot.lock().unwrap_or_else(|p| p.into_inner());
+    guard.as_ref().map(|session| session.stdin_tx.clone())
+}
+
+/// Owns one outbound connect for the lifetime of the task that runs it.
+///
+/// Dropping it closes the session and clears `connecting`, on every exit path
+/// the task has — early return, error, normal end, panic unwind — so no path
+/// can leave a claimed slot (which would refuse every later connect) or a
+/// permanently dead action button behind.
+///
+/// How long the dialled peer can keep it claimed is worth knowing: a peer that
+/// accepts the connection and then stalls holds `connecting` true for the
+/// bounded worst case of the dial ladder in `p2p::processor` (`CONNECT_TIMEOUTS`
+/// 3+5+8+12+12 s plus 4×1 s backoff = 44 s) followed by `handshake_timeout`
+/// (`config.rs`, 15 s by default) — about 59 s, after which this guard drops
+/// and the button comes back. It is bounded, self-clearing and only ever
+/// started by the user's own press, so a stalling peer can delay the next
+/// connect but cannot block it.
+#[cfg(feature = "gui")]
+struct ConnectSessionGuard {
+    slot: Arc<ChatSessionSlot>,
+    id: u64,
+    ui: slint::Weak<ChatWindow>,
+}
+
+#[cfg(feature = "gui")]
+impl Drop for ConnectSessionGuard {
+    fn drop(&mut self) {
+        // Close first, report second: the sender is gone before the UI offers
+        // the button that could start the next session.
+        end_connect_session(&self.slot, self.id);
+        let _ = self.ui.upgrade_in_event_loop(|ui| ui.set_connecting(false));
+    }
+}
+
 #[cfg(feature = "gui")]
 pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     let ui = ChatWindow::new()?;
     let ui_handle = ui.as_weak();
 
-    let (stdin_tx, stdin_rx) = mpsc::channel(100);
-    let (stdout_tx, stdout_rx) = mpsc::channel(100);
+    let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>(100);
     
     // Channel for M1 passphrase response: (passphrase, ticket, privkey, pubkey)
     let (pass_tx, mut pass_rx) = mpsc::channel::<(Zeroizing<String>, String, String, String)>(1);
 
-    let gui_provider = Arc::new(GuiIOProvider {
-        stdin_rx: Arc::new(tokio::sync::Mutex::new(stdin_rx)),
-        stdout_tx,
-    });
+    // The stdin side is deliberately NOT built here. Each connect gets its own
+    // channel and its own `GuiIOProvider` from `open_connect_session`, so there
+    // is no shared receiver for a second session to read a typed line from.
+    let chat_session: Arc<ChatSessionSlot> = Arc::new(std::sync::Mutex::new(None));
 
     // M4: Notification Manager
     #[cfg(feature = "gui-notifications")]
@@ -609,7 +728,6 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let gp = gui_provider.clone();
     let ui_handle_conn = ui_handle.clone();
     let pass_tx_for_ui = pass_tx.clone();
     let ui_handle_pass_cb = ui_handle.clone();
@@ -807,9 +925,10 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let ui_handle_for_connect = ui_handle.clone();
+    let chat_session_for_connect = chat_session.clone();
+    let stdout_tx_for_connect = stdout_tx.clone();
     ui.on_connect_pressed(move |ticket, privkey, pubkey| {
         let ui_handle = ui_handle_conn.clone();
-        let gp = gp.clone();
         let ticket = ticket.to_string();
         let privkey = privkey.to_string();
         let pubkey = pubkey.to_string();
@@ -821,19 +940,56 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             return;
         };
 
+        // Claim the connect slot now, synchronously, on the event-loop thread
+        // where every press arrives. A refusal here is the second line of
+        // defence behind `connecting` below: whatever the UI does, only one
+        // session can hold the typed-plaintext channel, so a line can never be
+        // handed to a session other than the one it was typed into.
+        let Some((session_id, session_provider)) =
+            open_connect_session(&chat_session_for_connect, &stdout_tx_for_connect)
+        else {
+            if let Some(ui) = ui_handle_for_connect.upgrade() {
+                ui.set_connection_error("A connection is already in progress.".into());
+            }
+            return;
+        };
+
+        // Mark the UI busy in the same turn as the press, the way the listen
+        // press sets `listening`. The action button is gated on `!connecting`
+        // (chat.slint `start-action-enabled`), so this is what makes a second
+        // press impossible during the seconds between the press and the
+        // handshake that sets `connected`. Only that button goes dead: the
+        // mode selector and the ticket/key fields around it stay usable.
+        if let Some(ui) = ui_handle_for_connect.upgrade() {
+            ui.set_connecting(true);
+        }
+        let session_guard = ConnectSessionGuard {
+            slot: chat_session_for_connect.clone(),
+            id: session_id,
+            ui: ui_handle_for_connect.clone(),
+        };
+
         tokio::spawn(async move {
+            // Every exit below — including the early returns — releases the
+            // slot and the button through this drop.
+            let _session_guard = session_guard;
             let mut config = build_connect_config(&ticket, &privkey, &pubkey);
 
-            // Branch on transfer mode: Chat reuses GuiIOProvider, FileSend
-            // builds a FileIOProvider with the selected file as input.
+            // Branch on transfer mode: Chat uses this session's GuiIOProvider,
+            // FileSend builds a FileIOProvider with the selected file as input.
             let mut total_send_bytes: Option<u64> = None;
             let (io_provider, is_file_mode): (Arc<dyn crate::network::IOProvider>, bool) = match mode {
                 TransferMode::Chat => {
                     config.chat_mode = true;
-                    (gp.clone(), false)
+                    (session_provider, false)
                 }
                 TransferMode::FileSend => {
                     config.chat_mode = false;
+                    // A file send has no chat input. Drop the session's reader
+                    // so its channel is closed: a line that somehow reached the
+                    // sender is refused rather than buffered in a channel no
+                    // one will ever read.
+                    drop(session_provider);
                     if selected_file_path.is_empty() {
                         let ui_handle = ui_handle.clone();
                         let _ = slint::invoke_from_event_loop(move || {
@@ -1191,10 +1347,33 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    let gp_pass = gui_provider.clone();
     let ui_handle_pass_retry = ui_handle.clone();
+    let chat_session_for_pass = chat_session.clone();
+    let stdout_tx_for_pass = stdout_tx.clone();
     tokio::spawn(async move {
         while let Some((passphrase, ticket, privkey, pubkey)) = pass_rx.recv().await {
+            // The unlocked retry is a chat session like any other, so it takes
+            // the slot like any other: its own channel, and a refusal if a
+            // session is already live rather than a second consumer of one.
+            let Some((session_id, session_provider)) =
+                open_connect_session(&chat_session_for_pass, &stdout_tx_for_pass)
+            else {
+                ui_handle_pass_retry.upgrade_in_event_loop(|ui| {
+                    ui.set_connection_error("A connection is already in progress.".into());
+                }).ok();
+                continue;
+            };
+            ui_handle_pass_retry.upgrade_in_event_loop(|ui| {
+                ui.set_connecting(true);
+            }).ok();
+            // Dropped at the end of this iteration, and on the early `return`
+            // below, so the slot and the button are never left claimed.
+            let _session_guard = ConnectSessionGuard {
+                slot: chat_session_for_pass.clone(),
+                id: session_id,
+                ui: ui_handle_pass_retry.clone(),
+            };
+
             let mut config = build_connect_config(&ticket, &privkey, &pubkey);
             config.chat_mode = true;
             config.passphrase = Some(passphrase);
@@ -1208,7 +1387,7 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
             };
-            let processor = crate::p2p::NetworkProcessor::new(config, endpoint, gp_pass.clone());
+            let processor = crate::p2p::NetworkProcessor::new(config, endpoint, session_provider);
             let ui_handle_for_callback = ui_handle_pass_retry.clone();
             let on_handshake = move || {
                 let ui_handle = ui_handle_for_callback.clone();
@@ -1243,11 +1422,32 @@ pub async fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let chat_session_for_send = chat_session.clone();
+    let ui_handle_send = ui_handle.clone();
     ui.on_send_message(move |text| {
+        // Take the sender of the session that is live in *this* event-loop
+        // turn. There is no other sender to take: the channel belongs to that
+        // one session, so the line cannot be read by a different peer's.
+        let Some(stdin_tx) = current_chat_sender(&chat_session_for_send) else {
+            // Nothing is live. The line is dropped, deliberately: holding it
+            // for the next session is how it would reach a peer the user never
+            // typed it for. Say so rather than swallowing it silently.
+            if let Some(ui) = ui_handle_send.upgrade() {
+                ui.set_connection_error("Not sent: no chat session is active.".into());
+            }
+            return;
+        };
         let text = text.to_string() + "\n";
-        let stdin_tx = stdin_tx.clone();
+        let ui_handle = ui_handle_send.clone();
         tokio::spawn(async move {
-            let _ = stdin_tx.send(text.into_bytes()).await;
+            // The session can still end between the two, and then this send
+            // fails against a dropped receiver — which is the outcome we want:
+            // the line goes nowhere, and the user is told it did not go.
+            if stdin_tx.send(text.into_bytes()).await.is_err() {
+                ui_handle.upgrade_in_event_loop(|ui| {
+                    ui.set_connection_error("Not sent: the chat session ended.".into());
+                }).ok();
+            }
         });
     });
 
@@ -1432,6 +1632,279 @@ mod listen_slot_tests {
 
         assert!(cancel_listener(&slot), "a poisoned slot must still yield its handle");
         assert!(became_true(&aborted).await, "the listener must be aborted");
+    }
+}
+
+/// Discipline of the chat session slot: a line the user typed reaches the
+/// session it was typed into, or no session at all.
+///
+/// These drive `open_connect_session` / `end_connect_session` /
+/// `current_chat_sender` — the three functions the connect press, the connect
+/// task's cleanup and the send handler are made of — because the handlers
+/// themselves need a Slint event loop. Reading from the provider each session
+/// is given is the point: it is exactly what `chat_loop` does with the bytes
+/// before encrypting them for that session's peer.
+#[cfg(all(test, feature = "gui"))]
+mod chat_session_tests {
+    use super::{ChatSessionSlot, current_chat_sender, end_connect_session, open_connect_session};
+    use crate::network::IOProvider;
+    use tokio::io::AsyncReadExt;
+
+    /// Long enough that a delivery would have landed; the clock is paused in
+    /// the tests that wait on it, so it costs no wall time.
+    const PROBE: std::time::Duration = std::time::Duration::from_secs(1);
+
+    fn empty_slot() -> ChatSessionSlot {
+        std::sync::Mutex::new(None)
+    }
+
+    /// The transcript channel every session shares — the display side, which
+    /// this change deliberately leaves shared.
+    fn transcript() -> (
+        tokio::sync::mpsc::Sender<Vec<u8>>,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        tokio::sync::mpsc::channel::<Vec<u8>>(8)
+    }
+
+    /// Two connects must not run at once: the second press is refused rather
+    /// than given a second claim on the one typed-plaintext channel.
+    #[tokio::test]
+    async fn a_second_connect_is_refused_while_one_is_in_flight() {
+        let (stdout_tx, _stdout_rx) = transcript();
+        let slot = empty_slot();
+
+        let (first_id, _first) = open_connect_session(&slot, &stdout_tx)
+            .expect("the first connect must claim the free slot");
+        assert!(
+            open_connect_session(&slot, &stdout_tx).is_none(),
+            "a second connect must be refused while the first is in flight"
+        );
+
+        assert!(end_connect_session(&slot, first_id), "the session must close");
+        let (second_id, _second) = open_connect_session(&slot, &stdout_tx)
+            .expect("the slot must be free once the session that held it ended");
+        assert_ne!(
+            first_id, second_id,
+            "each session must be distinguishable from the one before it"
+        );
+    }
+
+    /// The finding, directly: a line typed into the live session must be
+    /// readable only by that session. Before the fix both sessions read one
+    /// process-wide channel, so whichever polled first encrypted the line —
+    /// possibly for a peer the user never typed it for.
+    #[tokio::test(start_paused = true)]
+    async fn a_typed_line_reaches_only_the_session_it_was_typed_into() {
+        let (stdout_tx, _stdout_rx) = transcript();
+        let slot = empty_slot();
+
+        // A session with the first peer, which then ends.
+        let (first_id, first) = open_connect_session(&slot, &stdout_tx).expect("first session");
+        let mut first_stdin = first.stdin();
+        assert!(end_connect_session(&slot, first_id));
+
+        // The user connects to a second peer and types a line.
+        let (_second_id, second) = open_connect_session(&slot, &stdout_tx).expect("second session");
+        let mut second_stdin = second.stdin();
+        let sender = current_chat_sender(&slot).expect("the live session must have a sender");
+        sender
+            .send(b"meet me at the safe house\n".to_vec())
+            .await
+            .expect("the live session's channel must accept the line");
+
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(PROBE, second_stdin.read(&mut buf))
+            .await
+            .expect("the live session must receive what was typed into it")
+            .expect("its reader must not error");
+        assert_eq!(&buf[..n], b"meet me at the safe house\n");
+
+        // The first peer's session must see end-of-input, never the line.
+        let n = tokio::time::timeout(PROBE, first_stdin.read(&mut buf))
+            .await
+            .expect("an ended session's reader must be at EOF, not waiting for input")
+            .expect("its reader must not error");
+        assert_eq!(
+            n, 0,
+            "a line typed for the live session must never be readable by another peer's"
+        );
+    }
+
+    /// A sender captured while a session was live must not be able to deliver
+    /// once that session has ended — the "the session ended between `send` and
+    /// the loop's next read" case. It fails; it does not spill into whatever
+    /// session came next.
+    #[tokio::test(start_paused = true)]
+    async fn a_sender_from_an_ended_session_cannot_deliver_into_the_next_one() {
+        let (stdout_tx, _stdout_rx) = transcript();
+        let slot = empty_slot();
+
+        let (first_id, first) = open_connect_session(&slot, &stdout_tx).expect("first session");
+        let stale_sender = current_chat_sender(&slot).expect("a live session has a sender");
+        assert!(end_connect_session(&slot, first_id));
+        // The task that ran the session is gone, and its reader with it.
+        drop(first);
+
+        let (_second_id, second) = open_connect_session(&slot, &stdout_tx).expect("second session");
+        let mut second_stdin = second.stdin();
+        assert!(
+            stale_sender.send(b"for the first peer only\n".to_vec()).await.is_err(),
+            "a send on an ended session must fail rather than be re-routed"
+        );
+
+        let mut buf = [0u8; 64];
+        assert!(
+            tokio::time::timeout(PROBE, second_stdin.read(&mut buf)).await.is_err(),
+            "the new session must receive nothing that was typed for the old one"
+        );
+    }
+
+    /// With no session live there is nothing to send into. The line is dropped
+    /// — the alternative, holding it until the next connect, is the bug.
+    #[tokio::test(start_paused = true)]
+    async fn a_line_typed_with_no_live_session_has_nowhere_to_go() {
+        let (stdout_tx, _stdout_rx) = transcript();
+        let slot = empty_slot();
+
+        assert!(
+            current_chat_sender(&slot).is_none(),
+            "before any connect there is no session to type into"
+        );
+
+        let (id, session) = open_connect_session(&slot, &stdout_tx).expect("session");
+        let mut stdin = session.stdin();
+        assert!(end_connect_session(&slot, id));
+        assert!(
+            current_chat_sender(&slot).is_none(),
+            "the sender must go with the session, so a later line cannot be queued for the \
+             peer that connects next"
+        );
+
+        let mut buf = [0u8; 8];
+        let n = tokio::time::timeout(PROBE, stdin.read(&mut buf))
+            .await
+            .expect("the ended session's reader must be at EOF")
+            .expect("its reader must not error");
+        assert_eq!(n, 0, "dropping the sender is what ends the session's input");
+    }
+
+    /// Cleanup names the session it is cleaning up. A task that finishes late
+    /// must not close the session that replaced it — that would leave a live
+    /// chat with no sender, and the user's next line silently dropped.
+    #[tokio::test(start_paused = true)]
+    async fn a_late_cleanup_cannot_close_the_session_that_replaced_it() {
+        let (stdout_tx, _stdout_rx) = transcript();
+        let slot = empty_slot();
+
+        let (stale_id, _stale) = open_connect_session(&slot, &stdout_tx).expect("first session");
+        assert!(end_connect_session(&slot, stale_id));
+
+        let (live_id, live) = open_connect_session(&slot, &stdout_tx).expect("second session");
+        let mut live_stdin = live.stdin();
+        assert!(
+            !end_connect_session(&slot, stale_id),
+            "closing an already-closed session must not touch the slot"
+        );
+
+        let sender = current_chat_sender(&slot).expect("the live session must still be there");
+        sender.send(b"still mine\n".to_vec()).await.expect("still deliverable");
+        let mut buf = [0u8; 32];
+        let n = tokio::time::timeout(PROBE, live_stdin.read(&mut buf))
+            .await
+            .expect("the live session must still receive")
+            .expect("its reader must not error");
+        assert_eq!(&buf[..n], b"still mine\n");
+
+        assert!(end_connect_session(&slot, live_id), "its own id still closes it");
+    }
+
+    /// A panic elsewhere must not wedge the connect button: the slot is
+    /// recovered from poisoning rather than propagating it.
+    #[tokio::test]
+    async fn a_poisoned_slot_can_still_be_claimed_and_closed() {
+        let (stdout_tx, _stdout_rx) = transcript();
+        let slot = std::sync::Arc::new(empty_slot());
+
+        let poisoner = slot.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the chat session slot");
+        })
+        .join();
+        assert!(slot.is_poisoned());
+
+        let (id, _session) = open_connect_session(&slot, &stdout_tx)
+            .expect("a poisoned slot must still admit a session");
+        assert!(current_chat_sender(&slot).is_some());
+        assert!(end_connect_session(&slot, id));
+    }
+
+    /// The UI side of the same rule, and its limit: `connecting` must kill the
+    /// action button — set on the press, not on the handshake — and nothing
+    /// else. The panel around that button holds the mode selector and the
+    /// ticket and key fields, and taking those away would cost the user a
+    /// capability this finding never asked to remove.
+    #[test]
+    fn connecting_disables_the_action_button_and_nothing_around_it() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = super::ChatWindow::new().expect("build the window against the test backend");
+
+        assert!(ui.get_connection_settings_visible(), "idle: the panel is on screen");
+        assert!(ui.get_start_action_enabled(), "idle: the action button is live");
+        assert!(!ui.get_connecting_display_visible());
+
+        ui.set_connecting(true);
+        assert!(
+            !ui.get_start_action_enabled(),
+            "a connect in flight must kill the action button, rather than leaving it \
+             pressable until the handshake sets `connected`"
+        );
+        assert!(
+            ui.get_connection_settings_visible(),
+            "but the panel must stay: the mode selector and the ticket/key fields around \
+             the button are still the user's to see and change during a connect"
+        );
+        assert!(
+            ui.get_connecting_display_visible(),
+            "and the window must say a connect is in progress"
+        );
+        assert!(!ui.get_listening(), "the connect flow must not set the listen flag");
+
+        ui.set_connecting(false);
+        assert!(ui.get_start_action_enabled(), "the button comes back when the connect ends");
+
+        // The listen flow keeps its own, wider gate from ae7d35b4 — the whole
+        // panel goes while a listener is up — and the two flags stay separate.
+        ui.set_listening(true);
+        assert!(
+            !ui.get_connection_settings_visible(),
+            "a listener in flight still takes the panel down, as it did before"
+        );
+        assert!(!ui.get_connecting(), "the listen flow must not set the connect flag");
+    }
+
+    /// The mode selector stays reachable in every mode while a connect runs,
+    /// which is what makes "switch to File Receive during a connect" still
+    /// possible — up to the shared action button, which is disabled.
+    #[test]
+    fn the_mode_specific_rows_survive_a_connect_in_flight() {
+        i_slint_backend_testing::init_no_event_loop();
+        let ui = super::ChatWindow::new().expect("build the window against the test backend");
+        ui.set_connecting(true);
+
+        ui.set_transfer_mode(super::TransferMode::FileSend);
+        assert!(
+            ui.get_file_picker_visible(),
+            "the file chooser must not vanish because a connect is in flight"
+        );
+
+        ui.set_transfer_mode(super::TransferMode::FileReceive);
+        assert!(
+            ui.get_save_dir_visible(),
+            "nor the save-directory row: a receive listener is a separate flow that never \
+             touches the chat plaintext channel"
+        );
     }
 }
 

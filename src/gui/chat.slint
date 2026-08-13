@@ -22,6 +22,11 @@ export component ChatWindow inherits Window {
 
     in property <[StandardListViewItem]> messages: [];
     in-out property <bool> connected: false;
+    // True from the moment Connect / Send File is pressed until that connect
+    // task ends, where `connected` only becomes true when the handshake
+    // completes. The gap between the two is seconds long, and it is the window
+    // in which a second connect used to be startable beside the first.
+    in-out property <bool> connecting: false;
     in-out property <bool> asking-passphrase: false;
     in-out property <bool> scanning-qr: false;
     in-out property <string> connection-error: "";
@@ -63,6 +68,15 @@ export component ChatWindow inherits Window {
     out property <bool> save-dir-visible: !connected && !listening && !asking-passphrase && !scanning-qr && transfer-mode == TransferMode.FileReceive;
     out property <bool> connection-settings-visible: !connected && !listening && !asking-passphrase && !scanning-qr;
     out property <bool> listen-display-visible: listening && !connected;
+    out property <bool> connecting-display-visible: connecting && !connected;
+    // Only the one action button is taken away by a connect in flight, not the
+    // panel around it: the mode selector, the ticket field and the key fields
+    // stay visible and editable, as they were before `connecting` existed.
+    // Gating the panel instead would have removed a working capability —
+    // switching to File Receive during a connect — that was never part of this
+    // problem, since a receive listener uses its own FileIOProvider and never
+    // touches the chat plaintext channel.
+    out property <bool> start-action-enabled: !connecting;
     out property <bool> file-transfer-visible: connected && transfer-mode != TransferMode.Chat;
 
     VerticalBox {
@@ -189,6 +203,11 @@ export component ChatWindow inherits Window {
 
                 Button {
                     text: transfer-mode == TransferMode.Chat ? "Connect" : (transfer-mode == TransferMode.FileSend ? "Send File" : "Generate Ticket and Wait");
+                    // Dead while a connect is in flight. This one Button
+                    // dispatches all three modes, so it is also what stops a
+                    // second connect being started before the handshake sets
+                    // `connected`.
+                    enabled: start-action-enabled;
                     clicked => {
                         root.connection-error = "";
                         root.peer-fingerprint = "";
@@ -230,6 +249,15 @@ export component ChatWindow inherits Window {
                     clicked => { root.listen-cancel(); }
                 }
             }
+        }
+
+        // A connect in flight. The action button goes dead on the press rather
+        // than on the handshake, so this is what tells the user the press was
+        // taken and why the button is grey.
+        if connecting-display-visible : Text {
+            text: "🔗 Connecting to peer...";
+            color: green;
+            font-size: 11px;
         }
 
         // F2 + F3: File Transfer in Progress (post-handshake, non-chat modes)
