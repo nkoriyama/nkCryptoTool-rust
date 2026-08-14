@@ -9,18 +9,23 @@
 //! who holds the bytes and can read anything in them that is not
 //! encrypted. Whether store-and-forward costs the end-to-end guarantees
 //! is therefore decided by what the depositor hands over, not here — and
-//! for the MLS layer in [`crate::group`] today, **it does cost them**.
-//! Application messages (`PrivateMessage`), `Welcome`s (GroupSecrets
-//! HPKE-encrypted to the joiner) and KeyPackages (publishable by
-//! construction) are all opaque to this server. Commits and Proposals are
-//! not: mls-rs's default MlsRules emit them as `PublicMessage`, signed but
-//! unencrypted, and
-//! [`crate::group::transport::send_one_with_inbox`] deposits them like
-//! anything else — so an operator that keeps what it stores can
-//! reconstruct the group's membership graph and every member's transport
-//! identity. Unmitigated today; the fix is the `encrypt_control_messages`
-//! wire-format flag day. See `KNOWN_ISSUES.md` "Security Audit Residuals"
-//! item 11.
+//! no envelope the MLS layer in [`crate::group`] deposits gives this server
+//! group content. Application messages are `PrivateMessage`, a `Welcome`'s
+//! GroupSecrets are HPKE-encrypted to the joiner, and — since
+//! `GroupChatProcessor::new` sets `encrypt_control_messages`
+//! (`crate::group::processor::mls_rules`) — Commits and Proposals are
+//! `PrivateMessage` sealed under the epoch key schedule. A KeyPackage is
+//! not encrypted and does not need to be: it is publishable material by
+//! construction, which is why it is handed to strangers on purpose.
+//!
+//! Two things that leaves standing. The server learns the recipient node
+//! id, the payload size and the timing of every deposit, and for a
+//! `PrivateMessage` the group id, epoch and content type are unencrypted
+//! header fields (RFC 9420 §6.3) — a social graph and an activity
+//! timeline, not a roster. And the wire format is chosen by the depositor:
+//! a peer running a build without `encrypt_control_messages` deposits its
+//! Commits in the clear, and nothing here can tell or refuse. See
+//! `KNOWN_ISSUES.md` "Security Audit Residuals" item 11.
 //!
 //! ## Wire protocol
 //!

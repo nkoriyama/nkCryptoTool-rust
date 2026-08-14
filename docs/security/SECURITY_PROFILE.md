@@ -355,7 +355,7 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
 | バックアップ運用 | `groups.db` 単体では復号不可 — `at-rest.key` + `groups.db.kek` + passphrase の 3 要素全部が必要 | 3 ファイルを同一ディレクトリで一括バックアップ。passphrase はユーザーが別管理 |
 | DEK ローテーション | `nkct mls --mls-cmd rekey` (`group::at_rest::rotate_dek`) | 新規 DEK を生成し `PRAGMA rekey` で全ページ再暗号化 → 新 KEK を再 encapsulate。クラッシュ安全: 新 KEK を `groups.db.kek.pending` に先行ステージ → DB rekey → atomic promote の順。中断時は次回 open の `finalize_pending_rekey` がどの DEK で DB が開くか実測して解決するため、DB/KEK 2 ファイルのどの中断点でも復旧可能。DEK 漏洩疑い時の緩和策 (既に流出した旧 ciphertext のコピーは保護しない)。at-rest hybrid SK / passphrase は別途 `at-rest.key` 再生成で更新 |
 | 既存平文 DB の取扱い | 起動時に自動マイグレーション (`group::at_rest::migrate_plaintext_to_sqlcipher`) | 先頭 16 byte の `SQLite format 3\0` magic で平文 DB を検出し、`sqlcipher_export()` で DEK 暗号化コピーへ変換 → 鍵で開けることを検証してから原本を atomic rename で置換。平文の原本・WAL/journal サイドカーは置換後に unlink するため平文残存なし。検証成功前は原本を破壊しない |
-| inbox DB (store-and-forward リレー) | `inbox.db` も同じ at-rest レイヤで SQLCipher 暗号化 (`network::inbox::InboxServer::open` → `group::resolve_dek`) | `payload` 自体は MLS 暗号文だが、`recipient` / `sender` / `created_at` の**メタデータ**がリレーのディスク上で平文になるのを防ぐ。at-rest 鍵は共有 `at-rest.key` ではなく DB 固有の `inbox.db.at-rest.key` に置き (`AtRestPaths::beside_db`)、同一ディレクトリの MLS クライアントと初期化レースしない。`0o600` も適用 |
+| inbox DB (store-and-forward リレー) | `inbox.db` も同じ at-rest レイヤで SQLCipher 暗号化 (`network::inbox::InboxServer::open` → `group::resolve_dek`) | `payload` 自体は MLS 暗号文 — アプリケーションメッセージと `Welcome` に加え、Commit / Proposal も `encrypt_control_messages` (`group::processor::mls_rules`) により `PrivateMessage` として封緘される (KeyPackage のみ設計上の公開材で、暗号化は不要)。この列が守るのは `recipient` / `sender` / `created_at` の**メタデータ**がリレーのディスク上で平文になるのを防ぐこと。ただしリレー運用者は稼働中のプロセス内でこれらのメタデータ（宛先 node id・サイズ・時刻、および `PrivateMessage` ヘッダの group_id / epoch）を当然見られる。また封緘するのは**送信側**なので、`encrypt_control_messages` を持たないビルドのピアが預ける Commit は平文のまま (KNOWN_ISSUES.md 項目 11)。at-rest 鍵は共有 `at-rest.key` ではなく DB 固有の `inbox.db.at-rest.key` に置き (`AtRestPaths::beside_db`)、同一ディレクトリの MLS クライアントと初期化レースしない。`0o600` も適用 |
 
 ### 7.4 トランスポート抽象 (ALPN `nkct/mls/1`)
 
@@ -448,7 +448,12 @@ MLS プロトコル層と同じ X-Wing (X25519+ML-KEM-768) 暗号スイートを
     `handle_checkpoint`)。**オフデバイスの独立アンカー**なので、storage dir + state
     ファイルを丸ごと過去版に戻されても (software カウンタ単独では検知不能なケース)
     オンライン時に検知できる。ただし inbox サーバは**半信頼**(payload 非読取の
-    Delivery Service) — サーバが嘘をつけば false negative/positive があり得るため、
+    Delivery Service。このビルドを走らせている預託者のフレームは Commit /
+    Proposal を含め暗号文だが、封緘するのは送信側なので `encrypt_control_messages`
+    を持たないビルドのピアが預ける Commit は平文のままであり、いずれにせよ
+    サーバは宛先・サイズ・時刻というメタデータを見る。§7.3 の inbox DB 行と
+    KNOWN_ISSUES.md 項目 11 を参照) — サーバが嘘をつけば
+    false negative/positive があり得るため、
     `RollbackSuspected` は**警告**に留め、ローカル TPM/software カウンタを権威的な
     チェックとして維持する (ハードフェイルしない)。`--inbox-url` 設定かつ
     `NK_ROLLBACK_POLICY != off` のときに送信。

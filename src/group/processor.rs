@@ -34,11 +34,12 @@
 use std::sync::Arc;
 
 use mls_rs::client_builder::{
-    BaseConfig, WithCryptoProvider, WithGroupStateStorage, WithIdentityProvider,
-    WithKeyPackageRepo, WithPskStore,
+    BaseConfig, PaddingMode, WithCryptoProvider, WithGroupStateStorage, WithIdentityProvider,
+    WithKeyPackageRepo, WithMlsRules, WithPskStore,
 };
 use mls_rs::identity::SigningIdentity;
 use mls_rs::identity::basic::BasicCredential;
+use mls_rs::mls_rules::{DefaultMlsRules, EncryptionOptions};
 use mls_rs::{Client, ExtensionList, MlsMessage, WireFormat};
 use mls_rs_core::crypto::{CipherSuiteProvider, CryptoProvider};
 use zeroize::Zeroizing;
@@ -57,21 +58,71 @@ use crate::p2p::{P2pEndpoint, PeerAddr, PeerId};
 /// crypto/identity providers on top of the base config.
 ///
 /// Order matches the call chain in [`GroupChatProcessor::new`]:
-/// `.group_state_storage(..).key_package_repo(..).psk_store(..).crypto_provider(..).identity_provider(..)`,
-/// which composes outermost-first as `WithIdentityProvider<.., WithCryptoProvider<.., WithPskStore<.., WithKeyPackageRepo<.., WithGroupStateStorage<.., BaseConfig>>>>>`.
-type MlsConfig = WithIdentityProvider<
-    GroupIdentityProvider,
-    WithCryptoProvider<
-        HybridCryptoProvider,
-        WithPskStore<
-            RedbPreSharedKeyStorage,
-            WithKeyPackageRepo<
-                RedbKeyPackageStorage,
-                WithGroupStateStorage<RedbGroupStateStorage, BaseConfig>,
+/// `.group_state_storage(..).key_package_repo(..).psk_store(..).crypto_provider(..).identity_provider(..).mls_rules(..)`,
+/// which composes outermost-first as `WithMlsRules<.., WithIdentityProvider<.., WithCryptoProvider<.., WithPskStore<.., WithKeyPackageRepo<.., WithGroupStateStorage<.., BaseConfig>>>>>>`.
+type MlsConfig = WithMlsRules<
+    DefaultMlsRules,
+    WithIdentityProvider<
+        GroupIdentityProvider,
+        WithCryptoProvider<
+            HybridCryptoProvider,
+            WithPskStore<
+                RedbPreSharedKeyStorage,
+                WithKeyPackageRepo<
+                    RedbKeyPackageStorage,
+                    WithGroupStateStorage<RedbGroupStateStorage, BaseConfig>,
+                >,
             >,
         >,
     >,
 >;
+
+/// MlsRules installed on every `Client` this module builds.
+///
+/// The only deviation from `DefaultMlsRules::new()` is
+/// `encrypt_control_messages = true`, which makes a member-sent Commit or
+/// standalone Proposal a `WireFormat::PrivateMessage` (AEAD-sealed under the
+/// epoch key schedule) instead of the signed-but-readable
+/// `WireFormat::PublicMessage` mls-rs emits by default. That matters because
+/// those frames are deposited at the store-and-forward relay whenever a direct
+/// send fails (`send_one_with_inbox`), and an Add's inline KeyPackage carries
+/// the joiner's NKCB credential — iroh NodeId, ML-DSA-65 transport public key,
+/// display name — which is what `projected_member_fingerprints` turns into
+/// shell and port-forward policy.
+///
+/// The scope is exactly `Sender::Member`: `control_wire_format` returns
+/// `PrivateMessage` for `Sender::Member(_)` and `PublicMessage` for every
+/// other sender, so this covers a Commit or Proposal built by a member of the
+/// group. That is all this module ever builds — every commit path here goes
+/// through `Group::commit_builder()` on a loaded group, and there is no
+/// external-commit or `ExternalClient` path in this crate. A future one would
+/// not be covered by this setting.
+///
+/// Everything else is left at its default on purpose:
+/// - `commit_options` is `CommitOptions::default()`, byte-for-byte what
+///   `ClientBuilder::new()` already installs, so commit construction is
+///   unchanged (notably `path_required = false`).
+/// - `PaddingMode::StepFunction` is `PaddingMode`'s own `#[default]`, so it is
+///   the mode already in force for every application message this project
+///   sends. It is spelled out here only because of how the struct is built:
+///   `EncryptionOptions` is `#[non_exhaustive]`, which bars a struct literal
+///   (and `..Default::default()`) from outside mls-rs, so setting the flag in
+///   one expression goes through `new(encrypt_control_messages, padding_mode)`
+///   — which takes the mode positionally. `Default::default()` is public too,
+///   but what it yields is the flag `false`, which is the thing being changed.
+///   Naming the mode already in force keeps this a single-variable change.
+///
+/// This is **not** a flag day. `EncryptionOptions` is read from three
+/// send-side call sites in mls-rs 0.55.2 and from nothing on the receive path
+/// — `message_processor.rs` contains no `WireFormat` comparison at all — so a
+/// peer built before this change still applies our Commits, and we still apply
+/// theirs. See [`GroupChatProcessor::broadcast_commit`].
+fn mls_rules() -> DefaultMlsRules {
+    DefaultMlsRules::new().with_encryption_options(EncryptionOptions::new(
+        true,
+        PaddingMode::StepFunction,
+    ))
+}
 
 #[derive(Clone, Debug)]
 pub struct GroupIdentityProvider {
@@ -500,6 +551,7 @@ impl GroupChatProcessor {
             .psk_store(psk_storage)
             .crypto_provider(crypto.clone())
             .identity_provider(GroupIdentityProvider { crypto })
+            .mls_rules(mls_rules())
             .signing_identity(identity, signing_key, suite_id)
             .build();
 
@@ -521,16 +573,28 @@ impl GroupChatProcessor {
     /// promise about its behaviour: the operator holds the bytes and can
     /// read whatever is not encrypted. Application messages
     /// (`PrivateMessage`) and a `Welcome`'s GroupSecrets are encrypted,
-    /// so it learns only their size and timing. Commits and Proposals are
-    /// **not** — our client uses mls-rs's default MlsRules, which emit
-    /// them as signed-but-cleartext `PublicMessage` — and they are
-    /// deposited like anything else. **Setting an inbox therefore gives
-    /// its operator the group's membership graph and every member's
-    /// transport identity**, for every roster change that takes the
-    /// fallback. This is unmitigated today; `encrypt_control_messages`
-    /// (the scheduled wire-format flag day) is what closes it. See
-    /// `KNOWN_ISSUES.md` "Security Audit Residuals" item 11 — including
-    /// why refusing to relay those frames is *not* the answer.
+    /// so it learns only their size and timing. Commits and Proposals that
+    /// *we* emit are encrypted too — [`mls_rules`] sets
+    /// `encrypt_control_messages`, so they are `PrivateMessage` under the
+    /// epoch key schedule, which no relay holds. What the operator still
+    /// sees for every frame is the recipient's node id, the size and the
+    /// timing, which is enough to chart who talks to whom and when a group
+    /// is busy.
+    ///
+    /// One caveat that deployment cannot remove: the wire format is chosen
+    /// by whoever *builds* the Commit, and this setting is only ours. Every
+    /// frame deposited from here is one this node built itself
+    /// (`send_welcome_to`, `broadcast_commit`, `send_application_message`);
+    /// nothing here forwards a frame received from a peer, and the inbox
+    /// server stores rather than relays. What we cannot reach is the other
+    /// direction: a peer still running a build without
+    /// `encrypt_control_messages` deposits its own Commits in the clear, at
+    /// whatever inbox *it* was pointed at, so a group's control traffic is
+    /// only as private as its least-upgraded committer. See
+    /// `KNOWN_ISSUES.md` "Security Audit Residuals" item 11 — including why
+    /// refusing to deposit a control frame is *not* the answer.
+    ///
+    /// [`mls_rules`]: fn@mls_rules
     pub fn set_inbox(&mut self, inbox: Option<PeerAddr>) {
         self.inbox = inbox;
     }
@@ -1068,24 +1132,34 @@ impl GroupChatProcessor {
             GroupError::InvalidWelcome(format!("Commit decode for broadcast: {e}"))
         })?;
         // We accept either PublicMessage or PrivateMessage Commits and do not
-        // restrict here — recipients revalidate.
+        // restrict here — recipients revalidate. That is not cosmetic: a peer
+        // on a build without `encrypt_control_messages` sends PublicMessage
+        // Commits, and refusing them here would break the group rather than
+        // protect it. Keep this accepting.
         //
-        // Which one we *emit* is not a choice we have made: mls-rs defaults to
-        // **PublicMessage**, and PrivateMessage is the opt-in. `Client::builder()`
-        // in `new` does not call `.mls_rules(..)`, so `EncryptionOptions::default()`
-        // applies with `encrypt_control_messages = false`, and mls-rs's
-        // `control_wire_format` returns `PrivateMessage` only when that flag is
-        // true (mls-rs 0.55.2, `group/mls_rules.rs`). Every Commit this function
-        // broadcasts is therefore signed but sent in the clear: the group id,
-        // epoch, committer leaf index and the membership change itself — an Add
-        // carries the joining member's whole KeyPackage — are readable by anyone
-        // who holds the frame. Directly that is a current group member over an
-        // authenticated QUIC channel, but a recipient we cannot reach in time
-        // falls back to the store-and-forward relay (`send_one_with_inbox`), and
-        // the relay operator is not a member and reads all of it. Making the
-        // frames private needs `encrypt_control_messages = true`, a wire-format
-        // change every peer must adopt at once; until then the exposure stands —
-        // see `KNOWN_ISSUES.md` "Security Audit Residuals" item 11.
+        // Which one we *emit* is a choice, and `mls_rules()` makes it:
+        // `encrypt_control_messages = true`, so mls-rs's `control_wire_format`
+        // returns `PrivateMessage` for a member-sent Commit (mls-rs 0.55.2,
+        // `group/mls_rules.rs`). Both callers outside tests hand us bytes this
+        // node just built (`add_member`, `remove_member` via `cli::add_member`
+        // and `cli::remove_member`), so every Commit this function broadcasts
+        // is AEAD-sealed under the epoch key schedule: the committer's
+        // leaf index and the membership change itself — an Add carries the
+        // joining member's whole KeyPackage — are readable only by a member
+        // holding that epoch's secrets. The group id and epoch stay in the
+        // PrivateMessage header in the clear, by RFC 9420's framing, and so do
+        // the frame's size and timing.
+        //
+        // That is what makes the store-and-forward fallback safe. A recipient
+        // we cannot reach inside the direct window gets the frame via
+        // `send_one_with_inbox`, and the relay operator is not a member: it now
+        // holds a ciphertext plus that header, instead of the roster change in
+        // full. There is no flag day here — the wire format is read on the send
+        // path only, so an un-upgraded peer applies these Commits normally (and
+        // we apply its PublicMessage ones). What does *not* follow is that the
+        // group's control traffic is confidential: that holds only once every
+        // peer that commits in it has upgraded, since each sender frames its
+        // own Commits. See `KNOWN_ISSUES.md` "Security Audit Residuals" item 11.
         //
         // Parallel fan-out: a Welcome+Commit for member N reaches N-1
         // existing members. Sequential `connect()`s dominated setup
@@ -1246,11 +1320,25 @@ impl GroupChatProcessor {
             // *whole* retained history: `claimed_epoch` is 8 bytes the requester
             // chose, and a member admitted at epoch N that claims the oldest
             // retained epoch would be streamed up to DEFAULT_COMMIT_RETENTION
-            // epochs of Commits predating its own admission — in the clear, so
-            // it would learn the identities and transport fingerprints of
-            // members evicted before it arrived, which is exactly the
-            // membership history MLS's joiner model withholds. Clamp the floor
-            // to the requester's own admission where we witnessed it.
+            // epochs of Commits predating its own admission, learning the
+            // identities and transport fingerprints of members evicted before
+            // it arrived — exactly the membership history MLS's joiner model
+            // withholds. Clamp the floor to the requester's own admission where
+            // we witnessed it.
+            //
+            // Encrypting control frames (`mls_rules`) does not replace this
+            // clamp. This is an authorization decision, and two things keep it
+            // biting. Retained history is not uniform: `store_commit` keeps the
+            // frame as it arrived, so a group older than that change holds
+            // `PublicMessage` Commits, as does any epoch committed by a peer
+            // still on a build without `encrypt_control_messages` — those are
+            // readable by whoever we hand them to. And a member removed and
+            // later re-admitted is recorded at its *latest* admission while
+            // still holding the epoch secrets from its first stay, so for the
+            // span in between the key schedule is no barrier at all. Refusing
+            // to serve a frame is a property of this responder; failing to open
+            // one is a property of the requester's key material, and only the
+            // first is ours to decide.
             //
             // `None` (unknown) deliberately does NOT clamp. It means this node
             // never applied the Add commit for that member: an existing
@@ -3687,15 +3775,132 @@ mod tests {
         assert_eq!(bob_group.group_id(), alice_group.group_id());
     }
 
+    /// Every Commit this processor emits is a `WireFormat::PrivateMessage`.
+    ///
+    /// This is the assertion the `mls_rules()` builder call exists to make
+    /// true, and it is the one that must not silently regress: mls-rs's
+    /// `EncryptionOptions::default()` has `encrypt_control_messages = false`,
+    /// so dropping `.mls_rules(mls_rules())` from `GroupChatProcessor::new`
+    /// puts every frame below back to `PublicMessage` — signed but readable —
+    /// and this test fails on the first `assert_eq!`. Nothing else in the
+    /// suite catches that, because a `PublicMessage` Commit is processed
+    /// perfectly well by every receiver here; the leak is to whoever *holds*
+    /// the frame, which for the inbox-fallback path is the relay operator.
+    ///
+    /// The Add case is the one that matters most: an Add carries the joiner's
+    /// whole KeyPackage inline, so its plaintext is the NKCB credential — iroh
+    /// NodeId, ML-DSA-65 transport public key, display name.
+    ///
+    /// The test also pins the two frames this change must **not** touch: a
+    /// Welcome stays a `WireFormat::Welcome` (its GroupSecrets were already
+    /// HPKE-sealed to the joiner and `control_wire_format` never applied to
+    /// it), and an application message stays a `PrivateMessage` (it always
+    /// was one — `check_metadata` rejects a cleartext Application outright).
+    #[tokio::test]
+    async fn commits_are_emitted_as_private_message() {
+        let net = MockNetwork::new();
+        let (alice, _da) = build_proc_on_net(&net, "alice", 1);
+        let (bob, _db) = build_proc_on_net(&net, "bob", 2);
+        let (carol, _dc) = build_proc_on_net(&net, "carol", 3);
+
+        let gid = alice.create_group().await.expect("create_group");
+
+        // 1 -> 2: the Add whose plaintext would be Bob's KeyPackage.
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let add_bob_msg = MlsMessage::from_bytes(&add_bob.commit).expect("decode Add(bob)");
+        assert_eq!(
+            add_bob_msg.wire_format(),
+            WireFormat::PrivateMessage,
+            "an Add Commit must be encrypted; PublicMessage here means \
+             `.mls_rules(mls_rules())` was lost from `GroupChatProcessor::new` \
+             and the joiner's KeyPackage is readable by anyone holding the frame"
+        );
+
+        // The Welcome is a different envelope and is deliberately unchanged.
+        let welcome_msg = MlsMessage::from_bytes(&add_bob.welcome).expect("decode Welcome");
+        assert_eq!(
+            welcome_msg.wire_format(),
+            WireFormat::Welcome,
+            "the Welcome envelope must not change"
+        );
+        bob.join_group_from_welcome(&add_bob.welcome)
+            .await
+            .expect("bob joins");
+
+        // 2 -> 3: a second Add, so the assertion is not an artifact of the
+        // 1 -> 2 transition (which has no existing-member recipients).
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+        let add_carol = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+        let add_carol_msg = MlsMessage::from_bytes(&add_carol.commit).expect("decode Add(carol)");
+        assert_eq!(
+            add_carol_msg.wire_format(),
+            WireFormat::PrivateMessage,
+            "an Add Commit into a populated group must be encrypted"
+        );
+        carol
+            .join_group_from_welcome(&add_carol.welcome)
+            .await
+            .expect("carol joins");
+
+        // A Remove: its plaintext is the evicted leaf index, and it is the
+        // frame most likely to reach the relay (the peer being told about an
+        // eviction is exactly the peer that may be offline).
+        let remove = alice.remove_member(&gid, 1).await.expect("remove bob");
+        let remove_msg = MlsMessage::from_bytes(&remove).expect("decode Remove");
+        assert_eq!(
+            remove_msg.wire_format(),
+            WireFormat::PrivateMessage,
+            "a Remove Commit must be encrypted"
+        );
+
+        // Application messages were already PrivateMessage and stay so.
+        let app = alice
+            .send_application_message(&gid, b"hello", &[])
+            .await
+            .expect("send application message");
+        assert_eq!(
+            MlsMessage::from_bytes(&app)
+                .expect("decode application message")
+                .wire_format(),
+            WireFormat::PrivateMessage,
+            "application messages were already encrypted and must stay so"
+        );
+
+        // Encryption grows a Commit, and the growth must stay far inside the
+        // transport frame cap — a Commit that no longer fits would be an
+        // availability regression, not a confidentiality win. Printed so the
+        // margin is a measured number in the log rather than a claim.
+        let cap = crate::group::transport::MAX_MLS_FRAME_BYTES;
+        for (what, len) in [
+            ("Add(bob)", add_bob.commit.len()),
+            ("Add(carol)", add_carol.commit.len()),
+            ("Remove(leaf 1)", remove.len()),
+        ] {
+            println!(
+                "encrypted Commit {what}: {len} bytes = {:.3}% of MAX_MLS_FRAME_BYTES ({cap})",
+                100.0 * len as f64 / cap as f64
+            );
+            assert!(
+                len < cap / 16,
+                "{what} is {len} bytes, within 16x of the {cap}-byte frame cap"
+            );
+        }
+    }
+
     /// The SYNC responder clamps `claimed_epoch` to the requester's own
     /// admission, and to nothing more than that.
     ///
     /// `claimed_epoch` is 8 bytes the requester chooses, and the only floor it
     /// had was the oldest *retained* epoch. Carol is admitted at epoch 3, so
     /// the epoch-2 Commit — the Add that carries Erin's KeyPackage, i.e. her
-    /// NKCB credential, iroh NodeId and ML-DSA-65 transport key, in the clear —
-    /// is history from before Carol was in the group and must not be served
-    /// however low she claims. The epoch-4 delta she genuinely missed must
+    /// NKCB credential, iroh NodeId and ML-DSA-65 transport key — is history
+    /// from before Carol was in the group and must not be served however low
+    /// she claims. That the responder now *frames* its own Commits as
+    /// `PrivateMessage` does not decide this: retained history also holds
+    /// frames committed before that change or by a peer without it, and the
+    /// clamp is a decision about what to send rather than about what the
+    /// requester can open. The epoch-4 delta she genuinely missed must
     /// still be, and Bob (admitted at epoch 1) must still get every commit
     /// after his own: a clamp that starves legitimate resync would be a worse
     /// bug than the leak.

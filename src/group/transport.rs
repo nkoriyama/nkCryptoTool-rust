@@ -279,32 +279,41 @@ const DIRECT_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 ///
 /// ## What the relay can read
 ///
-/// **Every** wire format takes this fallback, including cleartext
-/// control frames. Application messages are `PrivateMessage` (AEAD-sealed
-/// under the epoch key schedule), a `Welcome`'s GroupSecrets are
-/// HPKE-encrypted to the joiner's KeyPackage init key, and a `KeyPackage`
-/// is publishable material by construction — none of those is readable by
-/// the relay. Commits and standalone Proposals are a different matter: our
-/// `Client::builder()` chain does not call `.mls_rules(..)`, so mls-rs's
-/// `EncryptionOptions::default()` applies with
-/// `encrypt_control_messages = false` and they go out as `PublicMessage`
-/// — signed, but **not** encrypted. An inbox operator that keeps what it
-/// stores therefore reads the group id, the epoch, the committer's leaf
-/// index and the whole membership change (an Add carries the joining
-/// member's KeyPackage, including its NKCB credential with the iroh
-/// NodeId and ML-DSA-65 transport key).
+/// **Every** wire format takes this fallback, and this function inspects
+/// none of them — `msg` is encoded and handed over whatever it is. What
+/// that costs depends entirely on how the frame was framed by whoever
+/// built it.
 ///
-/// **That exposure is real and unmitigated today.** Refusing to deposit
-/// `PublicMessage` frames was tried here and withdrawn: it is the only
-/// automatic delivery path for a Commit that missed the direct window, so
-/// refusing it silently left a *revocation* undelivered to any peer that
-/// was offline at broadcast time — that peer keeps the removed member on
-/// its roster and keeps encrypting to an epoch she can read. The fix that
-/// closes the exposure without that cost is
-/// `encrypt_control_messages = true`, which makes these frames
-/// `PrivateMessage` and safe to relay; it is a wire-format change every
-/// peer must adopt at once. See `KNOWN_ISSUES.md` "Security Audit
-/// Residuals" item 11.
+/// Application messages are `PrivateMessage` (AEAD-sealed under the epoch
+/// key schedule), a `Welcome`'s GroupSecrets are HPKE-encrypted to the
+/// joiner's KeyPackage init key, and a `KeyPackage` is publishable material
+/// by construction. Commits and standalone Proposals *we* build are
+/// `PrivateMessage` too: `GroupChatProcessor::new` installs MlsRules with
+/// `encrypt_control_messages = true` (`group::processor::mls_rules`), so
+/// mls-rs's `control_wire_format` seals a member-sent control frame under
+/// the epoch key schedule — which the relay, not being a member, does not
+/// hold. An Add's inline KeyPackage, with the joiner's NKCB credential,
+/// iroh NodeId and ML-DSA-65 transport key, is inside that seal.
+///
+/// What the operator still gets from any frame is the recipient node id it
+/// is deposited under, the byte count and the arrival time, plus — for a
+/// `PrivateMessage` — the group id, epoch and content type, which RFC 9420
+/// leaves in the header. That is a social graph and an activity timeline,
+/// not a roster. Two caveats worth keeping in view: this function is a
+/// *sender-side* property, so a peer still running a build without
+/// `encrypt_control_messages` deposits its own Commits here in the clear no
+/// matter what this node does; and a group's control traffic is only as
+/// private as its least-upgraded committer.
+///
+/// Refusing to deposit control frames was tried here and withdrawn, and it
+/// stays withdrawn for a reason that never depended on the wire format: it
+/// is the only automatic delivery path for a Commit that missed the direct
+/// window, so refusing it silently left a *revocation* undelivered to any
+/// peer that was offline at broadcast time — that peer keeps the removed
+/// member on its roster and keeps encrypting to an epoch she can read.
+/// Encryption does not make that argument any weaker; it only makes the
+/// refusal pointless as well, since a `PrivateMessage` is safe to relay.
+/// See `KNOWN_ISSUES.md` "Security Audit Residuals" item 11.
 pub async fn send_one_with_inbox(
     endpoint: &dyn P2pEndpoint,
     addr: &PeerAddr,

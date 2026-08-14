@@ -313,47 +313,113 @@ trade-off is explicit rather than forgotten.
       creating one requires storing at least one prekey blob (~4.5 KB), so they
       cannot be the cheapest way to grow this file.
 
-11. **MLS Commits and Proposals are sent in the clear — including to the
-    store-and-forward relay** (`group/processor.rs`, `group/transport.rs`,
-    2026-08): `Client::builder()`
-    in `GroupChatProcessor::new` does not call `.mls_rules(..)`, so mls-rs
-    applies `EncryptionOptions::default()` with `encrypt_control_messages =
-    false`, and its `control_wire_format` returns `PrivateMessage` only when
-    that flag is true (mls-rs 0.55.2, `group/mls_rules.rs`). **Every Commit and
-    standalone Proposal this project emits is therefore a
-    `WireFormat::PublicMessage` — signed, authenticated, and not encrypted.**
-    Application messages are unaffected: those are `PrivateMessage`, AEAD-sealed
-    under the epoch key schedule, as is a `Welcome`'s HPKE-wrapped GroupSecrets.
-    - **What a control frame discloses**: the group id, the epoch, the
-      committer's leaf index, and the membership change itself. An Add carries
-      the joining member's entire KeyPackage inline — the NKCB credential with
+11. **Control-frame confidentiality is a property of the sender, so a group's
+    Commits are only as private as its least-upgraded committer**
+    (`group/processor.rs`, `group/transport.rs`, 2026-08):
+    `GroupChatProcessor::new` calls `.mls_rules(mls_rules())` with
+    `encrypt_control_messages = true`, so mls-rs's `control_wire_format`
+    returns `PrivateMessage` for a member-sent Commit or standalone Proposal
+    (mls-rs 0.55.2, `group/mls_rules.rs`). **Every Commit and standalone
+    Proposal this build emits is therefore AEAD-sealed under the epoch key
+    schedule** — where before it was a `WireFormat::PublicMessage`, signed and
+    authenticated but readable by anyone holding the frame. "Every" is exact
+    because `control_wire_format` keys on `Sender::Member(_)` and this crate
+    builds control messages nowhere except `Group::commit_builder()` on a
+    loaded group; there is no external-commit or `ExternalClient` path, and a
+    future one would not inherit the setting. Application messages are
+    unchanged: those were and remain `PrivateMessage`, as is a `Welcome`'s
+    HPKE-wrapped GroupSecrets.
+
+    **This does not close the leak for a group, and the entry stays open for
+    that reason.** The wire format is decided where a Commit is *built*, by the
+    node building it, so an admin still on an older build deposits its own Adds
+    at the relay in the clear — same group, same day, nothing this node can do
+    about it. A group's control traffic becomes confidential exactly when every
+    member *that commits in it* has upgraded. That is monotone improvement with
+    **no coordination point and no flag day** (below), but it is also not a
+    deployment event: do not read this as "closed on release" or "closed by
+    upgrading the relay."
+    - **Why there is no flag day.** `EncryptionOptions` is read from three
+      places in all of mls-rs 0.55.2 — `group/commit.rs:679`,
+      `group/mod.rs:942`, `group/mod.rs:1525` — every one of them send-side,
+      all via `Group::encryption_options()`. Nothing in `message_processor.rs`
+      or `message_verifier.rs` reads it, `control_wire_format` or
+      `encrypt_control_messages`, and `message_processor.rs` contains no
+      `WireFormat` comparison at all: receive dispatch branches on the payload
+      that arrived, gated only on the compile-time `private_message` feature,
+      which both builds have (mls-rs's default `rfc_compliant` implies it). The
+      one wire-format rejection on the receive path runs the other way — a
+      *cleartext Application* message is refused. Probed in both directions
+      with one side upgraded and the other not: an un-upgraded receiver applies
+      our encrypted Add and Remove and lands on the same epoch and roster, and
+      an un-upgraded sender's `PublicMessage` Commits are still applied by us.
+    - **What a control frame still discloses.** The group id, the epoch and the
+      content type are unencrypted fields of a `PrivateMessage` header (RFC 9420
+      §6.3), as are the frame's size and its timing. What is now *inside* the
+      seal is the committer's leaf index and the membership change itself: for
+      an Add, the joining member's entire KeyPackage — the NKCB credential with
       its iroh NodeId, ML-DSA-65 transport public key and display name, plus the
-      hybrid signature key. A Remove carries the evicted leaf index. Those
-      transport keys are exactly what `projected_member_fingerprints` turns into
-      shell and port-forward authorization policy, so a party that collects
-      these frames reads the team's access list and its complete
-      membership-change timeline.
-    - **Who receives one.** Two parties. The first is a peer we reach directly
-      over authenticated QUIC, which is a *current group member* — already
-      entitled to the current roster and every later epoch's membership data.
-      That half is mild: what a member gains is the roster history back to its
-      own admission in a form it can parse without any group secret, rather
-      than only what the key schedule would grant.
-      The second is **the inbox relay operator, who is not a member**. When a
-      recipient is not reachable inside `DIRECT_CONNECT_TIMEOUT` (5 s),
-      `send_one_with_inbox` deposits the frame at the operator-configured
-      relay, cleartext Commits included. An operator that keeps what it stores
-      reconstructs the group's whole membership graph, every member's iroh
-      NodeId and ML-DSA-65 transport key, and the timeline of who joined and
-      who was evicted. **This is the sharp end of this item and it is
-      unmitigated.** Configuring `--inbox-url` is what enables it; running
+      hybrid signature key; for a Remove, the evicted leaf index. Those
+      transport keys are what `projected_member_fingerprints` turns into shell
+      and port-forward authorization policy, which is what made this the sharp
+      edge of the item. A party collecting frames from an upgraded sender now
+      reads an activity timeline against a known group id, not the team's
+      access list. Size is **not** part of that improvement, and one measurement
+      should not be read as saying otherwise: `PaddingMode::StepFunction` —
+      mls-rs's default, and already in force for application messages — pads the
+      frame's *sealed content*, not the frame, rounding that content up to one of
+      four buckets per octave (mls-rs's own comment: it "hides all but 2 most
+      significant bits"; 4096 bytes wide around 24 KB). In one 3-member group an
+      Add and a Remove happened to land in the same bucket, both arriving as
+      24 672-byte frames — 24 576 bytes of padded content plus header and tag,
+      which is why the figure is not itself a multiple of the bucket width. That
+      does not generalise and
+      was not designed to: a Commit carrying only Adds needs no UpdatePath
+      (`CommitOptions::path_required` is `false`), a Commit containing a Remove
+      must carry one (`path_update_required`), so the two are structurally
+      different sizes, and the bucket widens with the frame. Treat a control
+      frame's size as disclosed.
+    - **Who receives one.** Two parties, and the second is why this mattered.
+      The first is a peer we reach directly over authenticated QUIC, which is a
+      *current group member* — already entitled to the current roster and every
+      later epoch's membership data. The second is **the inbox relay operator,
+      who is not a member**. When a recipient is not reachable inside
+      `DIRECT_CONNECT_TIMEOUT` (5 s), `send_one_with_inbox` deposits the frame
+      at the operator-configured relay, and that is the ordinary
+      offline-delivery case the feature exists for rather than an edge. From an
+      upgraded sender the operator now holds a ciphertext plus the header fields
+      above. From a peer that has not upgraded it still reconstructs the group's
+      membership graph, every member's iroh NodeId and ML-DSA-65 transport key,
+      and the timeline of who joined and who was evicted. Configuring
+      `--inbox-url` is what puts any of it in front of a non-member; running
       without a relay confines control frames to member-to-member QUIC.
-    - **What *is* mitigated**: only the pull side. The SYNC commit-history
-      responder clamps a requester's `claimed_epoch` to the epoch at which this
-      node witnessed that member being added, so a member cannot ask a peer for
-      retained history predating its own admission. That closes a member's
-      *reach back*; it does nothing about the relay, which is handed the frames
-      unasked.
+    - **What encrypting cost.** These are figures from a one-off investigation
+      run taken to 12 members, not numbers the suite pins — nothing re-measures
+      them. The largest Commit observed there was 41 056 bytes against
+      `MAX_MLS_FRAME_BYTES` of 16 MiB (~400x margin), an overhead of roughly
+      +5.5 % on an Add and +16 % on a Remove. Add commits do not grow with group
+      size (`CommitOptions::path_required` is `false`); path-bearing Removes grow
+      with tree depth. What the suite does pin is deliberately weaker:
+      `commits_are_emitted_as_private_message` builds a 3-member group, *prints*
+      each Commit's size and asserts only that it stays under a sixteenth of the
+      frame cap — a guard against a Commit that stops fitting, not a check on
+      those percentages. Storage needed nothing —
+      `store_commit`/`load_commits` treat the frame as an opaque blob,
+      and a `groups.db` holding a mixed `PublicMessage`/`PrivateMessage` history
+      replays in sequence correctly, probed by upgrading a node in place
+      mid-history and resyncing a never-upgraded peer across the seam.
+    - **The SYNC clamp is a separate protection and is *not* subsumed by this.**
+      The commit-history responder clamps a requester's `claimed_epoch` to the
+      epoch at which this node witnessed that member being added, so a member
+      cannot ask a peer for retained history predating its own admission. That
+      is an **authorization** decision and the wire format does not touch it: a
+      SYNC requester is a current member; retained history includes frames
+      committed as `PublicMessage`, from before this change or from a peer
+      without it; and a member removed and re-admitted holds the epoch secrets
+      from its first stay while being recorded at its latest admission. Whether
+      we serve a frame is this responder's decision, whether the requester could
+      open it is not, and only the first is ours. It closes a member's *reach
+      back*; it does nothing about the relay, which is handed frames unasked.
     - **A refusal was tried here and withdrawn — do not re-propose it without
       reading this.** The obvious mitigation is for `send_one_with_inbox` to
       refuse to deposit a `PublicMessage`. It was implemented, then removed,
@@ -375,9 +441,15 @@ trade-off is explicit rather than forgotten.
       the roster changed" is precisely the case the relay exists for, and
       anyone who can disturb one peer's path for five seconds can make an
       eviction permanently invisible to it. Silent revocation failure is worse
-      than metadata disclosure to a relay the operator chose, and the flag day
-      below fixes both at once — once control frames are `PrivateMessage`,
-      relaying them is safe and the automatic path is safe with them.
+      than metadata disclosure to a relay the operator chose.
+      **That reasoning never depended on the wire format, and encrypting
+      control frames does not revive the refusal — it only makes it pointless
+      as well as harmful.** Once control frames are `PrivateMessage`, relaying
+      them is safe and the automatic path is safe with them. The refusal was
+      withdrawn on *availability* grounds, so "the leak is smaller now" is not
+      an argument for bringing it back, and neither is "some peers still send
+      cleartext" — refusing those is the same stranded revocation with a
+      narrower trigger.
     - **How a member that missed a Commit gets it, as of this change.** Almost
       always automatically, and only automatically: the relay holds the
       deposited frame and the recipient's inbox poll (2 s) applies it on its
@@ -580,12 +652,20 @@ trade-off is explicit rather than forgotten.
       `DEFAULT_COMMIT_RETENTION` (100 epochs). No migration can fix that — the
       information was never recorded. It ages out as those epochs prune, and
       applies from admission onward for everyone added afterwards.
-    - **What a real fix requires**: `encrypt_control_messages = true` via
-      `.mls_rules(..)`, which changes the wire format of every Commit and
-      Proposal. Every peer in a group must adopt it simultaneously — a peer on
-      the old build cannot process a `PrivateMessage` Commit from a peer on the
-      new one, and vice versa — so it is a flag day, scheduled separately and
-      deliberately **not** taken here.
+    - **What is left, and what would close it.** `encrypt_control_messages =
+      true` is taken (`group::processor::mls_rules`), so what remains is not a
+      code change in this repository: it is the population of peers. A group is
+      clear of this item once every member that ever *commits* in it runs a
+      build with that setting, and there is no way for one node to verify or
+      enforce that — a `PublicMessage` Commit arriving from a peer is
+      indistinguishable from one arriving from an old *release*, and refusing
+      it is the withdrawn refusal above wearing a different hat. What an
+      operator can do is upgrade the members who add and remove people (an Add
+      is the frame that carries a KeyPackage), and treat `--inbox-url` as
+      naming a party that sees the group's traffic pattern regardless. An
+      earlier draft of this entry called the change a flag day requiring
+      simultaneous adoption; that was **wrong and is withdrawn** — the two
+      builds interoperate in both directions, as the first bullet records.
 
 12. **A group member can synthesise a departure and silently drop a recipient
     from a running session** (`group/cli.rs`, `group/processor.rs`, 2026-08): a
@@ -664,8 +744,12 @@ trade-off is explicit rather than forgotten.
       port-forward allowlist — where the binding really does prove possession of
       the key being fingerprinted — therefore needs one of two larger changes:
       binding `peer_id` in the credential so it cannot be self-asserted (a
-      credential-format change with the same flag-day migration as item 11's
-      control-message encryption), or plumbing fingerprints through `PeerAddr`
+      credential-format change, which really would need a coordinated migration
+      — both sides parse a credential, so a receiver that cannot validate the
+      new binding rejects the member outright; item 11's control-message
+      encryption was once described here as the same kind of problem and is
+      not, because the wire format is read on the send path only), or plumbing
+      fingerprints through `PeerAddr`
       and every ticket producer and consumer. Both were judged larger than this
       finding and are deliberately not taken here.
 

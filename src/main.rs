@@ -407,7 +407,25 @@ struct Args {
     /// Run as a standalone `nkct/inbox/1` store-and-forward server.
     /// Binds an iroh endpoint, opens an inbox sqlite at `--mls-storage`
     /// (or `~/.local/share/nkct/inbox.db`), prints our ticket, and
-    /// serves DEPOSIT/POLL forever. Untrusted — never reads payloads.
+    /// serves DEPOSIT/POLL forever. Untrusted: it never reads payloads,
+    /// and from a depositor running this build no MLS envelope carries
+    /// group content it could read — application messages, Welcomes and
+    /// (since this release) Commits and Proposals are encrypted to keys it
+    /// does not hold, and a KeyPackage is publishable material by design.
+    /// It does see who each envelope is for, how big it is and when it
+    /// arrived.
+    ///
+    /// Read that scoping carefully before hosting this anywhere you would
+    /// not host the group itself: the depositors are other people's nodes,
+    /// and the wire format is chosen by whoever *builds* the frame. A peer
+    /// on a build without `encrypt_control_messages` deposits its Commits
+    /// in the clear, an Add among them carrying the joiner's whole
+    /// KeyPackage — NKCB credential, iroh NodeId, ML-DSA-65 transport key,
+    /// display name — and this server stores payloads without parsing
+    /// them, so it neither notices nor refuses. Until every peer that
+    /// commits in a group has upgraded, assume an operator here can
+    /// reconstruct that group's roster and identity map. See
+    /// `KNOWN_ISSUES.md` "Security Audit Residuals" item 11.
     #[arg(long, help = "Run as an MLS inbox (store-and-forward) server")]
     inbox_server: bool,
 
@@ -415,6 +433,11 @@ struct Args {
     /// When set, every `--mls-cmd` outbound send tries the direct
     /// connect first and falls back to the inbox if it fails or times
     /// out. The listen REPL also runs a background poll task.
+    ///
+    /// The frames handed to that server are encrypted (see
+    /// `--inbox-server`), but naming one still tells its operator which
+    /// node ids you send to and when. Point it at a relay you are content
+    /// to hand your group's traffic pattern to.
     #[arg(long)]
     inbox_url: Option<String>,
 
