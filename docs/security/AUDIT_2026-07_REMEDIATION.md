@@ -84,7 +84,10 @@ epoch compare-and-swap **inside the same redb write transaction**, refusing a
 snapshot older than what is stored. The lock prevents the race on the normal
 paths; the CAS keeps a future path that bypasses the lock from rolling state
 back silently. `request_resync` takes the lock per applied commit rather than
-for the whole stream, so a slow peer cannot stall the REPL.
+for the whole stream, so a slow peer cannot hold the group lock for the length of
+a stream. That is a statement about the lock only: an operator-initiated
+`/resync` is awaited in `listen_loop`'s stdin arm, which polls just the removal
+signal while the sweep runs, so typed lines — `/quit` included — do wait it out.
 
 **F9/F10.** Validation and the clobber check now run *before*
 `write_to_storage`, and `list_group_ids` skips a malformed row with a warning

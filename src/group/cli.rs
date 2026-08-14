@@ -86,6 +86,15 @@ pub enum MlsCommand {
     ///                              re-using this listener's iroh endpoint
     ///                              (no per-invocation process startup)
     ///   `/status`                — print active gid + peer count
+    ///   `/resync [ticket]`       — ask that peer — or, with no ticket, this
+    ///                              session's whole recipient list, which is
+    ///                              not the active group's roster — for the
+    ///                              Commits we missed while unreachable, and
+    ///                              apply them; the recovery path for a member
+    ///                              that was offline when the roster changed.
+    ///                              Reports the epoch it reached, never that we
+    ///                              are current — no responder can establish
+    ///                              that
     ///   `/quit`                  — exit the loop
     ///   (anything else)          — send the line as an application message
     ///                              to all `/peer` recipients in the active
@@ -134,6 +143,40 @@ pub enum MlsCommand {
     /// Print our own reachable address as a ticket. Hand this to a
     /// peer so they can `AddMember --recipient-ticket` you in.
     PrintLocalAddress,
+    /// Ask peers for the Commits we missed and apply them (delta resync).
+    ///
+    /// The recovery path for a member that fell behind on the roster: it
+    /// missed a Commit while unreachable and no store-and-forward relay
+    /// was configured to catch it, the deposit itself failed, or it stayed
+    /// away past the relay's envelope TTL. The delta-resync protocol has
+    /// existed on both sides since the commit-history table was added, but
+    /// until this command nothing outside the test suite called it.
+    ///
+    /// We send our *own* current epoch, so this asks only for what we are
+    /// missing; the responder additionally refuses history from before we
+    /// joined.
+    ///
+    /// It reports the epoch it reached, what our own state did across each
+    /// peer's exchange, and what each peer said — and never that we are up to
+    /// date: a SYNC responder is authenticated by nothing, so no peer's answer
+    /// can establish currency (see [`ResyncReport`]).
+    Resync {
+        group_id: GroupId,
+        /// The peer to ask — **at most one**. `run` refuses a longer list
+        /// before anything is dialled: a responder's Commits are applied as
+        /// they arrive, so the first peer asked would otherwise decide which of
+        /// the others the sweep still reaches (see `PeerSource::Operator`).
+        /// Ask a second peer with a second invocation.
+        ///
+        /// Empty means the group's remembered member addresses instead
+        /// (`known_member_addrs`), and that form **is** a multi-peer sweep:
+        /// **all** of them are asked, in order — see [`resync_sweep`] on why
+        /// there is no first-answer-wins — where "all" means all still on the
+        /// list when their turn comes, since a queued node a Commit applied
+        /// during the sweep took off this group's roster is dropped instead of
+        /// dialled.
+        peer_tickets: Vec<Ticket>,
+    },
 }
 
 /// Resolve the default sqlite storage path: `$HOME/.local/share/nkct/groups.db`.
@@ -330,6 +373,697 @@ pub async fn remove_member(
         .await
         .map_err(|e| anyhow!("broadcast remove Commit: {e}"))?;
     Ok(())
+}
+
+/// One peer that completed an exchange, described **only** by what our own
+/// state did across it.
+///
+/// Neither flag is the peer's account of its own stream. That distinction is
+/// the whole point: a responder is authenticated by nothing, so a report that
+/// makes a peer-supplied node id the subject of a positive sentence has to
+/// derive the predicate from something this node holds.
+#[derive(Debug, Clone)]
+pub struct PeerAnswer {
+    /// The address we dialled.
+    pub peer: PeerAddr,
+    /// Our own epoch, read from our own group state, was higher after this
+    /// peer's exchange than before it.
+    ///
+    /// A **window**, not causation. `listen_loop` applies inbound Commits on a
+    /// separate task, so one of those can land inside a peer's window and be
+    /// counted here; [`ResyncReport::render`] words the line accordingly rather
+    /// than saying the Commits came from this peer.
+    pub advanced_us: bool,
+    /// This peer's stream carried a Commit that removed **us** from the group,
+    /// which mls-rs verified against our own state before we persisted it
+    /// ([`crate::group::processor::ResyncOutcome::removed_us`]).
+    ///
+    /// Independent of `advanced_us`, and reported separately because of it:
+    /// mls-rs does not advance our persisted epoch for the Commit that evicts
+    /// us, so the common case is this `true` and `advanced_us` `false`. (Both
+    /// are `true` when the same stream carried an earlier Commit we could
+    /// apply.)
+    ///
+    /// **"Verified" is weaker here than on any other Commit**, which is a reason
+    /// to render this as evidence about the peer and never as a finding about
+    /// the group. mls-rs 0.55.2 gates `update_key_schedule` on `!is_self_removed`
+    /// (`group/message_processor.rs:836-846`) and recomputes the confirmation tag
+    /// only inside it (`group/mod.rs:2492-2499`), so on a Commit that removes us
+    /// the tag is required to be *present* and is never checked against the
+    /// transcript we would have derived. What still holds is the authentication
+    /// mls-rs runs before that point, against the sender's leaf in our own tree.
+    pub served_our_removal: bool,
+}
+
+/// What a [`resync`] sweep did, for the caller to render.
+///
+/// **What this can and cannot say.** A SYNC responder is authenticated by
+/// nothing — `request_resync` dials a [`PeerAddr`] and reads whatever comes
+/// back, and the exchange proves neither the responder's membership nor its
+/// epoch nor that it runs this software. So every field here is a record of
+/// what *this node* did: the epoch pair read from our own state, the per-peer
+/// flags of [`PeerAnswer`], the count of queued peers dropped because a Commit
+/// applied mid-sweep took them off the roster, and the node ids that left this
+/// group's roster while the sweep ran. What a peer *said* lives in `failures`
+/// and is rendered
+/// as that peer's claim. In particular there is no "we are up to date" here to
+/// render, because no peer can establish that; see [`ResyncReport::render`].
+#[derive(Debug, Clone)]
+pub struct ResyncReport {
+    /// Our epoch before the sweep, read from our own group state.
+    pub from_epoch: u64,
+    /// Our epoch after it, re-read from our own group state. Re-read
+    /// unconditionally, including when every peer failed: a stream that broke
+    /// mid-way can still have carried Commits we verified and applied, and
+    /// reporting the epoch captured before the sweep told the operator that
+    /// recovery made no progress when it partly did.
+    pub to_epoch: u64,
+    /// How many peers the sweep actually asked. Every peer still on the list
+    /// when its turn came is asked; see [`resync`] on why there is no
+    /// first-answer-wins short circuit, and `skipped` for the one way a peer
+    /// leaves the list.
+    pub asked: usize,
+    /// How many queued peers were dropped from the sweep because a Commit
+    /// applied while it ran removed them from the group (see [`PeerSource`]).
+    /// Normally that Commit came from the sweep itself; in a listener the
+    /// inbound task can apply one too, which is why neither this nor the
+    /// rendered line says which. Reported so "asked N peer(s)" is never quietly
+    /// smaller than the list the operator started from.
+    pub skipped: usize,
+    /// The node ids this group's roster listed when the sweep started and does
+    /// not list now, in byte order.
+    ///
+    /// **An observation, and nothing acts on it.** It is written in
+    /// [`resync_sweep`] after the queue has drained and read in
+    /// [`ResyncReport::render`]; the queue belongs to [`PeerSource::recheck`],
+    /// which does not see this value, [`PeerSource::Operator`] still re-derives
+    /// nothing, and no peer is dropped or refused because of what is here. It
+    /// is reported because the ids that
+    /// leave the roster during a sweep are largely *not* the peers the sweep
+    /// asked — an address the operator holds a ticket for need not be on the
+    /// queue at all — so `skipped`, which counts queue drops and names nobody,
+    /// leaves them unreported, and the operator's next invocation is where such
+    /// an address gets dialled.
+    ///
+    /// Both sides are read from our own state with
+    /// [`GroupChatProcessor::current_member_node_ids`], whose ids are
+    /// self-asserted by whoever seated the leaf carrying them; an unreadable
+    /// roster on either read leaves this empty rather than inferring a
+    /// departure.
+    pub departed: Vec<crate::p2p::PeerId>,
+    /// The peers that completed an exchange, in ask order.
+    pub answered: Vec<PeerAnswer>,
+    /// One rendered line per peer that failed, already sanitized and
+    /// length-bounded by [`describe_resync_failure`].
+    pub failures: Vec<String>,
+}
+
+impl ResyncReport {
+    /// Render the sweep as operator-facing lines — facts first, attribution
+    /// second, and no claim the exchange cannot support.
+    ///
+    /// The epoch pair is a fact about *our* state. "You are up to date" would
+    /// be an inference from unauthenticated sources and is deliberately absent:
+    /// four attacker-chosen bytes (`OK\x00\x00`, then close) are all it took to
+    /// produce it, which is exactly what a member that has just been evicted
+    /// and does not know it would have been shown.
+    ///
+    /// Where a node id **is** the subject of a sentence here, the predicate is
+    /// measured on our own state: our epoch moved across that peer's exchange
+    /// (a window — see [`PeerAnswer::advanced_us`]), mls-rs verified a Commit
+    /// from it that removed us, or this group's roster listed that id when the
+    /// sweep started and does not list it now ([`ResyncReport::departed`], which
+    /// is reported, not acted on). Crediting a peer with
+    /// "Commits came from you" on the strength of its own return value is what
+    /// this deliberately does not do; `request_resync` reports a Commit that
+    /// removes us as applied, and our epoch does not move for it, so that
+    /// credit was reachable with the epoch line directly contradicting it.
+    ///
+    /// **None of those three is a statement about the group**, and the removal
+    /// line in particular is not. mls-rs verifying a Commit says the sender held
+    /// this group's state at the epoch we are at — no more. A member the group
+    /// evicted at an epoch we have not applied still holds exactly that, so it
+    /// can sign a Commit removing us that verifies here while every honest
+    /// member's roster still lists us (there is a test that does it). Nor is it
+    /// a verdict on the responder: where no join epoch was recorded for us, an
+    /// honest responder that removed us and re-admitted us later serves that old
+    /// Remove out of its retained history (`member_join_epoch` `None` does not
+    /// clamp). So the line reports what was served, tells the operator to ask
+    /// another peer, offers no re-admission advice and names no
+    /// command: advice to go and take a fresh invitation is the steer that was
+    /// removed from the `ERR\x01` path, for the reason
+    /// `describe_resync_failure` gives below, and it lands in the same place —
+    /// `join_group_from_welcome` refuses a Welcome for a gid we already hold, so
+    /// the only Welcome that could be accepted is one for a *different* group,
+    /// from whoever connects first.
+    pub fn render(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        // Line 1 is about **our own** epoch, which is the only thing here we
+        // hold ourselves.
+        if self.to_epoch > self.from_epoch {
+            out.push(format!(
+                "epoch {} → {} after asking {} peer(s) ({} answered, {} failed)",
+                self.from_epoch,
+                self.to_epoch,
+                self.asked,
+                self.answered.len(),
+                self.failures.len()
+            ));
+        } else {
+            out.push(format!(
+                "our epoch did not move; still at epoch {} after asking {} peer(s) \
+                 ({} answered, {} failed)",
+                self.to_epoch,
+                self.asked,
+                self.answered.len(),
+                self.failures.len()
+            ));
+        }
+        if self.skipped > 0 {
+            // Says what was measured — they were on the list, and this group's
+            // roster does not list them now — and neither who the Commit removed
+            // nor who applied it. Not who it removed, because the sweep can also
+            // apply a Commit that removes *us*, and reading a drop back as "it
+            // removed them" would be this node's own eviction reported as
+            // theirs. Not who applied it, because on the listener path the drop
+            // is `prune_departed_recipients`' decision and its baseline moves on
+            // the inbound task too, so this side cannot tell a Commit the sweep
+            // pulled from one that arrived while it ran (`ResyncReport::skipped`
+            // says the same).
+            out.push(format!(
+                "{} queued peer(s) were not asked: this group's roster no longer lists \
+                 them. A Commit applied while this sweep ran took them off it — in a \
+                 listener the inbound task applies Commits too, so this does not say \
+                 which applied it — and a peer we have just watched drop off the roster \
+                 is not one to go on dialling",
+                self.skipped
+            ));
+        }
+        if !self.departed.is_empty() {
+            // Reported on every source, because the silence this closes is not
+            // the `Operator` path's alone: `skipped` covers a departure only
+            // when the departing node happened to be on this sweep's queue, and
+            // the address an operator dials next is typically one held as a
+            // ticket and never queued here at all.
+            //
+            // Hex via `PeerId`'s `Display`, which is `hex::encode` of 32 bytes,
+            // so a roster id — a field its own member writes — reaches this
+            // line as 64 hex characters and brings no other text with it.
+            //
+            // The predicate stays on our own two reads. It is not "the group
+            // removed them": these ids are self-asserted
+            // (`current_member_node_ids` reads `peer_id` out of the member's own
+            // credential), and a member that seats a leaf claiming any node id
+            // and then removes it produces this line. Nor is it advice — what to
+            // do about an address that has left the roster is the operator's,
+            // with the same caveat every other line here carries.
+            out.push(format!(
+                "{} node id(s) this group's roster listed when the sweep started are not \
+                 on it now: {}. Both sides read from our own state: this roster moves when \
+                 a Commit is applied, and in a listener the inbound task applies Commits \
+                 too, so this does not say which exchange carried the one that moved it. \
+                 It reports what our roster holds, not what the group did — a roster node \
+                 id is written by the member it describes. Named because passing a ticket \
+                 for one of them to a later invocation dials a node this roster no longer \
+                 lists",
+                self.departed.len(),
+                self.departed
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        // Attribution, and only of what our own state did.
+        let advanced: Vec<String> = self
+            .answered
+            .iter()
+            .filter(|a| a.advanced_us)
+            .map(|a| a.peer.peer_id.to_string())
+            .collect();
+        if !advanced.is_empty() {
+            // Deliberately a time window rather than "Commits came from": the
+            // listener applies inbound Commits on another task, so this node
+            // cannot attribute its own epoch change to the peer it was talking
+            // to at the time.
+            out.push(format!("our epoch advanced while asking: {}", advanced.join(", ")));
+        }
+        // Evidence about the responder, not about our membership. Every clause
+        // below is checkable in this repository: signing such a Commit takes
+        // this group's state at our epoch, which a member evicted at a later
+        // epoch still has; a responder whose *own current roster* reflected this
+        // Commit — i.e. no longer lists us — would have answered `ERR\x01`
+        // instead of streaming anything (`accept_next`'s membership check); and
+        // mls-rs skips `update_key_schedule` for a self-removal and drops the
+        // provisional state, so **that Commit** leaves our epoch, tree and
+        // roster as it found them.
+        //
+        // The last clause is scoped to that Commit on purpose. This line is
+        // rendered once per report, and `request_resync` applies and persists
+        // every Commit ahead of the removal before it breaks out of the stream,
+        // so a responder that streams `[Remove(someone), Remove(us)]` moves us
+        // for the first one. Line 1 is where that shows.
+        //
+        // Note also that the ERR\x01 clause is about the responder's roster, not
+        // about whether it applied the Commit: a responder that removed us and
+        // later re-admitted us does list us again, and with no join epoch
+        // recorded for us (`member_join_epoch` `None` does not clamp) it serves
+        // that old Remove out of its retained history while behaving honestly.
+        // Hence "ask another peer" rather than a verdict on this one.
+        let removals: Vec<String> = self
+            .answered
+            .iter()
+            .filter(|a| a.served_our_removal)
+            .map(|a| a.peer.peer_id.to_string())
+            .collect();
+        if !removals.is_empty() {
+            out.push(format!(
+                "{} served a Commit that removes us, and mls-rs verified it against the \
+                 state we hold — which says the signer held this group's state at our \
+                 epoch, not that we are out of the group: a member the group evicted at \
+                 an epoch we have not applied still holds that state, and a responder \
+                 whose own roster reflected this Commit would have answered ERR\\x01 \
+                 rather than streamed it to us. Applying that Commit alone left our \
+                 epoch, tree and roster as they were — mls-rs discards a self-removal — \
+                 which says nothing about anything else the same stream sent first; \
+                 line 1 above is where that shows. Ask another peer",
+                removals.join(", ")
+            ));
+        }
+        // Said on both outcomes, because it bounds both of them.
+        out.push(
+            "a SYNC responder is authenticated by nothing, so this reports what the peers we \
+             reached sent us — not that we are current with the group"
+                .to_string(),
+        );
+        out.extend(self.failures.iter().cloned());
+        out
+    }
+}
+
+/// Render one peer's resync failure as a line, **attributed to that peer**.
+///
+/// Classification is on the error variant, never on the rendered text. That
+/// much is a real property: a QUIC close reason the peer chose arrives inside
+/// `Transport(Connect(..))`, so substring matching let any failure be dressed
+/// as either protocol rejection, and the variants close that route.
+///
+/// What the variant establishes is **that the responder sent those four bytes,
+/// and nothing more.** It does not establish that the claim is true: the SYNC
+/// exchange authenticates no part of the responder — not its membership, not
+/// its view of the roster, not even that it runs this software — so any node
+/// this caller dials can send `ERR\x01`. These lines therefore say "it claims",
+/// name the wire code, and mark the claim unverified.
+///
+/// They also stop short of recommending a re-join. Advice to go and take a
+/// fresh invitation would be one unauthenticated peer's four bytes steering the
+/// operator into `--mls-cmd accept-one`, which is `accept_next` and authorizes
+/// no sender (`join_group_from_welcome`), so whoever arrives next is the
+/// inviter. Naming the peer and marking the claim unverified is what the code
+/// can support; deciding what to do about it is the operator's, with more than
+/// one peer's word to go on.
+///
+/// Everything else — transport failures included — falls through to the
+/// passthrough branch with the peer's own text sanitized and length-bounded,
+/// exactly as the add/remove paths do.
+fn describe_resync_failure(peer: &PeerAddr, err: &crate::group::GroupError) -> String {
+    use crate::group::GroupError;
+    let node = peer.peer_id;
+    match err {
+        GroupError::SyncRejectedByRoster => format!(
+            "{node} answered ERR\\x01: it claims we are not on this group's roster. \
+             Unverified — nothing authenticates this responder, so this is that peer's \
+             claim and not a finding that we were removed; ask another member before \
+             acting on it"
+        ),
+        GroupError::SyncEpochPruned => format!(
+            "{node} answered ERR\\x02: it claims it no longer retains the Commits we \
+             asked for, so it cannot serve a delta. Unverified — that is this peer's \
+             claim about its own store; another member may still have the history"
+        ),
+        other => format!(
+            "{node}: {}",
+            crate::utils::sanitize_for_terminal_bounded(&other.to_string(), 256)
+        ),
+    }
+}
+
+/// Where a sweep's peer list came from, and therefore how the peers it has
+/// **not yet asked** are re-derived once our own state moves under the loop.
+///
+/// A sweep applies Commits into our own MLS state as it runs, so the list it
+/// was handed can be stale by the second iteration. The concrete case: Alice
+/// streams the Commit that removed Carol, we verify and persist it, and the
+/// loop then dials Carol — telling a member we have just watched being evicted
+/// that we are online, at what network path, for which group, and at what
+/// post-eviction epoch, and putting her reply in the operator's REPL. That is
+/// the same connection-attempt/size/timing channel
+/// [`prune_departed_recipients`] exists to close, reopened between two
+/// iterations of one loop.
+///
+/// **Where there is a re-derivation, it is the source's own filter, never a
+/// fresh one.** A blunt "keep only this group's current members" pass over a
+/// listener's recipient list is exactly the cross-group revocation that finding
+/// F7 was about and that `prune_departed_recipients` spent five rounds learning
+/// to avoid: one group's Remove Commit must not silently stop delivery to a peer
+/// another operator-selected group still vouches for. So the two variants that
+/// re-derive re-run the decision that produced their list and nothing more —
+/// and [`PeerSource::Operator`] re-derives nothing at all, for the reason on
+/// that variant.
+enum PeerSource<'a> {
+    /// The address the operator named on this invocation
+    /// (`--mls-recipient-ticket`). **Re-derives nothing**: the queue is asked as
+    /// it was handed over, so no answer takes another address off it. From the
+    /// CLI there is nothing to re-derive in any case — `run`'s
+    /// `MlsCommand::Resync` arm refuses a second ticket before anything is
+    /// dialled, so that queue holds one peer and is empty by the time `recheck`
+    /// could run. (The test-only [`resync`] entry point still accepts a longer
+    /// slice, for the tests that need a two-peer sweep.)
+    ///
+    /// That one-ticket rule is what stands in for a filter here, and it replaced
+    /// one. The re-derivation this path used to run diffed the roster read
+    /// before the sweep against the live one — and the only thing that moves
+    /// between those two reads is our own roster, which is what the peer being
+    /// asked moves: `request_resync` applies and persists whatever a responder
+    /// streams once mls-rs verifies it against our own, possibly stale, state.
+    /// So the first responder could serve a Remove of the second named peer, and
+    /// that peer would be dropped from the queue instead of dialled — a
+    /// responder excising the very peer whose answer would have contradicted it,
+    /// rendered as a departure. Asking one peer per invocation leaves nothing to
+    /// excise. A second peer is a second command, which starts from our state as
+    /// the first left it, and whose failure to agree is visible to the operator.
+    ///
+    /// An explicit ticket also bypasses
+    /// [`GroupChatProcessor::known_member_addrs`], and that bypass is why one is
+    /// typed: the address is dialled because the operator named it, not because
+    /// a roster vouches for it.
+    Operator,
+    /// The group's remembered member addresses, i.e. whatever
+    /// [`GroupChatProcessor::known_member_addrs`] returned. That read filters
+    /// the stored book against this group's **live** roster every time, so
+    /// re-reading it is the same decision that built the list, made again
+    /// against the roster the sweep has since advanced. It is per-group by
+    /// construction and holds no operator-typed address, so nothing here can
+    /// revoke another group's delivery path.
+    Remembered,
+    /// A running listener's shared recipient list. Re-derived by running
+    /// [`prune_departed_recipients`] — S8's decision, cross-group vouching and
+    /// all — and then keeping the peers that survived in `recipients`. The
+    /// prune is the only thing that decides who departed; this variant just
+    /// stops the sweep from dialling whoever it dropped.
+    ///
+    /// Used for both REPL forms. `/resync` with no argument is the only one
+    /// with more than one peer, and its list *is* the recipient list — the
+    /// addresses `listen` started with (`resolve_recipients`, or the tickets
+    /// alone when no gid was given) plus every `/peer` typed since, held in one
+    /// `Vec` across whatever groups `listen_loop` addresses. So it is **not**
+    /// this group's roster, and it can hold addresses `known_member_addrs`
+    /// would have filtered out, including ones no roster lists. A
+    /// `/resync <ticket>` sweep has a single peer, so it is asked before there
+    /// is any tail to re-derive, and this variant's only effect there is that
+    /// the prune runs at all.
+    Listener {
+        recipients: &'a tokio::sync::Mutex<Vec<PeerAddr>>,
+        rosters: &'a tokio::sync::Mutex<RosterSnapshots>,
+    },
+}
+
+impl PeerSource<'_> {
+    /// Re-derive `queue` — the peers not yet asked — and return how many were
+    /// dropped, plus the prune's operator note when there is one.
+    ///
+    /// Called only after a peer whose exchange moved our own state, and once
+    /// after the loop if none did (so the listener's prune still runs on both
+    /// outcomes, as it did when it was a single call after the sweep).
+    ///
+    /// [`PeerSource::Remembered`] and [`PeerSource::Listener`] re-run the filter
+    /// that produced their own list, against the state the sweep has since
+    /// moved; [`PeerSource::Operator`] re-derives nothing. There is no separate
+    /// roster baseline to diff against — the one that existed served only the
+    /// `Operator` arm, and from the CLI that queue can no longer hold a second
+    /// peer (see that variant).
+    ///
+    /// **Locks.** Nothing is held across the two acquisitions here:
+    /// [`prune_departed_recipients`] takes `rosters` then `recipients` and has
+    /// released both by the time it returns, and the read below is a third,
+    /// separate acquisition. That function's critical section must stay free of
+    /// await points (its own doc says why); this call site adds none to it.
+    async fn recheck(
+        &self,
+        processor: &GroupChatProcessor,
+        gid: &GroupId,
+        queue: &mut std::collections::VecDeque<PeerAddr>,
+    ) -> (usize, Option<String>) {
+        let (keep, note) = match self {
+            // Nothing to re-derive. Filtering here would mean deciding what the
+            // operator's own list may still contain on evidence the peer we just
+            // asked supplied, which is the trade the one-ticket rule at the
+            // dispatch exists to avoid — and on the CLI path that admits one
+            // ticket the queue is empty by the time this runs anyway.
+            PeerSource::Operator => return (0, None),
+            PeerSource::Remembered => match processor.known_member_addrs(gid) {
+                Ok(addrs) => (addrs, None),
+                // Our own group state is unreadable. Leave the queue alone
+                // rather than guess: `request_resync` loads the same group
+                // before it connects, so every remaining peer fails there and
+                // no dial happens on the strength of this.
+                Err(_) => return (0, None),
+            },
+            PeerSource::Listener {
+                recipients,
+                rosters,
+            } => {
+                let note = prune_departed_recipients(processor, gid, recipients, rosters).await;
+                (recipients.lock().await.clone(), note)
+            }
+        };
+        let keep: std::collections::HashSet<[u8; 32]> =
+            keep.iter().map(|a| *a.peer_id.as_bytes()).collect();
+        let before = queue.len();
+        queue.retain(|a| keep.contains(a.peer_id.as_bytes()));
+        (before - queue.len(), note)
+    }
+}
+
+/// Ask **every** peer for the Commits we missed, and apply them.
+///
+/// The sweep does not stop at the first peer that answers, and that is a
+/// security property rather than thoroughness. A responder proves nothing about
+/// itself, so stopping early let a single peer decide the outcome by saying as
+/// little as `OK\x00\x00` — a member evicted while unreachable would be told
+/// nothing was missing by the very peer that had it, or the sweep would end
+/// after a partial catch-up. Whose answer arrives first is steerable too: on
+/// `--mls-cmd resync` with no ticket the list comes from `known_member_addrs`,
+/// whose order is `list_member_addrs`' redb key order (= node-id byte order),
+/// so grinding a low node key buys first place. Asking everyone makes being
+/// first worth nothing.
+///
+/// **On the two sources that hold a derived list, "everyone" means everyone
+/// still on the list when their turn comes.** The loop applies Commits into our
+/// own state as it goes, so after any peer that moved us it re-derives its own
+/// tail through [`PeerSource`] — the same filter that produced the list, run
+/// again — and the peers that drops are counted in [`ResyncReport::skipped`] and
+/// reported. Asking everyone is about not letting one peer end the sweep, and a
+/// peer removed from the group by a Commit we just verified did not end
+/// anything. [`PeerSource::Operator`] re-derives nothing; the restriction that
+/// makes that safe lives at the dispatch, and is described on that variant.
+///
+/// Returns `Err` only for a **local** failure — no peer to ask, or our own group
+/// state unreadable. Every remote outcome, including "every peer failed", comes
+/// back inside the [`ResyncReport`] so the caller can render the epoch we
+/// actually reached alongside each peer's reason. The `Vec<String>` is the
+/// listener prune's operator notes, empty for every other source.
+///
+/// The request carries our *own* current epoch
+/// ([`GroupChatProcessor::request_resync`]), so an honest catch-up asks for
+/// exactly the delta we are missing and is a no-op when we are current. Each
+/// Commit is verified by mls-rs before it touches our state, and a peer that
+/// serves a stream we cannot apply moves us nowhere.
+async fn resync_sweep(
+    processor: &GroupChatProcessor,
+    group_id: &GroupId,
+    peers: &[PeerAddr],
+    source: PeerSource<'_>,
+) -> (anyhow::Result<ResyncReport>, Vec<String>) {
+    let mut notes: Vec<String> = Vec::new();
+    if peers.is_empty() {
+        return (
+            Err(anyhow!(
+                "resync {group_id}: no peer to ask — pass --mls-recipient-ticket <ticket>, \
+                 or /peer <ticket> in the listener, or add the group's members to its \
+                 address book first"
+            )),
+            notes,
+        );
+    }
+    let from_epoch = match processor.load_group_summary(group_id).await {
+        Ok(s) => s.epoch,
+        Err(e) => return (Err(anyhow!("resync {group_id}: {e}")), notes),
+    };
+    // Read once for the report and for nothing else. It is not a filter and not
+    // a baseline anything is dropped against: the queue is re-derived only
+    // through `PeerSource::recheck`, which never sees this value, so
+    // `PeerSource::Operator` still asks the list exactly as it was given. An
+    // unreadable roster leaves `None` and the sweep reports no departure rather
+    // than inferring one.
+    let roster_before = processor.current_member_node_ids(group_id).ok();
+    let mut queue: std::collections::VecDeque<PeerAddr> = peers.iter().cloned().collect();
+    let mut answered: Vec<PeerAnswer> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut asked = 0usize;
+    let mut skipped = 0usize;
+    // Our own epoch as of the previous iteration, so each peer's exchange gets
+    // measured against the state that existed when it started.
+    let mut epoch = from_epoch;
+    let mut rechecked = false;
+    let mut aborted: Option<String> = None;
+
+    while let Some(peer) = queue.pop_front() {
+        asked += 1;
+        let outcome = processor.request_resync(group_id, &peer).await;
+        let served_our_removal = matches!(&outcome, Ok(o) if o.removed_us);
+        // Re-read our own epoch after every peer, whatever the exchange
+        // returned. This is what the per-peer flag is measured on, instead of
+        // the peer's own report of its own stream: `request_resync` counts a
+        // Commit that removes *us* as applied, and mls-rs does not advance our
+        // persisted epoch for that one, so the peer's flag could say "I sent
+        // you Commits" while the epoch line said nothing moved. A broken stream
+        // matters here too — an `Err` after a genuine Commit still moved us.
+        let (now, read_err) = match processor.load_group_summary(group_id).await {
+            Ok(s) => (s.epoch, None),
+            Err(e) => (epoch, Some(e.to_string())),
+        };
+        let advanced_us = now > epoch;
+        epoch = now;
+        match &outcome {
+            Ok(_) => answered.push(PeerAnswer {
+                peer,
+                advanced_us,
+                served_our_removal,
+            }),
+            Err(e) => failures.push(describe_resync_failure(&peer, e)),
+        }
+        if let Some(e) = read_err {
+            // We can no longer tell who this group's Commits have removed, so
+            // stop dialling rather than carry on blind. Recorded rather than
+            // left to the reload below, so a short sweep is always explained
+            // instead of silently reporting fewer peers than it was given.
+            aborted = Some(e);
+            break;
+        }
+        if advanced_us || served_our_removal {
+            rechecked = true;
+            let (dropped, note) = source.recheck(processor, group_id, &mut queue).await;
+            skipped += dropped;
+            if let Some(note) = note {
+                notes.push(note);
+            }
+        }
+    }
+    if !rechecked {
+        // The listener's prune runs on both outcomes — a sweep that ended in
+        // error can still have applied a Commit, and a baseline can be stale
+        // from an epoch change that happened while another group was active.
+        // Nothing is left to re-derive at this point, so it is handed an empty
+        // queue and only the prune's effect remains.
+        let mut nothing_left = std::collections::VecDeque::new();
+        let (_, note) = source.recheck(processor, group_id, &mut nothing_left).await;
+        if let Some(note) = note {
+            notes.push(note);
+        }
+    }
+    if let Some(e) = aborted {
+        return (
+            Err(anyhow!(
+                "resync {group_id}: our own group state became unreadable after {asked} \
+                 peer(s), so the rest were not asked: {e}"
+            )),
+            notes,
+        );
+    }
+
+    // Re-read on every path. On the failure path the old code reported the
+    // epoch captured before the loop, so a responder that streamed one genuine
+    // Commit and then aborted — a dropped link mid-resync, i.e. the exact
+    // population this command serves — had the operator told that nothing had
+    // moved when it had.
+    let to_epoch = match processor.load_group_summary(group_id).await {
+        Ok(s) => s.epoch,
+        Err(e) => {
+            return (
+                Err(anyhow!("resync {group_id}: reload after the sweep: {e}")),
+                notes,
+            )
+        }
+    };
+
+    // Which node ids this group's roster held when the sweep started and does
+    // not hold now. Read after the sweep, alongside `to_epoch`, and reported —
+    // the queue is already settled by here, so nothing downstream can act on
+    // it. Empty when either read failed: a roster we could not read is not
+    // evidence that anybody left, and it renders as the silence it is.
+    let mut departed: Vec<crate::p2p::PeerId> = match (
+        roster_before,
+        processor.current_member_node_ids(group_id).ok(),
+    ) {
+        (Some(before), Some(now)) => before
+            .into_iter()
+            .filter(|id| !now.contains(id))
+            .map(crate::p2p::PeerId::new)
+            .collect(),
+        _ => Vec::new(),
+    };
+    // `HashSet` iteration order is not stable, and the line is read by people
+    // and diffed by tests.
+    departed.sort_unstable_by_key(|p| *p.as_bytes());
+
+    (
+        Ok(ResyncReport {
+            from_epoch,
+            to_epoch,
+            asked,
+            skipped,
+            departed,
+            answered,
+            failures,
+        }),
+        notes,
+    )
+}
+
+/// Ask an operator-supplied list of peers — see [`resync_sweep`], whose
+/// [`PeerSource::Operator`] mode this is.
+///
+/// The list is asked exactly as given: nothing is re-derived between peers, so
+/// no peer's answer takes another address off it. (A sweep still stops early if
+/// our own group state becomes unreadable part-way through, which comes back as
+/// a local error naming how many peers were asked.) There is no recipient list
+/// on this path, so it never produces a prune note.
+///
+/// From the command line the list is one address at most — `run`'s
+/// `MlsCommand::Resync` arm refuses a second `--mls-recipient-ticket`. This
+/// signature stays a slice for the tests that need a two-peer sweep to pin that
+/// the loop does not stop at the first answer.
+///
+/// **Test-only, and compiled nowhere else.** The one-ticket rule is enforced at
+/// the dispatch, so a wrapper that takes N peers and re-derives nothing between
+/// them is sound only next to that check. Exported it would have been a library
+/// entry point without it — `cli` and `group` are both `pub` (`src/lib.rs`,
+/// `src/group/mod.rs`) — so the invariant would have lived in one caller rather
+/// than in the callable surface. `run` reaches [`resync_sweep`] directly and
+/// does not go through here. `#[cfg(test)]` rather than a plain private `fn`
+/// because every call site is in this file's test module: private alone leaves
+/// it uncalled in a non-test build, which is `dead_code`, and that is what the
+/// `pub` was standing in for.
+#[cfg(test)]
+async fn resync(
+    processor: &GroupChatProcessor,
+    group_id: &GroupId,
+    peers: &[PeerAddr],
+) -> anyhow::Result<ResyncReport> {
+    resync_sweep(processor, group_id, peers, PeerSource::Operator)
+        .await
+        .0
 }
 
 pub async fn send_application_message(
@@ -965,9 +1699,103 @@ pub async fn listen_loop(
                                     say(format!("[listen] /add failed: {msg}")).await
                                 }
                             }
+                        } else if trimmed == "/resync"
+                            || trimmed.strip_prefix("/resync ").is_some()
+                        {
+                            // /resync [ticket]
+                            //
+                            // Catch up on Commits we missed while unreachable.
+                            // This is where an operator lands after noticing
+                            // the group has gone quiet — a Commit missed with
+                            // no relay configured to catch it is not resent by
+                            // anyone, so the lagging side has to ask.
+                            //
+                            // With a ticket, that peer alone. With no argument,
+                            // this session's whole recipient list — the
+                            // addresses `resolve_recipients` produced at startup
+                            // plus every `/peer` since, shared across the groups
+                            // this loop addresses — so it is not the active
+                            // group's roster and can hold addresses
+                            // `known_member_addrs` would have filtered out. That
+                            // list is re-derived as the sweep runs: a recipient
+                            // a Commit applied here removes stops being dialled
+                            // before its turn comes (see `PeerSource`).
+                            let arg = trimmed
+                                .strip_prefix("/resync")
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string();
+                            let gid = match *group_id.lock().await {
+                                Some(g) => g,
+                                None => {
+                                    say("[listen] /resync needs an active group — use /gid first".to_string())
+                                        .await;
+                                    continue;
+                                }
+                            };
+                            let peers: Vec<PeerAddr> = if arg.is_empty() {
+                                recipients.lock().await.clone()
+                            } else {
+                                match arg.parse::<Ticket>() {
+                                    Ok(t) => vec![t.peer_addr()],
+                                    Err(e) => {
+                                        say(format!("[listen] /resync: bad ticket: {e}")).await;
+                                        continue;
+                                    }
+                                }
+                            };
+                            // Awaited *inside* a `select!` carrying the same
+                            // `kill_rx` branch as the outer loop. An `.await`
+                            // in a select! arm body is not polled alongside its
+                            // siblings, so awaiting the sweep inline wedged the
+                            // whole REPL — no `/quit`, no sends, and, worse, the
+                            // inbound task's "we were removed, stop" signal
+                            // unserviced — for as long as the peers took. That
+                            // was `n` x the per-read deadline, recoverable only
+                            // by killing the process. The sweep is cancel-safe:
+                            // `request_resync` has no await between a Commit's
+                            // `process_incoming_message` and its
+                            // `write_to_storage`, so dropping the future at a
+                            // read boundary cannot leave a half-applied commit,
+                            // and `prune_departed_recipients`' critical section
+                            // has no await either.
+                            let (swept, pruned) = tokio::select! {
+                                _ = kill_rx.recv() => {
+                                    say("[listen] stopping (we were removed)".to_string()).await;
+                                    break;
+                                }
+                                v = resync_and_prune(
+                                    &processor, &gid, &peers, &recipients, &rosters,
+                                ) => v,
+                            };
+                            match swept {
+                                // One line per fact; `render` decides what may
+                                // be claimed. Each peer's reason is already
+                                // sanitized and bounded by
+                                // `describe_resync_failure`, and each line is
+                                // said separately so a long tail of peers
+                                // cannot push the summary off the top.
+                                Ok(report) => {
+                                    for line in report.render() {
+                                        say(format!("[listen] /resync — {line}")).await;
+                                    }
+                                }
+                                // Local failure only (no peer to ask, or our own
+                                // group state unreadable) — remote outcomes come
+                                // back inside the report above.
+                                Err(e) => {
+                                    say(format!("[listen] /resync failed: {e}")).await
+                                }
+                            }
+                            // One per prune that had something to report. The
+                            // sweep prunes between peers, so a long sweep can
+                            // produce more than one.
+                            for note in pruned {
+                                say(note).await;
+                            }
                         } else if trimmed.starts_with('/') {
                             say(format!(
-                                "[listen] unknown command {trimmed:?}. Try /peer, /gid, /status, /add, /quit."
+                                "[listen] unknown command {trimmed:?}. Try /peer, /gid, /status, /add, /resync, /quit."
                             ))
                             .await;
                         } else {
@@ -1422,6 +2250,60 @@ async fn prune_departed_recipients(
     Some(note)
 }
 
+/// Run a [`resync_sweep`] for a running listener, re-checking the recipient list
+/// against the roster **as** the sweep moves it.
+///
+/// **The prune is the point of this pairing.** `/resync` is a second way to
+/// process a Remove Commit, and on its own it unbundled the two halves the
+/// inbound path always does together: the roster advanced, the evicted member
+/// dropped off `current_member_node_ids`, and the session went on dialling her
+/// — shipping a ciphertext frame, and the connection-attempt/size/timing
+/// metadata around it, on every line the operator typed next.
+/// [`prune_departed_recipients`] closes that; the only other trigger is an
+/// *inbound* epoch change for the active gid, which for the quiet group this
+/// command exists to rescue includes "never".
+///
+/// **Why it is interleaved rather than appended.** A single prune after the
+/// sweep leaves one contact still open, and it is the sharpest one: the sweep
+/// itself dials the peer whose eviction it has just applied, because the loop
+/// walks the list it was handed while the roster moves underneath it. So
+/// [`PeerSource::Listener`] runs the prune between peers, and the sweep drops
+/// whatever the prune dropped before it can dial it. The prune still runs when
+/// the sweep moved nothing, so a stale baseline is still caught.
+///
+/// Both halves are carried out rather than `?`-ed away: a stream that broke
+/// mid-way can still have carried Commits we verified and applied, so an error
+/// from the sweep is not evidence that the roster stood still. The `Vec` is one
+/// entry per prune that had something to report — normally none or one.
+///
+/// **Locks.** [`prune_departed_recipients`] takes `rosters` and then
+/// `recipients`, which is the one order this file ever uses; the sweep itself
+/// takes neither, and the caller clones the recipient list and releases it
+/// before calling. Cancelling this future (the listener drops it when the
+/// inbound task signals "we were removed") cannot tear the prune: cancellation
+/// happens only at await points, and that function's critical section contains
+/// none — an invariant to keep in mind before touching it, since
+/// `clippy::await_holding_lock` does not flag `tokio::sync` guards and CI
+/// cannot see it.
+async fn resync_and_prune(
+    processor: &GroupChatProcessor,
+    gid: &GroupId,
+    peers: &[PeerAddr],
+    recipients: &tokio::sync::Mutex<Vec<PeerAddr>>,
+    rosters: &tokio::sync::Mutex<RosterSnapshots>,
+) -> (anyhow::Result<ResyncReport>, Vec<String>) {
+    resync_sweep(
+        processor,
+        gid,
+        peers,
+        PeerSource::Listener {
+            recipients,
+            rosters,
+        },
+    )
+    .await
+}
+
 fn parse_gid_hex(hex: &str) -> anyhow::Result<GroupId> {
     let bytes =
         hex::decode(hex).map_err(|e| anyhow!("invalid gid hex: {e}"))?;
@@ -1590,6 +2472,71 @@ pub async fn run(
             let addrs = resolve_recipients(&processor, &group_id, &recipient_tickets);
             remove_member(&processor, &group_id, index, &addrs).await?;
             eprintln!("Removed leaf {index} from {group_id}");
+        }
+        MlsCommand::Resync {
+            group_id,
+            peer_tickets,
+        } => {
+            // At most one ticket on this subcommand, refused here — before a
+            // group is loaded or a peer is dialled.
+            //
+            // `--mls-recipient-ticket` stays a `Vec` (it is shared with the send
+            // paths, which use it as one); the restriction belongs to `resync`
+            // because of what a resync does with an answer. `request_resync`
+            // applies and persists every Commit a responder streams, verified
+            // only against our own — possibly stale — state, and one Commit can
+            // remove several leaves. Given a list, the first responder therefore
+            // decides which of the operator's other named peers this process
+            // still reaches: it can serve a Remove of them and the sweep either
+            // dials a peer it just watched being evicted or drops it, depending
+            // on how the tail is re-derived. Neither is the operator's decision,
+            // and both are the responder's. One peer per invocation removes the
+            // choice: there is no queue for an answer to act on, and a second
+            // peer is a second command whose disagreement the operator sees.
+            //
+            // A resync only *reads* history from a peer, so unlike the send
+            // paths it does not write the address book: a supplied ticket wins,
+            // otherwise ask the members this group already remembers. That
+            // second form is still a multi-peer sweep, re-derived between peers
+            // through `known_member_addrs` — the same live-roster filter that
+            // produced its list. There is no listener recipient list on either
+            // path to prune; the process exits when the sweep ends.
+            if peer_tickets.len() > 1 {
+                anyhow::bail!(
+                    "resync {group_id}: --mls-cmd resync takes at most one \
+                     --mls-recipient-ticket ({} given). A responder's Commits are \
+                     applied as they arrive, so the first peer asked would decide \
+                     which of the others this sweep still reaches — run the command \
+                     once per peer instead, and compare the answers. (Omitting the \
+                     ticket is a different thing, not a narrower one: it asks the \
+                     group's remembered member addresses, all of them.)",
+                    peer_tickets.len()
+                );
+            }
+            let (peers, source) = if peer_tickets.is_empty() {
+                (
+                    processor.known_member_addrs(&group_id).unwrap_or_default(),
+                    PeerSource::Remembered,
+                )
+            } else {
+                (tickets_to_peer_addrs(&peer_tickets), PeerSource::Operator)
+            };
+            // Neither source produces prune notes; only a listener has a
+            // recipient list to prune.
+            let (swept, _notes) = resync_sweep(&processor, &group_id, &peers, source).await;
+            let report = swept?;
+            for line in report.render() {
+                eprintln!("resync {group_id}: {line}");
+            }
+            // Non-zero exit when nobody could be reached at all, so a script
+            // can tell "asked and learned nothing" from "could not ask". The
+            // per-peer reasons are already on stderr above.
+            if report.answered.is_empty() {
+                anyhow::bail!(
+                    "resync {group_id}: none of the {} peer(s) asked answered",
+                    report.asked
+                );
+            }
         }
         MlsCommand::AcceptOne => {
             // Print our own address first so the inviter knows where to
@@ -2649,5 +3596,1811 @@ mod tests {
         let parsed: Ticket = s.parse().expect("parse ticket");
         let alice_addr = alice.local_addr().await.expect("alice addr");
         assert_eq!(parsed.peer_addr().peer_id, alice_addr.peer_id);
+    }
+
+    /// The operator-reachable recovery path works: a member that missed a
+    /// Commit catches up with `resync`, and a member that was actually removed
+    /// is told so.
+    ///
+    /// A Commit broadcast to an unreachable peer is retried by nobody: with a
+    /// store-and-forward relay configured it is deposited for later pickup, but
+    /// without one — or past the relay's envelope TTL — the lagging member is
+    /// simply left behind, and until this command existed `request_resync` had
+    /// no caller outside the test suite, so there was no way to ask.
+    ///
+    /// Phase 1 pins that the wired handler reaches `request_resync` and
+    /// *applies* the delta; phase 2 that an honest request is not clamped out
+    /// of its own history by the SYNC join-epoch floor; phase 3 that a removed
+    /// member gets an answer it can act on rather than a silent no-op.
+    #[tokio::test]
+    async fn resync_catches_up_a_member_that_missed_a_commit() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+
+        // Alice creates the group and admits Bob (epoch 1); Bob takes the
+        // Welcome, so his own admission epoch is recorded on Alice's side.
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+        assert_eq!(
+            bob.load_group_summary(&gid).await.expect("bob summary").epoch,
+            1
+        );
+
+        // Carol is admitted (epoch 2) while Bob is unreachable — exactly the
+        // case the inbox refusal leaves behind, since the Commit is never
+        // relayed. Bob is not told.
+        let _add_carol = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+        assert_eq!(
+            alice.load_group_summary(&gid).await.expect("alice").epoch,
+            2
+        );
+        assert_eq!(
+            bob.load_group_summary(&gid).await.expect("bob").epoch,
+            1,
+            "Bob must still be behind before he asks"
+        );
+
+        // Phase 1+2: Bob runs the recovery command against Alice.
+        let alice = {
+            let task = tokio::spawn(async move {
+                alice.accept_next().await.expect("alice serves the SYNC");
+                alice
+            });
+            let report = resync(&bob, &gid, std::slice::from_ref(&alice_addr))
+                .await
+                .expect("resync must succeed against a peer that has the history");
+            let alice = task.await.expect("alice task");
+
+            assert_eq!(report.from_epoch, 1);
+            assert_eq!(
+                report.to_epoch, 2,
+                "the delta Bob was entitled to must actually be applied"
+            );
+            assert_eq!(report.asked, 1);
+            assert_eq!(report.skipped, 0);
+            assert_eq!(report.answered.len(), 1);
+            assert_eq!(report.answered[0].peer.peer_id, alice_addr.peer_id);
+            assert!(
+                report.answered[0].advanced_us,
+                "our own epoch moved across Alice's exchange"
+            );
+            assert!(
+                !report.answered[0].served_our_removal,
+                "and it was a catch-up, not an eviction"
+            );
+            assert!(report.failures.is_empty(), "got: {:?}", report.failures);
+            assert_eq!(
+                bob.load_group_summary(&gid).await.expect("bob after").epoch,
+                2,
+                "catch-up must be persisted, not just reported"
+            );
+            alice
+        };
+
+        // With no peer to ask, the operator is told what to supply rather than
+        // getting a silent success.
+        let err = resync(&bob, &gid, &[])
+            .await
+            .expect_err("no peer must be an error");
+        assert!(
+            err.to_string().contains("no peer to ask"),
+            "got: {err:#}"
+        );
+
+        // Phase 3: Alice evicts Bob, and Bob asks again. The responder refuses
+        // on roster grounds and the operator gets a line naming that peer and
+        // its wire code — attributed, not restated as fact.
+        let bob_leaf = alice
+            .list_members(&gid)
+            .await
+            .expect("members")
+            .iter()
+            .map(|m| m.index)
+            .find(|i| *i == 1)
+            .expect("bob's leaf");
+        let _ = alice
+            .remove_member(&gid, bob_leaf)
+            .await
+            .expect("remove bob");
+
+        let task = tokio::spawn(async move {
+            // The responder surfaces the refusal as an error of its own.
+            let _ = alice.accept_next().await;
+            alice
+        });
+        let report = resync(&bob, &gid, std::slice::from_ref(&alice_addr))
+            .await
+            .expect("a remote refusal is a report, not a local error");
+        let _alice = task.await.expect("alice task");
+        assert!(
+            report.answered.is_empty(),
+            "an evicted member must not be served"
+        );
+        assert_eq!(report.failures.len(), 1);
+        assert!(
+            report.failures[0].contains("claims we are not on this group's roster"),
+            "the refusal must be attributed to that peer, got: {:?}",
+            report.failures
+        );
+        let rendered = report.render().join(" | ");
+        assert!(
+            !rendered.contains("up to date"),
+            "no wording may assert currency, got: {rendered:?}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("invitation"),
+            "one unauthenticated peer's four bytes must not recommend taking a Welcome, \
+             got: {rendered:?}"
+        );
+    }
+
+    /// A resync failure is classified on the error *variant* — and the line
+    /// that variant produces attributes the claim to the peer instead of
+    /// asserting it, and recommends nothing.
+    ///
+    /// Two separate properties, both load-bearing, both previously broken in a
+    /// different direction:
+    ///
+    /// 1. **Provenance.** The QUIC close reason a peer chooses arrives inside
+    ///    `Transport(Connect(..))`. While this classified by substring, a
+    ///    responder that put `peer rejected roster` in it produced the roster
+    ///    rejection's line with its own text dropped.
+    /// 2. **Not overclaiming.** The variant proves only that the responder sent
+    ///    four bytes — nothing authenticates the responder, so "you were
+    ///    removed; rejoining needs a fresh invitation" was a conclusion the code
+    ///    cannot reach, printed as advice. And it pointed at `--mls-cmd
+    ///    accept-one`, which is `accept_next` with no sender check
+    ///    (`join_group_from_welcome`), so any peer would do as the inviter: one
+    ///    hostile responder's four bytes could talk an operator into taking a
+    ///    Welcome from whoever answered next.
+    #[test]
+    fn resync_failure_is_attributed_to_the_peer_and_classified_by_variant() {
+        use crate::group::GroupError;
+        let peer = PeerAddr::new(PeerId::new([7; 32]));
+
+        // (1) A peer-chosen close reason that mimics the protocol rejection.
+        let forged = GroupError::Transport(crate::p2p::P2pError::Connect(
+            "peer rejected roster or group".to_string(),
+        ));
+        let line = describe_resync_failure(&peer, &forged);
+        assert!(
+            !line.contains("claims we are not on this group's roster"),
+            "a transport error must not be able to impersonate a roster rejection, got: {line:?}"
+        );
+        assert!(
+            line.contains("peer rejected roster or group"),
+            "the peer's own text belongs in the passthrough branch, got: {line:?}"
+        );
+
+        // (2) The genuine wire-level rejections are still explained, but as one
+        // peer's claim, marked unverified, and with no course of action
+        // attached to it.
+        let roster = describe_resync_failure(&peer, &GroupError::SyncRejectedByRoster);
+        let pruned = describe_resync_failure(&peer, &GroupError::SyncEpochPruned);
+        for line in [&roster, &pruned] {
+            assert!(
+                line.contains("claims"),
+                "the responder is unauthenticated, so its answer must read as a claim, \
+                 got: {line:?}"
+            );
+            assert!(
+                line.contains("Unverified"),
+                "and must be marked as one, got: {line:?}"
+            );
+            assert!(
+                !line.to_lowercase().contains("invitation")
+                    && !line.to_lowercase().contains("welcome")
+                    && !line.to_lowercase().contains("accept-one"),
+                "four unauthenticated bytes must not recommend accepting a Welcome — \
+                 `accept_next` authorizes no sender — got: {line:?}"
+            );
+        }
+        assert!(
+            roster.contains("ERR\\x01") && pruned.contains("ERR\\x02"),
+            "each line names the wire code it is reporting, got: {roster:?} / {pruned:?}"
+        );
+    }
+
+    /// The `--mls-cmd resync` dispatch arm resolves its ticket and reaches the
+    /// same handler — the argv-facing half of the wiring.
+    #[tokio::test]
+    async fn resync_command_dispatches_through_run() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let alice_ticket: Ticket = print_local_address(&alice)
+            .await
+            .expect("alice ticket")
+            .parse()
+            .expect("parse ticket");
+
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+
+        let task = tokio::spawn(async move {
+            alice.accept_next().await.expect("alice serves the SYNC");
+            alice
+        });
+        run(
+            MlsCommand::Resync {
+                group_id: gid,
+                peer_tickets: vec![alice_ticket],
+            },
+            bob,
+        )
+        .await
+        .expect("--mls-cmd resync must reach the peer");
+        let _alice = task.await.expect("alice task");
+    }
+
+    /// Register an endpoint that speaks the SYNC wire format and nothing else:
+    /// it reads the fixed 44-byte request and writes exactly `reply`, then
+    /// closes. No group state, no roster, no membership — which is precisely
+    /// the position every peer a resync dials is in as far as the caller can
+    /// tell, since the exchange authenticates none of that.
+    fn spawn_raw_sync_responder(
+        net: &Arc<MockNetwork>,
+        peer_byte: u8,
+        reply: Vec<u8>,
+    ) -> (PeerAddr, tokio::task::JoinHandle<()>) {
+        use crate::p2p::P2pEndpoint;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let id = PeerId::new([peer_byte; 32]);
+        let ep = net.register(id, vec![P2pProtocol(crate::network::ALPN_MLS)]);
+        let handle = tokio::spawn(async move {
+            let pending = match ep.accept().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let inc = match pending.establish(std::time::Duration::from_secs(5)).await {
+                Ok(i) => i,
+                Err(_) => return,
+            };
+            let mut s = inc.stream;
+            // b"SYNC" + group_id(32) + claimed_epoch(8)
+            let mut req = [0u8; 44];
+            if s.read_exact(&mut req).await.is_err() {
+                return;
+            }
+            let _ = s.write_all(&reply).await;
+            let _ = s.shutdown().await;
+        });
+        (PeerAddr::new(id), handle)
+    }
+
+    /// [`spawn_raw_sync_responder`] with a signal fired the moment the 44-byte
+    /// SYNC request has been read.
+    ///
+    /// So a test can assert on **whether this address was dialled at all**,
+    /// which is behaviour, rather than on the text of an error. The signal is
+    /// sound to read the instant the call under test returns: the sweep awaits
+    /// each `request_resync` to completion, so a dial that happened has already
+    /// delivered the request by then.
+    fn spawn_probed_sync_responder(
+        net: &Arc<MockNetwork>,
+        peer_byte: u8,
+        reply: Vec<u8>,
+    ) -> (
+        PeerAddr,
+        tokio::task::JoinHandle<()>,
+        tokio::sync::mpsc::Receiver<()>,
+    ) {
+        use crate::p2p::P2pEndpoint;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let id = PeerId::new([peer_byte; 32]);
+        let ep = net.register(id, vec![P2pProtocol(crate::network::ALPN_MLS)]);
+        let (dialled_tx, dialled_rx) = tokio::sync::mpsc::channel::<()>(4);
+        let handle = tokio::spawn(async move {
+            let pending = match ep.accept().await {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            let inc = match pending.establish(std::time::Duration::from_secs(5)).await {
+                Ok(i) => i,
+                Err(_) => return,
+            };
+            let mut s = inc.stream;
+            let mut req = [0u8; 44];
+            if s.read_exact(&mut req).await.is_err() {
+                return;
+            }
+            let _ = dialled_tx.send(()).await;
+            let _ = s.write_all(&reply).await;
+            let _ = s.shutdown().await;
+        });
+        (PeerAddr::new(id), handle, dialled_rx)
+    }
+
+    /// Four attacker-chosen bytes must not end the sweep, and must not become a
+    /// claim that we are current.
+    ///
+    /// `OK\x00\x00` followed by a close is the entire cost of this: the stream
+    /// EOFs at the first length prefix, `request_resync` breaks out of its loop
+    /// and returns `Ok(false)`, and the caller used to take the first `Ok` and
+    /// return, printing "Already up to date at epoch N". The scenario is not
+    /// exotic — a member evicted while unreachable is exactly who runs this
+    /// command, `known_member_addrs` filters remembered addresses against the
+    /// caller's own *stale* roster so the evicted peer survives the filter, and
+    /// redb key order is node-id byte order, so being asked first is grindable.
+    ///
+    /// Phase 1: that peer alone. Phase 2: that peer *ahead of* the honest one.
+    #[tokio::test]
+    async fn a_peer_that_only_says_ok_neither_ends_the_sweep_nor_claims_currency() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+        // Bob misses this one.
+        let _ = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+        assert_eq!(bob.load_group_summary(&gid).await.expect("bob").epoch, 1);
+
+        // Phase 1: the mute peer is the only one that answers.
+        let (mute_addr, mute) = spawn_raw_sync_responder(&net, 9, b"OK\x00\x00".to_vec());
+        let report = resync(&bob, &gid, std::slice::from_ref(&mute_addr))
+            .await
+            .expect("a peer that answers is not a local failure");
+        mute.await.expect("mute responder");
+        assert_eq!(report.answered.len(), 1);
+        assert!(
+            !report.answered[0].advanced_us,
+            "it moved our state nowhere, and the report must say so"
+        );
+        assert_eq!(report.from_epoch, 1);
+        assert_eq!(report.to_epoch, 1);
+        let rendered = report.render().join(" | ");
+        assert!(
+            !rendered.to_lowercase().contains("up to date"),
+            "an unauthenticated peer's silence is not a proof of currency, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("our epoch did not move"),
+            "the honest statement is about our own epoch, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("authenticated by nothing"),
+            "and it must carry what bounds it, got: {rendered:?}"
+        );
+
+        // Phase 2: the mute peer answers *first*, the honest one second. The
+        // sweep must reach Alice anyway — this is the assertion that fails
+        // against a first-answer-wins loop, and it fails there by leaving Bob
+        // at epoch 1.
+        let (mute2_addr, mute2) = spawn_raw_sync_responder(&net, 10, b"OK\x00\x00".to_vec());
+        let alice_task = tokio::spawn(async move {
+            alice.accept_next().await.expect("alice serves the SYNC");
+            alice
+        });
+        let report = resync(&bob, &gid, &[mute2_addr.clone(), alice_addr.clone()])
+            .await
+            .expect("sweep");
+        // Asserted *before* joining the helper tasks on purpose: a
+        // first-answer-wins loop never asks Alice at all, so joining her first
+        // would hang here instead of failing the claim under test.
+        assert_eq!(
+            bob.load_group_summary(&gid).await.expect("bob after").epoch,
+            2,
+            "the sweep must not stop at the peer that said nothing"
+        );
+        mute2.await.expect("mute responder 2");
+        let _alice = alice_task.await.expect("alice task");
+
+        assert_eq!(report.asked, 2);
+        assert_eq!(report.to_epoch, 2);
+        let contributors: Vec<_> = report
+            .answered
+            .iter()
+            .filter(|a| a.advanced_us)
+            .map(|a| a.peer.peer_id)
+            .collect();
+        assert_eq!(
+            contributors,
+            vec![alice_addr.peer_id],
+            "only the peer across whose exchange our own epoch moved is named"
+        );
+    }
+
+    /// The failure report names the epoch we actually reached, not the one we
+    /// started at.
+    ///
+    /// A responder that streams a **genuine** Commit and then breaks the stream
+    /// leaves us further along than we were and the call in error. The old
+    /// message captured `from_epoch` once, before the loop, and never re-read
+    /// it, so it told the operator recovery had made no progress when it partly
+    /// had — on a dropped link mid-resync, which is the exact population this
+    /// command serves.
+    ///
+    /// The Commit replayed here is real: Carol is a member entitled to it, and
+    /// the test fetches it from Alice over the wire rather than synthesising
+    /// one, so what Bob applies is a Commit mls-rs verifies.
+    #[tokio::test]
+    async fn a_stream_that_breaks_after_applying_reports_the_epoch_it_reached() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+        let (dave, _dir_d) = build_test_processor(&net, "dave", 4);
+
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+        let dave_kp = dave.export_key_package().await.expect("dave kp");
+
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+        let add_carol = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+        let carol = {
+            let task = tokio::spawn(async move {
+                carol.accept_next().await.expect("carol accepts welcome");
+                carol
+            });
+            alice
+                .send_welcome_to(&carol_addr, &add_carol.welcome)
+                .await
+                .expect("welcome to carol");
+            task.await.expect("carol task")
+        };
+
+        // Bob catches up honestly to epoch 2, so the epoch-3 Commit below is
+        // the next one he can apply.
+        let alice = {
+            let task = tokio::spawn(async move {
+                alice.accept_next().await.expect("alice serves the SYNC");
+                alice
+            });
+            resync(&bob, &gid, std::slice::from_ref(&alice_addr))
+                .await
+                .expect("bob catches up");
+            task.await.expect("alice task")
+        };
+        assert_eq!(bob.load_group_summary(&gid).await.expect("bob").epoch, 2);
+
+        // Epoch 3, which Bob misses.
+        let _ = alice.add_member(&gid, &dave_kp).await.expect("add dave");
+        assert_eq!(alice.load_group_summary(&gid).await.expect("alice").epoch, 3);
+
+        // Carol joined at epoch 2, so the SYNC join-epoch clamp entitles her to
+        // the epoch-3 Commit. Take it off the wire verbatim.
+        let commit_e3: Vec<u8> = {
+            let task = tokio::spawn(async move {
+                let _ = alice.accept_next().await;
+                alice
+            });
+            let mut s = carol
+                .endpoint_ref()
+                .connect(&alice_addr, crate::group::transport::ALPN_MLS_PROTOCOL)
+                .await
+                .expect("carol dials alice");
+            s.write_all(b"SYNC").await.expect("SYNC header");
+            let mut req = [0u8; 40];
+            req[0..32].copy_from_slice(gid.as_bytes());
+            req[32..40].copy_from_slice(&2u64.to_le_bytes());
+            s.write_all(&req).await.expect("SYNC request");
+            let mut resp = [0u8; 4];
+            s.read_exact(&mut resp).await.expect("SYNC response");
+            assert_eq!(&resp, b"OK\x00\x00");
+            let mut len = [0u8; 4];
+            s.read_exact(&mut len).await.expect("commit length");
+            let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+            s.read_exact(&mut body).await.expect("commit bytes");
+            let _alice = task.await.expect("alice task");
+            body
+        };
+
+        // Replay it and then break the stream: `OK`, the genuine frame, then a
+        // zero length, which `request_resync` rejects *after* it has applied.
+        let mut reply = b"OK\x00\x00".to_vec();
+        reply.extend_from_slice(&(commit_e3.len() as u32).to_le_bytes());
+        reply.extend_from_slice(&commit_e3);
+        reply.extend_from_slice(&0u32.to_le_bytes());
+        let (broken_addr, broken) = spawn_raw_sync_responder(&net, 9, reply);
+
+        let report = resync(&bob, &gid, std::slice::from_ref(&broken_addr))
+            .await
+            .expect("a broken remote stream is not a local failure");
+        broken.await.expect("broken responder");
+
+        assert_eq!(
+            bob.load_group_summary(&gid).await.expect("bob after").epoch,
+            3,
+            "the genuine Commit really was applied before the break"
+        );
+        assert!(report.answered.is_empty(), "the exchange did end in error");
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.from_epoch, 2);
+        assert_eq!(
+            report.to_epoch, 3,
+            "the epoch must be re-read after the sweep, not carried from before it"
+        );
+        let first = report.render().into_iter().next().expect("a summary line");
+        assert!(
+            first.contains("epoch 2 → 3"),
+            "the operator must be told what progress was made, got: {first:?}"
+        );
+        assert!(
+            !first.contains("still at epoch 2"),
+            "and not told the node is where it no longer is, got: {first:?}"
+        );
+    }
+
+    /// A Remove applied by `/resync` drops the removed member from the
+    /// listener's recipient list, in the same breath.
+    ///
+    /// On the inbound path the Remove and the prune are bundled. `/resync` is a
+    /// second way to process a Remove, and on its own it unbundled them: Carol
+    /// left the roster, `current_member_node_ids` stopped listing her, and the
+    /// session kept dialling her address on every line typed next — the
+    /// connection-attempt and size/timing channel `prune_departed_recipients`
+    /// exists to close. The only other trigger is an *inbound* epoch change for
+    /// the active gid, which for the quiet group this command rescues can be
+    /// never.
+    ///
+    /// This drives the pairing the REPL arm calls, with the listener's own
+    /// state shapes: one shared recipient list and the per-group
+    /// `RosterSnapshots` baseline seeded as an operator-named group.
+    #[tokio::test]
+    async fn resync_prunes_the_recipient_its_own_commit_removed() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+        let _ = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+
+        // Bob catches up to epoch 2, so his roster lists Carol and the listener
+        // state below is the one a real session would hold.
+        let alice = {
+            let task = tokio::spawn(async move {
+                alice.accept_next().await.expect("alice serves the SYNC");
+                alice
+            });
+            resync(&bob, &gid, std::slice::from_ref(&alice_addr))
+                .await
+                .expect("bob catches up");
+            task.await.expect("alice task")
+        };
+        assert_eq!(bob.load_group_summary(&gid).await.expect("bob").epoch, 2);
+
+        let recipients = tokio::sync::Mutex::new(vec![alice_addr.clone(), carol_addr.clone()]);
+        let rosters = tokio::sync::Mutex::new(RosterSnapshots::new());
+        seed_roster(&bob, &rosters, &gid, true).await;
+
+        // Alice evicts Carol while Bob is unreachable (epoch 3).
+        let carol_leaf = alice
+            .list_members(&gid)
+            .await
+            .expect("members")
+            .iter()
+            .map(|m| m.index)
+            .find(|i| *i == 2)
+            .expect("carol's leaf");
+        let _ = alice
+            .remove_member(&gid, carol_leaf)
+            .await
+            .expect("remove carol");
+
+        // Bob asks, applies the Remove, and must stop addressing her.
+        let task = tokio::spawn(async move {
+            alice.accept_next().await.expect("alice serves the SYNC");
+            alice
+        });
+        let (swept, notes) =
+            resync_and_prune(&bob, &gid, std::slice::from_ref(&alice_addr), &recipients, &rosters)
+                .await;
+        let _alice = task.await.expect("alice task");
+        let report = swept.expect("sweep");
+        assert_eq!(report.to_epoch, 3, "the Remove really was applied");
+        assert!(
+            !bob.current_member_node_ids(&gid)
+                .expect("bob roster")
+                .contains(carol_addr.peer_id.as_bytes()),
+            "Carol is off the roster"
+        );
+
+        let left: Vec<_> = recipients
+            .lock()
+            .await
+            .iter()
+            .map(|a| a.peer_id)
+            .collect();
+        assert!(
+            !left.contains(&carol_addr.peer_id),
+            "the member the applied Remove evicted must stop being dialled, got: {left:?}"
+        );
+        assert!(
+            left.contains(&alice_addr.peer_id),
+            "and nobody else may be dropped, got: {left:?}"
+        );
+        assert_eq!(notes.len(), 1, "one prune, one note, got: {notes:?}");
+        assert!(
+            notes[0].contains("dropped 1 recipient(s) removed from group"),
+            "the drop must be reported, never silent, got: {notes:?}"
+        );
+    }
+
+    /// The sweep stops dialling a peer once a Commit it applied **during that
+    /// sweep** removed her.
+    ///
+    /// The list a sweep is handed is bound once, but `request_resync` applies
+    /// Commits into our own MLS state inside the loop, so the roster moves
+    /// underneath it. Ask Alice first and she streams the Remove of Carol; the
+    /// next iteration then dials Carol — telling a member we have just watched
+    /// being evicted that we are online, at what network path, for which group,
+    /// and at what post-eviction epoch (the SYNC request carries it in clear,
+    /// `processor.rs`'s `b"SYNC" + gid + epoch`), and putting whatever she
+    /// answers into the operator's REPL. Pruning after the loop cannot close
+    /// that: by then the dial has happened.
+    ///
+    /// The drop is [`prune_departed_recipients`]' decision and nothing else —
+    /// the sweep only declines to dial what the prune removed — so a peer no
+    /// longer on *this* roster but vouched for by another operator-selected
+    /// group is still asked, exactly as it is still addressed.
+    #[tokio::test]
+    async fn resync_stops_dialling_a_peer_its_own_commit_just_removed() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+        let _ = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+
+        // Bob catches up to epoch 2, so his roster lists Carol and his
+        // recipient list is the one a real session would hold.
+        let alice = {
+            let task = tokio::spawn(async move {
+                alice.accept_next().await.expect("alice serves the SYNC");
+                alice
+            });
+            resync(&bob, &gid, std::slice::from_ref(&alice_addr))
+                .await
+                .expect("bob catches up");
+            task.await.expect("alice task")
+        };
+        assert_eq!(bob.load_group_summary(&gid).await.expect("bob").epoch, 2);
+
+        let recipients = tokio::sync::Mutex::new(vec![alice_addr.clone(), carol_addr.clone()]);
+        let rosters = tokio::sync::Mutex::new(RosterSnapshots::new());
+        seed_roster(&bob, &rosters, &gid, true).await;
+
+        // Alice evicts Carol at epoch 3 while Bob is unreachable.
+        let carol_leaf = alice
+            .list_members(&gid)
+            .await
+            .expect("members")
+            .iter()
+            .map(|m| m.index)
+            .find(|i| *i == 2)
+            .expect("carol's leaf");
+        let _ = alice
+            .remove_member(&gid, carol_leaf)
+            .await
+            .expect("remove carol");
+
+        // Carol stops accepting connections. This is only so a dial that *does*
+        // happen fails at once instead of sitting on the handshake deadline —
+        // the property under test is `asked`, which counts every peer the loop
+        // took off its queue whatever the dial then did.
+        carol
+            .endpoint_ref()
+            .close()
+            .await
+            .expect("carol leaves the network");
+
+        // Alice first, Carol second: the ordering that made the contact
+        // unconditional once the sweep stopped returning on the first answer.
+        let task = tokio::spawn(async move {
+            alice.accept_next().await.expect("alice serves the SYNC");
+            alice
+        });
+        let (swept, notes) = resync_and_prune(
+            &bob,
+            &gid,
+            &[alice_addr.clone(), carol_addr.clone()],
+            &recipients,
+            &rosters,
+        )
+        .await;
+        let _alice = task.await.expect("alice task");
+        let report = swept.expect("sweep");
+
+        assert_eq!(report.to_epoch, 3, "the Remove really was applied");
+        assert_eq!(
+            report.asked, 1,
+            "the sweep must not dial the member it has just watched being removed"
+        );
+        assert_eq!(report.skipped, 1, "and must say that it did not");
+        assert!(
+            report.failures.is_empty(),
+            "a peer that is never dialled cannot fail; a failure line here means it was \
+             dialled after all, got: {:?}",
+            report.failures
+        );
+        let rendered = report.render().join(" | ");
+        assert!(
+            rendered.contains("1 queued peer(s) were not asked"),
+            "the operator must be told the sweep is smaller than the list, got: {rendered:?}"
+        );
+
+        // And the prune that decided it is the one the listener already uses.
+        let left: Vec<_> = recipients.lock().await.iter().map(|a| a.peer_id).collect();
+        assert!(
+            !left.contains(&carol_addr.peer_id),
+            "she must also stop being addressed, got: {left:?}"
+        );
+        assert!(
+            left.contains(&alice_addr.peer_id),
+            "and nobody else may be dropped, got: {left:?}"
+        );
+        assert_eq!(notes.len(), 1, "one prune, one note, got: {notes:?}");
+        assert!(
+            notes[0].contains("dropped 1 recipient(s) removed from group"),
+            "got: {notes:?}"
+        );
+    }
+
+    /// The one-shot `--mls-cmd resync` stops dialling too, through its own
+    /// list's filter.
+    ///
+    /// There is no listener recipient list on that path — the process exits
+    /// when the sweep ends — so the sibling test above does not cover it, and
+    /// the same dial happens for the same reason: the list came from
+    /// `known_member_addrs` before the loop, and the loop moved the roster it
+    /// was filtered against. Re-reading it is that filter run again, not a new
+    /// rule: the remembered book is per-group and holds no operator-typed
+    /// address, so nothing here can revoke another group's delivery path.
+    #[tokio::test]
+    async fn the_one_shot_resync_stops_dialling_a_peer_its_own_commit_just_removed() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let alice_ticket: Ticket = print_local_address(&alice)
+            .await
+            .expect("alice ticket")
+            .parse()
+            .expect("parse alice");
+        let carol_ticket: Ticket = print_local_address(&carol)
+            .await
+            .expect("carol ticket")
+            .parse()
+            .expect("parse carol");
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+        let _ = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+
+        let alice = {
+            let task = tokio::spawn(async move {
+                alice.accept_next().await.expect("alice serves the SYNC");
+                alice
+            });
+            resync(&bob, &gid, std::slice::from_ref(&alice_addr))
+                .await
+                .expect("bob catches up");
+            task.await.expect("alice task")
+        };
+        assert_eq!(bob.load_group_summary(&gid).await.expect("bob").epoch, 2);
+
+        // Bob's address book: both members, which is what `--mls-cmd resync`
+        // with no ticket asks. redb key order is node-id byte order, so Alice
+        // (0x01…) is asked before Carol (0x03…).
+        bob.remember_member_tickets(&gid, &[alice_ticket, carol_ticket]);
+        let peers = bob.known_member_addrs(&gid).expect("book");
+        assert_eq!(peers.len(), 2, "both members are remembered");
+
+        let carol_leaf = alice
+            .list_members(&gid)
+            .await
+            .expect("members")
+            .iter()
+            .map(|m| m.index)
+            .find(|i| *i == 2)
+            .expect("carol's leaf");
+        let _ = alice
+            .remove_member(&gid, carol_leaf)
+            .await
+            .expect("remove carol");
+        carol
+            .endpoint_ref()
+            .close()
+            .await
+            .expect("carol leaves the network");
+
+        let task = tokio::spawn(async move {
+            alice.accept_next().await.expect("alice serves the SYNC");
+            alice
+        });
+        let (swept, notes) =
+            resync_sweep(&bob, &gid, &peers, PeerSource::Remembered).await;
+        let _alice = task.await.expect("alice task");
+        let report = swept.expect("sweep");
+
+        assert_eq!(report.to_epoch, 3, "the Remove really was applied");
+        assert_eq!(
+            report.asked, 1,
+            "the one-shot sweep must not dial the member it just watched being removed"
+        );
+        assert_eq!(report.skipped, 1);
+        assert!(
+            report.failures.is_empty(),
+            "a peer that is never dialled cannot fail, got: {:?}",
+            report.failures
+        );
+        assert!(
+            notes.is_empty(),
+            "there is no recipient list on this path to report a prune for, got: {notes:?}"
+        );
+    }
+
+    /// A departure the sweep watched happen is **named**, even where no queued
+    /// peer was dropped for it.
+    ///
+    /// The gap this closes is the operator's next invocation. `--mls-cmd resync`
+    /// takes one ticket, so the multi-peer forms' re-derivation has nothing to
+    /// do here: the queue is one address long and `PeerSource::Operator`
+    /// re-derives nothing anyway, which leaves `skipped` at 0 and, before this
+    /// line existed, the whole report silent about anyone else. Bob, offline,
+    /// holds tickets for Alice and Mallory. He asks Alice; her stream carries
+    /// the Commit evicting Mallory, which mls-rs verifies and he persists. Then
+    /// he reads the report and decides what to run next — and "epoch 2 → 3 after
+    /// asking 1 peer(s)" is compatible with Mallory still being a member. The
+    /// second invocation would hand a node this roster no longer lists his
+    /// liveness, his network path, the group id and his post-eviction epoch,
+    /// which `request_resync` puts in the SYNC request in clear.
+    ///
+    /// Nothing is *acted* on here, and the assertions below pin that too: the
+    /// queue is untouched, the sweep still asks exactly what it was given, and
+    /// there is no drop for a responder to steer. What changes is that the
+    /// operator sees the id before choosing.
+    ///
+    /// The line's claim is checked as narrowly as it is made. It says these ids
+    /// were on this group's roster as we held it at the start and are not on it
+    /// now; it does not say the group removed them — `current_member_node_ids`
+    /// reads a self-asserted `peer_id` out of each member's own credential — and
+    /// it does not tell the operator what to do.
+    #[tokio::test]
+    async fn a_departure_the_sweep_watched_is_named_even_with_nothing_dropped() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (mallory, _dir_m) = build_test_processor(&net, "mallory", 3);
+
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let mallory_addr = mallory.local_addr().await.expect("mallory addr");
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let mallory_kp = mallory.export_key_package().await.expect("mallory kp");
+
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+        let _ = alice
+            .add_member(&gid, &mallory_kp)
+            .await
+            .expect("add mallory");
+
+        // Bob catches up to the epoch that seats Mallory, so she is on the
+        // roster he starts the next sweep from.
+        let alice = {
+            let task = tokio::spawn(async move {
+                alice.accept_next().await.expect("alice serves the SYNC");
+                alice
+            });
+            resync(&bob, &gid, std::slice::from_ref(&alice_addr))
+                .await
+                .expect("bob catches up");
+            task.await.expect("alice task")
+        };
+        assert_eq!(bob.load_group_summary(&gid).await.expect("bob").epoch, 2);
+        assert!(
+            bob.current_member_node_ids(&gid)
+                .expect("bob roster")
+                .contains(mallory_addr.peer_id.as_bytes()),
+            "the premise: Mallory is on Bob's roster before the sweep"
+        );
+
+        // Now she is evicted while Bob is not looking.
+        let mallory_leaf = alice
+            .list_members(&gid)
+            .await
+            .expect("members")
+            .iter()
+            .map(|m| m.index)
+            .find(|i| *i == 2)
+            .expect("mallory's leaf");
+        let _ = alice
+            .remove_member(&gid, mallory_leaf)
+            .await
+            .expect("remove mallory");
+
+        // Invocation #1: the single ticket the CLI permits.
+        let task = tokio::spawn(async move {
+            alice.accept_next().await.expect("alice serves the SYNC");
+            alice
+        });
+        let (swept, notes) = resync_sweep(
+            &bob,
+            &gid,
+            std::slice::from_ref(&alice_addr),
+            PeerSource::Operator,
+        )
+        .await;
+        let _alice = task.await.expect("alice task");
+        let report = swept.expect("sweep");
+
+        assert_eq!(report.to_epoch, 3, "the Remove really was applied");
+        assert_eq!(report.asked, 1);
+        assert_eq!(
+            report.skipped, 0,
+            "nothing is dropped on this path — which is exactly why the report was silent"
+        );
+        assert!(notes.is_empty(), "no recipient list here, got: {notes:?}");
+        assert_eq!(
+            report.departed,
+            vec![mallory_addr.peer_id],
+            "the id that left the roster must be named, and only that one"
+        );
+
+        let lines = report.render();
+        let mallory_hex = mallory_addr.peer_id.to_string();
+        let line = lines
+            .iter()
+            .find(|l| l.contains(&mallory_hex))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the operator must see the node id before deciding what to run next, \
+                     got: {lines:?}"
+                )
+            });
+        // What reaches the line is a fixed-width hex id, not peer-chosen text:
+        // `PeerId`'s `Display` is `hex::encode` of 32 bytes.
+        assert_eq!(mallory_hex.len(), 64);
+        assert!(mallory_hex.chars().all(|c| c.is_ascii_hexdigit()));
+        // The claim stays where the code can support it.
+        let lower = line.to_lowercase();
+        assert!(
+            !lower.contains("the group removed") && !lower.contains("was removed from"),
+            "a roster node id is self-asserted, so the line reports our roster rather \
+             than the group's verdict, got: {line:?}"
+        );
+        assert!(
+            !lower.contains("do not ") && !lower.contains("stop dialling"),
+            "the line reports; what to do about it is the operator's, got: {line:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.to_lowercase().contains("up to date")),
+            "no wording may assert currency, got: {lines:?}"
+        );
+    }
+
+    /// A peer that serves us the Commit removing **us** is reported as exactly
+    /// that, and is never credited with moving our state.
+    ///
+    /// mls-rs verifies and persists that Commit like any other, but it does not
+    /// advance our locally persisted epoch, so `request_resync` returns
+    /// "applied" while `load_group_summary` still reads the epoch we came in
+    /// at. Crediting the peer on that return produced a report whose first line
+    /// said our epoch had not moved and whose second said Commits had come from
+    /// the peer — a positive sentence about a peer-supplied node id that the
+    /// code could not support. Any current member can drive it: the Commit
+    /// removing us is plain handshake material every one of them holds.
+    ///
+    /// So the credit is measured on our own epoch (it does not move here), and
+    /// the removal is reported from `CommitEffect::Removed`, which mls-rs sets
+    /// only after authenticating the Commit against our own group state. That
+    /// says the signer held this group's state at the epoch we are at — **not**
+    /// that we are out of the group, and not that only a legitimate member could
+    /// have produced it: the sibling test
+    /// `a_removal_minted_by_an_evicted_member_is_reported_as_the_responder_not_as_our_exit`
+    /// mints exactly this Commit from a member the group had already evicted, and
+    /// asserts that no wording here claims otherwise.
+    #[tokio::test]
+    async fn a_commit_that_removes_us_is_reported_as_removal_not_as_progress() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+        let add_carol = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+        let carol = {
+            let task = tokio::spawn(async move {
+                carol.accept_next().await.expect("carol accepts welcome");
+                carol
+            });
+            alice
+                .send_welcome_to(&carol_addr, &add_carol.welcome)
+                .await
+                .expect("welcome to carol");
+            task.await.expect("carol task")
+        };
+
+        // Bob catches up honestly to epoch 2.
+        let alice = {
+            let task = tokio::spawn(async move {
+                alice.accept_next().await.expect("alice serves the SYNC");
+                alice
+            });
+            resync(&bob, &gid, std::slice::from_ref(&alice_addr))
+                .await
+                .expect("bob catches up");
+            task.await.expect("alice task")
+        };
+        assert_eq!(bob.load_group_summary(&gid).await.expect("bob").epoch, 2);
+
+        // Alice removes Bob at epoch 3.
+        let bob_leaf = alice
+            .list_members(&gid)
+            .await
+            .expect("members")
+            .iter()
+            .map(|m| m.index)
+            .find(|i| *i == 1)
+            .expect("bob's leaf");
+        let _ = alice.remove_member(&gid, bob_leaf).await.expect("remove bob");
+
+        // Carol joined at epoch 2 and is entitled to the epoch-3 Commit, so take
+        // it off the wire verbatim rather than synthesising one: what Bob
+        // applies below is the genuine Remove, signed by Alice.
+        let commit_e3: Vec<u8> = {
+            let task = tokio::spawn(async move {
+                let _ = alice.accept_next().await;
+                alice
+            });
+            let mut s = carol
+                .endpoint_ref()
+                .connect(&alice_addr, crate::group::transport::ALPN_MLS_PROTOCOL)
+                .await
+                .expect("carol dials alice");
+            s.write_all(b"SYNC").await.expect("SYNC header");
+            let mut req = [0u8; 40];
+            req[0..32].copy_from_slice(gid.as_bytes());
+            req[32..40].copy_from_slice(&2u64.to_le_bytes());
+            s.write_all(&req).await.expect("SYNC request");
+            let mut resp = [0u8; 4];
+            s.read_exact(&mut resp).await.expect("SYNC response");
+            assert_eq!(&resp, b"OK\x00\x00");
+            let mut len = [0u8; 4];
+            s.read_exact(&mut len).await.expect("commit length");
+            let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+            s.read_exact(&mut body).await.expect("commit bytes");
+            let _alice = task.await.expect("alice task");
+            body
+        };
+
+        // Any member can replay it. This one answers with nothing else.
+        let mut reply = b"OK\x00\x00".to_vec();
+        reply.extend_from_slice(&(commit_e3.len() as u32).to_le_bytes());
+        reply.extend_from_slice(&commit_e3);
+        let (evictor_addr, evictor) = spawn_raw_sync_responder(&net, 11, reply);
+
+        let report = resync(&bob, &gid, std::slice::from_ref(&evictor_addr))
+            .await
+            .expect("a removal is a report, not a local error");
+        evictor.await.expect("evictor responder");
+
+        assert_eq!(report.answered.len(), 1);
+        assert!(
+            report.answered[0].served_our_removal,
+            "the Commit mls-rs verified removed us, and that is the one fact this \
+             exchange establishes"
+        );
+        assert!(
+            !report.answered[0].advanced_us,
+            "our own epoch did not move for it, so nothing may say this peer moved us"
+        );
+        assert_eq!(report.from_epoch, 2);
+        assert_eq!(
+            report.to_epoch, 2,
+            "mls-rs does not advance the persisted epoch for the Commit that evicts us"
+        );
+
+        let rendered = report.render().join(" | ");
+        assert!(
+            rendered.contains("our epoch did not move"),
+            "line 1 is still about our own state, got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("our epoch advanced while asking"),
+            "no peer may be credited with progress our own epoch did not make, \
+             got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("Commits came from"),
+            "and not under the old wording either, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("served a Commit that removes us"),
+            "the operator must be told what this peer sent, got: {rendered:?}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("up to date"),
+            "being evicted is not currency, got: {rendered:?}"
+        );
+    }
+
+    /// When the same stream moves us **and then** removes us, the removal line
+    /// says what it changed and nothing more.
+    ///
+    /// `request_resync` applies and persists every Commit ahead of the removal
+    /// before it breaks out of the stream, and the removal line is rendered once
+    /// per report, gated only on "some peer served one". So a responder that
+    /// streams `[Remove(someone else), Remove(us)]` — both signable from the
+    /// evicted-member position the sibling test documents — produces a report
+    /// whose first line records real movement. A sentence on the removal line
+    /// claiming our epoch, tree and roster are unchanged contradicts it and is
+    /// false: this responder just took a member off our roster.
+    ///
+    /// What is true, and all that is true, is the mls-rs behaviour for the
+    /// self-removal Commit itself: `update_key_schedule` is skipped and the
+    /// provisional state dropped, so **that** Commit changes nothing. The line
+    /// is scoped to it and points at the epoch line for the rest.
+    ///
+    /// Both Commits are genuine and are taken off the wire from Alice rather
+    /// than synthesised, so what Bob applies is what mls-rs verifies.
+    #[tokio::test]
+    async fn a_stream_that_moves_us_before_removing_us_scopes_the_unchanged_claim() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+        // Dave is used only as an *entitled SYNC requester*: Alice's roster
+        // lists him from the Add commit onward, which is all the responder's
+        // membership check reads, so he needs no group state of his own.
+        let (dave, _dir_d) = build_test_processor(&net, "dave", 4);
+
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+        let dave_kp = dave.export_key_package().await.expect("dave kp");
+
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+        let _ = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+        let _ = alice.add_member(&gid, &dave_kp).await.expect("add dave");
+
+        // Bob catches up honestly to epoch 3, so the epoch-4 and epoch-5
+        // Commits below are the next two he can apply, in that order.
+        let alice = {
+            let task = tokio::spawn(async move {
+                alice.accept_next().await.expect("alice serves the SYNC");
+                alice
+            });
+            resync(&bob, &gid, std::slice::from_ref(&alice_addr))
+                .await
+                .expect("bob catches up");
+            task.await.expect("alice task")
+        };
+        assert_eq!(bob.load_group_summary(&gid).await.expect("bob").epoch, 3);
+        assert!(
+            bob.current_member_node_ids(&gid)
+                .expect("bob roster")
+                .contains(carol_addr.peer_id.as_bytes()),
+            "Carol is on Bob's roster before the sweep, so her departure is measurable"
+        );
+
+        // Epoch 4 removes Carol; epoch 5 removes Bob.
+        let carol_leaf = alice
+            .list_members(&gid)
+            .await
+            .expect("members")
+            .iter()
+            .map(|m| m.index)
+            .find(|i| *i == 2)
+            .expect("carol's leaf");
+        let _ = alice
+            .remove_member(&gid, carol_leaf)
+            .await
+            .expect("remove carol");
+        let bob_leaf = alice
+            .list_members(&gid)
+            .await
+            .expect("members")
+            .iter()
+            .map(|m| m.index)
+            .find(|i| *i == 1)
+            .expect("bob's leaf");
+        let _ = alice.remove_member(&gid, bob_leaf).await.expect("remove bob");
+        assert_eq!(alice.load_group_summary(&gid).await.expect("alice").epoch, 5);
+
+        // Dave joined at epoch 3, so the join-epoch clamp entitles him to both.
+        let frames: Vec<Vec<u8>> = {
+            let task = tokio::spawn(async move {
+                let _ = alice.accept_next().await;
+                alice
+            });
+            let mut s = dave
+                .endpoint_ref()
+                .connect(&alice_addr, crate::group::transport::ALPN_MLS_PROTOCOL)
+                .await
+                .expect("dave dials alice");
+            s.write_all(b"SYNC").await.expect("SYNC header");
+            let mut req = [0u8; 40];
+            req[0..32].copy_from_slice(gid.as_bytes());
+            req[32..40].copy_from_slice(&3u64.to_le_bytes());
+            s.write_all(&req).await.expect("SYNC request");
+            let mut resp = [0u8; 4];
+            s.read_exact(&mut resp).await.expect("SYNC response");
+            assert_eq!(&resp, b"OK\x00\x00");
+            let mut out = Vec::new();
+            for _ in 0..2 {
+                let mut len = [0u8; 4];
+                s.read_exact(&mut len).await.expect("commit length");
+                let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+                s.read_exact(&mut body).await.expect("commit bytes");
+                out.push(body);
+            }
+            let _alice = task.await.expect("alice task");
+            out
+        };
+
+        let mut reply = b"OK\x00\x00".to_vec();
+        for f in &frames {
+            reply.extend_from_slice(&(f.len() as u32).to_le_bytes());
+            reply.extend_from_slice(f);
+        }
+        let (responder_addr, responder) = spawn_raw_sync_responder(&net, 16, reply);
+
+        let report = resync(&bob, &gid, std::slice::from_ref(&responder_addr))
+            .await
+            .expect("a removal is a report, not a local error");
+        responder.await.expect("responder");
+
+        // The sweep really did both things: it moved us, and it took a member
+        // off our roster.
+        assert_eq!(report.from_epoch, 3);
+        assert_eq!(
+            report.to_epoch, 4,
+            "the Remove of Carol was applied and persisted; the Remove of us was not \
+             counted as progress"
+        );
+        assert!(
+            !bob.current_member_node_ids(&gid)
+                .expect("bob roster")
+                .contains(carol_addr.peer_id.as_bytes()),
+            "this responder's stream took Carol off our roster"
+        );
+        assert_eq!(report.answered.len(), 1);
+        assert!(report.answered[0].advanced_us);
+        assert!(report.answered[0].served_our_removal);
+
+        let rendered = report.render().join(" | ");
+        assert!(
+            rendered.contains("epoch 3 → 4"),
+            "line 1 must record the movement, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("Applying that Commit alone left our epoch, tree and roster \
+                               as they were"),
+            "the unchanged claim must be scoped to the self-removal Commit, \
+             got: {rendered:?}"
+        );
+        // The unscoped form, which this very report falsifies.
+        assert!(
+            !rendered.contains("Our own epoch, tree and roster are unchanged"),
+            "a report that moved our epoch and shortened our roster may not also say \
+             nothing changed, got: {rendered:?}"
+        );
+    }
+
+    /// The one-shot `--mls-cmd resync` refuses a second
+    /// `--mls-recipient-ticket`, and refuses it **before it dials anybody**.
+    ///
+    /// `--mls-recipient-ticket` is a shared `Vec` flag, and the other
+    /// subcommands use it as one; the restriction is this subcommand's, because
+    /// of what a resync does with an answer. `request_resync` applies and
+    /// persists every Commit a responder streams, verified only against our own
+    /// — possibly stale — state, and one Commit can remove several leaves. Given
+    /// a list, the first peer asked therefore decides what happens to the rest:
+    /// it can serve a Remove of the operator's other named peers, and the sweep
+    /// then either dials a member it has just watched being evicted or drops it
+    /// from the queue — a responder excising the answers that would have
+    /// contradicted its own, reported as a departure. One peer per invocation
+    /// leaves no queue for an answer to act on.
+    ///
+    /// The assertion is on behaviour, not on the message: each address is a
+    /// responder that signals when it is dialled, and neither may be. If the
+    /// check were dropped both would answer `OK\x00\x00`, `run` would return
+    /// `Ok`, and both signals would arrive.
+    #[tokio::test]
+    async fn the_one_shot_resync_refuses_more_than_one_ticket() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+
+        // Two peers that would both answer, so nothing but the refusal can keep
+        // them un-dialled.
+        let (first_addr, first, mut first_rx) =
+            spawn_probed_sync_responder(&net, 14, b"OK\x00\x00".to_vec());
+        let (second_addr, second, mut second_rx) =
+            spawn_probed_sync_responder(&net, 15, b"OK\x00\x00".to_vec());
+
+        let err = run(
+            MlsCommand::Resync {
+                group_id: gid,
+                peer_tickets: vec![
+                    Ticket::new(first_addr, None, None),
+                    Ticket::new(second_addr, None, None),
+                ],
+            },
+            bob,
+        )
+        .await
+        .expect_err("two tickets must be refused");
+        first.abort();
+        second.abort();
+
+        assert!(
+            first_rx.try_recv().is_err(),
+            "the refusal must land before the first peer is dialled"
+        );
+        assert!(
+            second_rx.try_recv().is_err(),
+            "and no peer on the list may be dialled either"
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("at most one --mls-recipient-ticket"),
+            "the operator must be told the limit, got: {msg:?}"
+        );
+        // The alternative offered must not misdescribe itself: dropping the
+        // ticket selects the remembered-address sweep, which asks *every*
+        // remembered member, not one.
+        assert!(
+            msg.contains("all of them"),
+            "omitting the ticket is still a multi-peer sweep and the error must not \
+             imply otherwise, got: {msg:?}"
+        );
+    }
+
+    /// …and the one ticket it does take is asked even when no roster vouches for
+    /// it.
+    ///
+    /// That bypass is why an explicit ticket exists: `resolve_recipients` and
+    /// `known_member_addrs` filter the stored address book against this group's
+    /// live roster, and a ticket the operator typed is deliberately not put
+    /// through it — the address is dialled because the operator named it. Routing
+    /// the ticket branch through the roster instead would revoke that for every
+    /// address the roster cannot vouch for, including one that was never on it.
+    ///
+    /// Driven through `run` rather than through the sweep helper, because the
+    /// dispatch arm is where the two branches are chosen and so where the bypass
+    /// could be lost. Asserted on the dial itself: a filtered branch never
+    /// connects to this address at all.
+    #[tokio::test]
+    async fn the_one_shot_resync_still_asks_a_single_ticket_no_roster_vouches_for() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let alice_ticket: Ticket = print_local_address(&alice)
+            .await
+            .expect("alice ticket")
+            .parse()
+            .expect("parse alice");
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+        let _ = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+
+        // Bob's address book holds a member of this group, so a branch that
+        // consulted the roster would have somewhere else to go and would still
+        // return `Ok` — which is what makes the dial signal, not the return
+        // value, the thing under test.
+        bob.remember_member_tickets(&gid, &[alice_ticket]);
+        assert_eq!(
+            bob.known_member_addrs(&gid).expect("book").len(),
+            1,
+            "the roster-filtered list is non-empty, so this test cannot pass by \
+             accident of there being nothing else to ask"
+        );
+
+        // A node no group vouches for: never on this roster, never in the book.
+        let (outsider_addr, outsider, mut outsider_rx) =
+            spawn_probed_sync_responder(&net, 13, b"OK\x00\x00".to_vec());
+        let outsider_id = outsider_addr.peer_id;
+        assert!(
+            !bob.current_member_node_ids(&gid)
+                .expect("bob roster")
+                .contains(outsider_id.as_bytes()),
+            "the ticket under test must be for a node this group's roster does not list"
+        );
+
+        // Alice must not answer: if the ticket were filtered out and the sweep
+        // fell back to the remembered book, this would be the peer it reached,
+        // and the run would still succeed. Leaving her silent is what turns that
+        // substitution into a visible failure.
+        let alice_task = tokio::spawn(async move {
+            let _ = alice;
+            std::future::pending::<()>().await;
+        });
+
+        run(
+            MlsCommand::Resync {
+                group_id: gid,
+                peer_tickets: vec![Ticket::new(outsider_addr, None, None)],
+            },
+            bob,
+        )
+        .await
+        .expect("the outsider answered, so the sweep reached somebody");
+        outsider.abort();
+        alice_task.abort();
+
+        assert!(
+            outsider_rx.try_recv().is_ok(),
+            "a ticket for a peer no roster vouches for must still be dialled — that \
+             bypass is what an explicit ticket is for"
+        );
+    }
+
+    /// A Commit removing us is **not** proof we are out of the group, and the
+    /// report must not say it is.
+    ///
+    /// mls-rs verifying that Commit establishes one thing: its signer held this
+    /// group's state at the epoch we are at. A member the group evicted at a
+    /// *later* epoch — one we have not applied — still holds exactly that, and
+    /// that is precisely the party a lagging caller ends up dialling
+    /// (`known_member_addrs` filters the address book against our own stale
+    /// roster, so an evicted member survives it). Here Carol, evicted at epoch 3,
+    /// signs a Remove of Bob at Bob's epoch 2; Bob verifies it, while Alice — the
+    /// honest, up-to-date group — still lists Bob as a member.
+    ///
+    /// So this pins what the line may say. It reports the responder; it does not
+    /// call the Commit unmintable, does not tell the operator no delta can carry
+    /// us past it (mls-rs discards a self-removal, so a later honest delta
+    /// applies normally), and does not steer anyone to a fresh Welcome — which
+    /// `join_group_from_welcome` refuses for a gid we already hold, leaving only
+    /// a Welcome for a *different* group from whoever connects first. That is the
+    /// chain already taken off the `ERR\x01` path.
+    #[tokio::test]
+    async fn a_removal_minted_by_an_evicted_member_is_reported_as_the_responder_not_as_our_exit() {
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (bob, _dir_b) = build_test_processor(&net, "bob", 2);
+        let (carol, _dir_c) = build_test_processor(&net, "carol", 3);
+
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let bob_addr = bob.local_addr().await.expect("bob addr");
+        let carol_addr = carol.local_addr().await.expect("carol addr");
+        let bob_kp = bob.export_key_package().await.expect("bob kp");
+        let carol_kp = carol.export_key_package().await.expect("carol kp");
+
+        let gid = alice.create_group().await.expect("create");
+        let add_bob = alice.add_member(&gid, &bob_kp).await.expect("add bob");
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.expect("bob accepts welcome");
+                bob
+            });
+            alice
+                .send_welcome_to(&bob_addr, &add_bob.welcome)
+                .await
+                .expect("welcome to bob");
+            task.await.expect("bob task")
+        };
+        let add_carol = alice.add_member(&gid, &carol_kp).await.expect("add carol");
+        let carol = {
+            let task = tokio::spawn(async move {
+                carol.accept_next().await.expect("carol accepts welcome");
+                carol
+            });
+            alice
+                .send_welcome_to(&carol_addr, &add_carol.welcome)
+                .await
+                .expect("welcome to carol");
+            task.await.expect("carol task")
+        };
+
+        // Bob catches up honestly to epoch 2.
+        let alice = {
+            let task = tokio::spawn(async move {
+                alice.accept_next().await.expect("alice serves the SYNC");
+                alice
+            });
+            resync(&bob, &gid, std::slice::from_ref(&alice_addr))
+                .await
+                .expect("bob catches up");
+            task.await.expect("alice task")
+        };
+        assert_eq!(bob.load_group_summary(&gid).await.expect("bob").epoch, 2);
+
+        // The group evicts Carol at epoch 3. Bob is unreachable and never sees
+        // it, so his roster — and any address list derived from it — still has
+        // her on it.
+        let carol_leaf = alice
+            .list_members(&gid)
+            .await
+            .expect("members")
+            .iter()
+            .map(|m| m.index)
+            .find(|i| *i == 2)
+            .expect("carol's leaf");
+        let _ = alice
+            .remove_member(&gid, carol_leaf)
+            .await
+            .expect("remove carol");
+
+        // Carol, evicted but still holding epoch-2 state, signs a Remove of Bob.
+        // It is built at Bob's current epoch, which is all it takes.
+        let bob_leaf = carol
+            .list_members(&gid)
+            .await
+            .expect("members")
+            .iter()
+            .map(|m| m.index)
+            .find(|i| *i == 1)
+            .expect("bob's leaf");
+        let forged = carol
+            .remove_member(&gid, bob_leaf)
+            .await
+            .expect("an evicted member can still sign at the epoch it was evicted from");
+
+        let mut reply = b"OK\x00\x00".to_vec();
+        reply.extend_from_slice(&(forged.len() as u32).to_le_bytes());
+        reply.extend_from_slice(&forged);
+        let (responder_addr, responder) = spawn_raw_sync_responder(&net, 12, reply);
+
+        let report = resync(&bob, &gid, std::slice::from_ref(&responder_addr))
+            .await
+            .expect("a removal is a report, not a local error");
+        responder.await.expect("responder");
+
+        // mls-rs really did verify it — the detection is kept, not weakened.
+        assert_eq!(report.answered.len(), 1);
+        assert!(
+            report.answered[0].served_our_removal,
+            "mls-rs verified a Remove of us minted by a member the group had already \
+             evicted; that is the case the wording has to survive"
+        );
+
+        // And it established nothing about our membership.
+        assert!(
+            alice
+                .current_member_node_ids(&gid)
+                .expect("alice roster")
+                .contains(bob_addr.peer_id.as_bytes()),
+            "the honest, up-to-date group still lists us, so we are not out of it"
+        );
+        assert_eq!(
+            report.to_epoch, 2,
+            "mls-rs discards a self-removal, so our own epoch is untouched"
+        );
+        assert!(
+            bob.current_member_node_ids(&gid)
+                .expect("bob roster")
+                .contains(bob_addr.peer_id.as_bytes()),
+            "and our own roster still lists us, so a later honest delta applies normally"
+        );
+
+        let rendered = report.render().join(" | ");
+        assert!(
+            rendered.contains("served a Commit that removes us"),
+            "the operator must still be told what this peer sent, got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("Ask another peer"),
+            "and told what to do about it. Not that the responder is dishonest — an \
+             honest one that removed us and re-admitted us later serves this same \
+             Commit out of retained history where it recorded no join epoch for us — \
+             but that one peer's word settles nothing here, got: {rendered:?}"
+        );
+        // The three claims round 3 made here, each false in this very test.
+        assert!(
+            !rendered.contains("mint"),
+            "an evicted member just minted one, so nothing may say an outsider cannot, \
+             got: {rendered:?}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("welcome"),
+            "no re-admission steer: `join_group_from_welcome` refuses a Welcome for a gid \
+             we already hold, so the only one that could be accepted is for a different \
+             group, from whoever connects first, got: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("No delta can carry us past it"),
+            "a later honest delta applies normally, got: {rendered:?}"
+        );
+        assert!(
+            !rendered.to_lowercase().contains("accept-one")
+                && !rendered.to_lowercase().contains("accept_one"),
+            "and no command is named, got: {rendered:?}"
+        );
     }
 }

@@ -272,6 +272,59 @@ pub struct GroupChatProcessor {
     >,
 }
 
+/// What one SYNC exchange did to **our own** state
+/// ([`GroupChatProcessor::request_resync`]).
+///
+/// Both fields record what *this* node did — they are set only after mls-rs
+/// verified a Commit against our own group state and `write_to_storage`
+/// persisted it. Nothing in the SYNC exchange authenticates the responder, so
+/// these are the only two things a caller may build a statement out of; what the
+/// peer said about itself is not among them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResyncOutcome {
+    /// At least one Commit from this peer's stream was verified and written.
+    ///
+    /// **Not the same as "our epoch moved."** A Commit that removes *us* is
+    /// verified and persisted like any other, but mls-rs does not advance the
+    /// locally persisted epoch for it, so this can be `true` while
+    /// [`load_group_summary`](GroupChatProcessor::load_group_summary) reports
+    /// the epoch unchanged. A caller that wants to say the sweep made progress
+    /// has to read its own epoch rather than trust this flag.
+    pub applied: bool,
+    /// One of those Commits was a Remove of **us**, verified against our own
+    /// state.
+    ///
+    /// **This is a fact about the responder, not about our membership**, and a
+    /// caller must render it as one. mls-rs verifying the Commit establishes
+    /// that its signer held this group's state at the epoch we are at — and a
+    /// member the group evicted at some *later* epoch, one we have not applied,
+    /// still holds exactly that, so it can sign a Remove of us that verifies
+    /// here while every honest member's roster still lists us. It establishes
+    /// less than on any other Commit, at that: mls-rs 0.55.2 gates
+    /// `update_key_schedule` on `!is_self_removed` and recomputes the
+    /// confirmation tag only inside it, so on this one the tag must be present
+    /// but is never checked against the transcript.
+    ///
+    /// Applying **this Commit** changes nothing here: mls-rs skips
+    /// `update_key_schedule` for a self-removal and drops the provisional state,
+    /// so it leaves our epoch, tree and roster as it found them and a later
+    /// honest delta applies normally. That says nothing about the rest of the
+    /// stream — every Commit ahead of this one was applied and persisted before
+    /// the loop broke — so a caller reporting what a peer did to us must read
+    /// its own epoch rather than infer "nothing happened" from this flag.
+    ///
+    /// What it *is* good for is weighing the peer that sent it. A responder
+    /// streams history only to a caller its **current** roster lists (see the
+    /// membership check in `accept_next`, which answers `ERR\x01` otherwise), so
+    /// a node whose roster reflected this Commit — i.e. no longer lists us —
+    /// would have refused instead of streaming. That is not the same as "it
+    /// never applied this Commit": a responder that removed us and re-admitted
+    /// us later lists us again, and where it recorded no join epoch for us
+    /// (`member_join_epoch` `None` deliberately does not clamp) it serves the
+    /// old Remove out of retained history while behaving honestly.
+    pub removed_us: bool,
+}
+
 impl GroupChatProcessor {
     /// Acquire the per-group lock, creating it if this is the first waiter.
     ///
@@ -1310,7 +1363,7 @@ impl GroupChatProcessor {
         res
     }
 
-    pub async fn request_resync(&self, gid: &GroupId, peer_addr: &PeerAddr) -> Result<bool, GroupError> {
+    pub async fn request_resync(&self, gid: &GroupId, peer_addr: &PeerAddr) -> Result<ResyncOutcome, GroupError> {
         let group = self.client.load_group(gid.as_bytes()).map_err(|e| {
             let m = format!("{e}");
             if m.contains("GroupNotFound") || m.contains("group not found") {
@@ -1339,28 +1392,48 @@ impl GroupChatProcessor {
         })?;
 
         let mut resp = [0u8; 4];
-        tokio::time::timeout(crate::network::IDLE_TIMEOUT, stream.read_exact(&mut resp))
+        // HANDSHAKE_TIMEOUT, not the 5-minute bulk IDLE_TIMEOUT — the mirror
+        // image of the deadline the responder puts on *its* small fixed reads
+        // (see `accept_next` above, which calls that pattern a head-of-line
+        // DoS). A responder that connects and then says nothing would otherwise
+        // hold this call for 300 s, and the caller sweeps peers one at a time
+        // from a REPL, so n silent peers cost n x 300 s of an operator's
+        // session. IDLE_TIMEOUT itself is shared with the bulk transfer paths
+        // in `network` and `group::transport` and is deliberately not changed.
+        tokio::time::timeout(crate::network::HANDSHAKE_TIMEOUT, stream.read_exact(&mut resp))
             .await
             .map_err(|_| {
                 GroupError::Transport(crate::p2p::P2pError::Connect(
-                    "read SYNC response: idle timeout".into(),
+                    "read SYNC response: handshake timeout".into(),
                 ))
             })?
             .map_err(|e| {
                 GroupError::Transport(crate::p2p::P2pError::Connect(format!("read SYNC response: {e}")))
             })?;
 
+        // Typed, not stringly. These two are the responder's own rejection
+        // codes, and a caller that wants to tell them apart must not do it by
+        // matching substrings of the rendered error: a QUIC close reason the
+        // peer chose arrives inside `Transport(Connect(..))` and would match,
+        // so text matching let *any* peer produce the rejection of its choice.
+        //
+        // What the variant establishes is exactly this and no more: the
+        // responder sent that code. It does **not** establish that the claim is
+        // true. Nothing here authenticates the responder — not its membership,
+        // not its view of the roster, not that it runs this software — so a
+        // caller rendering these must attribute the claim to the peer rather
+        // than assert it (see `cli::describe_resync_failure`).
         if &resp == b"ERR\x01" {
-            return Err(GroupError::Backend("Sync rejected: peer rejected roster or group".to_string()));
+            return Err(GroupError::SyncRejectedByRoster);
         }
         if &resp == b"ERR\x02" {
-            return Err(GroupError::Backend("Sync rejected: epoch too old, Welcome fallback needed".to_string()));
+            return Err(GroupError::SyncEpochPruned);
         }
         if &resp != b"OK\x00\x00" {
             return Err(GroupError::Backend(format!("Sync rejected: unexpected response {:?}", resp)));
         }
 
-        let mut applied_any = false;
+        let mut outcome = ResyncOutcome::default();
         let mut loop_count = 0;
         loop {
             loop_count += 1;
@@ -1369,14 +1442,16 @@ impl GroupChatProcessor {
             }
 
             let mut len_bytes = [0u8; 4];
+            // Same deadline as the response read above, for the same reason: a
+            // peer that stops mid-stream must not pin the caller for 300 s.
             let read_res =
-                match tokio::time::timeout(crate::network::IDLE_TIMEOUT, stream.read_exact(&mut len_bytes))
+                match tokio::time::timeout(crate::network::HANDSHAKE_TIMEOUT, stream.read_exact(&mut len_bytes))
                     .await
                 {
                     Ok(r) => r,
                     Err(_) => {
                         return Err(GroupError::Transport(crate::p2p::P2pError::Connect(
-                            "read commit length: idle timeout".into(),
+                            "read commit length: handshake timeout".into(),
                         )))
                     }
                 };
@@ -1396,11 +1471,15 @@ impl GroupChatProcessor {
                 )));
             }
             let mut commit_bytes = vec![0u8; len];
-            tokio::time::timeout(crate::network::IDLE_TIMEOUT, stream.read_exact(&mut commit_bytes))
+            // The body too, mirroring the responder's own MLS-frame body read
+            // (`accept_next`, which bounds the same MAX_MLS_FRAME_BYTES-capped
+            // body by HANDSHAKE_TIMEOUT). A peer that sends a length prefix and
+            // then trickles is otherwise a second 300 s stall per frame.
+            tokio::time::timeout(crate::network::HANDSHAKE_TIMEOUT, stream.read_exact(&mut commit_bytes))
                 .await
                 .map_err(|_| {
                     GroupError::Transport(crate::p2p::P2pError::Connect(
-                        "read commit bytes: idle timeout".into(),
+                        "read commit bytes: handshake timeout".into(),
                     ))
                 })?
                 .map_err(|e| {
@@ -1437,11 +1516,17 @@ impl GroupChatProcessor {
             // message); persisting it into the commit-history DB as if it were a
             // Commit would corrupt future delta resyncs. Reject before any write
             // (the non-Commit mutation stays in-memory only and is dropped).
-            if !matches!(received, mls_rs::group::ReceivedMessage::Commit(_)) {
-                return Err(GroupError::Backend(
-                    "SYNC stream carried a non-Commit MLS message; aborting resync".into(),
-                ));
-            }
+            //
+            // Bound rather than matched so the commit's *effect* can be read
+            // after the write below. Same reject, same place, same bytes.
+            let commit = match received {
+                mls_rs::group::ReceivedMessage::Commit(desc) => desc,
+                _ => {
+                    return Err(GroupError::Backend(
+                        "SYNC stream carried a non-Commit MLS message; aborting resync".into(),
+                    ))
+                }
+            };
 
             group.write_to_storage().map_err(|e| {
                 GroupError::Storage(format!("SYNC write_to_storage: {e}"))
@@ -1462,10 +1547,32 @@ impl GroupChatProcessor {
                 &roster_before,
                 &Self::roster_peer_ids(&group),
             );
-            applied_any = true;
+            outcome.applied = true;
+
+            // Read the same way the direct-receive path reads it (see
+            // `accept_next`'s `CommitEffect::Removed` arm). What it is worth is
+            // spelled out on `ResyncOutcome::removed_us`, and it is less than it
+            // looks: verification says the signer held this group's state at our
+            // epoch, which an evicted member also does, so this is evidence
+            // about the responder rather than about our membership.
+            //
+            // Note it does *not* advance our persisted epoch — mls-rs discards
+            // the provisional state for a self-removal — so a caller measuring
+            // progress by epoch alone would report "nothing happened" for the
+            // one message a lagging member most needs to see.
+            //
+            // Stop reading here. Nothing later in the stream can apply to a
+            // group we are no longer in, so continuing would only feed more
+            // peer-chosen bytes to mls-rs and turn this into a `Backend` error
+            // that loses the fact above. The frames not read are dropped with
+            // the stream.
+            if matches!(commit.effect, mls_rs::group::CommitEffect::Removed { .. }) {
+                outcome.removed_us = true;
+                break;
+            }
         }
 
-        Ok(applied_any)
+        Ok(outcome)
     }
 
     /// Process a single MLS payload that arrived through some channel
@@ -3764,7 +3871,8 @@ mod tests {
         });
 
         let resync_res = bob.request_resync(&gid, &alice_addr).await.unwrap();
-        assert!(resync_res, "Bob should have applied missing commits");
+        assert!(resync_res.applied, "Bob should have applied missing commits");
+        assert!(!resync_res.removed_us, "this catch-up did not remove Bob");
 
         let alice = alice_task.await.unwrap();
 
@@ -3802,5 +3910,81 @@ mod tests {
         let resync_err_c = bob.request_resync(&gid, &alice_addr).await.unwrap_err();
         assert!(resync_err_c.to_string().contains("Welcome fallback") || resync_err_c.to_string().contains("pruned"));
         let _ = alice_task_3.await.unwrap();
+    }
+
+    /// A responder that connects and then says nothing is dropped on the
+    /// **handshake** deadline, not the five-minute bulk one.
+    ///
+    /// `request_resync` is the mirror image of the responder loop, whose own
+    /// comment calls a long block on a small fixed read a head-of-line DoS: the
+    /// caller sweeps peers one at a time, from an interactive REPL, so every
+    /// silent peer used to cost 300 s of an operator's session on a four-byte
+    /// read (and again on each frame length and body). `IDLE_TIMEOUT` itself is
+    /// shared with the bulk transfer paths and is deliberately unchanged, so
+    /// this pins which of the two deadlines this read uses.
+    ///
+    /// Time is paused, so the wait is virtual and the test is instant; the
+    /// silent peer holds the stream open on a far-future sleep so the runtime's
+    /// next timer is the deadline under test.
+    #[tokio::test(start_paused = true)]
+    async fn request_resync_bounds_a_silent_responder_by_the_handshake_deadline() {
+        use tokio::io::AsyncReadExt;
+
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_proc_on_net(&net, "alice", 1);
+        let (bob, _dir_b) = build_proc_on_net(&net, "bob", 2);
+        let bob_addr = bob.local_addr().await.unwrap();
+        let bob_kp = bob.export_key_package().await.unwrap();
+
+        let gid = alice.create_group().await.unwrap();
+        let add_bob = alice.add_member(&gid, &bob_kp).await.unwrap();
+        let bob = {
+            let task = tokio::spawn(async move {
+                bob.accept_next().await.unwrap();
+                bob
+            });
+            alice.send_welcome_to(&bob_addr, &add_bob.welcome).await.unwrap();
+            task.await.unwrap()
+        };
+
+        // A peer that accepts the connection, reads the request, and then never
+        // answers — holding the stream open so this is a stall, not an EOF.
+        let mute_id = PeerId::new([9; 32]);
+        let mute_ep = net.register(mute_id, vec![PROTO_MLS]);
+        let mute = tokio::spawn(async move {
+            let inc = mute_ep
+                .accept()
+                .await
+                .unwrap()
+                .establish(std::time::Duration::from_secs(5))
+                .await
+                .unwrap();
+            let mut s = inc.stream;
+            let mut req = [0u8; 44];
+            let _ = s.read_exact(&mut req).await;
+            tokio::time::sleep(std::time::Duration::from_secs(86_400)).await;
+        });
+
+        let started = tokio::time::Instant::now();
+        let err = bob
+            .request_resync(&gid, &PeerAddr::new(mute_id))
+            .await
+            .expect_err("a responder that says nothing must not be waited on forever");
+        let waited = started.elapsed();
+        mute.abort();
+
+        assert!(
+            waited >= crate::network::HANDSHAKE_TIMEOUT,
+            "it must actually wait the handshake deadline, waited {waited:?}"
+        );
+        assert!(
+            waited < crate::network::IDLE_TIMEOUT,
+            "a small fixed read must not be bounded by the 5-minute bulk deadline, \
+             waited {waited:?}"
+        );
+        assert!(
+            err.to_string().contains("handshake timeout"),
+            "got: {err}"
+        );
     }
 }

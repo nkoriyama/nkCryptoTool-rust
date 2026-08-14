@@ -328,7 +328,7 @@ struct Args {
     /// `create-group`, `list-groups`, `list-members`,
     /// `export-key-package`, `add-member`, `remove-member`,
     /// `accept-one`, `listen`, `send`, `chat-group`,
-    /// `print-local-address`.
+    /// `print-local-address`, `resync`.
     #[arg(long, help = "MLS subcommand to run (see --help for the list)")]
     mls_cmd: Option<String>,
 
@@ -3080,11 +3080,19 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
             recipient_tickets: parse_tickets(&args.mls_recipient_ticket)?,
         },
         "print-local-address" => MlsCommand::PrintLocalAddress,
+        "resync" => MlsCommand::Resync {
+            group_id: parse_group_id(&require(&args.mls_group_id, "mls-group-id")?)?,
+            // Optional, and at most one — `group::cli::run` refuses a longer
+            // list for this subcommand and says why. With no ticket the group's
+            // remembered member addresses are asked instead, and all of them
+            // are. The flag itself stays a `Vec`; the restriction is `resync`'s.
+            peer_tickets: parse_tickets(&args.mls_recipient_ticket)?,
+        },
         other => anyhow::bail!(
             "unknown --mls-cmd {other:?}; expected one of \
              create-group, list-groups, list-members, export-key-package, \
              add-member, remove-member, accept-one, listen, send, send-file, \
-             chat-group, print-local-address, rekey"
+             chat-group, print-local-address, resync, rekey"
         ),
     };
 

@@ -386,13 +386,185 @@ trade-off is explicit rather than forgotten.
       deployment with no `--inbox-url` configured at all, a deposit that was
       itself refused (a full slot — item 9), or an absence longer than the
       relay's 7-day envelope TTL. In those cases the member is stuck at its old
-      epoch and **there is no way to ask**: `GroupChatProcessor::request_resync`
-      implements the pull and the responder side is live, but nothing outside
-      the test suite calls it — no CLI subcommand, REPL command, GUI action or
-      FFI method — so recovery is re-admission (a fresh Welcome). Wiring that
-      pull to an operator-visible command is a separate follow-on change and is
-      deliberately not part of this patch; until it lands, treat the relay as
-      load-bearing for roster convergence.
+      epoch until someone asks for the delta by hand:
+
+          nk-crypto-tool --mls-cmd resync --mls-group-id <hex> \
+              --mls-recipient-ticket <peer-ticket>
+
+      or `/resync [ticket]` inside `--mls-cmd listen`, which is where an
+      operator actually notices the group has gone quiet. **The two forms ask
+      different sets, and neither set is "this group's members" as such:**
+        - `--mls-cmd resync` takes **at most one** `--mls-recipient-ticket` and
+          refuses a longer list before it dials anything (why, below). With no
+          ticket it asks the group's remembered member addresses —
+          `known_member_addrs`, i.e. the stored address book filtered against
+          this group's live roster — and **all** of them.
+        - `/resync <ticket>` asks that one peer. `/resync` with no argument asks
+          the **listener's recipient list**, which is not this group's roster: it
+          is whatever `resolve_recipients` produced at startup plus every address
+          `/peer` has added since, shared across every group the session
+          addresses. So it sends `SYNC` — the group id and our current epoch — to
+          peers `known_member_addrs` would have filtered out, including addresses
+          no roster lists at all.
+      The request carries the caller's *own* current epoch, so it fetches
+      exactly the delta it is missing and is a no-op when current — it is not
+      clamped out of its own history by the change above. Recovery is **not
+      automatic** on this path: nothing polls, so a member stays behind until
+      someone runs it.
+    - **What a resync can and cannot tell you.** `request_resync` dials a
+      `PeerAddr` and reads whatever comes back. **Nothing in that exchange
+      authenticates the responder** — not its membership, not its epoch, not its
+      view of the roster, not even that it runs this software. So the command
+      reports three different kinds of thing, and keeps them apart:
+        - *Facts about our own state.* The epoch before and after, read from our
+          own group state, re-read after the sweep (so a stream that applied a
+          genuine Commit and then broke is reported as the progress it made),
+          and per peer whether our epoch was higher after its exchange than
+          before it. That per-peer flag is a **window, not causation** — a
+          listener applies inbound Commits on another task — and the line says
+          "our epoch advanced while asking" rather than crediting the peer with
+          the Commits. It is measured on our own epoch precisely because
+          `request_resync`'s own "I applied something" return is `true` for the
+          Commit that removes us, which moves that epoch nowhere: crediting the
+          peer on it printed "Commits came from X" directly under "our epoch did
+          not move". Also here: the node ids this group's roster listed when the
+          sweep started and does not list when it ended, named in hex. That is
+          two reads of our own roster and no more — it does not say the group
+          removed them (a roster node id is written by the member it describes),
+          and nothing in the sweep acts on it; it is reported because the address
+          an operator dials next is usually one held as a ticket rather than one
+          this sweep had queued, so `skipped` alone left it unmentioned.
+        - *One thing measured about the responder.* If a peer's stream carried a
+          Commit removing **us**, mls-rs verified that Commit against our own
+          group state — which establishes that its signer held this group's state
+          at the epoch we are at, and **not** that we are out of the group. A
+          member the group evicted at a later epoch, one we have not applied,
+          still holds exactly that state and can sign a Remove of us that
+          verifies here while every honest member's roster still lists us (there
+          is a test that does it). "Verified" is also weaker on this Commit than
+          on any other: mls-rs 0.55.2 gates `update_key_schedule` on
+          `!is_self_removed` and recomputes the confirmation tag only inside it,
+          so on a Commit that removes us the tag must be *present* and is never
+          checked against the transcript we would have derived. Applying **that
+          Commit** changes nothing here: mls-rs skips `update_key_schedule` for a
+          self-removal and drops the provisional state, so it leaves our epoch,
+          tree and roster as it found them and a later honest delta applies
+          normally. The rendered line is scoped to that Commit, because the rest
+          of the same stream was applied and persisted before it — a responder
+          streaming `[Remove(someone else), Remove(us)]` really does advance our
+          epoch and shorten our roster, and the epoch line is where that shows.
+          What the event *is* good for is weighing the peer — a responder streams
+          history only to a caller its **current** roster lists, and answers
+          `ERR\x01` otherwise, so one whose roster reflected this Commit would
+          have refused — and that is short of a verdict, so the line stops at
+          "ask another peer". An honest responder produces the same event where
+          it recorded no join epoch for us (`member_join_epoch` `None`
+          deliberately does not clamp): having removed us and re-admitted us at
+          an epoch we never applied, its roster lists us again and it serves the
+          old Remove out of retained history. It carries
+          **no re-admission advice and names no command**: `join_group_from_welcome`
+          refuses a Welcome for a gid we already hold, so the only Welcome that
+          could be accepted is one for a *different* group, from whoever connects
+          first — the same steer that was taken off the `ERR\x01` path.
+        - *One peer's claim.* Whatever each responder said, attributed to it by
+          node id and marked unverified. The two protocol rejections are told
+          apart by `GroupError` variant carried from the `ERR\x01`/`ERR\x02`
+          wire codes, never by substring on the rendered error — a peer chooses
+          the QUIC close reason that lands inside `Transport(Connect(..))`, so
+          text matching let any failure be dressed as either rejection. What the
+          variant establishes is that the responder sent those four bytes, and
+          nothing more.
+      There is deliberately **no "you are up to date"** anywhere in the output,
+      and no recommendation to take a fresh invitation. Both were previously
+      reachable from four attacker-chosen bytes: `OK\x00\x00` then close made
+      the caller announce currency (to, of all people, a member that had just
+      been evicted and was asking why the group went quiet), and `ERR\x01`
+      pointed the operator at `--mls-cmd accept-one`, which is `accept_next`
+      with no sender check, so whoever answered next would have been the
+      inviter. For the same reason a multi-peer sweep asks **every** peer instead
+      of stopping at the first that answers: one peer must not be able to end it
+      by saying nothing, and `known_member_addrs` returns redb key order, which is
+      node-id byte order and therefore grindable for first place. "Every" means
+      every peer still on the list when its turn comes: the sweep applies
+      Commits into our own state as it runs, so after any peer that moved us it
+      re-derives its own tail — through `prune_departed_recipients` in the
+      listener, through `known_member_addrs` on the one-shot path — and stops
+      dialling whoever that dropped. Without it the sweep would ask Alice, apply
+      her Remove of Carol, and then dial Carol, handing a member we have just
+      watched being evicted our liveness, our network path, the group id and our
+      post-eviction epoch (the SYNC request carries it in clear). The count of
+      peers dropped this way is reported, so "asked N peer(s)" is never quietly
+      smaller than the list it started from — and the line says only that this
+      group's roster no longer lists them, not which Commit took them off it: on
+      the listener path the drop is `prune_departed_recipients`' decision, and
+      its baseline moves on the inbound task too.
+    - **Why `--mls-cmd resync` takes at most one `--mls-recipient-ticket`.** A
+      list on this subcommand hands the first peer asked a say over the rest.
+      `request_resync` applies and persists every Commit a responder streams once
+      mls-rs verifies it against our own — possibly stale — state, and one Commit
+      can remove several leaves, so a responder can serve a Remove of the other
+      named peers and either draw a dial to a member we have just watched being
+      evicted or take them out of the queue, depending on how the tail is
+      re-derived. Both are the responder's choice rather than the operator's, and
+      the second is worse than it looks: the peer excised is exactly the one
+      whose answer would have contradicted the first, and its absence is rendered
+      as a departure. One peer per invocation leaves no queue for an answer to act
+      on; a second peer is a second command, which starts from our state as the
+      first left it and whose disagreement the operator can see. The flag itself
+      stays a `Vec` — the send subcommands use it as one — so the restriction is
+      `resync`'s alone, and the single ticket is still **not** put through the
+      roster filter: an explicit ticket exists to reach a peer no group vouches
+      for, and that bypass is kept (there is a test).
+    - **What a resync still cannot defend against.** A peer that answers is
+      trusted for the Commits it streams to the extent mls-rs verifies them, and
+      it can stop early; a legitimate but partial catch-up and a deliberate one
+      look the same. This is the same exposure the direct-receive path already
+      has (`process_mls_bytes` applies any Commit any connecting peer pushes),
+      so the pull adds no new way for a peer to move our own group state — what
+      it does add is the sweep, which is the rest of this bullet — but it means
+      "no peer sent us anything" is a statement about the peers reached, never
+      about the group.
+      **The one-ticket rule above is narrower than it may read: it removes a
+      responder's say over the sweep only from the list an operator typed on one
+      invocation, and the same lever is still there on both multi-peer forms.**
+      `--mls-cmd resync` with no ticket walks `known_member_addrs` and `/resync`
+      with no argument walks the listener's recipient list, and in both the tail
+      is re-derived against *our own* roster as the responders being asked have
+      just moved it — so a responder that streams a Remove of a queued peer still
+      decides that peer is not asked. **That composition is introduced here, and
+      an earlier draft of this entry was wrong to call it pre-existing.** Both
+      halves of it are in the base: `known_member_addrs` filtering the stored
+      address book against our own possibly-stale roster is base code, and so is
+      `prune_departed_recipients`. What the base does not have is a caller — at
+      `ba6f9f68` `request_resync` has none outside the test module, which is the
+      gap this patch closes — so there was no sweep, no queue of peers waiting to
+      be asked, and nothing for one responder's Commits to steer. The loop that
+      walks such a queue while applying what the peer at its head streams is
+      added here, and it is what turns a filter that was merely stale into one a
+      responder can move on purpose.
+      What bounds it is well short of a fix. The lever needs a Commit mls-rs
+      verifies against our own state, so it is open to a node that holds this
+      group's state at our epoch — a member, or one the group evicted at an epoch
+      we have not applied — rather than to any node that answers a dial. It
+      reaches one invocation: a resync reads history and writes no address-book
+      row (`remember_member_tickets` is not called on this path), so the next
+      sweep resolves `known_member_addrs` from the same stored book, and what
+      carries over is the roster change, which is the Commit's doing rather than
+      the sweep's. And the excision is no longer silent — the node ids this
+      group's roster listed when a sweep started and does not list when it ended
+      are named in the report, on every form — so a peer dropped this way is one
+      the operator can go and ask on its own single-ticket invocation, which is
+      the form the roster filter is deliberately not applied to. Seeing it is not
+      the same as being protected from it, and this entry claims no more.
+      The roster all of this is measured against does not
+      authenticate the node ids it carries — `peer_id_from_credential` reads a
+      self-asserted field, so a member can seat a leaf claiming an arbitrary node
+      id and remove it to synthesise a departure. That is **item 12** below,
+      recorded there against the session recipient list; a resync sweep is a
+      second surface for it, and closing either needs the authenticated identity
+      at the prune site that item 12's "why it is not fixed here" describes.
+      Read "N queued peer(s) were not asked", and the node ids named alongside
+      it, as something a responder may have caused.
     - **What the SYNC clamp does not cover.** A join epoch is recorded only when
       this node applies the Add commit itself (`record_witnessed_joins`, on the
       commit-build, direct-receive and resync-apply paths), stored per

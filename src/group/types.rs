@@ -233,6 +233,36 @@ pub enum GroupError {
     InvalidWelcome(String),
     #[error("transport: {0}")]
     Transport(#[from] crate::p2p::P2pError),
+    /// The SYNC responder answered `ERR\x01`, i.e. it **claims** it does not
+    /// have us on the roster of the group we asked about.
+    ///
+    /// Distinct from [`NotMember`](Self::NotMember), which is *our* view of our
+    /// own membership, decided from state we hold. This is one peer's assertion
+    /// about it, and **nothing authenticates it**: the SYNC exchange proves
+    /// nothing about the responder's membership, its view of the roster, or even
+    /// that it runs this software. Any node the caller dials can send these four
+    /// bytes. A caller that renders this must attribute the claim to that peer,
+    /// never restate it as fact and never turn it into a recommendation to
+    /// accept a Welcome — `accept_next` authorizes no sender, so acting on one
+    /// unauthenticated peer's word is the mistake this wording has to avoid.
+    ///
+    /// This variant and [`SyncEpochPruned`](Self::SyncEpochPruned) exist so
+    /// callers can classify a rejection **on the variant**. The two are told
+    /// apart on the wire, and that distinction must be carried out as a type:
+    /// classifying by substring on the rendered error was strictly worse, because
+    /// a QUIC close reason the peer chose arrives inside `Transport(Connect(..))`
+    /// and would match, so *any* failure could be dressed as either rejection.
+    /// A transport-level failure must stay a transport-level failure. What the
+    /// variant buys is provenance of the four bytes, not their truth.
+    #[error("Sync rejected: peer rejected roster or group")]
+    SyncRejectedByRoster,
+    /// The SYNC responder answered `ERR\x02`, i.e. it **claims** the epoch we
+    /// asked from is older than its oldest retained commit, so it cannot bridge
+    /// the gap with a delta. See [`SyncRejectedByRoster`](Self::SyncRejectedByRoster)
+    /// on why this is a variant rather than a message — and on why it is one
+    /// unauthenticated peer's claim rather than a fact about the group.
+    #[error("Sync rejected: epoch too old, Welcome fallback needed")]
+    SyncEpochPruned,
     #[error("storage: {0}")]
     Storage(String),
     #[error("backend: {0}")]
