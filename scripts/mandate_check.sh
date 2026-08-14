@@ -354,6 +354,20 @@ else
     fail "check_allow_rationale.sh" "missing or not executable"
 fi
 
+# 21. Roster-map critical sections stay synchronous (2026-08 audit, S8 follow-up)
+# The compiler already enforces "no .await inside" by those functions not being
+# async; this guards the hole that leaves -- making them async again. Fails
+# closed: a missing anchor is an error, not a pass.
+if [ -x scripts/check_roster_sync_sections.sh ]; then
+    if bash scripts/check_roster_sync_sections.sh >/dev/null 2>&1; then
+        pass "check_roster_sync_sections.sh: roster critical sections are non-async"
+    else
+        fail "check_roster_sync_sections.sh" "a roster critical section became async, or its anchor moved (re-run manually for details)"
+    fi
+else
+    fail "check_roster_sync_sections.sh" "missing or not executable"
+fi
+
 # ---- End Phase 5 P1 additions ----
 
 # Summary

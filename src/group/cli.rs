@@ -1983,6 +1983,25 @@ async fn seed_roster(
     operator_selected: bool,
 ) {
     let mut snaps = rosters.lock().await;
+    seed_roster_locked(processor, gid, operator_selected, &mut snaps);
+}
+
+/// The synchronous half of [`seed_roster`], split out for the same reason as
+/// [`decide_departures`] and subject to the same rule: **do not make this
+/// `async`.**
+///
+/// This is the second door into the lost update that `decide_departures` closes.
+/// It reads the live roster through the same synchronous `&self` call while
+/// holding the same guard, and it writes the same baseline field, so an `.await`
+/// added between the read and the write here reintroduces the identical bug by a
+/// different route — with the identical CI blind spot, since no test fails and
+/// `clippy::await_holding_lock` does not flag a `tokio` guard.
+fn seed_roster_locked(
+    processor: &GroupChatProcessor,
+    gid: &GroupId,
+    operator_selected: bool,
+    snaps: &mut RosterSnapshots,
+) {
     let held = snaps.entry(*gid).or_default();
     // Monotonic, and independent of whether the read below succeeds.
     held.operator_selected |= operator_selected;
@@ -2139,68 +2158,16 @@ async fn prune_departed_recipients(
     // between the read and the write would have widened it by orders of
     // magnitude, which is what made closing it properly the only option.
     //
-    // Nothing inside this block awaits. The roster reads go to MLS state through
-    // a synchronous `&self` call, not through this map (`seed_roster` already
-    // calls it under this same lock), so the section cannot be interleaved at
-    // all rather than merely being unlikely to be.
+    // Nothing inside the section awaits, and that is now enforced rather than
+    // asserted: all four steps live in [`decide_departures`], which is not
+    // `async`, so an `.await` added to them is a compile error. See its doc for
+    // why a comment was not enough. Do not inline it back here.
     let (departed, vouched, unreadable) = {
         let mut snaps = rosters.lock().await;
-        let current = match processor.current_member_node_ids(gid) {
-            Ok(c) => c,
-            // Keep both the list and the baseline: a roster that cannot be
-            // loaded fails every send from the same group state anyway, so
-            // guessing here could only remove a still-valid recipient on top of
-            // that. The guard is dropped by the return.
-            Err(e) => {
-                return Some(format!(
-                    "[mls] could not re-check recipients against the roster: {}",
-                    crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256)
-                ))
-            }
-        };
-        let vouching: Vec<GroupId> = snaps
-            .iter()
-            .filter(|(g, snap)| *g != gid && snap.operator_selected)
-            .map(|(g, _)| *g)
-            .collect();
-        // No baseline yet — never looked, or the seeding read failed while the
-        // group was still unjoined. Record only; a departure is measurable
-        // against the next epoch change, not this one.
-        let departed: std::collections::HashSet<[u8; 32]> =
-            match snaps.get(gid).and_then(|snap| snap.members.as_ref()) {
-                Some(prev) => prev.difference(&current).copied().collect(),
-                None => std::collections::HashSet::new(),
-            };
-        // Which of the departures another operator-selected group still vouches
-        // for. Skipped entirely when nothing departed, which is the common case
-        // (every Add), so the usual epoch change still costs one roster read.
-        let mut vouched: std::collections::HashSet<[u8; 32]> =
-            std::collections::HashSet::new();
-        let mut unreadable = 0usize;
-        if !departed.is_empty() {
-            for g in &vouching {
-                match processor.current_member_node_ids(g) {
-                    Ok(members) => vouched.extend(departed.intersection(&members).copied()),
-                    Err(_) => unreadable += 1,
-                }
-            }
+        match decide_departures(processor, gid, &mut snaps) {
+            Ok(decided) => decided,
+            Err(note) => return Some(note),
         }
-        // The new baseline is the live roster **plus every id kept on another
-        // group's word**. A kept id has not finished departing: writing only the
-        // live roster would erase it from this group's snapshot, and since
-        // `departed` is a difference against that snapshot it could never be a
-        // candidate for this group again — the vouch, though re-read here, would
-        // never be re-read *for it*. The vouching group's own Remove produces no
-        // event this session acts on (both dispatch sites prune only for the
-        // active gid), so `gid`'s next epoch change is the only trigger there
-        // is, and this is what keeps it eligible for it. An id that is later
-        // re-added to `gid` comes back inside `current` and simply stops being a
-        // departure, which is why this is recorded as roster state rather than
-        // as a pending-departure list that would have to be cleaned up.
-        let mut next = current;
-        next.extend(vouched.iter().copied());
-        snaps.entry(*gid).or_default().members = Some(next);
-        (departed, vouched, unreadable)
     };
     if departed.is_empty() {
         return None;
@@ -2248,6 +2215,103 @@ async fn prune_departed_recipients(
         ));
     }
     Some(note)
+}
+
+/// The synchronous half of [`prune_departed_recipients`]: everything decided
+/// while the roster map is held.
+///
+/// **This function is deliberately not `async`, and that is the whole point of
+/// it existing separately.** The prune's correctness rests on the four steps
+/// below — the live roster read, the baseline read they are diffed against, the
+/// vouch re-reads, and the baseline write — happening with no suspension point
+/// between them, because `listen_loop` hands `rosters` to both the inbound task
+/// and the inbox-poll task with nothing serialising them. An `.await` anywhere
+/// in here lets the two interleave, the later writer clobbers the earlier, and a
+/// member dropped from the baseline can never be pruned again however many times
+/// he is later removed.
+///
+/// That guarantee used to be a convention held by a comment, and it was
+/// invisible to CI: every test stays green when it breaks, and
+/// `clippy::await_holding_lock` does not fire — it targets `std::sync` guards
+/// and deliberately does not flag a `tokio::sync::MutexGuard` held across an
+/// await, which is normally legal. Inside a non-`async fn` an `.await` is a
+/// compile error instead, so breaking the invariant now takes a visible edit
+/// that does not build.
+///
+/// Both roster reads reach MLS state through a synchronous `&self` call rather
+/// than through the map, so nothing here needs to await in the first place.
+///
+/// `Err` carries the operator-facing note the caller renders. It is not a
+/// failure of the prune so much as a decision not to prune against a roster we
+/// could not read.
+fn decide_departures(
+    processor: &GroupChatProcessor,
+    gid: &GroupId,
+    snaps: &mut RosterSnapshots,
+) -> Result<
+    (
+        std::collections::HashSet<[u8; 32]>,
+        std::collections::HashSet<[u8; 32]>,
+        usize,
+    ),
+    String,
+> {
+    let current = match processor.current_member_node_ids(gid) {
+        Ok(c) => c,
+        // Keep both the list and the baseline: a roster that cannot be
+        // loaded fails every send from the same group state anyway, so
+        // guessing here could only remove a still-valid recipient on top of
+        // that. The caller renders this and drops the guard.
+        Err(e) => {
+            return Err(format!(
+                "[mls] could not re-check recipients against the roster: {}",
+                crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256)
+            ))
+        }
+    };
+    let vouching: Vec<GroupId> = snaps
+        .iter()
+        .filter(|(g, snap)| *g != gid && snap.operator_selected)
+        .map(|(g, _)| *g)
+        .collect();
+    // No baseline yet — never looked, or the seeding read failed while the
+    // group was still unjoined. Record only; a departure is measurable
+    // against the next epoch change, not this one.
+    let departed: std::collections::HashSet<[u8; 32]> =
+        match snaps.get(gid).and_then(|snap| snap.members.as_ref()) {
+            Some(prev) => prev.difference(&current).copied().collect(),
+            None => std::collections::HashSet::new(),
+        };
+    // Which of the departures another operator-selected group still vouches
+    // for. Skipped entirely when nothing departed, which is the common case
+    // (every Add), so the usual epoch change still costs one roster read.
+    let mut vouched: std::collections::HashSet<[u8; 32]> =
+        std::collections::HashSet::new();
+    let mut unreadable = 0usize;
+    if !departed.is_empty() {
+        for g in &vouching {
+            match processor.current_member_node_ids(g) {
+                Ok(members) => vouched.extend(departed.intersection(&members).copied()),
+                Err(_) => unreadable += 1,
+            }
+        }
+    }
+    // The new baseline is the live roster **plus every id kept on another
+    // group's word**. A kept id has not finished departing: writing only the
+    // live roster would erase it from this group's snapshot, and since
+    // `departed` is a difference against that snapshot it could never be a
+    // candidate for this group again — the vouch, though re-read here, would
+    // never be re-read *for it*. The vouching group's own Remove produces no
+    // event this session acts on (both dispatch sites prune only for the
+    // active gid), so `gid`'s next epoch change is the only trigger there
+    // is, and this is what keeps it eligible for it. An id that is later
+    // re-added to `gid` comes back inside `current` and simply stops being a
+    // departure, which is why this is recorded as roster state rather than
+    // as a pending-departure list that would have to be cleaned up.
+    let mut next = current;
+    next.extend(vouched.iter().copied());
+    snaps.entry(*gid).or_default().members = Some(next);
+    Ok((departed, vouched, unreadable))
 }
 
 /// Run a [`resync_sweep`] for a running listener, re-checking the recipient list
