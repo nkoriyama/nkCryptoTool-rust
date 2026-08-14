@@ -39,6 +39,10 @@ test_file.txt
 tests/temp_*_keys/
 tests/input_*.txt
 tests/output_*.enc
+# Same hazard, different suite: tests/keybundle_cli.rs hard-codes
+# `tests/tmp_kb_*` as its working directories (expired, wrongpin, rawgate,
+# keyring, genmykey) and they hold KeyBundle material.
+tests/tmp_kb_*/
 
 # Network chat test artifacts
 ticket.txt

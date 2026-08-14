@@ -439,6 +439,7 @@ fn write_file_0600(path: &Path, data: &[u8]) -> Result<(), GroupError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -509,6 +510,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial(tpm)]
     fn strict_policy_matches_tpm_availability() {
         // Constructing the strict counter does no TPM I/O; it just reflects
         // whether a TPM is present. (No NV index is allocated here.)
@@ -538,15 +540,30 @@ mod tests {
     }
 
     /// Undefine an NV index so TPM tests leave no residue, even on panic.
+    ///
+    /// A failure here is reported rather than swallowed: it leaves a defined
+    /// index behind, and the next run of this test starts from a counter that
+    /// is already primed instead of a fresh one. Silently dropping the error
+    /// turned that into an unexplained intermittent failure. `Drop` must not
+    /// panic, so this is a diagnostic, not an assertion.
     struct NvCleanup(u32);
     impl Drop for NvCleanup {
         fn drop(&mut self) {
             let arg = format!("0x{:08X}", self.0);
-            let _ = tpm2(&["tpm2_nvundefine", &arg, "-C", "o"]);
+            if let Err(e) = tpm2(&["tpm2_nvundefine", &arg, "-C", "o"]) {
+                eprintln!("NvCleanup: {arg} was not undefined, next run inherits it: {e}");
+            }
         }
     }
 
+    /// `#[serial]` because the TPM tests share one `/dev/tpmrm0`. They use
+    /// distinct NV indices, so this is not an index collision — it keeps two
+    /// tests from driving the same device through `tpm2-tools` subprocesses at
+    /// once. This is the only cross-test coupling that was left; it has not
+    /// been shown to be the cause of the intermittent failure seen during the
+    /// 2026-08 audit, which was never reproduced.
     #[test]
+    #[serial(tpm)]
     fn tpm_counter_advances_monotonically() {
         if !tpm_available() {
             eprintln!("skipping: no TPM 2.0 available");

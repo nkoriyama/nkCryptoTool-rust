@@ -1111,6 +1111,7 @@ fn write_atomic_secret(path: &Path, data: &[u8]) -> Result<(), GroupError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use tempfile::tempdir;
 
     const TEST_PASS: &str = "nkct-at-rest-test-passphrase";
@@ -1720,7 +1721,14 @@ mod tests {
         assert!(storage.list_group_ids().expect("list").is_empty());
     }
 
+    /// `#[serial]` because every TPM-touching test drives the same
+    /// `/dev/tpmrm0` through `tpm2-tools` subprocesses. The index below is
+    /// outside `rollback::TPM_NV_BASE` (`0x0150_0000`), so it can never
+    /// collide with a real per-DB counter, and `rollback.rs`'s own TPM test
+    /// uses a different index again — the serialisation is about the shared
+    /// device, not about the index.
     #[test]
+    #[serial(tpm)]
     fn tpm_strict_end_to_end_detects_rollback() {
         use crate::group::rollback::{tpm_available, TpmCounter};
         if !tpm_available() {
@@ -1728,20 +1736,36 @@ mod tests {
             return;
         }
         let index = 0x0171_0000u32 | 0xFE02;
-        fn undefine(i: u32) {
-            let _ = std::process::Command::new("tpm2_nvundefine")
-                .arg(format!("0x{i:08X}"))
+        // Returns whether the index is now gone. The pre-test call is
+        // *expected* to fail on a clean run (nothing to undefine), so only the
+        // drop guard reports; a failure there leaves the index defined and the
+        // next run starts from an already-primed counter instead of a fresh
+        // one, which is the shape of an unexplained intermittent failure.
+        fn undefine(i: u32) -> bool {
+            let arg = format!("0x{i:08X}");
+            std::process::Command::new("tpm2_nvundefine")
+                .arg(&arg)
                 .args(["-C", "o"])
                 .env("TCTI", "device:/dev/tpmrm0")
-                .output();
+                .env("LC_ALL", "C")
+                .output()
+                .map(|out| out.status.success())
+                .unwrap_or(false)
         }
         struct Guard(u32);
         impl Drop for Guard {
             fn drop(&mut self) {
-                undefine(self.0);
+                // Diagnostic only — `Drop` must not panic.
+                if !undefine(self.0) {
+                    eprintln!(
+                        "tpm_strict_end_to_end_detects_rollback: NV index 0x{:08X} was not \
+                         undefined; the next run inherits it",
+                        self.0
+                    );
+                }
             }
         }
-        undefine(index); // clear any stale test index
+        let _ = undefine(index); // clear any stale test index; absent is normal
         let _guard = Guard(index);
 
         let dir = tempdir().expect("tempdir");

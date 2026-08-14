@@ -168,7 +168,15 @@ mod tests {
         assert!(ui.get_privacy_mode());
     }
 
+    // The three tests below drive the library's mock implementations, which are
+    // `#[cfg(any(test, feature = "testing"))]`. An integration test compiles the
+    // library as a *dependency*, so `cfg(test)` is not set for it and only the
+    // feature can supply them — without this gate `--features gui-mls` alone
+    // fails to build the whole `gui_test` binary, taking the GUI tests that need
+    // no mock down with it. CI always pairs a GUI build with `testing`
+    // (`ci.yml` and `rust.yml`), so nothing is silently lost there.
     #[test]
+    #[cfg(feature = "testing")]
     fn test_privacy_mode_invokes_os_api() {
         use nk_crypto_tool::gui::screen_protection::{MockScreenProtectionApi, ScreenProtectionApi};
         let ui = ui();
@@ -268,6 +276,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "testing")]
     fn test_file_picker_returns_path() {
         use nk_crypto_tool::gui::file_picker::{MockFilePickerProvider, FilePickerProvider};
         use nk_crypto_tool::gui::pick_and_apply_file;
@@ -285,6 +294,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "testing")]
     fn test_file_picker_save_dir_writable_check() {
         use nk_crypto_tool::gui::file_picker::{MockFilePickerProvider, FilePickerProvider};
         use nk_crypto_tool::gui::pick_and_apply_save_dir;
