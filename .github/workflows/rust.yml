@@ -104,3 +104,19 @@ jobs:
         sudo apt-get install -y --no-install-recommends libfontconfig1-dev pkg-config
     - name: Build and test the MLS subsystem
       run: cargo test --verbose --no-default-features --features backend-rustcrypto,mls --lib
+
+    # Release-blocking, and this is the ONLY place `mls` code is linted.
+    # Every other clippy invocation in CI omits the feature — ci.yml's
+    # release-blocking one runs `backend-openssl-vendored` + the gui-* features,
+    # and the windows one runs `testing backend-rustcrypto` — so all of
+    # src/group/ (gated on `mls`) was compiled and tested by the step above but
+    # never lint-checked anywhere. Measured when this was added: the feature
+    # surfaces 23 additional warnings (91 -> 114) and zero errors.
+    #
+    # `-D warnings` is intentionally NOT set, matching ci.yml: there is
+    # pre-existing warning debt and turning it fatal here would block on code
+    # this step is not meant to gate. What it does catch is a clippy ERROR — a
+    # deny-by-default correctness lint — which today has nowhere else to be
+    # caught.
+    - name: cargo clippy (MLS subsystem — release-blocking)
+      run: cargo clippy --all-targets --no-default-features --features "testing backend-rustcrypto,mls"
