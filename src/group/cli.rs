@@ -1279,7 +1279,8 @@ where
 // Inbound half:
 //   accept_next() → render → push line to stdout
 //   NewGroup → also adopt into `group_id`, but only when it is unset
-//   RemovedFromGroup → also break the outer loop
+//   RemovedFromGroup → also break the outer loop, but only for the active
+//     group (see `handle_removal`)
 //
 // Outbound half (this fn):
 //   read stdin line → parse slash-command → either mutate state or
@@ -1405,8 +1406,9 @@ pub async fn listen_loop(
                     // baseline for it; EpochAdvanced → drop whoever left
                     // (see `prune_departed_recipients`), since a Commit reaches
                     // us through this channel too; Removed → signal the outer
-                    // loop. Same logic as the inbound task; factor later if a
-                    // third source appears.
+                    // loop, but only when it was the active group we were
+                    // removed from. Same logic as the inbound task, and the
+                    // removal decision is now literally the same function.
                     if let IncomingGroupEvent::NewGroup { id } = &evt {
                         let line = adopt_new_group(&group_id, id).await;
                         // Welcome-derived: the sender chose this group and was
@@ -1430,7 +1432,17 @@ pub async fn listen_loop(
                             .await;
                         }
                     }
-                    let is_removed = matches!(evt, IncomingGroupEvent::RemovedFromGroup { .. });
+                    // Scoped to the active group the same way `EpochAdvanced` is
+                    // just above, through the same function the inbound task
+                    // uses: a Remove in a group a Welcome alone put us in is
+                    // reported, not fatal. See `handle_removal`, which also
+                    // retires the removed group's snapshot.
+                    let removal = match &evt {
+                        IncomingGroupEvent::RemovedFromGroup { group_id: evt_gid, .. } => {
+                            Some(handle_removal(&group_id, &rosters, evt_gid).await)
+                        }
+                        _ => None,
+                    };
                     if let Some(line) = event_to_line(&evt, &reasm).await {
                         let mut out = stdout.lock().await;
                         let _ = out.write_all(line.as_bytes()).await;
@@ -1443,9 +1455,18 @@ pub async fn listen_loop(
                         let _ = out.write_all(b"\n").await;
                         let _ = out.flush().await;
                     }
-                    if is_removed {
-                        let _ = kill_tx.send(()).await;
-                        return;
+                    match removal {
+                        Some(RemovalScope::Other(note)) => {
+                            let mut out = stdout.lock().await;
+                            let _ = out.write_all(note.as_bytes()).await;
+                            let _ = out.write_all(b"\n").await;
+                            let _ = out.flush().await;
+                        }
+                        Some(RemovalScope::Active) => {
+                            let _ = kill_tx.send(()).await;
+                            return;
+                        }
+                        None => {}
                     }
                 }
             }
@@ -1494,8 +1515,9 @@ pub async fn listen_loop(
                 // displace an already-active group, print which it was (see
                 // `adopt_new_group`) and take a membership baseline for it; on
                 // an epoch change drop the recipients that Commit removed (see
-                // `prune_departed_recipients`); on self-removal print, signal
-                // the outer loop, and stop.
+                // `prune_departed_recipients`); on self-removal print, and stop
+                // the session when it was the active group we were removed from
+                // (see `handle_removal`).
                 let mut pruned = None;
                 match &evt {
                     IncomingGroupEvent::NewGroup { id } => {
@@ -1509,15 +1531,34 @@ pub async fn listen_loop(
                         let _ = out.flush().await;
                         continue;
                     }
-                    IncomingGroupEvent::RemovedFromGroup { .. } => {
+                    IncomingGroupEvent::RemovedFromGroup { group_id: evt_gid, .. } => {
+                        // Scoped to the active group, exactly as the
+                        // `EpochAdvanced` arm below is and for a related reason:
+                        // a peer that can deliver a Welcome can make us a member
+                        // of a group of its own and remove us from it. See
+                        // `handle_removal`, which also retires the removed
+                        // group's snapshot. The inbox-poll task above runs the
+                        // same decision through the same function.
+                        let scope = handle_removal(&group_id, &rosters, evt_gid).await;
                         if let Some(line) = event_to_line(&evt, &reasm).await {
                             let mut out = stdout.lock().await;
                             let _ = out.write_all(line.as_bytes()).await;
                             let _ = out.write_all(b"\n").await;
                             let _ = out.flush().await;
                         }
-                        let _ = kill_tx.send(()).await;
-                        break;
+                        match scope {
+                            RemovalScope::Other(note) => {
+                                let mut out = stdout.lock().await;
+                                let _ = out.write_all(note.as_bytes()).await;
+                                let _ = out.write_all(b"\n").await;
+                                let _ = out.flush().await;
+                                continue;
+                            }
+                            RemovalScope::Active => {
+                                let _ = kill_tx.send(()).await;
+                                break;
+                            }
+                        }
                     }
                     IncomingGroupEvent::EpochAdvanced { group_id: evt_gid, .. } => {
                         let active = *group_id.lock().await;
@@ -1899,6 +1940,151 @@ async fn adopt_new_group(
     }
 }
 
+/// What a [`IncomingGroupEvent::RemovedFromGroup`] means for a running
+/// [`listen_loop`]: see [`handle_removal`].
+enum RemovalScope {
+    /// The removal was from the group this session addresses. End the session,
+    /// which is what the unscoped arm this replaces did for every removal.
+    Active,
+    /// The removal was from some other group this session is a member of. Print
+    /// this line and keep listening.
+    Other(String),
+}
+
+/// Decide whether a `RemovedFromGroup` event ends the listener; when it does
+/// not, retire the removed group's roster snapshot and render the
+/// operator-facing line.
+///
+/// **Why the event is scoped at all.** A listener is a member of every group a
+/// Welcome put it in, not just the one it addresses.
+/// `join_group_from_welcome` authorizes no sender and is reachable from an
+/// unauthenticated dialer over `nkct/mls/1`, so a peer holding one of this
+/// node's exported KeyPackages — a public blob, handed to inviters and carried
+/// in a KeyBundle — can seat this node in a group of its own choosing.
+/// [`adopt_new_group`] already refuses to let such a group become the active
+/// one, but membership is real either way, and the peer can then commit a
+/// Remove of our leaf in it. Treating that event as "we were removed" full stop
+/// ended the whole session — the operator's *own* group's listener with it, at
+/// a moment of that peer's choosing and as often as it liked, leaving in-flight
+/// transfers as orphaned `.part` files under `recv_dir` and delivering no
+/// further Welcome, Commit or message (both tasks are aborted and the loop
+/// returns) until the operator noticed and restarted.
+///
+/// So the event is scoped to the active group at both of `listen_loop`'s
+/// dispatch sites, the way [`IncomingGroupEvent::EpochAdvanced`] already was: a
+/// removal from the group whose traffic this session sends and reads ends it,
+/// and a removal from another group is reported and survived.
+///
+/// The two are scoped on the same predicate but **not** with the same lock
+/// discipline, and calling them "the same test" would overstate it. The
+/// `EpochAdvanced` arms copy the active gid out and drop the guard before
+/// calling [`prune_departed_recipients`]; this one holds it across the
+/// [`RosterSnapshots`] acquisition, because here the decision and the map write
+/// it authorises have to be one critical section (see below). The asymmetry is
+/// deliberate and fail-closed in the other direction: an interleaving that
+/// races `EpochAdvanced` produces the outcome
+/// [`prune_departed_recipients`]' own doc already records and accepts — a
+/// `[joined]` group does not vouch until `/gid` promotes it.
+///
+/// **What the scope rests on is the active-group selection, and nothing else.**
+/// A session that adopted its active group from an inbound Welcome — which
+/// [`adopt_new_group`] does when the operator named none — can still be ended by
+/// whoever sent that Welcome, because that group genuinely is the one it
+/// addresses. `--mls-group-id`, or a typed `/gid`, is what puts the selection
+/// out of an inbound peer's reach.
+///
+/// **Why the snapshot is retired, and why that is not optional.** Surviving the
+/// event means the session goes on holding a [`RosterSnapshot`] for a group it
+/// is no longer in — and, measured rather than assumed, that snapshot does not
+/// quietly stop mattering. After the removing Commit is applied,
+/// `current_member_node_ids(gid)` does **not** fail: mls-rs leaves the group
+/// loadable at the last epoch we held keys for, so the read succeeds and hands
+/// back that epoch's roster, ourselves still on it. Left in the map, a group the
+/// operator had selected would therefore go on vouching in [`decide_departures`]
+/// — from a roster that can no longer change — and an address seated on it would
+/// be exempt from every later prune of the active group for the rest of the
+/// session. That matters because a leaf may claim any node id
+/// (`KNOWN_ISSUES.md` residual 12), so a member of that group can choose the
+/// address the freeze protects. Dropping the entry takes the group out of
+/// `vouching`, which iterates this map, without touching that function: a group
+/// whose membership this session can no longer observe answers for nobody. The
+/// direction is the safe one — losing a vouch can cost an address, not keep a
+/// departed one — and it is the same direction [`seed_roster`]'s doc describes
+/// for a group whose roster cannot be read at all.
+///
+/// **What it deliberately does not do is prune.** Being removed from `gid` is a
+/// membership change, but the recipient list is scoped per group and pruning
+/// *another* group's list on `gid`'s event is precisely the cross-group
+/// revocation the scope check in [`prune_departed_recipients`] exists to
+/// prevent; it would also hand a peer that can deliver a Welcome a trigger into
+/// the active group's list. Both dispatch sites therefore still prune only for
+/// the active gid. An address that was kept on this group's word alone stays a
+/// departure candidate in the active group's baseline and is dropped at that
+/// group's next epoch change, once this retirement leaves nobody vouching for
+/// it — the same re-check, on the same "not prompt, and 'not prompt' includes
+/// 'never'" timing, that [`prune_departed_recipients`] already documents.
+///
+/// A `/gid` typed for the removed group afterwards re-seats it with its frozen
+/// roster and, because the operator typed it, with vouching rights again. That
+/// is narrower than it sounds — it is an operator act taken after reading the
+/// `[removed]` line this very function printed — but it is not nothing, and the
+/// cure is the one [`seed_roster`]'s doc gives for its own re-seating case:
+/// restart the session.
+///
+/// The returned line is repeatable by a peer that can deliver Welcomes, at the
+/// rate it can deliver them — the same exposure the `[joined]` line
+/// [`adopt_new_group`] renders on every Welcome already carries, and cheaper
+/// than the restart it replaces.
+///
+/// `GroupId`'s `Display` is `hex::encode` of its 32 raw bytes and the rest is a
+/// static literal, so nothing peer-influenced reaches the terminal.
+///
+/// **Locks — the `group_id` guard is held on purpose.** The exemption below is
+/// *decided* from `group_id` and *enforced* against `rosters`, so the two have
+/// to be one critical section. Copying the gid out and dropping the guard first
+/// leaves a window: `/gid` sets `*gid = Some(g)`, **releases the lock**, and only
+/// then calls [`seed_roster`], so between our read and our write the operator can
+/// re-point the session at the very group we are about to retire and seed it —
+/// and we would then delete the freshly-taken baseline of the *active* group.
+/// With no entry, [`decide_departures`] treats `None` as "record only" and writes
+/// `members = Some(current)`, so the departures that Commit effected never appear
+/// in any later `departed` difference and those addresses stay in `recipients`
+/// for the rest of the session; `or_default()` would also silently rebuild the
+/// entry with `operator_selected: false`, un-selecting a group the operator
+/// typed. Contention widens that window rather than closing it, because
+/// [`seed_roster_locked`] holds `rosters` across a synchronous `load_group`.
+///
+/// So: **do not "simplify" this to `let active = *group_id.lock().await;`.**
+/// Holding the guard makes `/gid` wait for this function instead of racing it.
+///
+/// The order is `group_id` → `rosters`, which extends the file's existing
+/// `rosters` → `recipients` rule rather than contradicting it: no site anywhere
+/// in this file acquires `rosters` and then `group_id` (`/gid` drops `group_id`
+/// two statements before it touches `rosters`), so there is no opposing order
+/// for this one to deadlock against. Keep it that way. Nothing is awaited
+/// between the `rosters` acquisition and the `remove`.
+async fn handle_removal(
+    group_id: &tokio::sync::Mutex<Option<GroupId>>,
+    rosters: &tokio::sync::Mutex<RosterSnapshots>,
+    evt_gid: &GroupId,
+) -> RemovalScope {
+    let active = group_id.lock().await;
+    if *active == Some(*evt_gid) {
+        return RemovalScope::Active;
+    }
+    rosters.lock().await.remove(evt_gid);
+    match *active {
+        Some(a) => RemovalScope::Other(format!(
+            "[mls] removed from group {evt_gid}, which is not this session's active \
+             group ({a}) — the listener keeps running"
+        )),
+        None => RemovalScope::Other(format!(
+            "[mls] removed from group {evt_gid}; this session has no active group — \
+             the listener keeps running"
+        )),
+    }
+}
+
 /// What a running loop last saw of one group: the node ids on its roster, and
 /// whether the **operator** named that group.
 ///
@@ -1936,9 +2122,13 @@ type RosterSnapshots = std::collections::HashMap<GroupId, RosterSnapshot>;
 /// Seeding at every point a group first becomes reachable by the session
 /// (loop start, `[joined]`, `/gid`) is what keeps that window shut.
 ///
-/// An existing baseline is never overwritten: it may predate a `/gid` detour,
-/// and a member who left during the detour is only detectable against the
-/// older set — the epoch change that evicted them was skipped as not-active.
+/// An existing baseline is never overwritten **by this function**: it may
+/// predate a `/gid` detour, and a member who left during the detour is only
+/// detectable against the older set — the epoch change that evicted them was
+/// skipped as not-active. [`handle_removal`] does delete a whole entry when
+/// this node is removed from a group that is not the active one, after which a
+/// later Welcome for that gid can create a fresh one here; see the note on
+/// `operator_selected` below.
 ///
 /// **The selection and the baseline are recorded independently**, and that
 /// separation is load-bearing rather than tidiness. `--mls-group-id G` is an
@@ -1949,11 +2139,21 @@ type RosterSnapshots = std::collections::HashMap<GroupId, RosterSnapshot>;
 /// where an operator who typed the gid would expect the opposite. So the flag is
 /// taken on every call and the baseline is taken on the first call that can read
 /// one. The two rules compose without opening a path from an inbound event to a
-/// `true`: the flag only ever moves up (`|=`), and it moves at all only for a
-/// caller that passes `true`, which is only the three sites where the gid came
-/// from the operator (`--mls-group-id`, `chat-group`'s positional gid, `/gid`).
-/// Both `[joined]` sites pass `false` and can therefore create an entry, or fill
-/// in a missing baseline, but never grant vouching rights.
+/// `true`: within the life of one entry the flag only ever moves up (`|=`), and
+/// it moves at all only for a caller that passes `true`, which is only the three
+/// sites where the gid came from the operator (`--mls-group-id`, `chat-group`'s
+/// positional gid, `/gid`). Both `[joined]` sites pass `false` and can therefore
+/// create an entry, or fill in a missing baseline, but never grant vouching
+/// rights.
+///
+/// "Within the life of one entry" is the exact claim, and it is weaker than
+/// monotonicity of the flag itself. [`handle_removal`] removes an entry
+/// outright when this node is removed from a non-active group, so a gid that
+/// was `true` can come back `false` if a later Welcome re-creates it. That is
+/// the intended direction — a group we are no longer in must stop vouching, and
+/// its roster is frozen at the pre-removal membership because mls-rs leaves our
+/// state untouched on a Commit that removes us — but it means the flag is
+/// monotone per entry, not per gid, and code must not assume otherwise.
 ///
 /// **New call sites**: a group this session learns of from the network — a
 /// Welcome, or one discovered through a resync — is inbound-derived and must be
@@ -2862,6 +3062,327 @@ mod tests {
         assert!(
             !line.contains("/gid "),
             "a re-add of the active group must not read as a refusal, got {line:?}"
+        );
+    }
+
+    /// A Remove committed in a group the operator never selected does not end
+    /// the listener; a Remove in the active group still does.
+    ///
+    /// Regression (A-F6): both of `listen_loop`'s event sinks matched
+    /// `RemovedFromGroup { .. }` with a wildcard and killed the session,
+    /// discarding the event's `group_id` — while the `EpochAdvanced` arm ten
+    /// lines above each of them was already scoped to the active gid. A peer
+    /// holding one of this node's exported KeyPackages (a public blob, handed to
+    /// inviters and carried in a KeyBundle) could therefore create a group of
+    /// its own, add us with it over an unauthenticated `join_group_from_welcome`,
+    /// and commit a Remove of our leaf. `adopt_new_group` correctly refused to
+    /// make that group active — but the removal from it stopped the operator's
+    /// *own* group's listener anyway, repeatably, orphaning in-flight transfers
+    /// as `.part` files and delivering no further Welcome, Commit or message.
+    ///
+    /// The exploit is built here rather than argued: a real second group the
+    /// victim is a member of but has not selected, a real Remove Commit in it,
+    /// and the event that Commit actually produces on the victim's side —
+    /// generated over **both** transports that feed `listen_loop`,
+    /// `accept_next` (`nkct/mls/1`) and `process_inbox_envelope` (the inbox
+    /// poll), so the attack is shown to be live on each and the decision is
+    /// checked against the event each one really yields.
+    ///
+    /// **What this does not cover, stated plainly.** It exercises
+    /// `handle_removal`, not `listen_loop`'s two call sites, because
+    /// `listen_loop` reads the process's real stdin and so cannot be driven from
+    /// a test — the same constraint
+    /// `one_groups_removal_cannot_prune_another_groups_recipient` records. So
+    /// reverting either call site alone to an unconditional kill leaves this
+    /// test green. That the two sites agree is a **review**-derived guarantee,
+    /// not a suite-derived one: they are the only two `RemovedFromGroup`
+    /// handlers and the only two `kill_tx` senders in the loop, and both route
+    /// through this one function. Anyone changing one must read the other.
+    ///
+    /// The last two blocks pin the reason the surviving session retires the
+    /// removed group's snapshot instead of leaving it: the roster read does not
+    /// start failing after the removal, it **freezes**, so an entry left behind
+    /// would vouch forever. If a future mls-rs makes the read fail instead, the
+    /// freeze assertion here is what says so.
+    #[tokio::test]
+    async fn a_removal_from_an_unselected_group_does_not_end_the_listener() {
+        use tokio::sync::Mutex;
+
+        let net = MockNetwork::new();
+        let (alice, _dir_a) = build_test_processor(&net, "alice", 1);
+        let (mallory, _dir_m) = build_test_processor(&net, "mallory", 2);
+        let alice = Arc::new(alice);
+        let alice_addr = alice.local_addr().await.expect("alice addr");
+        let mallory_addr = mallory.local_addr().await.expect("mallory addr");
+
+        // The group the operator named (`--mls-group-id`) and is chatting in.
+        // Mallory is a legitimate member of it too, and one of its recipients —
+        // her Welcome is never delivered, alice's Add still seats her.
+        let team = create_group(&alice, "alice-team").await.expect("create team");
+        let mallory_kp = mallory.export_key_package().await.expect("mallory kp");
+        alice
+            .add_member(&team, &mallory_kp)
+            .await
+            .expect("add mallory to team");
+        let rosters = Mutex::new(RosterSnapshots::new());
+        seed_roster(&alice, &rosters, &team, true).await;
+        let recipients = Mutex::new(vec![mallory_addr.clone()]);
+        let active = Mutex::new(Some(team));
+
+        // Two groups of mallory's own, one per transport under test. Each seats
+        // alice from a KeyPackage she published, which is all it takes.
+        let mut mallory_gids = Vec::new();
+        for name in ["mallory-direct", "mallory-inbox"] {
+            let alice_kp = alice.export_key_package().await.expect("alice kp");
+            let m = create_group(&mallory, name).await.expect("create mallory group");
+            let add = mallory.add_member(&m, &alice_kp).await.expect("add alice");
+            let alice_task = {
+                let alice = Arc::clone(&alice);
+                tokio::spawn(async move { alice.accept_next().await })
+            };
+            tokio::task::yield_now().await;
+            mallory
+                .send_welcome_to(&alice_addr, &add.welcome)
+                .await
+                .expect("welcome→alice");
+            match alice_task.await.expect("alice task").expect("alice joins m") {
+                IncomingGroupEvent::NewGroup { id } => assert_eq!(id, m),
+                other => panic!("alice expected NewGroup, got {other:?}"),
+            }
+            // The precondition the attack needs and already has: alice is a
+            // member of `m`, and `m` is *not* what her session addresses.
+            let line = adopt_new_group(&active, &m).await;
+            assert_eq!(
+                *active.lock().await,
+                Some(team),
+                "an inbound Welcome must not re-point the active group"
+            );
+            assert!(line.contains("not active"), "got {line:?}");
+            // The `[joined]` seeding, which does not grant vouching rights.
+            seed_roster(&alice, &rosters, &m, false).await;
+            mallory_gids.push(m);
+        }
+        // …but the operator typed `/gid` for the first one at some point, and
+        // `operator_selected` only ever moves up. That is what puts a group
+        // alice is about to be thrown out of into the vouching population.
+        seed_roster(&alice, &rosters, &mallory_gids[0], true).await;
+
+        // ---- transport 1: the direct `nkct/mls/1` stream (`accept_next`) ----
+        let m_direct = mallory_gids[0];
+        // Alice is leaf 1: mallory created the group (leaf 0) and added her.
+        let remove = mallory
+            .remove_member(&m_direct, 1)
+            .await
+            .expect("mallory removes alice from her own group");
+        let alice_task = {
+            let alice = Arc::clone(&alice);
+            tokio::spawn(async move { alice.accept_next().await })
+        };
+        tokio::task::yield_now().await;
+        mallory
+            .broadcast_commit(&remove, std::slice::from_ref(&alice_addr))
+            .await
+            .expect("remove commit→alice");
+        let direct_evt = alice_task.await.expect("alice task").expect("alice applies it");
+
+        // ---- transport 2: the inbox poll (`process_inbox_envelope`) ---------
+        let m_inbox = mallory_gids[1];
+        let remove = mallory
+            .remove_member(&m_inbox, 1)
+            .await
+            .expect("mallory removes alice from her second group");
+        let inbox_evt = alice
+            .process_inbox_envelope(&remove)
+            .await
+            .expect("alice applies the inbox-delivered commit");
+
+        for (evt, expected_gid, transport) in [
+            (direct_evt, m_direct, "accept_next"),
+            (inbox_evt, m_inbox, "process_inbox_envelope"),
+        ] {
+            let evt_gid = match evt {
+                IncomingGroupEvent::RemovedFromGroup { group_id, .. } => group_id,
+                other => panic!("{transport}: expected RemovedFromGroup, got {other:?}"),
+            };
+            assert_eq!(
+                evt_gid, expected_gid,
+                "{transport}: the removal is for mallory's group, not the team"
+            );
+            assert!(
+                rosters.lock().await.contains_key(&evt_gid),
+                "{transport}: the test needs a snapshot to exist before the removal"
+            );
+            let note = match handle_removal(&active, &rosters, &evt_gid).await {
+                RemovalScope::Other(note) => note,
+                RemovalScope::Active => panic!(
+                    "{transport}: a removal from a group the operator never selected \
+                     ended the whole listen session"
+                ),
+            };
+            // The operator has to be able to tell that this was some other
+            // group, and which one their session is still addressing.
+            assert!(
+                note.contains(&evt_gid.to_string()) && note.contains(&team.to_string()),
+                "{transport}: the note must name both groups, got {note:?}"
+            );
+            assert!(
+                !note.contains("stopping"),
+                "{transport}: a survived removal must not read as a shutdown, got {note:?}"
+            );
+            assert!(
+                !rosters.lock().await.contains_key(&evt_gid),
+                "{transport}: the snapshot of a group we were removed from must be \
+                 retired, or it vouches from a roster that can never change again"
+            );
+        }
+        assert_eq!(
+            *active.lock().await,
+            Some(team),
+            "the session is still addressing the team group afterwards"
+        );
+
+        // ---- why the retirement above is not housekeeping -------------------
+        // The removal does not make the group unreadable. mls-rs keeps the local
+        // state at the last epoch we held keys for, so the roster read still
+        // succeeds and still lists alice herself. A snapshot left in the map
+        // would therefore vouch from a membership that can no longer change.
+        let frozen = alice
+            .current_member_node_ids(&m_direct)
+            .expect("the removed group is still loadable — this is the whole point");
+        assert!(
+            frozen.contains(alice_addr.peer_id.as_bytes()),
+            "the roster froze at the pre-removal epoch, so alice is still on it"
+        );
+        assert!(
+            frozen.contains(mallory_addr.peer_id.as_bytes()),
+            "and so is the member who removed her"
+        );
+
+        // ---- and what the retirement buys: mallory is prunable again --------
+        // Alice now evicts mallory from the team group. Mallory is on the frozen
+        // roster of `m_direct`, which the operator had selected — so had that
+        // snapshot survived, it would have vouched for her address against
+        // alice's own Commit, permanently and with no later re-check possible.
+        alice
+            .remove_member(&team, 1)
+            .await
+            .expect("alice evicts mallory from her own group");
+        let note = prune_departed_recipients(&alice, &team, &recipients, &rosters).await;
+        assert!(
+            !recipients
+                .lock()
+                .await
+                .iter()
+                .any(|a| a.peer_id == mallory_addr.peer_id),
+            "a group alice was thrown out of must not go on vouching for a peer \
+             her own group just removed"
+        );
+        assert_eq!(
+            note,
+            Some(format!("[mls] dropped 1 recipient(s) removed from group {team}")),
+            "the drop is a plain one: nothing vouched, and nothing was unreadable"
+        );
+
+        // ---- the kill path is still reachable, and still correct ------------
+        // A removal from the group this session actually addresses ends it, and
+        // leaves the roster map alone (the session is about to stop anyway).
+        let before = rosters.lock().await.len();
+        assert!(
+            matches!(
+                handle_removal(&active, &rosters, &team).await,
+                RemovalScope::Active
+            ),
+            "a removal from the active group must still end the session"
+        );
+        assert_eq!(before, rosters.lock().await.len());
+        // And when nothing is selected there is no active group whose traffic
+        // could be interrupted: the session may still be told to `/gid` into
+        // one of the groups it holds.
+        assert!(
+            matches!(
+                handle_removal(&Mutex::new(None), &rosters, &m_direct).await,
+                RemovalScope::Other(_)
+            ),
+            "with no active group there is no active group to have been removed from"
+        );
+    }
+
+    /// `handle_removal` decides from `group_id` and acts on `rosters`, and holds
+    /// the first lock until it has done the second — the two are one critical
+    /// section, not two.
+    ///
+    /// Without that, the exemption is decided at one instant and enforced at a
+    /// later one against a map somebody else may have re-seeded in between. The
+    /// window is real and reachable: `/gid` sets the active gid, *releases the
+    /// lock*, and only then calls `seed_roster`, so a `/gid M` landing inside the
+    /// window re-points the session at M and seeds it, and the enforcement step
+    /// then deletes the baseline of the group that is now active. A group with
+    /// no entry is "record only" to `decide_departures`, so the departures that
+    /// Commit effected never become a `departed` difference and those addresses
+    /// keep being dialled for the rest of the session.
+    ///
+    /// The race itself cannot be scheduled deterministically, so this pins the
+    /// property that forecloses it instead: while `rosters` is held by somebody
+    /// else, `handle_removal` is parked on it **still holding `group_id`**. Hold
+    /// `rosters`, start the call, and `group_id` must be unavailable — which is
+    /// exactly what a copy-out-and-drop implementation fails, since it releases
+    /// `group_id` before it ever reaches `rosters`.
+    #[tokio::test]
+    async fn the_removal_decision_and_the_retirement_are_one_critical_section() {
+        use std::time::{Duration, Instant};
+        use tokio::sync::Mutex;
+
+        let team = GroupId::new([0x11; 32]);
+        let other = GroupId::new([0xaa; 32]);
+        let active = Arc::new(Mutex::new(Some(team)));
+        let rosters = Arc::new(Mutex::new(RosterSnapshots::from([(
+            other,
+            RosterSnapshot { members: None, operator_selected: true },
+        )])));
+
+        // Stand in for a concurrent `seed_roster`, which holds this lock across a
+        // synchronous `load_group`.
+        let held = rosters.clone().lock_owned().await;
+
+        let task = {
+            let active = Arc::clone(&active);
+            let rosters = Arc::clone(&rosters);
+            tokio::spawn(async move { handle_removal(&active, &rosters, &other).await })
+        };
+
+        // Bounded wait for the call to take `group_id` and park on `rosters`.
+        // Fixed: `group_id` goes unavailable within a poll or two and stays that
+        // way. Broken: it is released before `rosters` is even attempted, so it
+        // stays available for the whole budget and `saw_held` never flips.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_held = false;
+        while Instant::now() < deadline {
+            if active.try_lock().is_err() {
+                saw_held = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_held,
+            "handle_removal released `group_id` before acquiring `rosters`: the \
+             active-group check and the retirement are not one critical section, \
+             so a `/gid` landing between them retires the group it just selected"
+        );
+        assert!(
+            !task.is_finished(),
+            "the call must still be parked on `rosters`, not already done"
+        );
+
+        drop(held);
+        let scope = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("handle_removal must finish once `rosters` is free")
+            .expect("task");
+        assert!(matches!(scope, RemovalScope::Other(_)));
+        assert!(
+            !rosters.lock().await.contains_key(&other),
+            "and it still retires the snapshot once it gets the lock"
         );
     }
 
