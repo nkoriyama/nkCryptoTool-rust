@@ -203,7 +203,7 @@ jobs:
   # Verified before flipping it: `cargo audit` exits 0 at this revision, and
   # exits 1 at 50078278 — i.e. this gate would have caught h2.
   audit:
-    name: cargo audit (advisory)
+    name: cargo audit (release-blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
