@@ -439,6 +439,16 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 /// previous line, keeps both bounded and still visible.
 const ACCEPT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Shortest interval between two `establish`-failure lines, and between two
+/// handler-error lines. Same mechanism and reason as
+/// [`ACCEPT_ERROR_LOG_INTERVAL`]: both are remotely triggerable, so a line per
+/// event hands any peer an unbounded write to the operator's log.
+///
+/// Two gates, one interval. Sharing a single *gate* would let the cheaper line
+/// spend the window and silence the dearer one; sharing the interval value
+/// costs nothing.
+const PEER_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Stored prekey bytes above which PUBLISH starts reporting the total to the
 /// operator (`META_PREKEY_BYTES` in [`crate::group::redb_storage`], counted per
 /// row and refunded when a row is fetched or evicted).
@@ -492,15 +502,13 @@ const PREKEY_BYTES_WARN_AT: u64 = 256 * 1024 * 1024;
 /// the number of crossings suppressed since the previous line, keeps it bounded
 /// and still visible.
 ///
-/// This bounds only what the watermark itself writes, and that is all it
-/// claims. It does not keep the line *legible*: two other lines in
-/// [`InboxServer::run`] — the `establish` failure and the `handle` error — are
-/// ungated and remotely triggerable, so a peer can still bury this one in noise
-/// of its own choosing. A gate over those was written here and taken back out:
-/// it is a pre-existing, prekey-independent problem, and one shared gate is the
-/// wrong shape for it because `handle` also returns the relay's own `Storage`
-/// failures. See `KNOWN_ISSUES.md` item 10's "operator-log noise" follow-up for
-/// both paths, their relative cost, and the shape that would work.
+/// This bounds only what the watermark itself writes. The two other remotely
+/// triggerable lines in [`InboxServer::run`] — the `establish` failure and the
+/// `handle` error — were ungated when this was written, so a peer could bury
+/// this one in noise of its own choosing; they now have gates of their own
+/// ([`PEER_LOG_INTERVAL`]), one instance each, with the relay's own `Storage`
+/// and `AtRest` failures routed around them entirely rather than sharing a
+/// window with anything a peer can provoke.
 const PREKEY_WARN_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default per-frame idle timeout. Generous enough to absorb iroh
@@ -924,7 +932,7 @@ mod server {
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Mutex as StdMutex;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
     use zeroize::Zeroizing;
 
     /// A leaky-bucket throttle: `tokens` refills at `refill_per_sec` up to
@@ -1058,32 +1066,38 @@ mod server {
         )
     }
 
-    /// Rate gate for the prekey-watermark line, which a remote peer can
-    /// trigger: when the last one was written, and how many crossings went
-    /// unreported since.
+    /// Rate gate for one line of remotely-triggerable operator output: when the
+    /// last one was written, and how many writes went unreported since.
     ///
     /// The same shape [`InboxServer::run`] keeps inline for accept failures,
-    /// held in a mutex rather than a loop-local because PUBLISH is handled on a
-    /// task per connection. It is named and scoped for its one caller
-    /// ([`InboxServer::note_prekey_bytes`]) and hard-wired to
-    /// [`PREKEY_WARN_LOG_INTERVAL`]: generalising it over an interval belongs
-    /// with the second caller that needs a different one, not before.
+    /// held in a mutex rather than a loop-local because every other caller is
+    /// on a task per connection.
+    ///
+    /// This started life as `PrekeyWarnGate`, hard-wired to
+    /// [`PREKEY_WARN_LOG_INTERVAL`], with a note saying an interval parameter
+    /// belonged with the second caller that needed one rather than before it.
+    /// There are now three callers, so it takes the interval.
+    ///
+    /// **One gate per line, never one gate for several.** Sharing an instance
+    /// lets whichever line is cheapest to provoke spend the window, and the
+    /// others fall silent behind it. That is the trap [`InboxServer::run`]'s
+    /// handler-error arm documents in detail.
     #[derive(Debug, Default)]
-    pub(super) struct PrekeyWarnGate {
+    pub(super) struct LogGate {
         last: Option<Instant>,
         suppressed: u64,
     }
 
-    impl PrekeyWarnGate {
+    impl LogGate {
         /// Ask for permission to write a line at `now`, returning the number of
-        /// crossings suppressed since the previous line when one is due.
+        /// writes suppressed since the previous line when one is due.
         ///
         /// Every call is either reported or counted, so the numbers the
-        /// operator sees add up to the crossings that happened.
-        pub(super) fn admit(&mut self, now: Instant) -> Option<u64> {
+        /// operator sees add up to the events that happened.
+        pub(super) fn admit(&mut self, now: Instant, interval: Duration) -> Option<u64> {
             let due = self
                 .last
-                .is_none_or(|t| now.saturating_duration_since(t) >= PREKEY_WARN_LOG_INTERVAL);
+                .is_none_or(|t| now.saturating_duration_since(t) >= interval);
             if due {
                 let suppressed = self.suppressed;
                 self.last = Some(now);
@@ -1120,6 +1134,105 @@ mod server {
         )
     }
 
+    /// The line a failed `establish` puts on the operator's stderr, reporting
+    /// how many went unlogged since the previous one.
+    ///
+    /// Carries no detail about the failure, and that is deliberate and
+    /// pre-existing: the backend's message can embed peer-supplied bytes (an
+    /// unknown ALPN) and this line is written for something anyone can cause.
+    /// The count is the whole signal.
+    pub(super) fn setup_fail_line(suppressed: u64) -> String {
+        format!(
+            "[inbox] connection setup failed or timed out ({suppressed} suppressed \
+             since the previous line)"
+        )
+    }
+
+    /// The line a handler error puts on the operator's stderr.
+    ///
+    /// Sanitized even though today's `Protocol` messages are integers this
+    /// module read: `Io` carries an OS-formatted `std::io::Error`, which is not
+    /// this module's text, and `Storage` carries redb's. Cheaper to route every
+    /// variant through the sanitizer than to keep the argument that none of
+    /// them can ever quote a byte off the wire.
+    pub(super) fn peer_error_line(e: &InboxError, suppressed: u64) -> String {
+        format!(
+            "[inbox] handle error ({suppressed} suppressed since the previous \
+             line): {}",
+            crate::utils::sanitize_for_terminal(&e.to_string())
+        )
+    }
+
+    /// The line a handler error the *relay itself* caused puts on stderr.
+    ///
+    /// Ungated, and separated from [`peer_error_line`] so it reads as what it
+    /// is: not a peer misbehaving, this relay failing. See the classification
+    /// in [`InboxServer::run`].
+    pub(super) fn own_error_line(e: &InboxError) -> String {
+        format!(
+            "[inbox] RELAY FAILURE (not caused by a peer): {}",
+            crate::utils::sanitize_for_terminal(&e.to_string())
+        )
+    }
+
+    /// Whether an error off `handle` is something a peer chose, and so must be
+    /// rate-gated, or something the relay is reporting about itself, and so
+    /// must not be.
+    ///
+    /// Measured rather than assumed, because the obvious split is wrong.
+    /// `KNOWN_ISSUES.md` item 10 proposed routing `Storage` *and `Io`* around
+    /// the gate; `Io` belongs on the gated side. It is never constructed
+    /// anywhere in this module — it arrives only through
+    /// `#[from] std::io::Error`, and on the server path the only things that
+    /// produce one are the 31 `read_timed` / `write_timed` calls against the
+    /// peer's own stream. (The client half's `endpoint.connect(..).await?`
+    /// yields `Transport`, not `Io`, and never runs here.) So a peer that opens
+    /// a stream and resets it produces one at will, exactly as cheaply as a
+    /// `Protocol`. Routing it around the gate would have left the hole open
+    /// through a different variant.
+    ///
+    /// `Storage` is the relay's disk and its own spawned tasks
+    /// (`RedbStorageError`, and the `deposit task` / `poll task` join
+    /// failures); `AtRest` is its key material. Neither is anything a peer can
+    /// pick, and both are what an operator needs during an incident.
+    fn is_peer_caused(e: &InboxError) -> bool {
+        // Both relay-caused variants are `mls`-gated, so without the feature
+        // every error off `handle` is peer-caused and the gate covers all of
+        // them. Written as a cfg rather than a wildcard arm so that adding a
+        // variant is a compile error here, not a silent reclassification.
+        #[cfg(feature = "mls")]
+        {
+            !matches!(e, InboxError::Storage(_) | InboxError::AtRest(_))
+        }
+        #[cfg(not(feature = "mls"))]
+        {
+            let _ = e;
+            true
+        }
+    }
+
+    #[cfg(test)]
+    impl InboxServer {
+        pub(super) fn report_setup_failure_for_test(&self, now: Instant) -> Option<String> {
+            self.report_setup_failure_at(now)
+        }
+        pub(super) fn report_handle_error_for_test(
+            &self,
+            e: &InboxError,
+            now: Instant,
+        ) -> Option<String> {
+            self.report_handle_error_at(e, now)
+        }
+    }
+
+    /// Test handles for the two private items above. `is_peer_caused` is the
+    /// classification the whole split rests on, so it is asserted directly
+    /// rather than inferred from what a log line happened to contain.
+    #[cfg(test)]
+    pub(super) fn is_peer_caused_for_test(e: &InboxError) -> bool {
+        is_peer_caused(e)
+    }
+
     /// Outcome of [`InboxServer::draw_prekey`].
     enum Draw {
         /// A popped one-time prekey blob.
@@ -1152,7 +1265,15 @@ mod server {
         /// critical section is a comparison and two field writes, with no
         /// `.await` and no I/O — the line itself is written after the lock is
         /// dropped.
-        prekey_warn: StdMutex<PrekeyWarnGate>,
+        prekey_warn: StdMutex<LogGate>,
+        /// Rate gate for the `establish`-failure line. Its own instance, not
+        /// shared with `handle_err` below: these two are provoked at different
+        /// prices, and one gate would let the cheaper one silence the dearer.
+        setup_fail: StdMutex<LogGate>,
+        /// Rate gate for peer-caused handler errors. Relay-caused ones
+        /// (`Storage`, `AtRest`) do not pass through it at all — see
+        /// [`is_peer_caused`].
+        handle_err: StdMutex<LogGate>,
         /// The watermark [`Self::note_prekey_bytes`] compares against. A field
         /// only so a test can lower it; production is always
         /// [`PREKEY_BYTES_WARN_AT`].
@@ -1194,7 +1315,9 @@ mod server {
                 store,
                 fetch_rl: StdMutex::new(FetchLimiter::new(Instant::now())),
                 prekey_reserve: StdMutex::new(HashMap::new()),
-                prekey_warn: StdMutex::new(PrekeyWarnGate::default()),
+                prekey_warn: StdMutex::new(LogGate::default()),
+                setup_fail: StdMutex::new(LogGate::default()),
+                handle_err: StdMutex::new(LogGate::default()),
                 prekey_warn_at: PREKEY_BYTES_WARN_AT,
                 conn_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             })
@@ -1228,6 +1351,44 @@ mod server {
         /// **Reports; does not refuse.** The caller has already committed the
         /// PUBLISH and answers `REPLY_OK` either way — see
         /// [`PREKEY_BYTES_WARN_AT`] for why a refusal here was removed.
+        /// Decide what, if anything, a failed `establish` should put on stderr
+        /// at `now`. `None` means the gate swallowed it.
+        ///
+        /// A method rather than three lines inline in `run()` so a test can
+        /// drive **this server's** gate. The property being protected is that
+        /// two gates are two, and a test over two locally-constructed `LogGate`s
+        /// would hold just as well if `run()` shared one -- which is the bug.
+        fn report_setup_failure_at(&self, now: Instant) -> Option<String> {
+            self.setup_fail
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .admit(now, PEER_LOG_INTERVAL)
+                .map(setup_fail_line)
+        }
+
+        /// Decide what, if anything, an error off `handle` should put on stderr
+        /// at `now`.
+        ///
+        /// Relay-caused errors return `Some` unconditionally: they never touch
+        /// a gate, so no peer can spend their window. See [`is_peer_caused`].
+        ///
+        /// The residual that buys, said plainly: on a persistent fault -- a full
+        /// disk -- this writes one line per affected connection, unbounded. That
+        /// is the deliberate side of the trade. A rate on it would be a rate on
+        /// the relay's own alarm, and the failure it reports is one an operator
+        /// has to act on rather than one that resolves itself; a peer cannot
+        /// cause the condition, only arrive while it holds.
+        fn report_handle_error_at(&self, e: &InboxError, now: Instant) -> Option<String> {
+            if !is_peer_caused(e) {
+                return Some(own_error_line(e));
+            }
+            self.handle_err
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .admit(now, PEER_LOG_INTERVAL)
+                .map(|suppressed| peer_error_line(e, suppressed))
+        }
+
         fn note_prekey_bytes(&self, total: u64) {
             if total < self.prekey_warn_at {
                 return;
@@ -1237,7 +1398,7 @@ mod server {
                 .prekey_warn
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .admit(Instant::now());
+                .admit(Instant::now(), PREKEY_WARN_LOG_INTERVAL);
             if let Some(suppressed) = suppressed {
                 eprintln!("{}", prekey_warn_line(total, self.prekey_warn_at, suppressed));
             }
@@ -1589,7 +1750,18 @@ mod server {
                             // Timed out or dropped mid-setup. No detail is logged:
                             // the message can embed remote-supplied bytes (an
                             // unknown ALPN) that would inject terminal escapes.
-                            eprintln!("[inbox] connection setup failed or timed out");
+                            //
+                            // The cheapest line on this path to provoke: in the
+                            // iroh backend an ALPN outside the endpoint's set
+                            // fails before the QUIC handshake completes, and a
+                            // peer that completes it and never opens a bi-stream
+                            // fails at `accept_bi`. Neither needs a byte of
+                            // protocol, so ungated this was an unbounded write to
+                            // the operator's log for anyone who could reach the
+                            // port.
+                            if let Some(line) = me.report_setup_failure_at(Instant::now()) {
+                                eprintln!("{line}");
+                            }
                             return;
                         }
                     };
@@ -1599,7 +1771,33 @@ mod server {
                         return;
                     }
                     if let Err(e) = me.handle(incoming).await {
-                        eprintln!("[inbox] handle error: {e}");
+                        // Two classes on one channel, and they must not share a
+                        // gate. `handle` returns `Protocol` / `Timeout` /
+                        // `TooLarge` / `Io`, which a peer picks for the price of
+                        // one byte, *and* `Storage` / `AtRest`, which are this
+                        // relay reporting its own failure -- `No space left on
+                        // device` among them.
+                        //
+                        // A single content-blind gate was written for this and
+                        // removed on review, because it hands an attacker a
+                        // capability it does not otherwise have: claim each
+                        // window with a malformed frame and the text of every
+                        // storage error behind it is suppressed. Measured on the
+                        // rejected version -- one 0x7f per window, 501
+                        // `No space left on device` errors behind it, zero of
+                        // them printed. It compounds, too: on a full disk the
+                        // prekey watermark has already stopped firing (it runs
+                        // after a `publish_prekeys(..)?` that now fails), so
+                        // this line is the relay's last self-report at exactly
+                        // the moment a shared gate would give it away.
+                        //
+                        // So: peer-caused errors are gated, relay-caused ones
+                        // are not. Same shape as `run()` routing
+                        // `P2pError::Closed` around the accept gate above rather
+                        // than counting it as noise.
+                        if let Some(line) = me.report_handle_error_at(&e, Instant::now()) {
+                            eprintln!("{line}");
+                        }
                     }
                 });
             }
@@ -2511,6 +2709,123 @@ mod tests {
         );
     }
 
+    /// The classification the split rests on, asserted directly.
+    ///
+    /// The flood property is exercised against a real server below; this pins
+    /// only which side of the gate each variant falls on, because that is the
+    /// thing a future variant can silently get wrong.
+    #[cfg(feature = "mls")]
+    #[test]
+    fn relay_caused_errors_are_not_peer_caused() {
+        let cheap = InboxError::Protocol("unknown tag 0x7f".into());
+        let disk = InboxError::Storage("No space left on device".into());
+        let key = InboxError::AtRest("kek unwrap failed".into());
+        assert!(super::server::is_peer_caused_for_test(&cheap));
+        assert!(!super::server::is_peer_caused_for_test(&disk));
+        assert!(!super::server::is_peer_caused_for_test(&key));
+    }
+
+    /// The two peer-caused gates are separate instances, so the cheaper line
+    /// cannot spend the dearer one's window.
+    ///
+    /// Driven through a real `InboxServer`, not two locally-constructed gates:
+    /// the bug this guards against is `run()` sharing ONE gate, and a test over
+    /// two locals it made itself would pass in exactly that case.
+    #[test]
+    fn the_setup_and_handler_gates_do_not_share_a_window() {
+        let dir = tempdir().expect("tempdir");
+        let server = InboxServer::open(dir.path().join("inbox.db"), &test_passphrase())
+            .expect("open");
+        let t0 = std::time::Instant::now();
+
+        // `establish` failures are the cheaper of the two: no protocol byte is
+        // needed. Claim the window with them.
+        assert!(server.report_setup_failure_for_test(t0).is_some());
+        for _ in 0..500 {
+            assert!(
+                server.report_setup_failure_for_test(t0).is_none(),
+                "the setup gate must collapse its own flood"
+            );
+        }
+
+        // The dearer line still gets its first write in the same window.
+        let e = InboxError::Protocol("unknown tag 0x7f".into());
+        assert!(
+            server.report_handle_error_for_test(&e, t0).is_some(),
+            "a handler error still gets its own first line, however much setup noise ran"
+        );
+        assert!(
+            server.report_handle_error_for_test(&e, t0).is_none(),
+            "and it is gated in turn"
+        );
+    }
+
+    /// The same, for the property the whole split exists for -- driven through
+    /// the server rather than through the classifier alone.
+    #[cfg(feature = "mls")]
+    #[test]
+    fn a_relay_failure_prints_even_while_a_peer_holds_the_window_on_the_real_server() {
+        let dir = tempdir().expect("tempdir");
+        let server = InboxServer::open(dir.path().join("inbox.db"), &test_passphrase())
+            .expect("open");
+        let t0 = std::time::Instant::now();
+        let cheap = InboxError::Protocol("unknown tag 0x7f".into());
+        let disk = InboxError::Storage("No space left on device".into());
+
+        assert!(server.report_handle_error_for_test(&cheap, t0).is_some());
+        let mut disk_lines = 0;
+        for i in 0..501 {
+            let t = t0 + Duration::from_millis(i);
+            assert!(
+                server.report_handle_error_for_test(&cheap, t).is_none(),
+                "the peer's own line stays gated"
+            );
+            if let Some(line) = server.report_handle_error_for_test(&disk, t) {
+                assert!(line.contains("RELAY FAILURE"), "{line}");
+                disk_lines += 1;
+            }
+        }
+        assert_eq!(
+            disk_lines, 501,
+            "this is the number the rejected single-gate version drove to zero"
+        );
+    }
+
+    /// `Io` is on the gated side, and the reason is that it is not this
+    /// module's to construct: it arrives only from the peer's own stream.
+    ///
+    /// `KNOWN_ISSUES.md` item 10 proposed routing it around the gate together
+    /// with `Storage`. That would have reopened the hole through a variant a
+    /// peer produces by resetting a connection.
+    #[test]
+    fn io_errors_are_peer_caused_and_therefore_gated() {
+        let reset = InboxError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset by peer",
+        ));
+        assert!(
+            super::server::is_peer_caused_for_test(&reset),
+            "a peer resets a stream at will; this must not bypass the gate"
+        );
+    }
+
+    /// Both lines account for what they swallowed, and neither quotes raw
+    /// peer bytes at the terminal.
+    #[test]
+    fn the_gated_lines_carry_their_suppressed_count_and_are_sanitized() {
+        let setup = super::server::setup_fail_line(17);
+        assert!(setup.contains("17 suppressed"), "{setup}");
+
+        // A Protocol message is integers this module read, but the sanitizer is
+        // applied regardless -- an escape here would be acting on the operator's
+        // terminal, and arguing per-variant that none can carry one is how that
+        // class keeps coming back.
+        let nasty = InboxError::Protocol("\u{1b}[2Jcleared".into());
+        let line = super::server::peer_error_line(&nasty, 3);
+        assert!(line.contains("3 suppressed"), "{line}");
+        assert!(!line.contains('\u{1b}'), "escape reached the line: {line:?}");
+    }
+
     /// PUBLISH is remotely triggerable, so the watermark line is gated exactly
     /// as the accept-failure line is: at most one per
     /// [`PREKEY_WARN_LOG_INTERVAL`], each carrying the number of crossings
@@ -2518,32 +2833,34 @@ mod tests {
     /// watermark writes to the operator's log at will; without the count the
     /// operator cannot tell one straggler from a flood.
     ///
-    /// This bounds the watermark's own output and nothing else. It does not
-    /// make the line legible under noise a peer chooses on the ungated paths
-    /// beside it — see `KNOWN_ISSUES.md` item 10's "operator-log noise"
-    /// follow-up.
+    /// This bounds the watermark's own output and nothing else. It used to say
+    /// the line could still be buried by noise a peer chose on the *ungated*
+    /// paths beside it; those paths are gated now
+    /// ([`PEER_LOG_INTERVAL`], one instance each), so what remains is that
+    /// three bounded lines share one stderr, not that one unbounded one can
+    /// drown the others.
     #[test]
     fn the_prekey_watermark_line_is_rate_gated_and_counts_what_it_suppressed() {
-        let mut gate = super::server::PrekeyWarnGate::default();
+        let mut gate = super::server::LogGate::default();
         let t0 = std::time::Instant::now();
         let iv = PREKEY_WARN_LOG_INTERVAL;
 
-        assert_eq!(gate.admit(t0), Some(0), "the first crossing is always reported");
+        assert_eq!(gate.admit(t0, iv), Some(0), "the first crossing is always reported");
         for _ in 0..40 {
-            assert_eq!(gate.admit(t0), None, "inside the interval, nothing is written");
+            assert_eq!(gate.admit(t0, iv), None, "inside the interval, nothing is written");
         }
         assert_eq!(
-            gate.admit(t0 + iv - Duration::from_millis(1)),
+            gate.admit(t0 + iv - Duration::from_millis(1), iv),
             None,
             "a millisecond short of the interval is still inside it"
         );
         assert_eq!(
-            gate.admit(t0 + iv),
+            gate.admit(t0 + iv, iv),
             Some(41),
             "the next line must account for every crossing it swallowed"
         );
         assert_eq!(
-            gate.admit(t0 + iv * 2),
+            gate.admit(t0 + iv * 2, iv),
             Some(0),
             "and the count resets with each line written"
         );

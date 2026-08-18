@@ -415,7 +415,35 @@ trade-off is explicit rather than forgotten.
         and a line per crossing would be an unbounded write to the operator's
         log.
       - **Residual: the watermark line can be buried in operator-log noise an
-        attacker chooses** (open; follow-up, not fixed in the 2026-08 change).
+        attacker chooses** — **CLOSED 2026-08-19.** Both lines now have gates of
+        their own (`PEER_LOG_INTERVAL`, one `LogGate` instance each), and the
+        relay's own failures are routed around them. The analysis below is kept
+        because the fix came out of it — **with one correction, which is the
+        useful part**: it says to route `Storage` *and `Io`* around the gate.
+        `Io` belongs on the gated side. It is never constructed anywhere in
+        `network/inbox.rs`; it arrives only via `#[from] std::io::Error`, and on
+        the server path the only sources are the 31 `read_timed`/`write_timed`
+        calls against the peer's own stream — so a peer produces one by
+        resetting a connection, as cheaply as a `Protocol`. Ungating it would
+        have reopened the hole through a different variant. Pinned by
+        `io_errors_are_peer_caused_and_therefore_gated`.
+
+        Two further departures from the plan below. Sanitizing was called "a
+        separate question, and the answer today is no"; the answer is now yes,
+        because that argument has to be re-made for every variant that reaches
+        the line and `Io` carries an OS-formatted string this module did not
+        write. And both arms moved out of `run()` into
+        `report_setup_failure_at` / `report_handle_error_at`, so a test can
+        drive the server's real gates — a test over two locally-constructed
+        `LogGate`s would pass even if `run()` shared one, which is the bug.
+
+        The ungated branch has a residual of its own, stated rather than
+        implied: on a persistent fault (a full disk) the relay writes one line
+        per affected connection, unbounded. That is the deliberate side of the
+        trade — a rate on it would be a rate on the relay's own alarm — and a
+        peer can only arrive while the condition holds, not cause it.
+
+        The original analysis follows.
         The gate above bounds what the *watermark* writes — one line per 60 s,
         whatever else is happening — but two other lines on the same stderr are
         ungated and remotely triggerable, so a peer can push the watermark line
