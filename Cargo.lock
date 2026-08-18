@@ -5211,7 +5211,7 @@ dependencies = [
  "slint-build",
  "spki 0.8.0",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
  "tracing-subscriber",
