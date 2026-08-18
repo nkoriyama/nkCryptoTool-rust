@@ -105,7 +105,7 @@ mls-rs-provider-sqlite = { version = "0.23", default-features = false, features 
 # build). Version must match `mls-rs-provider-sqlite`'s pin (0.37).
 rusqlite = { version = "0.37", default-features = false, features = ["bundled-sqlcipher"], optional = true }
 notify-rust = { version = "4.0", optional = true }
-rfd = { version = "0.14", optional = true }
+rfd = { version = "0.17", optional = true }
 
 # Pure-Rust embedded KV store backing the SQLCipher replacement (P1, see
 # DB_PURERUST_DESIGN.md). Removes the system libcrypto link that
