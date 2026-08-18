@@ -8,6 +8,9 @@ Three scans of `src/`, run as a split so that no candidate went unvoted:
 | `CLAUDE-SECURITY-20260806-173039` | `src/group` | 10 (`A-F1`..`A-F10`) |
 | `CLAUDE-SECURITY-20260811-090443` | `src/p2p` + `src/network` + `src/gui` | 13 (`B-F1`..`B-F13`) |
 
+この3スキャンより前の4ターンと、7ターンを跨いだ推移は
+[`AUDIT_CROSS_ANALYSIS.md`](./AUDIT_CROSS_ANALYSIS.md) にある。
+
 **25 findings. No HIGH, no CRITICAL.** All were derived from reading; the scans
 executed none of the repository's code. Every fix below is backed by tests that
 do run.
