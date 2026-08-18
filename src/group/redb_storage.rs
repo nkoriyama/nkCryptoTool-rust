@@ -1405,6 +1405,35 @@ const META_NEXT_ID: &[u8] = b"next_id";
 /// [`charge_ledgers`] / [`refund_ledgers`], both of which take the amount from
 /// that one function.
 const META_ENV_BYTES: &[u8] = b"env_bytes";
+/// Running total of the sealed size of every stored prekey row, the sibling of
+/// [`META_ENV_BYTES`] for [`TBL_PREKEY`].
+///
+/// **A meter, not a budget.** No path in this store reads it to refuse a write:
+/// it is read to be updated (here and in [`RedbInboxStore::fetch_prekey`]) and
+/// returned to the caller, and the relay reports it to the operator past a
+/// watermark (`network::inbox::PREKEY_BYTES_WARN_AT`). A *cap* on it was
+/// written and then deliberately taken out again: refusing PUBLISH at one would
+/// have let ~1 GiB of published junk turn every later PUBLISH on the relay into
+/// a failure — honest recipients' included — and a recipient that cannot
+/// replenish has senders that fall back to `MODE_STATIC_ONLY`, which is the
+/// post-quantum forward-secrecy downgrade this subsystem exists to prevent.
+/// Nothing an attacker publishes into its own slots is ever fetched, so that
+/// state would also have been self-sustaining. The disk exhaustion a cap would
+/// have bounded is the lesser harm because it is loud and the operator can act
+/// on it; that trade is recorded in `KNOWN_ISSUES.md` item 10.
+///
+/// **Deliberately a second counter rather than a share of [`META_ENV_BYTES`].**
+/// That one *is* enforced, so mixing them would let a PUBLISH flood spend the
+/// envelope budget — after which `deposit_in`'s global check refuses **every**
+/// depositor, which is the outcome the envelope budget exists to bound rather
+/// than to hand to a stranger. Prekey bytes also have no expiry to give them
+/// back (see [`RedbInboxStore::publish_prekeys`]), so a shared total would be
+/// pinned by them permanently.
+///
+/// Moved only by [`RedbInboxStore::publish_prekeys`] (charge on insert, refund
+/// on the row-cap eviction) and [`RedbInboxStore::fetch_prekey`] (refund on the
+/// one-time pop), each taking the amount from the row's own stored length.
+const META_PREKEY_BYTES: &[u8] = b"prekey_bytes";
 /// Schema version of the inbox database (u64 BE). Absent or lower than
 /// [`INBOX_SCHEMA_VERSION`] means [`TBL_ENV_TS`] and the byte ledgers have not
 /// been built for the rows already present; see `RedbInboxStore::upgrade_*`.
@@ -1646,6 +1675,10 @@ impl EnvTs {
 }
 
 /// The byte budgets [`RedbInboxStore::deposit`] enforces.
+///
+/// Envelopes only. Prekey rows are metered rather than budgeted — they are
+/// counted in [`META_PREKEY_BYTES`] and nothing here bounds them, deliberately
+/// (see that constant).
 #[derive(Clone, Copy, Debug)]
 struct ByteBudget {
     total: u64,
@@ -1728,15 +1761,19 @@ fn sender_ledger_key(sender_bi: &[u8; BLIND_INDEX_LEN]) -> Vec<u8> {
 /// stating rather than worth encrypting.
 ///
 /// Row cost: 35 B of key + 8 B of value per recipient that has ever published,
-/// never removed. Uncounted by any budget, like [`sender_ledger_key`]'s rows.
-/// **Do not read a floor into the PUBLISH that creates one**: the server never
-/// parses a prekey blob, and `handle_publish` accepts any blob of `1..=`
-/// [`crate::network::inbox::MAX_PREKEY_BLOB`] bytes, so the real minimum is one
-/// tiny row — which the publisher can then FETCH away, leaving this row behind.
-/// It is bounded by comparison instead: [`TBL_CHECKPOINT`] already gives a
+/// never removed. **This row is uncounted by any budget**, like
+/// [`sender_ledger_key`]'s rows — the prekey blob that creates one is charged
+/// to [`META_PREKEY_BYTES`] and floored at
+/// [`crate::network::inbox::MIN_PREKEY_BLOB`], but that charge is refunded when
+/// the blob is drawn or evicted, and this row stays. So the blob prices
+/// *creating* the row and bounds nothing about keeping it: the publisher can
+/// FETCH its own prekey straight back, giving the meter its bytes back and
+/// leaving this row behind for nothing.
+/// **It is not the cheapest way to leave one**: [`TBL_CHECKPOINT`] gives a
 /// freely minted NodeId a permanent, equally uncharged row for a 9-byte frame
-/// and no stored bytes at all, so this is the strictly more expensive of the two
-/// ways to leave one uncounted row per identity.
+/// and no stored bytes at all. That comparison, rather than the blob, is what
+/// this bound rests on, and it is the comparison to keep — the blob is a
+/// deposit the publisher gets back, not a price it pays.
 fn prekey_mark_key(recipient_bi: &[u8; BLIND_INDEX_LEN]) -> Vec<u8> {
     let mut k = Vec::with_capacity(META_PREKEY_MARK_PREFIX.len() + BLIND_INDEX_LEN);
     k.extend_from_slice(META_PREKEY_MARK_PREFIX);
@@ -2547,18 +2584,72 @@ impl RedbInboxStore {
     /// Replacing costs nothing against the attack this defends, because a
     /// fetcher cannot reach this path at all: the slot — and therefore the
     /// mark — is keyed on the handshake-authenticated NodeId.
+    ///
+    /// # The prekey byte meter
+    ///
+    /// The batch is charged to [`META_PREKEY_BYTES`] from the rows' own sealed
+    /// sizes, and the row-cap eviction below refunds what it removes in the
+    /// same transaction, so a publisher already at `max_prekeys` rotating its
+    /// pool moves the total by the difference in blob sizes rather than by the
+    /// whole batch. The committed total is returned, for the caller to report
+    /// past a watermark (`network::inbox::PREKEY_BYTES_WARN_AT`).
+    ///
+    /// **This is accounting, not admission: no total refuses a PUBLISH here.**
+    /// A cap was written and taken out again — at one, ~1 GiB of junk published
+    /// across minted identities would refuse every subsequent PUBLISH on the
+    /// relay, honest recipients' included, and the attacker's own rows are
+    /// never fetched so nothing would give the space back. Senders to a
+    /// recipient that cannot replenish seal `MODE_STATIC_ONLY`, so that cap was
+    /// a relay-wide post-quantum forward-secrecy downgrade available for the
+    /// price of the upload. See [`META_PREKEY_BYTES`] and `KNOWN_ISSUES.md`
+    /// item 10 for the trade, which leaves the disk-exhaustion risk open.
+    ///
+    /// # Why the `created_at` sealed into every row is not a TTL
+    ///
+    /// It is written for the record's shape and read by nothing; expiring
+    /// prekey rows on it would be a straightforward way to make this meter
+    /// drain, and it is **not** taken, because in this tree the relay would be
+    /// destroying post-quantum forward secrecy on a timer:
+    ///
+    /// - A recipient whose pool expires has no prekeys, and a sender that
+    ///   cannot get one seals `MODE_STATIC_ONLY` under the default profile —
+    ///   encapsulating only to the long-term X-Wing static key, so an adversary
+    ///   recording those messages and later obtaining that key can read them.
+    ///   That is the downgrade this whole subsystem exists to prevent.
+    /// - Nothing republishes a pool on its own. `replenish_to_target` is
+    ///   reached from one production call site, `--prekey-cmd maintain`, which
+    ///   `main.rs` documents as one-shot ("run it from a timer/cron"); no timer
+    ///   or cron artifact ships with the tree, `USAGE.md` does not mention
+    ///   prekeys, and `PQFS_DESIGN.md` already says the republication window is
+    ///   operator-scheduled and so effectively unbounded.
+    /// - A recipient that publishes once — `--prekey-cmd init-identity` and
+    ///   nothing after, which is a realistic state and arguably the default one
+    ///   — would have its pool deleted at the TTL and no way to notice. There
+    ///   is no low-water signal back to a pool's owner: the depleted FETCH is
+    ///   answered to the *sender*, whose warning prints on the sender's own
+    ///   terminal.
+    ///
+    /// So a TTL here would silently downgrade honest traffic on a clock, with
+    /// no attacker involved, to bound bytes an attacker pays 1:1 in bandwidth
+    /// for. Not taken; the meter above reports those bytes instead of
+    /// reclaiming them, and the cost of not expiring — that a flood's bytes
+    /// stay until the database is replaced — is recorded with it.
+    ///
+    /// Returns the committed [`META_PREKEY_BYTES`] total.
     pub fn publish_prekeys(
         &self,
         recipient: &[u8; 32],
         blobs: &[Vec<u8>],
         created_at: i64,
-    ) -> Result<(), RedbStorageError> {
+    ) -> Result<u64, RedbStorageError> {
         let bi = self.b.blind_index(recipient);
         let wtx = self
             .b
             .db
             .begin_write()
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        // Charge each row from the size actually stored, not a prediction.
+        let mut charged = 0u64;
         for blob in blobs {
             let id = self.next_id(&wtx)?;
             let key = composite_key(&bi, id);
@@ -2571,47 +2662,67 @@ impl RedbInboxStore {
                 .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
             t.insert(key.as_slice(), sealed.as_slice())
                 .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            charged = charged.saturating_add(sealed.len() as u64);
         }
-        // Evict oldest beyond the cap.
+        // Evict oldest beyond the cap, refunding exactly what leaves — each
+        // row's own stored length, read from the same range that decides which
+        // rows go.
         let stocked: u64;
+        let mut refunded = 0u64;
         {
             let mut t = wtx
                 .open_table(TBL_PREKEY)
                 .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
             let lo = composite_key(&bi, 0);
             let hi = composite_key(&bi, u64::MAX);
-            let mut keys: Vec<Vec<u8>> = Vec::new();
+            let mut rows: Vec<(Vec<u8>, u64)> = Vec::new();
             {
                 let range = t
                     .range::<&[u8]>(lo.as_slice()..=hi.as_slice())
                     .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
                 for entry in range {
-                    let (k, _v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
-                    keys.push(k.value().to_vec());
+                    let (k, v) = entry.map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                    rows.push((k.value().to_vec(), v.value().len() as u64));
                 }
             }
-            if keys.len() > self.max_prekeys {
-                let drop_count = keys.len() - self.max_prekeys;
-                for k in keys.iter().take(drop_count) {
+            if rows.len() > self.max_prekeys {
+                let drop_count = rows.len() - self.max_prekeys;
+                for (k, n) in rows.iter().take(drop_count) {
                     t.remove(k.as_slice())
                         .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                    refunded = refunded.saturating_add(*n);
                 }
             }
             // What this PUBLISH leaves in the slot: the rows just counted, less
             // whatever the cap evicted.
-            stocked = keys.len().min(self.max_prekeys) as u64;
+            stocked = rows.len().min(self.max_prekeys) as u64;
         }
+        let total;
         {
             let mut meta = wtx
                 .open_table(TBL_META)
                 .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
             meta_write_u64(&mut meta, &prekey_mark_key(&bi), stocked)?;
+            total = meta_read_u64(&meta, META_PREKEY_BYTES)?
+                .unwrap_or(0)
+                .saturating_add(charged)
+                .saturating_sub(refunded);
+            meta_write_u64(&mut meta, META_PREKEY_BYTES, total)?;
         }
         wtx.commit()
-            .map_err(|e| RedbStorageError::Backend(e.to_string()))
+            .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        Ok(total)
     }
 
     /// FETCH: atomically pop the oldest prekey for `recipient` (one-time use).
+    ///
+    /// The popped row's bytes are given back to [`META_PREKEY_BYTES`] in the
+    /// same transaction, from the row's own stored length — this and the
+    /// row-cap eviction in [`Self::publish_prekeys`] are what let that meter
+    /// fall as well as rise. Note what it does *not* reclaim: those are the two
+    /// ways a prekey row leaves, and both need someone to act on the pool, so
+    /// bytes a flood publishes into slots it minted for itself stay counted
+    /// until the database is replaced (see [`META_PREKEY_BYTES`]).
     pub fn fetch_prekey(
         &self,
         recipient: &[u8; 32],
@@ -2624,6 +2735,7 @@ impl RedbInboxStore {
             .db
             .begin_write()
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+        let mut popped_bytes = 0u64;
         let result = {
             let mut t = wtx
                 .open_table(TBL_PREKEY)
@@ -2647,6 +2759,7 @@ impl RedbInboxStore {
                 Some((k, v)) => {
                     t.remove(k.as_slice())
                         .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+                    popped_bytes = v.len() as u64;
                     let pt = self.b.open_record(TID_PREKEY, &k, &v)?;
                     if pt.len() < PREKEY_HEADER_LEN {
                         return Err(RedbStorageError::Malformed("prekey too short".into()));
@@ -2655,6 +2768,15 @@ impl RedbInboxStore {
                 }
             }
         };
+        if popped_bytes > 0 {
+            let mut meta = wtx
+                .open_table(TBL_META)
+                .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
+            let total = meta_read_u64(&meta, META_PREKEY_BYTES)?
+                .unwrap_or(0)
+                .saturating_sub(popped_bytes);
+            meta_write_u64(&mut meta, META_PREKEY_BYTES, total)?;
+        }
         wtx.commit()
             .map_err(|e| RedbStorageError::Backend(e.to_string()))?;
         Ok(result)
@@ -4791,6 +4913,237 @@ mod tests {
         }
         assert_eq!(s.prekey_level_and_mark(&rcpt).expect("mark"), (3, 10));
         assert_eq!(mark_row(), Some(10));
+    }
+
+    // ---------------- prekey byte meter ----------------
+
+    /// The prekey ledger recomputed from the rows themselves, the same way
+    /// [`recomputed_total`] does it for envelopes. Every charge and refund takes
+    /// its amount from a row's stored length, so this and [`META_PREKEY_BYTES`]
+    /// are two ways of counting one thing and must agree.
+    fn recomputed_prekey_total(s: &RedbInboxStore) -> u64 {
+        let rtx = s.b.db.begin_read().expect("read txn");
+        let t = rtx.open_table(TBL_PREKEY).expect("open prekey");
+        let mut sum = 0u64;
+        for entry in t.iter().expect("iter") {
+            sum += entry.expect("entry").1.value().len() as u64;
+        }
+        sum
+    }
+
+    /// A 1 KiB stand-in blob — the smallest thing `handle_publish` admits, so
+    /// the byte figures here are measured against a publisher that can exist.
+    fn meter_blob() -> Vec<u8> {
+        vec![7u8; 1024]
+    }
+
+    /// Stored size of one [`meter_blob`] row.
+    fn meter_row() -> u64 {
+        sealed_len_for(PREKEY_HEADER_LEN + 1024)
+    }
+
+    /// One of a flood's minted recipient ids.
+    fn minted(i: u32) -> [u8; 32] {
+        let mut who = [0xF1u8; 32];
+        who[..4].copy_from_slice(&i.to_le_bytes());
+        who
+    }
+
+    /// [`META_PREKEY_BYTES`] rises by exactly what a PUBLISH stores and falls by
+    /// exactly what leaves — the one-time pop and the row-cap eviction — so the
+    /// number the operator is eventually shown is a count of the rows actually
+    /// on disk rather than an estimate that can drift away from them.
+    ///
+    /// The value `publish_prekeys` *returns* is asserted alongside the stored
+    /// one because that return is what the relay compares against its watermark:
+    /// a total that drifted high would cry wolf, and one that drifted low would
+    /// keep the operator quiet through the flood the meter exists to surface.
+    #[test]
+    fn inbox_prekey_bytes_are_charged_and_refunded_exactly() {
+        let (_d, s) = inbox(4);
+        let rcpt = [0xb1u8; 32];
+        let row = meter_row();
+
+        assert_eq!(meta_of(&s, META_PREKEY_BYTES), None, "nothing stored, no ledger row");
+
+        let total = s.publish_prekeys(&rcpt, &vec![meter_blob(); 3], 10).expect("publish");
+        assert_eq!(meta_of(&s, META_PREKEY_BYTES), Some(3 * row));
+        assert_eq!(total, 3 * row, "the returned total must be the committed one");
+        assert_eq!(recomputed_prekey_total(&s), 3 * row, "ledger must equal the rows");
+
+        // The one-time pop gives its own row back.
+        s.fetch_prekey(&rcpt).expect("fetch");
+        assert_eq!(meta_of(&s, META_PREKEY_BYTES), Some(2 * row));
+        assert_eq!(recomputed_prekey_total(&s), 2 * row);
+
+        // A pop on an empty slot moves nothing.
+        let empty = [0xb2u8; 32];
+        assert_eq!(s.fetch_prekey(&empty).expect("fetch empty"), None);
+        assert_eq!(meta_of(&s, META_PREKEY_BYTES), Some(2 * row));
+
+        // Publishing past the row cap refunds what the cap evicts: 2 + 4 rows
+        // with a cap of 4 leaves 4, so two rows' bytes come back.
+        let total = s.publish_prekeys(&rcpt, &vec![meter_blob(); 4], 11).expect("republish");
+        assert_eq!(total, 4 * row, "the returned total must net off the eviction");
+        assert_eq!(s.count_prekeys(&rcpt).expect("count"), 4);
+        assert_eq!(
+            meta_of(&s, META_PREKEY_BYTES),
+            Some(4 * row),
+            "the row cap's eviction must refund, or a pool held at the cap would \
+             charge the meter forever for rows it no longer stores"
+        );
+        assert_eq!(recomputed_prekey_total(&s), 4 * row);
+
+        // Draining the pool returns the whole of it.
+        for _ in 0..4 {
+            s.fetch_prekey(&rcpt).expect("drain");
+        }
+        assert_eq!(meta_of(&s, META_PREKEY_BYTES), Some(0));
+        assert_eq!(recomputed_prekey_total(&s), 0);
+    }
+
+    /// A flood is **counted**, and counting is all that happens to it here: no
+    /// PUBLISH is refused, no pool is evicted to make room, and every honest
+    /// operation on the store keeps working while the meter climbs.
+    ///
+    /// This is the shape the fix deliberately retreated to. An earlier revision
+    /// refused a PUBLISH past a byte cap, which handed an attacker a worse
+    /// weapon than the disk exhaustion it bounded: publish ~1 GiB across minted
+    /// identities and *every* later PUBLISH is refused, honest recipients'
+    /// included, so their pools drain by FETCH and can never be restocked and
+    /// their senders seal `MODE_STATIC_ONLY`. The attacker's own rows are never
+    /// fetched, so nothing gives the space back. So the assertion that matters
+    /// most here is the one that revision would have failed: after the flood,
+    /// **the honest recipient can still publish**.
+    #[test]
+    fn inbox_prekey_flood_is_counted_and_leaves_every_honest_operation_working() {
+        let (_d, s) = inbox(4);
+        let honest = [0xa1u8; 32];
+        let row = meter_row();
+
+        s.publish_prekeys(&honest, &vec![meter_blob(); 4], 10).expect("honest publish");
+        let honest_keys = keys_of(&s, TBL_PREKEY);
+        assert_eq!(honest_keys.len(), 4);
+        let honest_mark = s.prekey_level_and_mark(&honest).expect("mark");
+
+        // The attacker mints an identity per slot and stocks each one itself.
+        const SLOTS: u32 = 50;
+        let mut total = 0u64;
+        for i in 0..SLOTS {
+            total = s
+                .publish_prekeys(&minted(i), &vec![meter_blob(); 4], 10)
+                .expect("nothing refuses a flood — that is the point of this test");
+        }
+        assert_eq!(
+            total,
+            (4 + 4 * u64::from(SLOTS)) * row,
+            "every flooded row must be counted, or the meter under-reports the \
+             one thing the operator is shown"
+        );
+        assert_eq!(total, recomputed_prekey_total(&s), "the meter must equal the rows");
+        assert_eq!(meta_of(&s, META_PREKEY_BYTES), Some(total));
+
+        // The flood took nothing from anyone else: same rows, same mark, same
+        // bytes served back.
+        let after: std::collections::HashSet<Vec<u8>> =
+            keys_of(&s, TBL_PREKEY).into_iter().collect();
+        for k in &honest_keys {
+            assert!(
+                after.contains(k),
+                "a flood must not evict a third party's prekey rows — that would \
+                 be a remote PQ-FS downgrade, strictly worse than the disk it is \
+                 being kept from filling"
+            );
+        }
+        assert_eq!(s.count_prekeys(&honest).expect("count"), 4);
+        assert_eq!(s.prekey_level_and_mark(&honest).expect("mark"), honest_mark);
+        assert_eq!(
+            s.fetch_prekey(&honest).expect("fetch"),
+            Some(meter_blob()),
+            "and the rows it left behind are still the bytes their owner published"
+        );
+
+        // The regression the retreat exists for: the honest recipient, now a
+        // row down, replenishes. `--prekey-cmd maintain` publishes a pool's
+        // *deficit*, so a pool that has shrunk is exactly the one asking the
+        // meter to grow — which is what the removed cap refused.
+        let after_refill = s
+            .publish_prekeys(&honest, &[meter_blob()], 13)
+            .expect("an honest publisher must keep working while a flood is counted");
+        assert_eq!(s.count_prekeys(&honest).expect("count"), 4);
+        // The FETCH above refunded one row and this republishes it, so the
+        // meter lands exactly back where the flood left it — the refill is
+        // charged like any other row, and the draw's refund was real.
+        assert_eq!(after_refill, total, "one row out, one row in");
+        assert_eq!(after_refill, recomputed_prekey_total(&s));
+    }
+
+    /// A publisher at its row cap rotating its pool moves the meter by nothing,
+    /// because the eviction the row cap performs refunds in the same
+    /// transaction as the charge.
+    ///
+    /// Kept after the byte cap was removed, for a different reason than it was
+    /// written for: with no refusal there is no admission to protect, but there
+    /// *is* a number an operator is shown. Were the eviction to go unrefunded,
+    /// the steady-state `--prekey-cmd maintain` on a stocked pool would inflate
+    /// the meter forever and the watermark would eventually fire on a relay
+    /// storing a constant number of rows — a false report is the way this
+    /// warning stops being read.
+    #[test]
+    fn inbox_prekey_rotation_at_the_row_cap_moves_the_meter_by_nothing() {
+        let (_d, s) = inbox(4);
+        let honest = [0xa2u8; 32];
+
+        let full = s
+            .publish_prekeys(&honest, &vec![meter_blob(); 4], 10)
+            .expect("honest publish");
+        for round in 0..5i64 {
+            let after = s
+                .publish_prekeys(&honest, &vec![meter_blob(); 4], 11 + round)
+                .expect("a full pool must be able to replace its own rows");
+            assert_eq!(s.count_prekeys(&honest).expect("count"), 4);
+            assert_eq!(
+                after, full,
+                "replacing four rows with four of the same size must move the \
+                 meter by nothing, however many times it is repeated"
+            );
+            assert_eq!(recomputed_prekey_total(&s), full);
+        }
+    }
+
+    /// The prekey meter is a **second** counter, not a share of the envelope
+    /// budget. That budget *is* enforced, so charging prekey rows to it would
+    /// hand an attacker the outcome `MAX_TOTAL_ENVELOPE_BYTES` exists to bound
+    /// — `deposit_in`'s global check refusing every depositor — by a cheaper
+    /// route than depositing. With the prekey cap gone this is the one refusal
+    /// a prekey flood could still inflict on somebody else, so keeping the two
+    /// counters apart is what keeps PUBLISH from being a way to switch DEPOSIT
+    /// off.
+    #[test]
+    fn inbox_prekey_flood_does_not_spend_the_envelope_budget() {
+        let (_d, s) = inbox(4);
+        let rcpt = [0xa3u8; 32];
+        let sender = [0xa4u8; 32];
+
+        for i in 0..50u32 {
+            s.publish_prekeys(&minted(i), &vec![meter_blob(); 4], 10).expect("flood");
+        }
+        assert!(meta_of(&s, META_PREKEY_BYTES).unwrap_or(0) > 0, "the flood landed");
+        assert_eq!(
+            meta_of(&s, META_ENV_BYTES).unwrap_or(0),
+            0,
+            "prekey rows must not be charged to the envelope ledger"
+        );
+
+        s.deposit(&rcpt, &sender, b"still delivering", 10)
+            .expect("a prekey flood must not refuse a deposit");
+        let env_after = meta_of(&s, META_ENV_BYTES).unwrap_or(0);
+        assert!(env_after > 0);
+
+        // ...and the reverse: a deposit is not charged to the prekey meter.
+        let prekey_before = meta_of(&s, META_PREKEY_BYTES).unwrap_or(0);
+        s.deposit(&rcpt, &sender, b"and another", 10).expect("deposit");
+        assert_eq!(meta_of(&s, META_PREKEY_BYTES).unwrap_or(0), prekey_before);
     }
 
     /// Sorted table names of a redb file, opened raw (no store handle, so the

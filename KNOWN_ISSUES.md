@@ -69,9 +69,11 @@ trade-off is explicit rather than forgotten.
      `RESERVE_MAX_TRACKED` = 4096 entries. Because `level == 0` returns before
      the table is touched, only recipients with a genuinely stocked pool create
      entries — but the attacker can supply those itself: PUBLISH writes to the
-     slot of the handshake-authenticated NodeId and never parses the blob, so
+     slot of the handshake-authenticated NodeId and does not parse the blob, so
      4096 minted NodeIds each stocked with junk blobs will do. **No third
-     party's prekeys are consumed**, only the victim's own.
+     party's prekeys are consumed**, only the victim's own. Junk still works;
+     what changed in 2026-08 is that it is no longer free — see the size floor
+     under the first residual below.
    - **What it bought was the removal of the refill race the reserve exists to
      win.** After a prune the mark re-derived from the drawn-down level `L` and
      the floor became `L/4`, so the pool could be walked down in ungated stages:
@@ -120,12 +122,55 @@ trade-off is explicit rather than forgotten.
    Four residuals stand:
    - **An attacker holding 4096 *distinct* pools below their floors at once**
      — each at the sustained below-floor cost — keeps the reserve table full,
-     and a recipient first drawn from while it is full goes untracked, hence
-     ungated, until room appears. Unchanged by the persistence fix: the floor is
-     known for such a recipient, but there is nowhere to put the bucket that
-     would charge it, and the admission rule fails **open** deliberately
+     and a recipient drawn from while it is full goes untracked, hence ungated,
+     for as long as it stays that way (no entry is inserted on that path, so
+     this is not limited to the recipient's first draw). Unchanged by the
+     persistence fix and **still open**: the floor is known for such a
+     recipient, but there is nowhere to put the bucket that would charge it,
+     and the admission rule fails **open** deliberately
      (`REPLY_RATE_LIMITED` is a downgrade lever to `one_shot`, not a retry
      signal, so refusing untracked callers would be worse than serving them).
+
+     What changed in 2026-08 is the **price**, not the escape. PUBLISH now
+     admits a blob only from `MIN_PREKEY_BLOB` = 1 KiB up
+     (`network/inbox.rs`), where it previously took any byte string of 1 byte
+     and up. It still does not parse, verify or interpret a blob — it compares
+     a length it has already read, and junk of an admissible size is stored and
+     served exactly as before, so this establishes nothing about whether a
+     stored blob is a real prekey. What it prices is the flood: an entry
+     survives the prune only while its bucket is off full, only a draw at or
+     below the floor charges one, and a pool of fewer than
+     `PREKEY_RESERVE_DIVISOR` prekeys has a floor of 0 by integer division and
+     is never charged at all — so a slot costs a pool of at least four prekeys,
+     republished and drained about once per 30 s
+     (`an_unprunable_reserve_entry_costs_a_pool_of_four` pins that boundary;
+     the 30 s is `RESERVE_RL_REFILL_PER_SEC` arithmetic, not a test). Stocking
+     more scales the hold and the price together at the same four-per-30 s
+     rate, until the pool outgrows what the eight-token bucket can absorb.
+     Across 4096 slots that cheapest rate is ~546 prekeys published per
+     second: **~3.3 KiB/s of PUBLISH frames before the floor, ~549 KiB/s
+     after**. The ~683 connections per second it also takes are unchanged, and
+     an attacker willing to pay the bytes still opens the escape — a size
+     floor buys bytes and nothing else. Those bytes are counted now
+     (`META_PREKEY_BYTES`, item 10), but counting is all that happens to them:
+     nothing refuses a PUBLISH, and at 4096 slots holding four 1 KiB prekeys
+     each — ~17 MiB — this escape would not even reach the 256 MiB watermark
+     that would tell the operator about it.
+
+     The floor is deliberately *not* the 4537 B the current encoding produces.
+     A relay that validated the wire format would become a version gate on an
+     operation with no negotiation, and the failure mode of that gate is the
+     downgrade this whole mechanism exists to prevent: a recipient whose
+     PUBLISH is refused (`--prekey-cmd publish` / `maintain` exit non-zero)
+     stops replenishing, its pool empties, and its senders fall back to
+     `MODE_STATIC_ONLY`. 1 KiB sits below any encoding that carries a
+     post-quantum KEM public key together with a post-quantum signature over
+     it — the smallest FIPS 203 encapsulation key is 800 B (ML-KEM-512) and the
+     most compact signature among NIST's selected PQ schemes is several hundred
+     bytes more — and every plausible change to the format (larger KEM, larger
+     signature) moves further above the floor.
+     `a_real_signed_prekey_clears_the_size_floor` pins the current encoding
+     against it.
    - **A pool anchored on its first draw is anchored at whatever it then holds.**
      If it had already been drawn down before the relay upgraded, the anchor is
      the drained level rather than what its owner stocked — that information was
@@ -140,8 +185,14 @@ trade-off is explicit rather than forgotten.
      (the next clean replenishment restores the mark), and unlike the prune it
      cannot be fired on demand.
    - **~43 B of meta row per recipient that has ever published**, never removed.
-     Uncounted by any budget, like the per-depositor ledger rows beside it, and
-     dwarfed by the ~4.5 KB prekey blob a PUBLISH must store to create one.
+     Uncounted by any budget, like the per-depositor ledger rows beside it. The
+     PUBLISH that creates one has to store at least `MIN_PREKEY_BLOB` = 1 KiB
+     (~4.5 KB for a real prekey) and is charged that against the prekey meter
+     — but the publisher can then FETCH its own prekey away, which refunds the
+     charge and leaves the row, so the blob is a deposit returned rather than a
+     price paid. A `TBL_CHECKPOINT` row is cheaper still, at a 9-byte frame and
+     no stored bytes, so this is not the cheapest way to leave an uncounted row
+     per identity.
 4. **Non-constant-time fingerprint / pinned-key comparison**
    (`p2p/processor.rs`, `network/tcp.rs`): both operands are *public* values
    (a peer public key and its SHA3-256), compared once per connection, so a
@@ -271,9 +322,170 @@ trade-off is explicit rather than forgotten.
       nothing is reclaimed at all until someone does. A *slot* is not subject
       to this (item 9's hold really does end at the TTL) because a deposit
       sweeps its own recipient's range as well; the global budget is what walks.
-    - **Operator note**: the 1 GiB budget is the disk bound, so the flood costs
-      the relay disk it already agreed to. Run a relay for correspondents you
+    - **Operator note**: the 1 GiB budget above bounds *envelope* bytes. It is
+      not a bound on the size of this file: prekey rows are counted but **not**
+      bounded (see the sub-item below), and the rows listed under "growth
+      vectors" are neither. Provision for the envelope budget plus however much
+      prekey storage you are willing to serve, plus redb's overhead. Nothing
+      shrinks the file once it has grown: `Database::compact` is called on the
+      node-local `RedbPrekeyStore` and not on `RedbInboxStore`, so what the
+      envelope budget bounds is a high-water mark, and deleting rows does not
+      give the space back to the filesystem. Run a relay for correspondents you
       are willing to serve; there is no way to tell a fleet from a crowd here.
+    - **PUBLISH is metered and reported, not bounded** (`META_PREKEY_BYTES` +
+      `PREKEY_BYTES_WARN_AT`, 2026-08). Prekey rows used to sit outside every
+      storage defence the relay had *and* outside every count:
+      `publish_prekeys` touched no ledger, neither sweep walks `TBL_PREKEY`, and
+      the `created_at` it seals into every row is read by nothing, so there is
+      no prekey TTL. A slot is capped at 256 rows, but the slot key is the
+      handshake NodeId — free to mint — so **2 MiB of permanent relay disk per
+      minted identity**, in two connections.
+      What the 2026-08 change adds is accounting and a report, nothing else:
+      those bytes are counted per row (refunded on the two paths that remove a
+      row — a FETCH of it, and the row-cap eviction in `publish_prekeys`; no
+      other code path removes one), and crossing a watermark prints one line per
+      60 s on the operator's stderr carrying the total and the number of
+      crossings it suppressed. **No PUBLISH is refused, and nothing about this
+      slows an attacker down.**
+      - **The residual, unchanged and open**: an unauthenticated flood can still
+        fill the relay's disk, at 1:1 bandwidth cost (2 MiB per identity, ~8 KiB
+        per row), and the bytes are permanent in practice — nothing expires
+        them, and the two ways a prekey row leaves are a FETCH of that row and
+        its owner republishing over it. An attacker has no reason to do either
+        to its own pools, and nobody else can do it for them: FETCH needs the
+        slot's NodeId, and what the relay stores is a blind index of it, so an
+        operator holding the database cannot enumerate the minted slots to drain
+        them. When the filesystem fills, every path that takes a write
+        transaction fails (DEPOSIT, PUBLISH, FETCH, CHECKPOINT; POLL reads and
+        would survive), and there is no recovery from inside the relay short of
+        replacing the database.
+      - **What the operator can actually do: notice, and intervene from
+        outside.** There is no remedy inside the relay — no publisher
+        allowlist, no prekey TTL, no sweep over `TBL_PREKEY`, and no compaction
+        of this database. The available moves are to restrict who can reach the
+        relay at a lower layer (do not hand out the node ticket; firewall it) or
+        to stop the relay and replace `inbox.db`, which discards every stored
+        envelope and every honest prekey pool with the flood's rows. The
+        watermark line exists to make that decision possible before the disk
+        decides it; it is not a defence.
+      - **A byte cap was implemented here and then deliberately removed**
+        (2026-08, same review). Refusing a PUBLISH past a 1 GiB prekey cap
+        turned out to hand an attacker something worse than the disk: publish
+        ~1 GiB across ~508 minted identities and **every** later PUBLISH on the
+        relay is refused, honest recipients' included. Their pools then drain
+        through FETCH — which any unauthenticated caller can drive — and can
+        never be replenished, so every sender to every recipient on that relay
+        seals `MODE_STATIC_ONLY`: a permanent, relay-wide post-quantum
+        forward-secrecy downgrade, invisible to the senders it hits, for the
+        price of the upload. It was also self-funding, since each prekey a
+        victim served freed exactly the space the attacker needed to re-take,
+        and self-sustaining, since the flood's own rows are never fetched. A
+        full disk is the lesser harm: it is loud, and the operator can act on
+        it.
+      - **Why prekey bytes are not charged to the envelope budget**: that budget
+        *is* enforced, so a PUBLISH flood spending it would make `deposit_in`'s
+        global check refuse every depositor — the outcome this item is about,
+        reached by a cheaper route. Prekey bytes also have no expiry to give
+        them back, so a shared total would be pinned by them permanently.
+        `inbox_prekey_flood_does_not_spend_the_envelope_budget` pins the
+        separation. With the prekey cap gone, that budget is the one refusal a
+        flood could still inflict on somebody else, which is what makes keeping
+        the two counters apart worth a test.
+      - **Why there is no prekey TTL**, though `created_at` is already stored
+        for one: nothing in this tree republishes a pool on its own.
+        `--prekey-cmd maintain` is a one-shot command the operator schedules,
+        no timer or cron artifact ships here, and there is no low-water signal
+        back to a pool's owner — the depleted FETCH is answered to the *sender*.
+        A recipient that runs `init-identity` once and never returns would have
+        its pool deleted on the clock, and every sender to it would then seal
+        `MODE_STATIC_ONLY`: the relay would be destroying post-quantum forward
+        secrecy on a timer, with no attacker involved, to bound bytes an
+        attacker pays 1:1 in bandwidth for. Not taken.
+      - **Where the watermark is set, and what it is worth**: 256 MiB, about
+        58,000 real prekey rows — ~580 recipients stocked to the
+        `--prekey-count` default of 100, or ~230 at the 256 maximum. Above the
+        scale this relay is built for, so an honest deployment should not trip
+        it, and well below the 1 GiB the operator already provisions for
+        envelopes, so the line arrives with room left to act. It cannot tell a
+        flood from a relay that simply grew, and the line says so; an operator
+        whose relay legitimately holds this much has also outgrown the
+        documented provisioning and is the right person to hear about it. The
+        line itself is rate-gated exactly as the accept-failure line is
+        (`ACCEPT_ERROR_LOG_INTERVAL`), because PUBLISH is remotely triggerable
+        and a line per crossing would be an unbounded write to the operator's
+        log.
+      - **Residual: the watermark line can be buried in operator-log noise an
+        attacker chooses** (open; follow-up, not fixed in the 2026-08 change).
+        The gate above bounds what the *watermark* writes — one line per 60 s,
+        whatever else is happening — but two other lines on the same stderr are
+        ungated and remotely triggerable, so a peer can push the watermark line
+        off an operator's screen or out of a log tail at a volume of its own
+        choosing. The noise does not stop the line being *written*: the
+        watermark's gate is state of its own, and nothing on those two paths
+        touches it (`prekey_warn` has exactly one non-test reader,
+        `note_prekey_bytes`), so however many of those two lines are written the
+        watermark's own gate is unmoved, it still carries its own
+        suppressed-count, and a `grep` for it still finds it. What the noise
+        costs is the chance an operator *reads* it.
+
+        Two things do stop the line, and neither is the noise itself. The disk
+        actually filling: `note_prekey_bytes` runs after
+        `publish_prekeys(..)?`, so a failing PUBLISH returns before the report.
+        And connection starvation: the permit at `InboxServer::run` is taken
+        before the spawn and held for the connection's life, so peers that hold
+        all `MAX_CONCURRENT_CONNECTIONS` of them stalled in `establish` park the
+        accept loop and no PUBLISH is dispatched to fire the watermark at all.
+        That is pre-existing and documented at the semaphore, but it is the same
+        flood: an attacker generating the noise can also starve the line it
+        would bury. Read "the gate is unmoved" as a statement about the gate,
+        not a promise that the line arrives.
+        The two paths, in `network/inbox.rs`'s accept loop:
+        - `eprintln!("[inbox] connection setup failed or timed out")`, on any
+          `P2pPending::establish` failure. **The cheaper of the two**: in the
+          iroh backend an ALPN outside the endpoint's set fails before the QUIC
+          handshake even completes, and a peer that completes the handshake and
+          never opens a bi-stream fails at `accept_bi`. Neither needs a byte of
+          protocol.
+        - `eprintln!("[inbox] handle error: {e}")`, on any `Err` from `handle`.
+          Dearer: it needs a completed handshake *plus* `accept_bi` *plus* one
+          byte the dispatcher rejects. Pre-existing and prekey-independent —
+          this line predates prekeys entirely.
+
+        A gate over the second line was written during the 2026-08 change and
+        **removed on review, because a single shared gate is the wrong shape**.
+        `handle` returns `Protocol` / `Timeout` / `TooLarge`, which are cheap
+        and attacker-chosen, *and* `Storage`, which is the relay reporting its
+        own failure — `No space left on device` among them. One content-blind
+        gate mixes the two, so an attacker that claims each 60 s window with a
+        malformed frame suppresses the text of every storage error behind it.
+        That would be a capability an unauthenticated peer does not have today,
+        bought for one byte per minute, and it compounds with the parenthesis
+        above: on a full disk the watermark has already stopped firing, so the
+        handler-error line is the relay's last self-report at exactly the moment
+        the shared gate would hand it to the attacker. A probe of the rejected
+        version measured it — one 0x7f per window, 501 `No space left on device`
+        errors behind it, zero of them printed. Whoever picks this up should
+        gate both lines and route `Storage` (and `Io`) around the gate, or give
+        it a gate of its own, the way `run()` already routes `P2pError::Closed`
+        around the accept-error gate rather than counting it as noise.
+        Sanitizing is a separate question and the
+        answer today is no: the `establish` line interpolates nothing, and every
+        `Protocol` message `handle` can produce is integers the server itself
+        read.
+      - **A pool at its row cap does not creep**: the eviction the row cap
+        performs refunds in the same transaction as the charge, so a publisher
+        already at 256 rows replacing them moves the meter by the difference in
+        blob sizes and a steady-state `maintain` moves it by nothing. That
+        matters for the report rather than for admission: a meter that drifted
+        upward on rotation would eventually fire the watermark on a relay
+        storing a constant number of rows, and a warning that cries wolf is one
+        nobody reads.
+      - **The meter under-reports on an upgraded relay**: prekey rows written
+        before it existed are not counted, and nothing sweeps them, so the
+        number in the warning line is a lower bound on what `TBL_PREKEY`
+        actually occupies until those rows are fetched or republished over. It
+        does not decay on a clock the way `EnvTs::cost`'s upgrade allowance
+        does.
 
     Three consequences of the same mechanism that are not attacks but **are**
     changes an honest deployment will notice:
@@ -294,8 +506,12 @@ trade-off is explicit rather than forgotten.
       `MAX_PAYLOAD` envelope. Large transfers fail while the store is above its
       soft limit, whoever sends them.
 
-    Three growth vectors the budgets deliberately do not count, listed so a
-    capacity plan does not miss them:
+    Growth vectors the envelope budget does not count, listed so a capacity plan
+    does not miss them. The largest by far is the prekey blobs themselves — 2 MiB
+    of permanent storage per minted identity — which are now *counted* and
+    reported past a watermark but, as the sub-item above says, still bounded by
+    nothing. The rest are small, but they are small per *identity*, and
+    identities are free:
     - **~90 B per envelope on upgrade**: `EnvTs::cost` charges an
       upgrade-stamped row only for the envelope that was already there, not for
       the index row it adds (`ENV_TS_ROW_BYTES`). Charging it would push a store
@@ -303,15 +519,29 @@ trade-off is explicit rather than forgotten.
       open and refuse every deposit until the sweep caught up. So a large legacy
       inbox exceeds the 1 GiB bound by about 90 B per stored envelope; it
       decays to zero one TTL window after the upgrade.
+    - **Every prekey row written before the prekey meter existed**: uncounted
+      for the same reason, and never decaying, because nothing sweeps
+      `TBL_PREKEY` — a row leaves only when someone fetches it or its owner
+      republishes over it. Nothing is refused on the meter, so this costs no
+      admission; what it costs is accuracy, and the warning line under-reports
+      the table by exactly those rows.
     - **~43 B per active depositor**: the per-depositor ledger rows in
       `TBL_META` (35 B key + 8 B value) are themselves uncharged. Bounded by the
       number of depositors holding a live backlog, and a row is dropped as soon
       as its balance reaches zero.
     - **~43 B per recipient that has ever published a prekey**: the stocking
       marks in the same table (item 3). Unlike the ledger rows these are never
-      removed, so they are bounded by identities rather than by live state — but
-      creating one requires storing at least one prekey blob (~4.5 KB), so they
-      cannot be the cheapest way to grow this file.
+      removed, so they are bounded by identities rather than by live state. The
+      blob that creates one is floored at `MIN_PREKEY_BLOB` and charged to the
+      prekey meter, but the publisher can FETCH its own prekey straight back —
+      which refunds the meter and leaves this row — so treat the blob as a
+      deposit returned rather than a price paid. A `TBL_CHECKPOINT` row is
+      cheaper still, at a 9-byte frame and no stored bytes, so this is not the
+      cheapest way to leave an uncounted row per identity.
+    - **The prekey rows' own keys** (40 B each: blind index + id) and redb's
+      per-page overhead. The prekey meter counts sealed *values*, the way the
+      envelope ledger counts `sealed_len`, so the file runs above both figures
+      by a per-row constant.
 
 11. **Control-frame confidentiality is a property of the sender, so a group's
     Commits are only as private as its least-upgraded committer**

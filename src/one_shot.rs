@@ -1060,7 +1060,9 @@ mod tests {
     /// Every draw spends a *fresh* NodeId, so nothing here is the per-NodeId
     /// FETCH bucket; and the blobs are opaque because the server stores them
     /// verbatim and never parses them — the seal under test is throttled, so it
-    /// never receives one.
+    /// never receives one. Opaque, but not tiny: PUBLISH admits a blob only
+    /// from [`inbox::MIN_PREKEY_BLOB`] bytes up, so the padding is what a
+    /// publisher on the wire would have to send.
     async fn drain_into_spent_reserve(
         net: &Arc<MockNetwork>,
         srv: &PeerAddr,
@@ -1068,7 +1070,13 @@ mod tests {
         recipient: PeerId,
         stock: usize,
     ) {
-        let blobs: Vec<Vec<u8>> = (0..stock).map(|i| format!("pk-{i}").into_bytes()).collect();
+        let blobs: Vec<Vec<u8>> = (0..stock)
+            .map(|i| {
+                let mut b = format!("pk-{i}").into_bytes();
+                b.resize(inbox::MIN_PREKEY_BLOB, 0);
+                b
+            })
+            .collect();
         inbox::publish_prekeys(recipient_ep, srv, &blobs).await.expect("publish");
         let mut minted = Vec::new();
         for i in 0..(stock as u16 * 2) {

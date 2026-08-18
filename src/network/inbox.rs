@@ -99,7 +99,23 @@
 //! opaque `SignedPrekey::to_bytes()`; the server stores it verbatim and
 //! never parses or verifies it (verification is the *fetching sender's*
 //! job, against the recipient's ML-DSA identity). A per-recipient cap of
-//! [`MAX_PREKEYS_STORED`] bounds storage abuse: the newest prekeys win.
+//! [`MAX_PREKEYS_STORED`] bounds one slot: the newest prekeys win. That caps a
+//! *slot*, not the store — the slot key is free to mint, so an attacker can
+//! hold as many slots as it cares to pay for and **nothing here bounds the
+//! aggregate**. What the store does is count it (`META_PREKEY_BYTES` in
+//! [`crate::group::redb_storage`], charged per row and refunded when a row is
+//! fetched or evicted), and what this module does is *tell the operator* once
+//! that total passes [`PREKEY_BYTES_WARN_AT`]. A byte cap was written here and
+//! then removed on review: see that constant for why refusing PUBLISH is worse
+//! than the disk it would save.
+//!
+//! The one thing PUBLISH does judge about a blob is its **length**, which it
+//! has to read anyway to frame the batch: [`MIN_PREKEY_BLOB`] ..=
+//! [`MAX_PREKEY_BLOB`]. That is a bound on absurdity, not a format check —
+//! junk of an acceptable size is admitted, stored and served unchanged — and
+//! it is deliberately not the size of the current encoding, because refusing
+//! a *format* here would gate any future client against an un-upgraded relay.
+//! See [`MIN_PREKEY_BLOB`] for what the lower bound is for and what it costs.
 //!
 //! PUBLISH is also where the reserve below gets its anchor: the pool level this
 //! call leaves in the slot is recorded as the recipient's *stocking level*, in
@@ -208,7 +224,52 @@ pub const MAX_POLL_BATCH: u32 = 64;
 /// Largest single serialized prekey blob accepted by PUBLISH/FETCH. A
 /// X-Wing `SignedPrekey` is ~4.5 KiB (1216 B key + 3309 B ML-DSA-65 sig +
 /// framing); 8 KiB leaves headroom while rejecting absurd lengths.
+/// [`MIN_PREKEY_BLOB`] is the other end of the same bound.
 pub const MAX_PREKEY_BLOB: usize = 8 * 1024;
+
+/// Smallest single serialized prekey blob accepted by PUBLISH.
+///
+/// **A size floor, not a format check.** The server still does not parse,
+/// interpret or verify any byte of a blob — it compares a length it has
+/// already read off the wire. A byte string of this size that is not a prekey
+/// at all is stored and served exactly as before.
+///
+/// It exists because the reserve table's cost model rested on a size nothing
+/// enforced. An entry in `InboxServer::draw_prekey`'s table is created only
+/// for a slot that holds prekeys, so an attacker filling that table stocks the
+/// pools itself — and with no floor a "stocked pool" cost **one byte per
+/// prekey**. Two places in the tree still bounded a cost by "a PUBLISH must
+/// store ~4.5 KB" — `KNOWN_ISSUES.md` item 3's fourth residual and item 10's
+/// third bullet — and a third, `prekey_mark_key` in
+/// [`crate::group::redb_storage`], had already been re-grounded on a different
+/// comparison for exactly this reason. The floor is what makes a bound of that
+/// shape true, at 1 KiB rather than 4.5.
+///
+/// **It does not make the flood impossible, and it does not check that a blob
+/// is a prekey.** A structurally valid `SignedPrekey` can be minted by anyone
+/// for a pool they own, so parsing would establish nothing about the publisher;
+/// what a floor buys is bytes, and bytes are the whole of what parsing would
+/// have bought here too.
+///
+/// It moves the cheap end only. A slot is still bounded by
+/// [`MAX_PREKEYS_STORED`] × [`MAX_PREKEY_BLOB`], so the most a publisher can
+/// make the relay store is unchanged; what changes is that a flood cannot
+/// occupy pools for nothing, and the disk it costs the relay now rises with
+/// the bandwidth it costs the attacker.
+///
+/// 1 KiB, not the 4537 B the current encoding actually produces, because **a
+/// relay that pins a wire format becomes a version gate and PUBLISH has no
+/// negotiation**. A blob has to carry a post-quantum KEM public key together
+/// with a post-quantum signature over it: the smallest FIPS 203 encapsulation
+/// key is 800 B (ML-KEM-512), the most compact signature among NIST's selected
+/// PQ schemes is several hundred bytes more, and every direction this format
+/// can plausibly move — a larger KEM, a larger signature — moves further above
+/// the floor rather than toward it. A future encoding that fell below 1 KiB
+/// would still be refused by an un-upgraded relay; that is the cost of this
+/// bound, and the reason it is set where nothing has to sit near it.
+/// `a_real_signed_prekey_clears_the_size_floor` pins the current encoding
+/// against it.
+pub const MIN_PREKEY_BLOB: usize = 1024;
 
 /// Largest number of prekeys accepted in one PUBLISH.
 pub const MAX_PUBLISH_BATCH: u32 = 128;
@@ -319,8 +380,8 @@ pub const RESERVE_RL_REFILL_PER_SEC: f64 = 1.0 / 30.0;
 /// once — and the next draw re-derived the mark from the drawn-down level,
 /// collapsing the floor in stages until the pool was empty. Firing the prune
 /// needs this many tracked recipients, which an attacker can mint itself
-/// (PUBLISH keys on the connecting NodeId and does not parse the blob), so the
-/// whole sequence was repeatable on demand.
+/// (PUBLISH keys on the connecting NodeId and does not parse the blob, only
+/// bound its length), so the whole sequence was repeatable on demand.
 ///
 /// The stocking level now comes from the store
 /// (`RedbInboxStore::prekey_level_and_mark`), so a prune cannot reach it —
@@ -338,10 +399,27 @@ pub const RESERVE_RL_REFILL_PER_SEC: f64 = 1.0 / 30.0;
 ///
 /// One residual stands, recorded in `KNOWN_ISSUES.md` item 3: an attacker
 /// holding this many *distinct* pools below their floors at once keeps the
-/// table full, and a recipient first drawn from while it is full goes untracked
-/// — hence ungated — until room appears. Its floor is known; there is simply no
-/// room for the bucket that would charge it, and the admission rule fails open
-/// deliberately (see [`FETCH_RL_MAX_TRACKED`]).
+/// table full, and a recipient drawn from while it is full goes untracked —
+/// hence ungated — for as long as it stays that way. Its floor is known; there
+/// is simply no room for the bucket that would charge it, and the admission
+/// rule fails open deliberately (see [`FETCH_RL_MAX_TRACKED`]).
+///
+/// **The escape is unchanged; what it costs to open is not.** Holding an entry
+/// unprunable means keeping its bucket off full, and only a draw at or below
+/// the floor charges one, so a slot costs a pool of at least
+/// [`PREKEY_RESERVE_DIVISOR`] prekeys — anything smaller has a floor of 0 by
+/// integer division and is never charged at all
+/// (`an_unprunable_reserve_entry_costs_a_pool_of_four` pins that boundary).
+/// Stocking more scales the hold and the price together: `S` prekeys buy
+/// `S/`[`PREKEY_RESERVE_DIVISOR`] charges and so `S/4` × `1/`
+/// [`RESERVE_RL_REFILL_PER_SEC`] of non-fullness, the same 4 prekeys per 30 s,
+/// until `S` passes [`RESERVE_RL_CAPACITY`] × 4 and the bucket cannot absorb
+/// the rest. Across 4096 slots that cheapest rate is ~546 prekeys published
+/// per second, and each one now costs at least [`MIN_PREKEY_BLOB`] instead of
+/// one byte: ~3.3 KiB/s of PUBLISH frames before the floor, ~549 KiB/s after.
+/// The ~683 connections per second it also takes are unchanged — a size floor
+/// buys bytes and nothing else, so this raises the price of the flood without
+/// bounding it, and an attacker willing to pay still opens the escape.
 const RESERVE_MAX_TRACKED: usize = 4096;
 
 /// Upper bound on connections whose per-connection setup + handling run
@@ -360,6 +438,70 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 256;
 /// `run()`. One line per interval, carrying the number suppressed since the
 /// previous line, keeps both bounded and still visible.
 const ACCEPT_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Stored prekey bytes above which PUBLISH starts reporting the total to the
+/// operator (`META_PREKEY_BYTES` in [`crate::group::redb_storage`], counted per
+/// row and refunded when a row is fetched or evicted).
+///
+/// **A watermark, not a cap. Nothing refuses a PUBLISH on it** — crossing it
+/// writes one line per [`PREKEY_WARN_LOG_INTERVAL`] and changes no reply.
+///
+/// A cap here was implemented and then taken out again, and the reason is worth
+/// keeping: prekey rows are written by anyone, into a slot keyed by a
+/// free-to-mint NodeId, and just two code paths remove one — a FETCH of that row
+/// (`RedbInboxStore::fetch_prekey`) and the row-cap eviction inside
+/// `publish_prekeys` — neither of which an attacker has reason to aim at its own
+/// pools. So at a cap, ~1 GiB of published junk would refuse every later PUBLISH
+/// that asked the total to grow, honest recipients' included, permanently.
+///
+/// Three production paths publish, and each one adds rows: `--prekey-cmd
+/// init-identity` and `--prekey-cmd publish` (`main.rs`) each send a whole
+/// `--prekey-count` batch — `publish` unconditionally, so repeated runs also
+/// drive the row-cap eviction — and `--prekey-cmd maintain` sends a pool's
+/// *deficit* (`one_shot::replenish_to_target`), so the recipient asking is one
+/// whose pool has already shrunk. A cap turns each of them into a failure for a
+/// recipient that needs restocking, which is the moment its forward secrecy
+/// depends on the call succeeding. Those pools would go on draining through
+/// FETCH (which anyone can drive), never be restocked, and every sender to them
+/// would seal `MODE_STATIC_ONLY` under the default profile. That is the
+/// post-quantum forward-secrecy downgrade this whole subsystem exists to
+/// prevent, it would be invisible to the senders it hits, and worse, each
+/// prekey a victim served would free exactly the space the attacker needed to
+/// re-take. The uncapped failure — a full disk — is louder and an operator can
+/// act on it, so it is the one kept.
+///
+/// **What this buys is notice, not protection.** The relay cannot tell a flood
+/// from a popular relay, and the line says so; nothing about it slows or
+/// bounds an attacker.
+///
+/// Set at 256 MiB: at the ~4.6 KB a real sealed prekey row occupies that is
+/// ~58,000 rows, or ~580 recipients stocked to the `--prekey-count` default of
+/// 100 (~230 at the [`MAX_PREKEYS_STORED`] maximum of 256) — above the scale
+/// this relay is built for, so an honest deployment should not trip it, and
+/// well below the 1 GiB `MAX_TOTAL_ENVELOPE_BYTES` the operator is already told
+/// to provision for envelopes, so the warning arrives with room left to act
+/// rather than as an epitaph. An operator whose relay legitimately holds this
+/// much has also outgrown the documented provisioning and is the right person
+/// to hear about it.
+const PREKEY_BYTES_WARN_AT: u64 = 256 * 1024 * 1024;
+
+/// Shortest interval between two prekey-watermark lines on the operator's
+/// stderr. Same mechanism and same reason as [`ACCEPT_ERROR_LOG_INTERVAL`]:
+/// PUBLISH is remotely triggerable, so a line per crossing would hand any peer
+/// an unbounded write to the operator's log — one line per interval, carrying
+/// the number of crossings suppressed since the previous line, keeps it bounded
+/// and still visible.
+///
+/// This bounds only what the watermark itself writes, and that is all it
+/// claims. It does not keep the line *legible*: two other lines in
+/// [`InboxServer::run`] — the `establish` failure and the `handle` error — are
+/// ungated and remotely triggerable, so a peer can still bury this one in noise
+/// of its own choosing. A gate over those was written here and taken back out:
+/// it is a pre-existing, prekey-independent problem, and one shared gate is the
+/// wrong shape for it because `handle` also returns the relay's own `Storage`
+/// failures. See `KNOWN_ISSUES.md` item 10's "operator-log noise" follow-up for
+/// both paths, their relative cost, and the shape that would work.
+const PREKEY_WARN_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Default per-frame idle timeout. Generous enough to absorb iroh
 /// hole-punching latency; short enough to bound retry cost.
@@ -916,6 +1058,68 @@ mod server {
         )
     }
 
+    /// Rate gate for the prekey-watermark line, which a remote peer can
+    /// trigger: when the last one was written, and how many crossings went
+    /// unreported since.
+    ///
+    /// The same shape [`InboxServer::run`] keeps inline for accept failures,
+    /// held in a mutex rather than a loop-local because PUBLISH is handled on a
+    /// task per connection. It is named and scoped for its one caller
+    /// ([`InboxServer::note_prekey_bytes`]) and hard-wired to
+    /// [`PREKEY_WARN_LOG_INTERVAL`]: generalising it over an interval belongs
+    /// with the second caller that needs a different one, not before.
+    #[derive(Debug, Default)]
+    pub(super) struct PrekeyWarnGate {
+        last: Option<Instant>,
+        suppressed: u64,
+    }
+
+    impl PrekeyWarnGate {
+        /// Ask for permission to write a line at `now`, returning the number of
+        /// crossings suppressed since the previous line when one is due.
+        ///
+        /// Every call is either reported or counted, so the numbers the
+        /// operator sees add up to the crossings that happened.
+        pub(super) fn admit(&mut self, now: Instant) -> Option<u64> {
+            let due = self
+                .last
+                .is_none_or(|t| now.saturating_duration_since(t) >= PREKEY_WARN_LOG_INTERVAL);
+            if due {
+                let suppressed = self.suppressed;
+                self.last = Some(now);
+                self.suppressed = 0;
+                Some(suppressed)
+            } else {
+                self.suppressed = self.suppressed.saturating_add(1);
+                None
+            }
+        }
+    }
+
+    /// The line a PUBLISH past [`PREKEY_BYTES_WARN_AT`] puts on the operator's
+    /// stderr, reporting how many crossings went unlogged since the previous
+    /// line (see [`PREKEY_WARN_LOG_INTERVAL`]).
+    ///
+    /// Split out so a test can assert what reaches the terminal. Unlike
+    /// [`accept_error_line`] it carries no peer-supplied bytes — three integers
+    /// this module computed — so there is nothing here to sanitize; keep it that
+    /// way rather than adding the publisher's NodeId, which would be both
+    /// attacker-chosen and useless (a flood mints a fresh one per slot).
+    ///
+    /// It deliberately does not claim to have stopped anything: nothing was
+    /// refused, and an operator who reads this as a mitigation would be misled
+    /// about the state of their disk.
+    pub(super) fn prekey_warn_line(total: u64, warn_at: u64, suppressed: u64) -> String {
+        format!(
+            "[inbox] prekey storage is at {total} B, above the {warn_at} B watermark \
+             ({suppressed} suppressed since the previous line). Nothing is being \
+             refused and these bytes are reclaimed only when a prekey is fetched or \
+             its owner republishes over it, so this can keep growing until the disk \
+             is full; an unauthenticated flood of minted identities looks exactly \
+             like organic growth from here. See KNOWN_ISSUES.md item 10."
+        )
+    }
+
     /// Outcome of [`InboxServer::draw_prekey`].
     enum Draw {
         /// A popped one-time prekey blob.
@@ -943,6 +1147,16 @@ mod server {
         /// the critical section spans two synchronous redb calls and, still,
         /// no `.await`.
         prekey_reserve: StdMutex<HashMap<PeerId, Reserve>>,
+        /// Rate gate for the prekey-watermark line (see
+        /// [`PREKEY_BYTES_WARN_AT`]). A std mutex like the two above: the
+        /// critical section is a comparison and two field writes, with no
+        /// `.await` and no I/O — the line itself is written after the lock is
+        /// dropped.
+        prekey_warn: StdMutex<PrekeyWarnGate>,
+        /// The watermark [`Self::note_prekey_bytes`] compares against. A field
+        /// only so a test can lower it; production is always
+        /// [`PREKEY_BYTES_WARN_AT`].
+        prekey_warn_at: u64,
         /// Bounds concurrent per-connection setup + handling (see
         /// [`MAX_CONCURRENT_CONNECTIONS`]).
         conn_sem: Arc<tokio::sync::Semaphore>,
@@ -980,8 +1194,53 @@ mod server {
                 store,
                 fetch_rl: StdMutex::new(FetchLimiter::new(Instant::now())),
                 prekey_reserve: StdMutex::new(HashMap::new()),
+                prekey_warn: StdMutex::new(PrekeyWarnGate::default()),
+                prekey_warn_at: PREKEY_BYTES_WARN_AT,
                 conn_sem: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
             })
+        }
+
+        /// Lower the prekey watermark so a test can cross it without publishing
+        /// 256 MiB of blobs. Test-only; production always uses
+        /// [`PREKEY_BYTES_WARN_AT`].
+        #[cfg(test)]
+        #[must_use]
+        pub(crate) fn with_prekey_warn_at_for_test(mut self, warn_at: u64) -> Self {
+            self.prekey_warn_at = warn_at;
+            self
+        }
+
+        /// Test-only view of whether the watermark line has been written at
+        /// least once: the gate records the instant of its last line, so this is
+        /// the same state that decides whether the next crossing is reported.
+        #[cfg(test)]
+        pub(crate) fn prekey_warned_for_test(&self) -> bool {
+            self.prekey_warn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .last
+                .is_some()
+        }
+
+        /// Report `total` stored prekey bytes to the operator if it is at or
+        /// above the watermark and the log gate allows a line.
+        ///
+        /// **Reports; does not refuse.** The caller has already committed the
+        /// PUBLISH and answers `REPLY_OK` either way — see
+        /// [`PREKEY_BYTES_WARN_AT`] for why a refusal here was removed.
+        fn note_prekey_bytes(&self, total: u64) {
+            if total < self.prekey_warn_at {
+                return;
+            }
+            // Take the gate's verdict under the lock, write outside it.
+            let suppressed = self
+                .prekey_warn
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .admit(Instant::now());
+            if let Some(suppressed) = suppressed {
+                eprintln!("{}", prekey_warn_line(total, self.prekey_warn_at, suppressed));
+            }
         }
 
         /// Charge one FETCH token against the connecting NodeId's bucket,
@@ -1102,6 +1361,15 @@ mod server {
                     // honest sender does changes; what changes is that the
                     // entry is no longer left full, and therefore immediately
                     // prunable, by an attacker that stopped at the floor.
+                    // Future (no issue open): unlike `allow_fetch_at`'s prune
+                    // this one has no [`FETCH_RL_PRUNE_INTERVAL`] time gate, so
+                    // once the table is at `RESERVE_MAX_TRACKED` every untracked
+                    // draw pays a fresh O(n) scan over 4096 entries. Judged
+                    // worth leaving alone rather than fixed here: reaching this
+                    // path at all costs the caller a `MIN_PREKEY_BLOB` PUBLISH
+                    // and two connections per slot, and the scan is dominated by
+                    // the redb write transaction `fetch_prekey` takes on the
+                    // same draw. A time gate here would mirror `allow_fetch_at`.
                     if reserve.len() >= RESERVE_MAX_TRACKED {
                         reserve.retain(|_, r| !r.bucket.is_full_at(now));
                     }
@@ -1187,14 +1455,52 @@ mod server {
 
         /// Test-only door onto the PUBLISH store call. See
         /// [`Self::draw_prekey_reply_for_test`].
+        ///
+        /// It applies `handle_publish`'s size bound itself, so this door cannot
+        /// stock a pool more cheaply than a publisher on the wire can — what a
+        /// minted pool costs is the whole of the reserve table's residual — and
+        /// it reports to the operator on the same terms, so a flood driven
+        /// through here is as visible as one driven over the wire.
         #[cfg(test)]
         pub(crate) fn publish_for_test(
             &self,
             recipient: PeerId,
             blobs: &[Vec<u8>],
         ) -> Result<(), InboxError> {
-            self.store.publish_prekeys(recipient.as_bytes(), blobs, 0)?;
+            for b in blobs {
+                // Same two errors `handle_publish` answers with, in the same
+                // direction: `TooLarge` above the ceiling, `Protocol` below the
+                // floor. A door that reported `TooLarge` for a *short* blob
+                // would name the opposite of what happened.
+                if b.len() > MAX_PREKEY_BLOB {
+                    return Err(InboxError::TooLarge(b.len()));
+                }
+                if b.len() < MIN_PREKEY_BLOB {
+                    return Err(InboxError::Protocol(format!(
+                        "publish blob of {} B below the {MIN_PREKEY_BLOB} B minimum",
+                        b.len()
+                    )));
+                }
+            }
+            let stored_bytes = self.store.publish_prekeys(recipient.as_bytes(), blobs, 0)?;
+            self.note_prekey_bytes(stored_bytes);
             Ok(())
+        }
+
+        /// Test-only view of whether a recipient's reserve entry is currently
+        /// *prunable*: [`TokenBucket::is_full_at`] is the predicate
+        /// `draw_prekey`'s `retain` tests, so this is exactly what decides
+        /// whether an entry survives a forced prune — and therefore how many
+        /// prekeys an attacker must publish per slot to hold the table full.
+        /// `None` when the recipient has no entry at all.
+        #[cfg(test)]
+        pub(crate) fn reserve_bucket_is_full_for_test(&self, recipient: PeerId) -> Option<bool> {
+            let now = Instant::now();
+            self.prekey_reserve
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&recipient)
+                .map(|r| r.bucket.is_full_at(now))
         }
 
         /// Test-only view of a slot's pool level, for asserting what a drain
@@ -1484,6 +1790,19 @@ mod server {
                     let _ = write_timed(stream, &[REPLY_FAIL], "publish reply (fail)").await;
                     return Err(InboxError::TooLarge(len));
                 }
+                // Length only — the blob itself is still never parsed. A byte
+                // string too small to hold a post-quantum key and a signature
+                // over it is not a prekey, and admitting one made a stocked
+                // pool cost a byte, which is the size the statements about
+                // what flooding the reserve table costs were resting on. See
+                // [`MIN_PREKEY_BLOB`]; the batch is refused whole, before any
+                // of it reaches the store.
+                if len < MIN_PREKEY_BLOB {
+                    let _ = write_timed(stream, &[REPLY_FAIL], "publish reply (fail)").await;
+                    return Err(InboxError::Protocol(format!(
+                        "publish blob of {len} B below the {MIN_PREKEY_BLOB} B minimum"
+                    )));
+                }
                 let mut blob = vec![0u8; len];
                 read_timed(stream, &mut blob, "publish blob").await?;
                 blobs.push(blob);
@@ -1495,7 +1814,14 @@ mod server {
             // The slot is keyed by `recipient` = the handshake-authenticated
             // NodeId, so a peer can only ever publish into its own pool. The
             // store appends the batch and evicts the oldest beyond the cap.
-            self.store.publish_prekeys(recipient.as_bytes(), &blobs, now)?;
+            let stored_bytes = self.store.publish_prekeys(recipient.as_bytes(), &blobs, now)?;
+            // Every PUBLISH is admitted; past the watermark the operator is
+            // told what prekey rows are now costing. This is a report on a
+            // committed write, so it cannot change the reply, and it must stay
+            // that way: refusing here would let a flood turn PUBLISH off for
+            // honest recipients too, whose senders would then seal
+            // MODE_STATIC_ONLY. See `PREKEY_BYTES_WARN_AT`.
+            self.note_prekey_bytes(stored_bytes);
             write_timed(stream, &[REPLY_OK], "publish reply (ok)").await?;
             tokio::time::timeout(IO_TIMEOUT, stream.flush())
                 .await
@@ -1608,6 +1934,20 @@ mod tests {
 
     fn test_passphrase() -> zeroize::Zeroizing<String> {
         zeroize::Zeroizing::new("nkct-inbox-test-passphrase".to_string())
+    }
+
+    /// A stand-in prekey blob: `tag` followed by zero padding, at exactly the
+    /// smallest size PUBLISH admits ([`MIN_PREKEY_BLOB`]).
+    ///
+    /// Junk, deliberately — the server does not parse a blob, and these tests
+    /// are about what it does with the bytes rather than what they mean. The
+    /// padding is what makes them honest about *price*: a test that stocked a
+    /// pool with four bytes would model an attacker that no longer exists.
+    fn blob(tag: &str) -> Vec<u8> {
+        let mut b = tag.as_bytes().to_vec();
+        assert!(b.len() <= MIN_PREKEY_BLOB, "tag longer than a prekey blob");
+        b.resize(MIN_PREKEY_BLOB, 0);
+        b
     }
 
     /// End-to-end: alice deposits a payload addressed to bob; bob polls
@@ -1915,13 +2255,31 @@ mod tests {
         PeerAddr,
         tempfile::TempDir,
     ) {
+        spawn_server_with_prekey_warn_at(None).await
+    }
+
+    /// [`spawn_server`] with the prekey watermark lowered to `warn_at`, so a
+    /// test can cross [`PREKEY_BYTES_WARN_AT`] over the wire without publishing
+    /// 256 MiB. `None` leaves the production watermark in place.
+    async fn spawn_server_with_prekey_warn_at(
+        prekey_warn_at: Option<u64>,
+    ) -> (
+        Arc<MockNetwork>,
+        Arc<InboxServer>,
+        tokio::task::JoinHandle<()>,
+        PeerAddr,
+        tempfile::TempDir,
+    ) {
         let net = MockNetwork::new();
         let server_ep =
             Arc::new(net.register(pid(99), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
         let dir = tempdir().expect("tempdir");
-        let server = Arc::new(
-            InboxServer::open(dir.path().join("inbox.db"), &test_passphrase()).expect("open"),
-        );
+        let opened =
+            InboxServer::open(dir.path().join("inbox.db"), &test_passphrase()).expect("open");
+        let server = Arc::new(match prekey_warn_at {
+            Some(warn_at) => opened.with_prekey_warn_at_for_test(warn_at),
+            None => opened,
+        });
         let task = {
             let s = Arc::clone(&server);
             let ep = Arc::clone(&server_ep);
@@ -1942,17 +2300,18 @@ mod tests {
         let alice =
             Arc::new(net.register(pid(1), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
 
-        let batch = vec![b"prekey-A".to_vec(), b"prekey-B".to_vec()];
+        let batch = vec![blob("prekey-A"), blob("prekey-B")];
         publish_prekeys(bob.as_ref(), &srv, &batch).await.expect("publish");
 
-        // FIFO: A then B.
+        // FIFO: A then B, byte-identical to what was published — the server
+        // stores and returns the blob unchanged.
         assert_eq!(
             fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
-            FetchOutcome::Prekey(b"prekey-A".to_vec())
+            FetchOutcome::Prekey(blob("prekey-A"))
         );
         assert_eq!(
             fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
-            FetchOutcome::Prekey(b"prekey-B".to_vec())
+            FetchOutcome::Prekey(blob("prekey-B"))
         );
         // One-time: the pool is now empty.
         assert_eq!(
@@ -1961,6 +2320,263 @@ mod tests {
         );
 
         task.abort();
+    }
+
+    /// PUBLISH admits a blob only within [`MIN_PREKEY_BLOB`] ..=
+    /// [`MAX_PREKEY_BLOB`], and the bound is on **size alone**: junk of an
+    /// admissible length is stored and served back unchanged, exactly as
+    /// before. Nothing here says a blob is a prekey — a publisher can mint any
+    /// bytes it likes for its own slot, and this only prices them.
+    ///
+    /// Enforced where a hostile publisher meets the relay, which is why the
+    /// test drives it through the wire handler rather than through some
+    /// client-side check: the peer this bound exists for does not use our
+    /// client.
+    #[tokio::test]
+    async fn publish_refuses_a_blob_below_the_size_floor() {
+        let (net, _server, task, srv, _dir) = spawn_server().await;
+        let bob =
+            Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+
+        // One byte under the floor. The server writes REPLY_FAIL and stops
+        // reading the batch, so the client either reads that byte or fails
+        // writing the rest — which one lands is a timing detail of the
+        // transport, and both are the refusal. What must hold either way is
+        // that the slot stays empty.
+        match publish_prekeys(bob.as_ref(), &srv, &[vec![7u8; MIN_PREKEY_BLOB - 1]]).await {
+            Err(InboxError::Rejected) | Err(InboxError::Io(_)) => {}
+            other => panic!("a blob below the floor must be refused, got {other:?}"),
+        }
+        assert_eq!(
+            count_prekeys(bob.as_ref(), &srv).await.unwrap(),
+            0,
+            "a refused PUBLISH must not stock the pool"
+        );
+
+        // A batch is refused whole: the short blob is caught before any of the
+        // batch reaches the store, so pairing it with a good one buys nothing.
+        match publish_prekeys(
+            bob.as_ref(),
+            &srv,
+            &[vec![7u8; MIN_PREKEY_BLOB], vec![7u8; MIN_PREKEY_BLOB - 1]],
+        )
+        .await
+        {
+            Err(InboxError::Rejected) | Err(InboxError::Io(_)) => {}
+            other => panic!("a batch holding a short blob must be refused, got {other:?}"),
+        }
+        assert_eq!(
+            count_prekeys(bob.as_ref(), &srv).await.unwrap(),
+            0,
+            "a batch containing a short blob must not stock the pool with the rest of it"
+        );
+
+        // At the floor: accepted, unparsed, returned byte for byte.
+        let junk = vec![7u8; MIN_PREKEY_BLOB];
+        publish_prekeys(bob.as_ref(), &srv, std::slice::from_ref(&junk))
+            .await
+            .expect("a blob at the floor must be accepted");
+        assert_eq!(count_prekeys(bob.as_ref(), &srv).await.unwrap(), 1);
+        let alice =
+            Arc::new(net.register(pid(1), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        assert_eq!(
+            fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
+            FetchOutcome::Prekey(junk),
+            "the bound is on length only — the relay still does not judge the bytes"
+        );
+
+        task.abort();
+    }
+
+    /// The documented figures around the size floor — the KiB/s a reserve-table
+    /// flood costs, the "at least 1 KiB per prekey" the row-cost bounds rest on
+    /// — are arithmetic on this constant, and nothing else in the suite fails if
+    /// it is quietly halved. So pin the value itself: changing it means changing
+    /// those numbers in the same edit.
+    ///
+    /// The second half pins the *shape* of the bound rather than its value: the
+    /// test door and the wire handler answer the same two errors in the same
+    /// directions, so a cost measured through the door is a cost a publisher on
+    /// the wire would actually pay.
+    #[test]
+    fn the_prekey_size_bound_is_pinned_where_the_documented_costs_assume_it() {
+        assert_eq!(
+            MIN_PREKEY_BLOB, 1024,
+            "the byte figures in this module's docs and in KNOWN_ISSUES.md item \
+             3 are computed from this constant"
+        );
+        assert_eq!(MAX_PREKEY_BLOB, 8 * 1024);
+
+        let dir = tempdir().expect("tempdir");
+        let server = bare_server(dir.path());
+        assert!(
+            matches!(
+                server.publish_for_test(pid(2), &[vec![7u8; MIN_PREKEY_BLOB - 1]]),
+                Err(InboxError::Protocol(_))
+            ),
+            "a blob below the floor is a protocol refusal, not `TooLarge` — the \
+             door must name what happened, as the wire handler does"
+        );
+        assert!(
+            matches!(
+                server.publish_for_test(pid(2), &[vec![7u8; MAX_PREKEY_BLOB + 1]]),
+                Err(InboxError::TooLarge(_))
+            ),
+            "and above the ceiling it is `TooLarge`, as on the wire"
+        );
+    }
+
+    /// The probe the byte cap failed: a flood is **reported and admitted**,
+    /// while every honest operation on the relay keeps working — including the
+    /// one that matters most, an honest recipient's own PUBLISH.
+    ///
+    /// The removed cap refused a PUBLISH past a byte budget. That gave an
+    /// unauthenticated attacker a relay-wide PQ-FS downgrade: hold the budget
+    /// with junk in slots nobody ever fetches, and every honest recipient's
+    /// `--prekey-cmd maintain` is refused too, so their pools drain through
+    /// FETCH and their senders seal `MODE_STATIC_ONLY` for good. What replaces
+    /// it is visibility only, and this test is written to say exactly that —
+    /// the flood lands, the operator is told, and nothing is stopped.
+    ///
+    /// Driven over the wire because `handle_publish` is where the reply byte
+    /// and the report are decided.
+    #[tokio::test]
+    async fn a_prekey_flood_is_reported_to_the_operator_and_refuses_nobody() {
+        // A 1 KiB blob seals to 1,073 B (1024 + an 8 B header + AEAD framing),
+        // so three rows sit under this watermark and four sit over it.
+        let (net, server, task, srv, _dir) = spawn_server_with_prekey_warn_at(Some(4_000)).await;
+        let bob =
+            Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        let junk = vec![7u8; MIN_PREKEY_BLOB];
+
+        publish_prekeys(bob.as_ref(), &srv, &[junk.clone(), junk.clone()])
+            .await
+            .expect("publish");
+        assert_eq!(count_prekeys(bob.as_ref(), &srv).await.unwrap(), 2);
+        assert!(
+            !server.prekey_warned_for_test(),
+            "below the watermark the operator must not be woken"
+        );
+
+        // The flood: an identity per slot, each stocking its own pool, none of
+        // them ever fetched. Every one is admitted.
+        for i in 0..6u8 {
+            let minted = Arc::new(net.register(pid(100 + i), vec![P2pProtocol(ALPN_INBOX)]))
+                as Arc<dyn P2pEndpoint>;
+            publish_prekeys(minted.as_ref(), &srv, &[junk.clone(), junk.clone()])
+                .await
+                .expect("a flood is not refused — it is counted and reported");
+        }
+        assert!(
+            server.prekey_warned_for_test(),
+            "past the watermark the operator must be told, or this fix buys nothing"
+        );
+
+        // The regression the retreat exists for. `maintain` publishes a pool's
+        // deficit, so an honest recipient topping up is exactly the request the
+        // cap refused once a flood held the budget.
+        publish_prekeys(bob.as_ref(), &srv, std::slice::from_ref(&junk))
+            .await
+            .expect("an honest publisher must keep working while a flood is reported");
+        assert_eq!(count_prekeys(bob.as_ref(), &srv).await.unwrap(), 3);
+
+        // And the rest of the relay is untouched: bob's pool serves the bytes
+        // he published, and store-and-forward still round-trips.
+        let alice =
+            Arc::new(net.register(pid(1), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
+        assert_eq!(
+            fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
+            FetchOutcome::Prekey(junk.clone())
+        );
+        deposit(alice.as_ref(), &srv, pid(2), b"still delivering").await.expect("deposit");
+        let (_cursor, envelopes) = poll(bob.as_ref(), &srv, 0).await.expect("poll");
+        assert_eq!(envelopes, vec![b"still delivering".to_vec()]);
+
+        task.abort();
+    }
+
+    /// What the watermark puts on the operator's terminal: the numbers needed
+    /// to act, an honest account of what was suppressed, and **no claim to have
+    /// stopped anything**. An operator who read this as a mitigation would be
+    /// wrong about the state of their disk.
+    #[test]
+    fn the_prekey_watermark_line_reports_without_claiming_a_defence() {
+        let line = super::server::prekey_warn_line(300_000_000, PREKEY_BYTES_WARN_AT, 41);
+        assert!(line.contains("300000000"), "{line:?}");
+        assert!(line.contains(&PREKEY_BYTES_WARN_AT.to_string()), "{line:?}");
+        assert!(line.contains("41 suppressed"), "{line:?}");
+        assert!(
+            line.contains("Nothing is being refused"),
+            "the line must not read as a mitigation: {line:?}"
+        );
+    }
+
+    /// PUBLISH is remotely triggerable, so the watermark line is gated exactly
+    /// as the accept-failure line is: at most one per
+    /// [`PREKEY_WARN_LOG_INTERVAL`], each carrying the number of crossings
+    /// suppressed since the previous one. Without the gate an attacker past the
+    /// watermark writes to the operator's log at will; without the count the
+    /// operator cannot tell one straggler from a flood.
+    ///
+    /// This bounds the watermark's own output and nothing else. It does not
+    /// make the line legible under noise a peer chooses on the ungated paths
+    /// beside it — see `KNOWN_ISSUES.md` item 10's "operator-log noise"
+    /// follow-up.
+    #[test]
+    fn the_prekey_watermark_line_is_rate_gated_and_counts_what_it_suppressed() {
+        let mut gate = super::server::PrekeyWarnGate::default();
+        let t0 = std::time::Instant::now();
+        let iv = PREKEY_WARN_LOG_INTERVAL;
+
+        assert_eq!(gate.admit(t0), Some(0), "the first crossing is always reported");
+        for _ in 0..40 {
+            assert_eq!(gate.admit(t0), None, "inside the interval, nothing is written");
+        }
+        assert_eq!(
+            gate.admit(t0 + iv - Duration::from_millis(1)),
+            None,
+            "a millisecond short of the interval is still inside it"
+        );
+        assert_eq!(
+            gate.admit(t0 + iv),
+            Some(41),
+            "the next line must account for every crossing it swallowed"
+        );
+        assert_eq!(
+            gate.admit(t0 + iv * 2),
+            Some(0),
+            "and the count resets with each line written"
+        );
+    }
+
+    /// The floor must not be able to refuse what this build actually
+    /// publishes. A real `SignedPrekey` is several times
+    /// [`MIN_PREKEY_BLOB`], and the gap is the headroom that keeps the bound
+    /// from becoming a version gate on a format PUBLISH cannot negotiate.
+    ///
+    /// This is the regression that fires if the floor is ever raised toward
+    /// the encoding, or the encoding shrunk toward the floor.
+    #[test]
+    fn a_real_signed_prekey_clears_the_size_floor() {
+        let (dsa_priv, _, _) = crate::backend::pqc_keygen_dsa(crate::prekey::PREKEY_SIGN_ALGO)
+            .expect("ML-DSA-65 keygen");
+        let batch = crate::prekey::generate(1, 0, &dsa_priv).expect("generate prekey");
+        let wire = batch[0].signed.to_bytes();
+        assert!(
+            wire.len() >= MIN_PREKEY_BLOB && wire.len() <= MAX_PREKEY_BLOB,
+            "the encoding this build publishes ({} B) must sit inside the size \
+             bound PUBLISH admits ({MIN_PREKEY_BLOB}..={MAX_PREKEY_BLOB}); a \
+             relay that refused it would empty every honest pool it serves",
+            wire.len()
+        );
+        // Not a tight fit: the floor is set below what the format could
+        // plausibly shrink to, not at what it currently is.
+        assert!(
+            wire.len() >= MIN_PREKEY_BLOB * 4,
+            "a real prekey is {} B, which leaves less headroom over the floor \
+             than the bound was chosen to keep",
+            wire.len()
+        );
     }
 
     /// Prekey pools are isolated by recipient slot, which is the publisher's
@@ -1973,14 +2589,14 @@ mod tests {
         let alice =
             Arc::new(net.register(pid(1), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
 
-        publish_prekeys(bob.as_ref(), &srv, &[b"bob-pk".to_vec()])
+        publish_prekeys(bob.as_ref(), &srv, &[blob("bob-pk")])
             .await
             .expect("publish");
 
         // Fetching for bob (pid 2) yields bob's prekey...
         assert_eq!(
             fetch_prekey(alice.as_ref(), &srv, pid(2)).await.unwrap(),
-            FetchOutcome::Prekey(b"bob-pk".to_vec())
+            FetchOutcome::Prekey(blob("bob-pk"))
         );
         // ...but carol (pid 3) published nothing, so her slot is empty even
         // though bob deposited to the same server.
@@ -2006,7 +2622,7 @@ mod tests {
         // Publish more prekeys than the burst capacity so we hit the rate
         // limit before the pool runs dry — proving the two are distinct.
         let cap = FETCH_RL_CAPACITY as usize;
-        let batch: Vec<Vec<u8>> = (0..cap + 4).map(|i| format!("pk-{i}").into_bytes()).collect();
+        let batch: Vec<Vec<u8>> = (0..cap + 4).map(|i| blob(&format!("pk-{i}"))).collect();
         publish_prekeys(bob.as_ref(), &srv, &batch).await.expect("publish");
 
         // The first `cap` fetches succeed (burst); negligible time passes so
@@ -2057,7 +2673,7 @@ mod tests {
         let (net, _server, task, srv, _dir) = spawn_server().await;
         let bob =
             Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
-        let batch: Vec<Vec<u8>> = (0..STOCK).map(|i| format!("pk-{i}").into_bytes()).collect();
+        let batch: Vec<Vec<u8>> = (0..STOCK).map(|i| blob(&format!("pk-{i}"))).collect();
         publish_prekeys(bob.as_ref(), &srv, &batch).await.expect("publish");
 
         let floor = STOCK / PREKEY_RESERVE_DIVISOR; // 25
@@ -2103,7 +2719,7 @@ mod tests {
         // A `maintain` run (top back up to the same target) disengages the gate
         // on the very next draw: the pool is above its floor again, so no token
         // is consulted even though the reserve bucket is still empty.
-        let refill: Vec<Vec<u8>> = (0..STOCK - left).map(|i| format!("re-{i}").into_bytes()).collect();
+        let refill: Vec<Vec<u8>> = (0..STOCK - left).map(|i| blob(&format!("re-{i}"))).collect();
         publish_prekeys(bob.as_ref(), &srv, &refill).await.expect("republish");
         let after = fresh_fetcher(&net, 9001);
         assert!(matches!(
@@ -2128,9 +2744,9 @@ mod tests {
             Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
         let carol =
             Arc::new(net.register(pid(3), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
-        let bobs: Vec<Vec<u8>> = (0..STOCK).map(|i| format!("bob-{i}").into_bytes()).collect();
+        let bobs: Vec<Vec<u8>> = (0..STOCK).map(|i| blob(&format!("bob-{i}"))).collect();
         publish_prekeys(bob.as_ref(), &srv, &bobs).await.expect("publish bob");
-        let carols: Vec<Vec<u8>> = (0..8u64).map(|i| format!("carol-{i}").into_bytes()).collect();
+        let carols: Vec<Vec<u8>> = (0..8u64).map(|i| blob(&format!("carol-{i}"))).collect();
         publish_prekeys(carol.as_ref(), &srv, &carols).await.expect("publish carol");
 
         // Drain bob's pool through its floor with one fresh identity per draw.
@@ -2188,11 +2804,13 @@ mod tests {
     /// Nothing here needs a victim's cooperation: PUBLISH writes to the slot of
     /// the handshake-authenticated NodeId and never parses the blob, so a junk
     /// byte string per minted identity is a stocked pool as far as the relay is
-    /// concerned, and no third party's prekeys are consumed.
+    /// concerned, and no third party's prekeys are consumed. What it does cost
+    /// is bytes — [`MIN_PREKEY_BLOB`] of them per prekey, which is why `blob`
+    /// pads rather than sending four characters.
     fn flood_reserve_table(server: &InboxServer) {
         for i in 0..RESERVE_MAX_TRACKED {
             server
-                .publish_for_test(filler(i), &[b"junk".to_vec()])
+                .publish_for_test(filler(i), &[blob("junk")])
                 .expect("publish filler");
             assert_eq!(
                 server.draw_prekey_reply_for_test(filler(i)).expect("draw filler"),
@@ -2200,6 +2818,68 @@ mod tests {
                 "a filler's own freshly stocked pool is above its floor"
             );
         }
+    }
+
+    /// What one *unprunable* reserve-table entry costs the attacker that mints
+    /// it — the multiplicand behind the cost figures given for the table-full
+    /// escape at [`RESERVE_MAX_TRACKED`].
+    ///
+    /// An entry survives the prune only while its bucket is off full, and only
+    /// a draw at or below the floor charges it. A pool of fewer than
+    /// [`PREKEY_RESERVE_DIVISOR`] prekeys has a floor of 0 by integer division,
+    /// so *every* draw on it short-circuits above the floor and its entry is
+    /// reclaimed by the next prune — which the flood itself fires. Four is the
+    /// smallest pool that buys a charge, and each of those four now costs at
+    /// least [`MIN_PREKEY_BLOB`] to publish rather than one byte.
+    #[test]
+    fn an_unprunable_reserve_entry_costs_a_pool_of_four() {
+        let dir = tempdir().expect("tempdir");
+        let server = bare_server(dir.path());
+
+        // Three prekeys: floor 0, so no draw is ever charged.
+        let cheap = pid(2);
+        let batch: Vec<Vec<u8>> = (0..PREKEY_RESERVE_DIVISOR - 1)
+            .map(|i| blob(&format!("c-{i}")))
+            .collect();
+        server.publish_for_test(cheap, &batch).expect("publish");
+        for _ in 0..(PREKEY_RESERVE_DIVISOR - 1) {
+            assert_eq!(server.draw_prekey_reply_for_test(cheap).expect("draw"), REPLY_OK);
+        }
+        assert_eq!(
+            server.reserve_bucket_is_full_for_test(cheap),
+            Some(true),
+            "a pool under PREKEY_RESERVE_DIVISOR has a floor of 0, so its entry \
+             is never charged and the next prune reclaims it — such a filler \
+             cannot hold the table full"
+        );
+
+        // Four prekeys: floor 1, so the draw that lands *on* the floor is
+        // charged and the entry survives a prune.
+        let holding = pid(3);
+        let batch: Vec<Vec<u8>> = (0..PREKEY_RESERVE_DIVISOR)
+            .map(|i| blob(&format!("h-{i}")))
+            .collect();
+        server.publish_for_test(holding, &batch).expect("publish");
+        for _ in 0..PREKEY_RESERVE_DIVISOR {
+            assert_eq!(server.draw_prekey_reply_for_test(holding).expect("draw"), REPLY_OK);
+        }
+        assert_eq!(
+            server.reserve_bucket_is_full_for_test(holding),
+            Some(false),
+            "the draw at the floor must charge the recipient's bucket, or a \
+             slot in the table would cost one prekey instead of \
+             PREKEY_RESERVE_DIVISOR"
+        );
+
+        // And the cost is bytes as well as count: PUBLISH would not have taken
+        // those four blobs any smaller, and neither does the door above.
+        assert!(
+            server
+                .publish_for_test(pid(4), &[vec![7u8; MIN_PREKEY_BLOB - 1]])
+                .is_err(),
+            "the test door must apply the same admission bound the wire does, \
+             or these costs are measured against a publisher that cannot exist"
+        );
     }
 
     /// The attack `KNOWN_ISSUES.md` item 3 describes, run end to end.
@@ -2227,7 +2907,7 @@ mod tests {
         let server = bare_server(dir.path());
         let victim = pid(2);
 
-        let batch: Vec<Vec<u8>> = (0..STOCK).map(|i| format!("pk-{i}").into_bytes()).collect();
+        let batch: Vec<Vec<u8>> = (0..STOCK).map(|i| blob(&format!("pk-{i}"))).collect();
         server.publish_for_test(victim, &batch).expect("publish");
 
         // Walk the pool down to exactly its floor, spending nothing.
@@ -2288,7 +2968,7 @@ mod tests {
         {
             let server = bare_server(dir.path());
             let batch: Vec<Vec<u8>> =
-                (0..STOCK).map(|i| format!("pk-{i}").into_bytes()).collect();
+                (0..STOCK).map(|i| blob(&format!("pk-{i}"))).collect();
             server.publish_for_test(victim, &batch).expect("publish");
             for _ in 0..(STOCK - floor) {
                 assert_eq!(
@@ -2337,7 +3017,7 @@ mod tests {
         let server = bare_server(dir.path());
         let victim = pid(2);
 
-        let batch: Vec<Vec<u8>> = (0..STOCK).map(|i| format!("pk-{i}").into_bytes()).collect();
+        let batch: Vec<Vec<u8>> = (0..STOCK).map(|i| blob(&format!("pk-{i}"))).collect();
         server.publish_for_test(victim, &batch).expect("publish");
         // The on-disk shape of a pool stocked by the previous version.
         server.forget_prekey_mark_for_test(victim);
@@ -2394,7 +3074,7 @@ mod tests {
         {
             let server = bare_server(dir.path());
             let batch: Vec<Vec<u8>> =
-                (0..STOCK).map(|i| format!("pk-{i}").into_bytes()).collect();
+                (0..STOCK).map(|i| blob(&format!("pk-{i}"))).collect();
             server.publish_for_test(bob, &batch).expect("publish");
             server.forget_prekey_mark_for_test(bob);
             // One draw is all it takes to anchor the pool at 100.
@@ -2422,7 +3102,7 @@ mod tests {
         // And the owner still governs it: republishing to the full target puts
         // the pool back above its floor and disengages the gate at once.
         let refill: Vec<Vec<u8>> = (0..(STOCK - server.pool_level_for_test(bob) as u64))
-            .map(|i| format!("re-{i}").into_bytes())
+            .map(|i| blob(&format!("re-{i}")))
             .collect();
         server.publish_for_test(bob, &refill).expect("republish");
         assert_eq!(server.pool_level_for_test(bob) as u64, STOCK);
@@ -2451,7 +3131,7 @@ mod tests {
         let server = bare_server(dir.path());
         let bob = pid(2);
 
-        let batch: Vec<Vec<u8>> = (0..STOCK).map(|i| format!("pk-{i}").into_bytes()).collect();
+        let batch: Vec<Vec<u8>> = (0..STOCK).map(|i| blob(&format!("pk-{i}"))).collect();
         server.publish_for_test(bob, &batch).expect("publish");
         let floor = STOCK / PREKEY_RESERVE_DIVISOR; // 10
         for _ in 0..(STOCK - floor + RESERVE_RL_CAPACITY as u64) {
@@ -2468,7 +3148,7 @@ mod tests {
         // so a gated draw would answer RATE_LIMITED — the new level being above
         // the new floor is the only thing that can serve this.
         let small: Vec<Vec<u8>> = (0..8u64.saturating_sub(left))
-            .map(|i| format!("sm-{i}").into_bytes())
+            .map(|i| blob(&format!("sm-{i}")))
             .collect();
         server.publish_for_test(bob, &small).expect("republish small");
         assert_eq!(server.pool_level_for_test(bob), 8);
@@ -2508,7 +3188,7 @@ mod tests {
         // record is what the floor is derived from.
         let bob =
             Arc::new(net.register(pid(2), vec![P2pProtocol(ALPN_INBOX)])) as Arc<dyn P2pEndpoint>;
-        publish_prekeys(bob.as_ref(), &srv, &[b"pk-1".to_vec()]).await.expect("publish");
+        publish_prekeys(bob.as_ref(), &srv, &[blob("pk-1")]).await.expect("publish");
         assert!(matches!(
             fetch_prekey(stranger.as_ref(), &srv, pid(2)).await.unwrap(),
             FetchOutcome::Prekey(_)
@@ -2532,7 +3212,7 @@ mod tests {
         // Empty slot → 0.
         assert_eq!(count_prekeys(bob.as_ref(), &srv).await.unwrap(), 0);
 
-        let batch = vec![b"pk-A".to_vec(), b"pk-B".to_vec(), b"pk-C".to_vec()];
+        let batch = vec![blob("pk-A"), blob("pk-B"), blob("pk-C")];
         publish_prekeys(bob.as_ref(), &srv, &batch).await.expect("publish");
         assert_eq!(count_prekeys(bob.as_ref(), &srv).await.unwrap(), 3);
 
