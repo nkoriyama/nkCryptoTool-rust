@@ -158,7 +158,33 @@ fi
 # Trigger 2 §4.4 escalation: in RELEASE_MODE, unexpected security-critical
 # dep drift is FAIL (must be intentional and documented in commit message
 # or CHANGELOG). In dev mode it remains WARN.
-if git diff b9ec19a -- Cargo.lock 2>/dev/null | grep -qE '^[+-]name = "(slint|iroh|tokio|rfd|sha2|aes-gcm|chacha20poly1305|fips203|fips204)"'; then
+#
+# Compare the resolved versions themselves rather than grepping the diff text:
+#   - `git diff ... | grep -qE ...` was inverted by the `set -o pipefail` above.
+#     `grep -q` exits at its first match and closes the pipe, git dies of EPIPE
+#     (141), pipefail hands that status to the `if`, so the check took the
+#     "no drift" branch precisely when a match WAS found.
+#   - `^[+-]name = "..."` only fires when a whole package block is added or
+#     removed. An in-place version bump leaves the `name =` line as unchanged
+#     context, so it was invisible even to a non-inverted grep.
+# A crate may legitimately resolve to several [[package]] blocks (two majors in
+# the tree at once), so every block is listed and the sorted lists compared.
+LOCK_CRITICAL_CRATES='slint|iroh|tokio|rfd|sha2|aes-gcm|chacha20poly1305|fips203|fips204'
+
+lock_critical_versions() {
+    # stdin: a Cargo.lock. stdout: sorted "<crate> <version>" lines, one per
+    # [[package]] block of a security-critical dep.
+    awk -F'"' '
+        /^name = "/    { pkg = $2; next }
+        /^version = "/ { if (pkg != "") { print pkg " " $2; pkg = "" } }
+    ' | grep -E "^($LOCK_CRITICAL_CRATES) " | sort
+}
+
+LOCK_BASELINE="$(git show b9ec19a:Cargo.lock 2>/dev/null | lock_critical_versions)"
+LOCK_CURRENT="$(lock_critical_versions < Cargo.lock)"
+# An unreadable baseline (shallow clone, missing object) leaves nothing to
+# compare against, which is the previous behaviour of this check: stay quiet.
+if [ -n "$LOCK_BASELINE" ] && [ "$LOCK_BASELINE" != "$LOCK_CURRENT" ]; then
     if [ "${RELEASE_MODE:-0}" = "1" ]; then
         # In release mode require explicit ALLOW_LOCK_DRIFT=1 to bypass.
         if [ "${ALLOW_LOCK_DRIFT:-0}" = "1" ]; then
