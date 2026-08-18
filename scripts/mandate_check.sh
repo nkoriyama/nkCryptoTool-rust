@@ -127,30 +127,67 @@ else
 fi
 
 # 8. CI yaml forbidden patterns
-CI_YAML_GLOB=".github/workflows/*.yml"
-if compgen -G "$CI_YAML_GLOB" > /dev/null; then
-    # 8a. pull_request_target trigger
-    if grep -lE '^\s*-?\s*pull_request_target\s*:' $CI_YAML_GLOB >/dev/null 2>&1; then
-        fail "CI yaml: pull_request_target" "$(grep -lE 'pull_request_target' $CI_YAML_GLOB | head -3)"
-    else
-        pass "CI yaml: no pull_request_target"
-    fi
+#
+# Enumerate BOTH extensions. GitHub Actions runs `.yaml` exactly as it runs
+# `.yml`, but every check here used to read `.github/workflows/*.yml` only, so
+# adding one character to a filename removed a workflow from all three checks
+# at once. Nothing in the repository is named `.yaml` today; that is a fact
+# about the present tree, not a property of the gate.
+#
+# An array, not a glob string: the old `$CI_YAML_GLOB` was deliberately
+# unquoted so the shell would split and expand it, which also word-split any
+# path containing a space. `-f` filters the literal pattern that bash leaves
+# behind when a glob matches nothing, so no `shopt -s nullglob` is needed --
+# setting that globally would change how every other check in this file
+# expands.
+CI_YAML_FILES=()
+for _ci_yaml in .github/workflows/*.yml .github/workflows/*.yaml; do
+    [ -f "$_ci_yaml" ] && CI_YAML_FILES+=("$_ci_yaml")
+done
+unset _ci_yaml
+
+if [ "${#CI_YAML_FILES[@]}" -gt 0 ]; then
+    # 8a. pull_request_target trigger.
+    #
+    # Delegated to a parser. The regex this replaces required a trailing colon,
+    # so it saw `on:\n  pull_request_target:` and missed `on: [push,
+    # pull_request_target]` entirely; two attempts to widen it were rejected by
+    # an independent verifier for reddening legitimate workflows -- the
+    # defensive `if: github.event_name != 'pull_request_target'` among them.
+    # A text match cannot separate a trigger declaration from a mention.
+    # scripts/check_workflow_triggers.py explains the design and the YAML 1.1
+    # `on:`-is-a-boolean trap; scripts/test_check_workflow_triggers.sh pins all
+    # sixteen cases, including the three that caused the rejections.
+    PRT_OUT="$(python3 scripts/check_workflow_triggers.py 2>&1)"
+    case $? in
+        0) pass "CI yaml: no pull_request_target trigger (parsed, .yml + .yaml)" ;;
+        1) fail "CI yaml: pull_request_target" "$(printf '%s' "$PRT_OUT" | head -3)" ;;
+        *) fail "CI yaml: pull_request_target" "check could not run: $(printf '%s' "$PRT_OUT" | head -3)" ;;
+    esac
+    unset PRT_OUT
 
     # 8b. permissions: write-all
-    if grep -lE 'permissions:\s*write-all' $CI_YAML_GLOB >/dev/null 2>&1; then
-        fail "CI yaml: write-all permissions" "$(grep -lE 'write-all' $CI_YAML_GLOB | head -3)"
+    #
+    # Matches the literal `write-all` only, so a workflow with no `permissions:`
+    # block at all passes -- which .github/workflows/rust.yml is today. That
+    # gap is real and is NOT closed here: closing it means requiring a
+    # `permissions:` declaration, which is a change to the workflows rather
+    # than to the gate. Recorded so the pass is not read as "every workflow
+    # declares least privilege".
+    if grep -lE 'permissions:\s*write-all' "${CI_YAML_FILES[@]}" >/dev/null 2>&1; then
+        fail "CI yaml: write-all permissions" "$(grep -lE 'write-all' "${CI_YAML_FILES[@]}" | head -3)"
     else
-        pass "CI yaml: no write-all permissions"
+        pass "CI yaml: no write-all permissions (literal match only; a missing permissions block also passes)"
     fi
 
     # 8c. secret echo
-    if grep -lE '(echo|printf|cat).*\$\{\{\s*secrets\.' $CI_YAML_GLOB >/dev/null 2>&1; then
-        fail "CI yaml: secret echo" "$(grep -lE '(echo|printf|cat).*\$\{\{\s*secrets\.' $CI_YAML_GLOB | head -3)"
+    if grep -lE '(echo|printf|cat).*\$\{\{\s*secrets\.' "${CI_YAML_FILES[@]}" >/dev/null 2>&1; then
+        fail "CI yaml: secret echo" "$(grep -lE '(echo|printf|cat).*\$\{\{\s*secrets\.' "${CI_YAML_FILES[@]}" | head -3)"
     else
         pass "CI yaml: no secret echo"
     fi
 else
-    warn "CI yaml" "no .github/workflows/*.yml present yet (F4 in progress)"
+    warn "CI yaml" "no .github/workflows/*.yml or *.yaml present"
 fi
 
 # 9. Cargo.lock baseline check (Gemini §3.2#3 + Trigger 2 §4.4 reflection).
@@ -250,11 +287,11 @@ else
 fi
 
 # 13. CI yaml で clippy step に continue-on-error: true 不在 (P1-R4, lands in commit 7)
-if compgen -G "$CI_YAML_GLOB" > /dev/null; then
+if [ "${#CI_YAML_FILES[@]}" -gt 0 ]; then
     # 単純化: ファイル全体で "clippy" を含む行の前後 5 行以内に continue-on-error: true
     # が現れたら advisory モードと判定 (false positive 許容、保守的に warn)
     CLIPPY_ADVISORY=0
-    for f in $CI_YAML_GLOB; do
+    for f in "${CI_YAML_FILES[@]}"; do
         if grep -nE 'clippy' "$f" >/dev/null 2>&1; then
             if awk '/clippy/{c=NR} /continue-on-error:[[:space:]]*true/{e=NR; if(c && e-c<10 && e>c){found=1}} END{exit !found}' "$f"; then
                 CLIPPY_ADVISORY=1
@@ -360,6 +397,23 @@ if [ "$CUR_UNWRAPS" -le "$BASE_UNWRAPS" ]; then
     pass "no new prod unwrap/expect in security-critical files (cur=$CUR_UNWRAPS <= base=$BASE_UNWRAPS @22a8011a)"
 else
     fail "unwrap/expect grep" "$((CUR_UNWRAPS - BASE_UNWRAPS)) new prod occurrence(s) since 22a8011a (cur=$CUR_UNWRAPS base=$BASE_UNWRAPS); annotate idiomatic ones with '// ALLOW-UNWRAP: <reason>'"
+fi
+
+# 18b. The workflow-trigger checker's own unit test (F5).
+# Check 8a delegates to a parser, and a parser can be edited into a fail-open
+# that still prints a pass. Measured, not assumed: deleting one line -- the
+# branch handling YAML 1.1's `on:`-is-boolean-True -- makes the checker report
+# every workflow clean, and nothing else in this file notices. So the test runs
+# here, where the gate is, rather than sitting in the tree hoping to be run.
+# Cheap: sixteen cases against temp files, well under a second.
+if [ -f scripts/test_check_workflow_triggers.sh ]; then
+    if bash scripts/test_check_workflow_triggers.sh >/dev/null 2>&1; then
+        pass "check_workflow_triggers.py: 16/16 self-tests (incl. the 3 false positives that rejected the regex)"
+    else
+        fail "check_workflow_triggers.py self-test" "run 'bash scripts/test_check_workflow_triggers.sh' for the failing cases"
+    fi
+else
+    fail "check_workflow_triggers.py self-test" "scripts/test_check_workflow_triggers.sh missing — it is tracked, so this means deletion"
 fi
 
 # 19. .security-baseline.sha256 strict match (P1-R12)
