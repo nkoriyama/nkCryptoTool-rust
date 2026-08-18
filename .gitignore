@@ -36,13 +36,24 @@ test_file.txt
 # tests/ rather than a tempdir, so a plain `cargo test` leaves private keys in
 # the worktree. Ignore them: jj auto-tracks anything not listed here, which is
 # how they nearly ended up in a commit.
-tests/temp_*_keys/
-tests/input_*.txt
-tests/output_*.enc
-# Same hazard, different suite: tests/keybundle_cli.rs hard-codes
-# `tests/tmp_kb_*` as its working directories (expired, wrongpin, rawgate,
-# keyring, genmykey) and they hold KeyBundle material.
-tests/tmp_kb_*/
+#
+# Match the prefixes, not the leaf names. Enumerating leaf names has already
+# missed three working directories -- tests/interop_data/ (tests/interop.rs),
+# tests/temp_security/ and tests/temp_encrypted_key/ (tests/security.rs) -- and
+# cleanup runs on the success path only, so a failing assertion leaves the keys
+# behind. tests/temp_* also covers the e2e/threat suites and tests/tmp_* the
+# KeyBundle ones (tests/keybundle_cli.rs: expired, wrongpin, rawgate, keyring,
+# genmykey).
+tests/temp_*/
+tests/tmp_*/
+tests/interop_data/
+tests/input_*
+tests/output_*
+# Belt and braces for whatever the next suite names its directory: no private
+# key material anywhere under tests/, regardless of the directory it lands in.
+tests/**/*.key
+# ...except the fixtures, which are committed on purpose as test vectors.
+!tests/fixtures/**/*.key
 
 # Network chat test artifacts
 ticket.txt
