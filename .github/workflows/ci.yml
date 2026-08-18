@@ -184,14 +184,28 @@ jobs:
       - name: cargo test hardening (release-blocking — native windows ACL/reparse/junction semantics)
         run: cargo test --no-default-features --features backend-rustcrypto -- --nocapture secure_fs windows_confine
 
-  # Optional: cargo audit for security advisories (F4-O2 推奨).
-  # Non-blocking — security advisories are reviewed but do not fail the
-  # workflow automatically (some advisories may be transitively unfixable).
+  # Release-blocking: a RUSTSEC advisory against a dependency fails the run.
+  #
+  # This was `continue-on-error: true` until 2026-08-19, which meant the only
+  # job that looks at the dependency graph reported real vulnerabilities without
+  # being able to stop anything. It did exactly that for RUSTSEC-2026-0258 (h2,
+  # unbounded empty DATA frames) — the advisory was live on `main`, the job was
+  # red, and nothing surfaced it; the bump in `ad8f27d2` happened because a
+  # person happened to read the job output. Finding a live advisory should not
+  # depend on someone looking.
+  #
+  # The old comment's worry — "some advisories may be transitively unfixable" —
+  # is real, and `.cargo/audit.toml` is the answer to it: an ignore there needs a
+  # written rationale and a review date, so an unfixable advisory is a recorded
+  # decision instead of a silently red job. Two are ignored that way today
+  # (RUSTSEC-2026-0194/0195, quick-xml, unreachable from the P2P wire path).
+  #
+  # Verified before flipping it: `cargo audit` exits 0 at this revision, and
+  # exits 1 at 50078278 — i.e. this gate would have caught h2.
   audit:
     name: cargo audit (advisory)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    continue-on-error: true  # F4-X13 explicit allowance for advisory step
     steps:
       - name: Checkout
         uses: actions/checkout@v7

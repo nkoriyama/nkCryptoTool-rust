@@ -282,14 +282,19 @@ else
     fail "scripts/check_env.sh" "missing or not executable"
 fi
 
-# 15. cargo deny + Dependabot 構成 (P1-R7, lands in commit 5)
+# 15. Supply-chain config present (P1-R7, landed in commit 5)
+# Presence only. `cargo deny` is NOT run by any workflow, so deny.toml's
+# licenses/bans/sources sections are unenforced config; only its advisories
+# overlap with something that runs, and that is `cargo audit` reading
+# .cargo/audit.toml instead. The advisory gate itself lives in ci.yml and is
+# release-blocking as of 2026-08-19 — this check does not stand in for it.
 DENY_MISSING=""
 [ -f deny.toml ] || DENY_MISSING="$DENY_MISSING deny.toml"
 [ -f .github/dependabot.yml ] || DENY_MISSING="$DENY_MISSING .github/dependabot.yml"
 if [ -z "$DENY_MISSING" ]; then
-    pass "cargo deny + Dependabot: deny.toml + .github/dependabot.yml present"
+    pass "supply-chain config present: deny.toml + .github/dependabot.yml (presence only; cargo deny is not run)"
 else
-    warn "cargo deny + Dependabot: missing$DENY_MISSING (lands in P1 commit 5)"
+    fail "supply-chain config" "missing$DENY_MISSING"
 fi
 
 # 16. serial_test の [dev-dependencies] 配置 (P1-R6, lands in commit 6)
