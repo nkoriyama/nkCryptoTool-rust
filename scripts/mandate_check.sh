@@ -234,7 +234,9 @@ else
     warn "tests/e2e.rs not found, skipping subprocess e2e #[ignore] check"
 fi
 
-# 12. 異常系 E2E 3 件存在 (P1-R3, lands in commit 10)
+# 12. 異常系 E2E 3 件存在 (P1-R3, landed in commit 10)
+# These tests are present in the tree, so a shortfall now means they were
+# deleted or renamed, not that they have not landed yet: fail, don't warn.
 ADV_FT=0
 [ -f tests/e2e_file_transfer.rs ] && \
     ADV_FT="$(grep -cE '\basync fn test_e2e_(aead_tampering|chunk_len_forgery)' tests/e2e_file_transfer.rs 2>/dev/null || true)"
@@ -244,7 +246,7 @@ ADV_HS=0
 if [ "$ADV_FT" -ge 2 ] && [ "$ADV_HS" -ge 1 ]; then
     pass "adversarial E2E: $((ADV_FT + ADV_HS)) tests present (file_transfer:$ADV_FT, handshake:$ADV_HS)"
 else
-    warn "adversarial E2E: found file_transfer:$ADV_FT handshake:$ADV_HS, need >=2 + >=1 (lands in P1 commit 10)"
+    fail "adversarial E2E" "found file_transfer:$ADV_FT handshake:$ADV_HS, need >=2 + >=1 — expected tests/e2e_file_transfer.rs::test_e2e_aead_tampering + test_e2e_chunk_len_forgery and tests/e2e_handshake_tampering.rs::test_handshake_signature_tampering"
 fi
 
 # 13. CI yaml で clippy step に continue-on-error: true 不在 (P1-R4, lands in commit 7)
@@ -355,7 +357,10 @@ else
     fail "unwrap/expect grep" "$((CUR_UNWRAPS - BASE_UNWRAPS)) new prod occurrence(s) since 22a8011a (cur=$CUR_UNWRAPS base=$BASE_UNWRAPS); annotate idiomatic ones with '// ALLOW-UNWRAP: <reason>'"
 fi
 
-# 19. .security-baseline.sha256 strict match (P1-R12, Gemini §3.3#3: skip if absent)
+# 19. .security-baseline.sha256 strict match (P1-R12)
+# The baseline file is tracked in git, so its absence means it was deleted,
+# not that it has yet to be initialised: fail, don't warn. Skipping here would
+# let `rm .security-baseline.sha256` silence the whole integrity check.
 if [ -f .security-baseline.sha256 ]; then
     if sha256sum --check --quiet .security-baseline.sha256 2>/dev/null; then
         pass ".security-baseline.sha256: strict match"
@@ -363,7 +368,7 @@ if [ -f .security-baseline.sha256 ]; then
         fail ".security-baseline.sha256" "hash mismatch — see HANDOFF §1.7.3 baseline reconstruction protocol"
     fi
 else
-    warn ".security-baseline.sha256 not yet present, skipping (init in P1 commit 3)"
+    fail ".security-baseline.sha256" "missing — the file is tracked; restore it with 'git checkout -- .security-baseline.sha256', or regenerate it with scripts/rebaseline_security.sh if the baseline is intentionally being renewed"
 fi
 
 # 20. clippy #[allow(...)] rationale + Future plan (P1-X12 v2, diff-based)
