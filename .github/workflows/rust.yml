@@ -18,14 +18,23 @@ env:
 jobs:
   repo-integrity:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v7
     - name: Verify critical source files exist in the tracked tree
       run: bash scripts/check_repo_integrity.sh
+    # Every apt step in every workflow now goes through scripts/ci_apt.sh, and
+    # its whole value is one `timeout` call. Deleting that line leaves a wrapper
+    # that still installs packages on a healthy runner, so nothing else here
+    # would notice until the next mirror outage. The self-test injects a fake
+    # apt that hangs, so it does notice — no sudo, no network, ~15 s.
+    - name: Self-test the apt wrapper (fake apt, no network)
+      run: bash scripts/test_ci_apt.sh
 
   p2p-abstraction-check:
     needs: repo-integrity
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v7
     - name: Enforce iroh-crate imports only live in src/p2p/backend/iroh.rs
@@ -34,6 +43,7 @@ jobs:
   mls-abstraction-check:
     needs: repo-integrity
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
     - uses: actions/checkout@v7
     - name: Enforce mls_rs* imports only live in src/group/ (+ gui/group_chat.rs)
@@ -41,6 +51,7 @@ jobs:
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -73,9 +84,10 @@ jobs:
     steps:
     - uses: actions/checkout@v7
     - name: Install dependencies
+      # Via scripts/ci_apt.sh, not a bare apt-get: a stalled mirror hung this
+      # exact step for over an hour on 2026-08-18. See the script's header.
       run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends \
+        bash scripts/ci_apt.sh \
           libfontconfig1-dev \
           libssl-dev \
           pkg-config \
@@ -93,15 +105,14 @@ jobs:
   mls-tests:
     needs: repo-integrity
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v7
     - name: Install dependencies
       # The unconditional dev-dependency `i-slint-backend-testing` pulls
       # fontconfig-sys, which `cargo test` compiles even for --lib, so the build
       # needs fontconfig headers (the mls subsystem crypto itself is C-free).
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y --no-install-recommends libfontconfig1-dev pkg-config
+      run: bash scripts/ci_apt.sh libfontconfig1-dev pkg-config
     - name: Build and test the MLS subsystem
       run: cargo test --verbose --no-default-features --features backend-rustcrypto,mls --lib
 

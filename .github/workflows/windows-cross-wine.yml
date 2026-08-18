@@ -39,9 +39,11 @@ jobs:
           shared-key: windows-cross-wine
 
       - name: Install cargo-xwin toolchain (clang/lld/llvm) + wine64
+        # This is the step that stalled for 39 minutes on 2026-08-18 and burned
+        # the job's whole 40-minute budget without installing anything. Via
+        # scripts/ci_apt.sh so a hung mirror becomes a retried failure.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang llvm lld wine64
+          bash scripts/ci_apt.sh clang llvm lld wine64
           cargo install --locked cargo-xwin
 
       - name: Cache the xwin Windows SDK/CRT

@@ -64,9 +64,10 @@ jobs:
           key: apt-${{ runner.os }}-${{ hashFiles('.github/workflows/ci.yml') }}
 
       - name: Install Slint / Iroh / OpenSSL system deps
+        # Via scripts/ci_apt.sh — see that script's header for the 2026-08-18
+        # mirror stall it exists to survive.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          bash scripts/ci_apt.sh \
             libfontconfig1-dev \
             libxcb1-dev \
             libxkbcommon-dev \
