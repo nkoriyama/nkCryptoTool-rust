@@ -460,9 +460,48 @@ fi
 
 # ---- End Phase 5 P1 additions ----
 
+# 22. Check-count floor (2026-08 turn-8 audit, F2).
+#
+# Every check above reports FAIL only when it runs and objects. A check that
+# stops running reports nothing, and this file's summary never noticed: deleting
+# a whole block took PASS from 22 to 21 and still printed "all required checks
+# passed". The two branches F2 demonstrated were promoted to FAIL, but that
+# closes the two, not the class -- the class is "the gate got smaller".
+#
+# The floor is on the TOTAL, not on PASS, and that is measured rather than
+# preferred. At b955c49e the same tree reports PASS=22 WARN=2 locally and
+# PASS=21 WARN=3 in CI, because check 19 looks for ../issue/nkCryptoTool-rust,
+# a path outside the repository that no runner has. The split moves with the
+# environment; the number of checks that ran does not. A floor on PASS would be
+# wrong in one of the two places no matter which value it held.
+#
+# Note this cannot be gamed the way a documented PASS total can. Weakening a
+# check -- turning a FAIL into a WARN -- leaves the total untouched, so it buys
+# nothing here; only deleting a check moves it, which is the thing being caught.
+#
+# That is also the limitation, stated so the floor is not read as more than it
+# is: a weakened check still runs, still counts, and the floor stays silent.
+# Measured -- reverting check 19's missing-baseline branch to WARN and then
+# deleting .security-baseline.sha256 gives 24 checks, floor satisfied, exit 0.
+# That case is carried by the FAIL promotion in check 19, not by this. The two
+# are complementary and neither subsumes the other.
+#
+# Below the floor is FAIL: a check vanished. Above it is WARN, not FAIL, so that
+# adding a check never blocks the commit that adds it; the warning says to raise
+# the floor, and until someone does, the floor still catches any removal down to
+# its own value. That WARN cannot hide a removal, which is the property F2's
+# WARN class lacked.
+CHECKS_RUN=$((PASS_COUNT + FAIL_COUNT + WARN_COUNT))
+EXPECTED_CHECKS=24
+if [ "$CHECKS_RUN" -lt "$EXPECTED_CHECKS" ]; then
+    fail "check-count floor" "only $CHECKS_RUN checks ran, expected >= $EXPECTED_CHECKS — a check was deleted, renamed, or silently skipped. Compare this run's lines against git show HEAD:scripts/mandate_check.sh"
+elif [ "$CHECKS_RUN" -gt "$EXPECTED_CHECKS" ]; then
+    warn "check-count floor" "$CHECKS_RUN checks ran, floor is $EXPECTED_CHECKS — raise EXPECTED_CHECKS in this file to $CHECKS_RUN so the new check is protected too"
+fi
+
 # Summary
 echo ""
-echo "[mandate] summary: PASS=$PASS_COUNT FAIL=$FAIL_COUNT WARN=$WARN_COUNT"
+echo "[mandate] summary: PASS=$PASS_COUNT FAIL=$FAIL_COUNT WARN=$WARN_COUNT (checks run: $CHECKS_RUN, floor: $EXPECTED_CHECKS)"
 if [ "$FAIL_COUNT" -gt 0 ]; then
     echo "[mandate] FAIL: cannot proceed to commit / release"
     exit 1
