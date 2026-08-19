@@ -420,8 +420,9 @@ trade-off is explicit rather than forgotten.
         relay's own failures are routed around them. The analysis below is kept
         because the fix came out of it — **with one correction, which is the
         useful part**: it says to route `Storage` *and `Io`* around the gate.
-        `Io` belongs on the gated side. It is never constructed anywhere in
-        `network/inbox.rs`; it arrives only via `#[from] std::io::Error`, and on
+        `Io` belongs on the gated side. Nothing on the production path constructs
+        one — the module's only explicit construction is in the test that pins
+        this classification; it arrives via `#[from] std::io::Error`, and on
         the server path the only sources are the 31 `read_timed`/`write_timed`
         calls against the peer's own stream — so a peer produces one by
         resetting a connection, as cheaply as a `Protocol`. Ungating it would

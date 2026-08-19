@@ -1181,11 +1181,11 @@ mod server {
     ///
     /// Measured rather than assumed, because the obvious split is wrong.
     /// `KNOWN_ISSUES.md` item 10 proposed routing `Storage` *and `Io`* around
-    /// the gate; `Io` belongs on the gated side. It is never constructed
-    /// anywhere in this module — it arrives only through
-    /// `#[from] std::io::Error`, and on the server path the only things that
-    /// produce one are the 31 `read_timed` / `write_timed` calls against the
-    /// peer's own stream. (The client half's `endpoint.connect(..).await?`
+    /// the gate; `Io` belongs on the gated side. Nothing on the production
+    /// path constructs one — the module's only explicit construction is in
+    /// the test that pins this. It arrives through `#[from] std::io::Error`,
+    /// and on the server path the only things that produce one are the 31
+    /// `read_timed` / `write_timed` calls against the peer's own stream. (The client half's `endpoint.connect(..).await?`
     /// yields `Transport`, not `Io`, and never runs here.) So a peer that opens
     /// a stream and resets it produces one at will, exactly as cheaply as a
     /// `Protocol`. Routing it around the gate would have left the hole open
@@ -2791,8 +2791,9 @@ mod tests {
         );
     }
 
-    /// `Io` is on the gated side, and the reason is that it is not this
-    /// module's to construct: it arrives only from the peer's own stream.
+    /// `Io` is on the gated side, and the reason is that the production path
+    /// never constructs one: it arrives only from the peer's own stream.
+    /// The construction below is this test's, and exists to name the variant.
     ///
     /// `KNOWN_ISSUES.md` item 10 proposed routing it around the gate together
     /// with `Storage`. That would have reopened the hole through a variant a
