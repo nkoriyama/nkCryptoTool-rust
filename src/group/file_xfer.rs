@@ -25,8 +25,9 @@
 
 use sha3::{Digest, Sha3_256};
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Magic prefix marking an app message as a file-transfer frame. Chosen to be
 /// extremely unlikely to collide with a chat message's leading bytes.
@@ -311,6 +312,19 @@ impl Reassembler {
         if base.contains('/') || base.contains('\\') || base.contains('\0') {
             return None;
         }
+        // Separator-free is still not the same as *contained*. On Windows a
+        // basename like `C:evil.exe` (which survives `file_name()` whole when the
+        // sender writes `a/C:evil.exe`, because the prefix parser only looks at
+        // offset 0) carries a drive prefix, and `dir.join` of a prefixed path
+        // drops the receive directory entirely. Ask the platform's own parser
+        // instead of lengthening the character blacklist — see
+        // `is_plain_component`. Rejecting here rather than only at the create
+        // sinks also keeps such a name out of the derived staging filename
+        // below, whose containment would otherwise rest on the accident that its
+        // leading `.` stops Windows reading it as a drive.
+        if !is_plain_component(base) {
+            return None;
+        }
         // The sender chooses this name and it becomes both a real filename and
         // display text. Control characters (ESC/CSI, CR) and the bidi/zero-width
         // marks let a sender repaint the receiving operator's transcript or
@@ -409,7 +423,11 @@ impl Reassembler {
         }
         // Stage to a sibling temp created exclusively (no clobber / symlink
         // follow), mirroring the at-rest temp-file pattern.
-        let tmp_path = self.dir.join(format!(".{}.{}.part", name, hex16(&id)));
+        let tmp_name = format!(".{}.{}.part", name, hex16(&id));
+        let tmp_path = match join_in_dir(&self.dir, &tmp_name) {
+            Some(p) => p,
+            None => return FileStatus::Error(format!("unsafe staging name {tmp_name:?}")),
+        };
         let file = match exclusive_create(&tmp_path) {
             Ok(f) => f,
             Err(e) => return FileStatus::Error(format!("stage {tmp_path:?}: {e}")),
@@ -575,23 +593,60 @@ impl Reassembler {
     /// `dir/name (k)`, creating the first one that does not already exist via an
     /// exclusive create (so a received file never silently overwrites an
     /// existing one, even under a concurrent creator). Returns the claimed path,
-    /// or `None` if every candidate is taken.
+    /// or `None` if every candidate is taken — or if a candidate would not land
+    /// directly inside `dir` (see `join_in_dir`; `safe_name` has already refused
+    /// such a name at `START`, so the caller's "no free destination filename" is
+    /// a report of the unreachable case, not of a name it accepted).
     fn claim_dest(&self, name: &str) -> Option<PathBuf> {
-        if exclusive_create(&self.dir.join(name)).is_ok() {
-            return Some(self.dir.join(name));
+        let dest = join_in_dir(&self.dir, name)?;
+        if exclusive_create(&dest).is_ok() {
+            return Some(dest);
         }
         let (stem, ext) = match name.rsplit_once('.') {
             Some((s, e)) => (s.to_string(), format!(".{e}")),
             None => (name.to_string(), String::new()),
         };
         for k in 1..10_000 {
-            let cand = self.dir.join(format!("{stem} ({k}){ext}"));
+            let cand = join_in_dir(&self.dir, &format!("{stem} ({k}){ext}"))?;
             if exclusive_create(&cand).is_ok() {
                 return Some(cand);
             }
         }
         None
     }
+}
+
+/// True when the *receiving platform's own* path parser reads `name` as exactly
+/// one plain relative component — the property `dir.join(name)` needs for its
+/// result to stay inside `dir`.
+///
+/// A character blacklist cannot decide this. On Windows `C:evil.exe` holds no
+/// separator, no NUL and no control character, yet std's prefix parser gives it
+/// a `Disk` prefix, and `PathBuf::push` clears the buffer for any path carrying
+/// a prefix — so `dir.join("C:evil.exe")` is the bare drive-relative path,
+/// resolved against that drive's current directory, outside the receive
+/// directory. Deferring to `Path` costs unix nothing: there `:` is an ordinary
+/// filename byte and such a name is still exactly one `Normal` component, so a
+/// unix receiver accepts and places exactly what it did before.
+fn is_plain_component(name: &str) -> bool {
+    Path::new(name).components().eq([Component::Normal(OsStr::new(name))])
+}
+
+/// Join one filename onto `dir`, yielding a path only if it is a plain
+/// component *and* the joined result really does sit directly in `dir`.
+///
+/// The second half is the invariant the create sinks actually need, and it is
+/// checked on the joined path rather than inferred from the name — so it still
+/// holds for anything a name-level filter failed to anticipate.
+fn join_in_dir(dir: &Path, name: &str) -> Option<PathBuf> {
+    if !is_plain_component(name) {
+        return None;
+    }
+    let joined = dir.join(name);
+    if joined.parent() != Some(dir) {
+        return None;
+    }
+    Some(joined)
 }
 
 fn hex16(id: &[u8; ID_LEN]) -> String {
@@ -625,6 +680,45 @@ mod tests {
         // Ordinary names, including non-ASCII ones, keep working.
         assert_eq!(Reassembler::safe_name("hello.bin").as_deref(), Some("hello.bin"));
         assert_eq!(Reassembler::safe_name("報告書 v2.pdf").as_deref(), Some("報告書 v2.pdf"));
+    }
+
+    #[test]
+    fn drive_relative_name_cannot_escape_the_receive_directory() {
+        // `file_name()` hands back `C:evil.exe` whole on both platforms: the
+        // Windows prefix parser only looks at offset 0, so a `C:` inside a later
+        // component is an ordinary component. What differs is what joining that
+        // basename onto the receive directory *means*, so that is what decides
+        // whether it is accepted.
+        let got = Reassembler::safe_name("a/C:evil.exe");
+        if cfg!(windows) {
+            // Drive-prefixed here: `dir.join(..)` would discard the receive
+            // directory, so the name is refused outright at START.
+            assert_eq!(got, None);
+        } else {
+            // `:` is an ordinary filename byte on unix — unchanged behaviour,
+            // and the join stays inside the receive directory.
+            assert_eq!(got.as_deref(), Some("C:evil.exe"));
+            let dir = Path::new("recv");
+            assert_eq!(join_in_dir(dir, "C:evil.exe"), Some(dir.join("C:evil.exe")));
+        }
+    }
+
+    #[test]
+    fn join_in_dir_only_yields_paths_directly_inside_dir() {
+        let dir = Path::new("recv");
+        assert_eq!(join_in_dir(dir, "ok.bin"), Some(dir.join("ok.bin")));
+        // The derived staging name of a legitimate transfer still joins.
+        assert_eq!(join_in_dir(dir, ".ok.bin.0011.part"), Some(dir.join(".ok.bin.0011.part")));
+        for bad in ["", ".", "..", "a/b", "sub/../escape", "/abs"] {
+            assert_eq!(join_in_dir(dir, bad), None, "{bad:?} must not join");
+        }
+        if cfg!(windows) {
+            // Drive-relative: `join` would replace `dir` outright. The
+            // backslash form is a separator Windows splits on.
+            for bad in ["C:evil.exe", "C:", "a\\b"] {
+                assert_eq!(join_in_dir(dir, bad), None, "{bad:?} must not join");
+            }
+        }
     }
 
     #[test]
