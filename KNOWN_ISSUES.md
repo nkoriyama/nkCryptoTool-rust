@@ -738,10 +738,13 @@ trade-off is explicit rather than forgotten.
           peers `known_member_addrs` would have filtered out, including addresses
           no roster lists at all.
       The request carries the caller's *own* current epoch, so it fetches
-      exactly the delta it is missing and is a no-op when current — it is not
-      clamped out of its own history by the change above. Recovery is **not
-      automatic** on this path: nothing polls, so a member stays behind until
-      someone runs it.
+      exactly the delta it is missing and is a no-op when current — the clamp
+      above withholds history *predating* the caller's admission, which its own
+      epoch is never below. The one case where a well-formed request still comes
+      back empty is a responder that can vouch for no span of its own history
+      (the history floor, below); there the answer is a fresh Welcome. Recovery
+      is **not automatic** on this path: nothing polls, so a member stays behind
+      until someone runs it.
     - **What a resync can and cannot tell you.** `request_resync` dials a
       `PeerAddr` and reads whatever comes back. **Nothing in that exchange
       authenticates the responder** — not its membership, not its epoch, not its
@@ -789,8 +792,9 @@ trade-off is explicit rather than forgotten.
           `ERR\x01` otherwise, so one whose roster reflected this Commit would
           have refused — and that is short of a verdict, so the line stops at
           "ask another peer". An honest responder produces the same event where
-          it recorded no join epoch for us (`member_join_epoch` `None`
-          deliberately does not clamp): having removed us and re-admitted us at
+          it does not clamp what it serves to our own admission — a peer older
+          than the history floor below, where an unrecorded join epoch was
+          served unclamped: having removed us and re-admitted us at
           an epoch we never applied, its roster lists us again and it serves the
           old Remove out of retained history. It carries
           **no re-admission advice and names no command**: `join_group_from_welcome`
@@ -896,21 +900,40 @@ trade-off is explicit rather than forgotten.
       at the prune site that item 12's "why it is not fixed here" describes.
       Read "N queued peer(s) were not asked", and the node ids named alongside
       it, as something a responder may have caused.
-    - **What the SYNC clamp does not cover.** A join epoch is recorded only when
-      this node applies the Add commit itself (`record_witnessed_joins`, on the
-      commit-build, direct-receive and resync-apply paths), stored per
-      (group, member) in the existing application-data KV. `None` means
-      "unknown" and deliberately does **not** clamp, because failing closed
-      there would cut off legitimate resync. Unknown arises in two ways. For a
-      member that was already on the roster when *we* joined, it is harmless: our
-      own commit history starts at our own join, which is at or after theirs, so
-      there is nothing older to leak. For a **database written before this
-      release**, it is a real gap: members admitted before the upgrade have no
-      record, so they keep being served from whatever epoch they claim, down to
-      the oldest retained one, for as long as that history survives
-      `DEFAULT_COMMIT_RETENTION` (100 epochs). No migration can fix that — the
-      information was never recorded. It ages out as those epochs prune, and
-      applies from admission onward for everyone added afterwards.
+    - **What the SYNC clamp rests on when it does not know the requester.** A
+      join epoch is recorded only when this node applies the Add commit itself
+      (`record_witnessed_joins`, on the commit-build, direct-receive,
+      resync-apply and remove paths), stored per (group, member) in the existing
+      application-data KV. `None` means "unknown", and unknown is **not** an
+      entitlement: it can mean a member already on the roster when we joined
+      (harmless — our own history starts at our own join, at or after theirs), a
+      database written before this record existed, or a record we failed to
+      write. Nothing in a `None` tells those apart, so the responder falls back
+      to a group-wide **history floor** (`GroupStorage::history_floor`): the
+      exclusive bound of the epoch span in which our join records are complete.
+      It is pinned at `epoch - 1` by the first commit this node applies once
+      the record exists — *any* commit, an Add, a Remove or anything else, since
+      what pins it is the fact that we now know who joined at that epoch, which
+      a Remove settles as surely as an Add — and it is raised above
+      any epoch whose join records we failed to write, so the span it claims is
+      never stale. Above the floor "no record" demonstrably means "did not join
+      here", so that span is served; a database that can vouch for no span at
+      all serves an **empty delta** rather than the requester's own guess, and a
+      storage error on either lookup is refused with `ERR\x02` rather than
+      served unclamped. The decision is one pure function,
+      `group::processor::sync_history_floor`.
+    - **What that leaves: one availability residual, no disclosure.** A database
+      written before this release, holding retained commits and having applied
+      no commit since, has no floor — so a member it never witnessed joining
+      gets an empty delta and has to take a fresh Welcome for that group. It
+      self-heals at that node's very next applied commit, of any kind. It does
+      not arise on a database created after this release: there the floor is
+      pinned by the same commit that first retains history, so it sits below
+      every epoch retained and the clamp does not bite an unrecorded member at
+      all (barring a storage failure on the floor write, which is logged).
+      Before this floor existed the same `None` was served unclamped, down to
+      the oldest retained epoch — up to `DEFAULT_COMMIT_RETENTION` (100 epochs)
+      of pre-admission Adds, each carrying a KeyPackage.
     - **What is left, and what would close it.** `encrypt_control_messages =
       true` is taken (`group::processor::mls_rules`), so what remains is not a
       code change in this repository: it is the population of peers. A group is

@@ -257,12 +257,18 @@ impl GroupStorage {
     /// three cases: a database written before this record existed, a member
     /// that was already on the roster when *we* joined (we were handed a
     /// Welcome, not their Add commit), and a group whose adds we have simply
-    /// never applied. Callers must treat `None` as *no clamp* — failing closed
-    /// would break legitimate delta resync for every member of every group that
-    /// predates this record.
+    /// never applied.
     ///
-    /// A malformed value (not exactly 8 bytes) is reported as `None` for the
-    /// same reason.
+    /// **`None` is not "no clamp".** It carries no entitlement, so a caller
+    /// deciding what history to disclose must fall back to the group-wide
+    /// [`history_floor`](Self::history_floor) — which bounds the span this node
+    /// can vouch for without knowing who joined when — and must disclose
+    /// nothing where even that is absent. Reading `None` as "serve from
+    /// whatever the requester asked for" is the disclosure this record exists
+    /// to stop.
+    ///
+    /// A malformed value (not exactly 8 bytes) is reported as `None`: it is
+    /// the answer that discloses least.
     pub fn member_join_epoch(
         &self,
         group_id: &[u8],
@@ -278,6 +284,80 @@ impl GroupStorage {
                 .ok()
                 .map(u64::from_be_bytes)
         }))
+    }
+
+    /// Application-KV key for a group's history floor.
+    fn history_floor_key(group_id: &[u8]) -> String {
+        format!("mls:histfloor:{}", hex::encode(group_id))
+    }
+
+    /// The **exclusive** lower bound of the epoch span over which this node's
+    /// [`member_join_epoch`](Self::member_join_epoch) records are complete: for
+    /// every epoch strictly greater than the floor, every Add we applied at that
+    /// epoch was recorded.
+    ///
+    /// That is what makes a *missing* join record informative. Below the floor
+    /// we know nothing; above it, "no record" means "this member did not join in
+    /// that span", so history from above the floor is safe to serve to a member
+    /// we cannot date. `None` means we cannot vouch for any span at all — a
+    /// database whose retained commits all predate this record and which has
+    /// applied no commit since — and discloses nothing.
+    ///
+    /// A malformed value (not exactly 8 bytes) is reported as `None` for the
+    /// same reason it is on `member_join_epoch`: it is the answer that
+    /// discloses least.
+    pub fn history_floor(&self, group_id: &[u8]) -> Result<Option<u64>, GroupError> {
+        let raw = self
+            .backend
+            .application_data_storage()
+            .get(&Self::history_floor_key(group_id))
+            .map_err(|e| GroupError::Storage(format!("history_floor: {e}")))?;
+        Ok(raw.and_then(|v| {
+            <[u8; 8]>::try_from(v.as_slice())
+                .ok()
+                .map(u64::from_be_bytes)
+        }))
+    }
+
+    /// Pin the floor at `floor` if none is recorded yet, leaving an existing one
+    /// untouched.
+    ///
+    /// Called with `epoch - 1` each time we apply a commit landing at `epoch`
+    /// whose Adds we recorded in full. Only the *first* such call after the
+    /// record existed can move it: the floor must stay as low as we can honestly
+    /// vouch for, or every later commit would ratchet it up and starve the delta
+    /// resync this whole path exists to serve.
+    ///
+    /// An unreadable (malformed) existing value is replaced, which can only
+    /// raise the floor — the replacement is derived from the epoch we are at
+    /// now, which is at or above anything an earlier pin could have written.
+    pub fn pin_history_floor_if_absent(
+        &self,
+        group_id: &[u8],
+        floor: u64,
+    ) -> Result<(), GroupError> {
+        if self.history_floor(group_id)?.is_some() {
+            return Ok(());
+        }
+        self.backend
+            .application_data_storage()
+            .insert(&Self::history_floor_key(group_id), &floor.to_be_bytes())
+            .map_err(|e| GroupError::Storage(format!("pin_history_floor_if_absent: {e}")))
+    }
+
+    /// Raise the floor to at least `floor`; never lower it.
+    ///
+    /// Called with the epoch of a commit whose join records we failed to write:
+    /// we can no longer claim completeness at or below it, and the floor has to
+    /// move up to stay honest. Raising only ever discloses less.
+    pub fn raise_history_floor(&self, group_id: &[u8], floor: u64) -> Result<(), GroupError> {
+        if self.history_floor(group_id)?.is_some_and(|cur| cur >= floor) {
+            return Ok(());
+        }
+        self.backend
+            .application_data_storage()
+            .insert(&Self::history_floor_key(group_id), &floor.to_be_bytes())
+            .map_err(|e| GroupError::Storage(format!("raise_history_floor: {e}")))
     }
 }
 
@@ -429,6 +509,51 @@ mod tests {
             storage.member_join_epoch(&gid, &member).expect("get"),
             Some(77)
         );
+    }
+
+    /// The history floor is per group, pins once, and only ever moves up.
+    ///
+    /// The two directions are not symmetric on purpose: the pin must *not*
+    /// ratchet (each commit we apply offers `epoch - 1`, and taking the latest
+    /// would starve every legitimate delta), while a failed join-record must
+    /// raise it (we can no longer claim our records are complete at that epoch).
+    #[test]
+    fn history_floor_pins_once_and_never_moves_down() {
+        let dir = tempdir().expect("tempdir");
+        let storage =
+            GroupStorage::open_at(dir.path().join("groups.redb"), test_pass()).expect("open");
+        let gid = [7u8; 32];
+        let other_gid = [1u8; 32];
+
+        assert_eq!(
+            storage.history_floor(&gid).expect("get"),
+            None,
+            "a group we have never vouched for must read as unknown, never as epoch 0"
+        );
+
+        storage.pin_history_floor_if_absent(&gid, 10).expect("pin");
+        assert_eq!(storage.history_floor(&gid).expect("get"), Some(10));
+        assert_eq!(
+            storage.history_floor(&other_gid).expect("get"),
+            None,
+            "the floor is per group"
+        );
+
+        // Every later commit offers its own `epoch - 1`; none of them may move
+        // a floor that is already pinned, in either direction.
+        storage.pin_history_floor_if_absent(&gid, 99).expect("pin again");
+        storage.pin_history_floor_if_absent(&gid, 3).expect("pin lower");
+        assert_eq!(storage.history_floor(&gid).expect("get"), Some(10));
+
+        // A failed join-record raises it; a stale raise does not lower it.
+        storage.raise_history_floor(&gid, 5).expect("raise below");
+        assert_eq!(storage.history_floor(&gid).expect("get"), Some(10));
+        storage.raise_history_floor(&gid, 20).expect("raise above");
+        assert_eq!(storage.history_floor(&gid).expect("get"), Some(20));
+
+        // Raising a group that has no floor yet establishes one.
+        storage.raise_history_floor(&other_gid, 4).expect("raise fresh");
+        assert_eq!(storage.history_floor(&other_gid).expect("get"), Some(4));
     }
 
     #[test]

@@ -505,11 +505,12 @@ impl ResyncReport {
     /// evicted at an epoch we have not applied still holds exactly that, so it
     /// can sign a Commit removing us that verifies here while every honest
     /// member's roster still lists us (there is a test that does it). Nor is it
-    /// a verdict on the responder: where no join epoch was recorded for us, an
-    /// honest responder that removed us and re-admitted us later serves that old
-    /// Remove out of its retained history (`member_join_epoch` `None` does not
-    /// clamp). So the line reports what was served, tells the operator to ask
-    /// another peer, offers no re-admission advice and names no
+    /// a verdict on the responder: an honest responder that removed us and
+    /// re-admitted us later, and that does not clamp what it serves to our own
+    /// admission — a peer older than `sync_history_floor`, where an unrecorded
+    /// join epoch was served unclamped — hands us that old Remove out of its
+    /// retained history. So the line reports what was served, tells the
+    /// operator to ask another peer, offers no re-admission advice and names no
     /// command: advice to go and take a fresh invitation is the steer that was
     /// removed from the `ERR\x01` path, for the reason
     /// `describe_resync_failure` gives below, and it lands in the same place —
@@ -626,9 +627,11 @@ impl ResyncReport {
         //
         // Note also that the ERR\x01 clause is about the responder's roster, not
         // about whether it applied the Commit: a responder that removed us and
-        // later re-admitted us does list us again, and with no join epoch
-        // recorded for us (`member_join_epoch` `None` does not clamp) it serves
-        // that old Remove out of its retained history while behaving honestly.
+        // later re-admitted us does list us again, and one that does not clamp
+        // what it serves to our own admission — a peer older than
+        // `sync_history_floor`, where an unrecorded join epoch was served
+        // unclamped — hands us that old Remove out of its retained history
+        // while behaving honestly.
         // Hence "ask another peer" rather than a verdict on this one.
         let removals: Vec<String> = self
             .answered

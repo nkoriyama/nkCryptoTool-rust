@@ -370,10 +370,50 @@ pub struct ResyncOutcome {
     /// a node whose roster reflected this Commit — i.e. no longer lists us —
     /// would have refused instead of streaming. That is not the same as "it
     /// never applied this Commit": a responder that removed us and re-admitted
-    /// us later lists us again, and where it recorded no join epoch for us
-    /// (`member_join_epoch` `None` deliberately does not clamp) it serves the
-    /// old Remove out of retained history while behaving honestly.
+    /// us later lists us again, and one that does not clamp what it serves to
+    /// our own admission — a peer on a build older than `sync_history_floor`,
+    /// where an unrecorded join epoch served history unclamped — hands us the
+    /// old Remove out of its retained history while behaving honestly.
     pub removed_us: bool,
+}
+
+/// The **exclusive** lower bound of the commit span a SYNC responder may stream
+/// to a requester: everything above it is the requester's to have, everything at
+/// or below it is not.
+///
+/// Three inputs, only one of which the requester supplies:
+/// - `claimed_epoch` — 8 bytes the requester chose. It can only ever raise the
+///   floor ("I already have up to here"), never lower it.
+/// - `requester_join_epoch` — the epoch at which *we* witnessed its Add, if we
+///   did. This is the authorization: history from before a member's own
+///   admission is not history it is entitled to, however low it claims.
+/// - `group_history_floor` — the exclusive bound of the span in which our join
+///   records are complete (see [`GroupStorage::history_floor`]).
+///
+/// The `None` cases are where this earns its keep. An unrecorded requester is
+/// not an entitled one: it may be a member that predates the record, a member
+/// already on the roster when we joined, or a member whose record we failed to
+/// write, and the answer cannot depend on telling those apart. Above the group
+/// floor our records are complete, so an unrecorded member demonstrably did not
+/// join there and that span is safe to serve; with no floor at all we can
+/// demonstrate nothing and return `local_epoch`, which yields an empty delta.
+///
+/// Every path is monotone in the direction of disclosing less, and nothing the
+/// requester sends can lower the result below what we recorded ourselves.
+fn sync_history_floor(
+    claimed_epoch: u64,
+    local_epoch: u64,
+    requester_join_epoch: Option<u64>,
+    group_history_floor: Option<u64>,
+) -> u64 {
+    match (requester_join_epoch, group_history_floor) {
+        // We watched them join: their own admission is the floor.
+        (Some(joined), _) => claimed_epoch.max(joined),
+        // We did not, but we can vouch for the span above the floor.
+        (None, Some(floor)) => claimed_epoch.max(floor),
+        // We can vouch for nothing. Serve nothing.
+        (None, None) => local_epoch,
+    }
 }
 
 impl GroupChatProcessor {
@@ -1340,28 +1380,54 @@ impl GroupChatProcessor {
             // one is a property of the requester's key material, and only the
             // first is ours to decide.
             //
-            // `None` (unknown) deliberately does NOT clamp. It means this node
-            // never applied the Add commit for that member: an existing
-            // database written before this record existed, or — the common case
-            // — a member that was already on the roster when *we* joined. The
-            // latter cannot leak anything, because our own history starts at our
-            // own join, which is at or after theirs. The former keeps today's
-            // behaviour for members admitted before the upgrade rather than
-            // cutting off delta resync for everyone already in a group.
+            // `None` (unknown) is not an entitlement, and must not be read as
+            // one. It means this node never applied the Add commit for that
+            // member, which covers three different situations: a database
+            // written before this record existed, a member that was already on
+            // the roster when *we* joined, and a record we failed to write. Only
+            // the middle one is harmless — our own history starts at our own
+            // join, which is at or after theirs — and nothing in a `None` says
+            // which of the three we are looking at.
+            //
+            // So the group-wide history floor answers instead. It is the
+            // exclusive bound of the epoch span in which our join records are
+            // complete, which is exactly what makes a missing record mean
+            // something: above the floor, "no record" really does say "this
+            // member did not join here", so that history is theirs to have. A
+            // database that can vouch for no span at all reads `None` there too,
+            // and then we serve nothing rather than everything.
             let requester_join_epoch = match self
                 .storage
                 .member_join_epoch(&gid_bytes, peer_id.as_bytes())
             {
                 Ok(v) => v,
                 Err(e) => {
-                    eprintln!("[mls] sync: join-epoch lookup failed, serving unclamped: {e}");
-                    None
+                    // A lookup failure is not a `None`. `None` is an answer;
+                    // this is the absence of one, and treating the two alike
+                    // would make "break this read" a way to ask for unclamped
+                    // history. Refuse with the same `ERR\x02` the pruning floor
+                    // uses — "no delta for you, take a Welcome".
+                    let _ = inc.stream.write_all(b"ERR\x02").await;
+                    return Err(GroupError::Storage(format!(
+                        "Sync refused: join-epoch lookup failed: {e}"
+                    )));
                 }
             };
-            let effective_floor = match requester_join_epoch {
-                Some(joined) => claimed_epoch.max(joined),
-                None => claimed_epoch,
+            let group_history_floor = match self.storage.history_floor(&gid_bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = inc.stream.write_all(b"ERR\x02").await;
+                    return Err(GroupError::Storage(format!(
+                        "Sync refused: history-floor lookup failed: {e}"
+                    )));
+                }
             };
+            let effective_floor = sync_history_floor(
+                claimed_epoch,
+                local_epoch,
+                requester_join_epoch,
+                group_history_floor,
+            );
 
             // Case B: Delta resync. Bound the *entire* response (the OK marker
             // plus every commit frame) by a single HANDSHAKE_TIMEOUT deadline.
@@ -1863,18 +1929,32 @@ impl GroupChatProcessor {
     }
 
     /// Persist `epoch` as the join epoch of every peer that is on the roster in
-    /// `after` but was not in `before` — i.e. every member this commit added.
+    /// `after` but was not in `before` — i.e. every member this commit added —
+    /// and move the group's history floor to match.
     ///
     /// Call it immediately after a commit has been applied *and* persisted, with
-    /// `epoch = group.current_epoch()`. That is the epoch whose Add commit the
+    /// `epoch = group.current_epoch()`, on **every** commit we apply and not
+    /// only the ones that add someone. That is the epoch whose Add commit the
     /// new member never receives (it gets a Welcome instead), so it is exactly
-    /// the exclusive floor the SYNC responder may serve that member from.
+    /// the exclusive floor the SYNC responder may serve that member from — and
+    /// a commit that adds nobody still carries the fact the floor is made of:
+    /// that we now know who joined at this epoch, namely no one.
     ///
-    /// Best-effort, like the commit-history write next to it: a failure here
-    /// costs the clamp for that member (it falls back to today's behaviour of
-    /// serving from the requester's `claimed_epoch`), which must not fail a
-    /// group operation that has already advanced the epoch on disk. Never
-    /// silent.
+    /// The floor is the group-wide half of the same statement, and it is what
+    /// makes a *missing* join record mean something. It is pinned at
+    /// `epoch - 1` the first time we get here (`load_commits` reads its lower
+    /// bound exclusively, so `E - 1` serves epoch `E` onwards), and left where
+    /// it is by every later commit whose records we wrote — the invariant it
+    /// stands for is "for every epoch above the floor, every Add we applied
+    /// there was recorded", which the first successful call establishes and each
+    /// later one merely extends.
+    ///
+    /// Best-effort on the individual record, like the commit-history write next
+    /// to it: it must not fail a group operation that has already advanced the
+    /// epoch on disk. But a record we failed to write breaks that invariant at
+    /// this epoch, so instead of pinning we *raise* the floor above it — the
+    /// span we can vouch for shrinks rather than silently going stale. Never
+    /// silent either way.
     fn record_witnessed_joins(
         &self,
         group_id: &[u8],
@@ -1882,16 +1962,30 @@ impl GroupChatProcessor {
         before: &std::collections::HashSet<PeerId>,
         after: &std::collections::HashSet<PeerId>,
     ) {
+        let mut all_recorded = true;
         for pid in after.difference(before) {
             if let Err(e) = self
                 .storage
                 .put_member_join_epoch(group_id, pid.as_bytes(), epoch)
             {
+                all_recorded = false;
                 eprintln!(
                     "[mls] failed to record a member's join epoch (sync history for that \
-                     member will not be clamped): {e}"
+                     member will not be clamped to its own admission): {e}"
                 );
             }
+        }
+        let floor = if all_recorded {
+            self.storage
+                .pin_history_floor_if_absent(group_id, epoch.saturating_sub(1))
+        } else {
+            self.storage.raise_history_floor(group_id, epoch)
+        };
+        if let Err(e) = floor {
+            eprintln!(
+                "[mls] failed to update the group's sync history floor (delta resync may \
+                 serve less history to members whose join epoch we never recorded): {e}"
+            );
         }
     }
 
@@ -2159,6 +2253,14 @@ impl GroupChatProcessor {
             .and_then(|m| Self::peer_id_from_credential(&m.signing_identity.credential))
             .map(|pid| *pid.as_bytes());
 
+        // Same roster diff as the Add path. A Remove adds nobody, so this
+        // records no join epoch — but it is still a commit we applied, and
+        // saying so is what pins the group's history floor (see
+        // `record_witnessed_joins`). Skipping it here would leave a node whose
+        // only group operations are removals retaining history it can vouch for
+        // and refusing to serve it.
+        let roster_before = Self::roster_peer_ids(&group);
+
         let commit_output = group
             .commit_builder()
             .remove_member(index)
@@ -2204,6 +2306,12 @@ impl GroupChatProcessor {
             // Welcome instead of a delta. Never silent.
             eprintln!("[mls] failed to persist commit history (epoch advanced): {e}");
         }
+        self.record_witnessed_joins(
+            group.group_id(),
+            group.current_epoch(),
+            &roster_before,
+            &Self::roster_peer_ids(&group),
+        );
 
         Ok(Zeroizing::new(commit_bytes))
     }
@@ -4021,6 +4129,170 @@ mod tests {
             );
             alice
         };
+    }
+
+    /// The decision itself, on all four shapes of what we know about a
+    /// requester.
+    ///
+    /// The two `None` rows are the ones the responder used to get wrong: an
+    /// unrecorded requester was served from its own `claimed_epoch`, i.e. from
+    /// no floor at all. What replaces that is not "refuse everyone" — with a
+    /// history floor we can still say which span is safely theirs — but the
+    /// no-floor row does refuse, because a database that can vouch for no span
+    /// has nothing to offer but a guess.
+    #[test]
+    fn sync_history_floor_never_takes_the_requester_at_its_word() {
+        // Recorded: the requester's own admission is the floor, and claiming
+        // lower does not move it.
+        assert_eq!(sync_history_floor(1, 90, Some(42), None), 42);
+        assert_eq!(sync_history_floor(1, 90, Some(42), Some(7)), 42);
+        // ...but a requester that is already ahead of its admission keeps its
+        // own (higher) floor: we never re-serve what it has.
+        assert_eq!(sync_history_floor(80, 90, Some(42), Some(7)), 80);
+
+        // Unrecorded, with a floor: the span above the floor is where our
+        // records are complete, so it is demonstrably not this member's
+        // pre-admission history.
+        assert_eq!(sync_history_floor(1, 90, None, Some(60)), 60);
+        assert_eq!(sync_history_floor(70, 90, None, Some(60)), 70);
+
+        // Unrecorded, no floor: we can demonstrate nothing. `local_epoch` makes
+        // the delta empty rather than serving the requester's own guess.
+        assert_eq!(sync_history_floor(1, 90, None, None), 90);
+        assert_eq!(sync_history_floor(0, 0, None, None), 0);
+
+        // The requester's 8 bytes can only ever raise the floor.
+        for claimed in [0u64, 1, 41, 42, 43, u64::MAX] {
+            for join in [None, Some(42u64)] {
+                for floor in [None, Some(60u64)] {
+                    let got = sync_history_floor(claimed, 90, join, floor);
+                    let at_word = sync_history_floor(0, 90, join, floor);
+                    assert!(
+                        got >= at_word,
+                        "claimed_epoch {claimed} lowered the floor ({got} < {at_word}) \
+                         for join={join:?} floor={floor:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A responder that joined by Welcome and whose own group operations are
+    /// **removals only** must still serve the delta a legitimate member is
+    /// entitled to.
+    ///
+    /// This is the shape a one-shot CLI produces — join, evict, exit, never
+    /// process an inbound Commit — and it is the shape in which a history floor
+    /// is easiest to get wrong. Bob retains commits, none of which predate
+    /// Carol's admission (she was in the group before he was), so there is no
+    /// pre-admission history to withhold here and an empty delta would be a
+    /// pure availability regression: exactly the "clamp that starves legitimate
+    /// resync" the sibling test above warns about.
+    ///
+    /// It also drives the responder's *unrecorded* branch end to end, which no
+    /// other test does: every requester in the sibling test is recorded on the
+    /// responder, so only the recorded path is exercised there. Bob applied no
+    /// member's Add, so `member_join_epoch` is `None` for every requester he can
+    /// possibly answer.
+    #[tokio::test]
+    async fn sync_serves_a_removals_only_responder_delta_to_an_unrecorded_member() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        /// Issue a raw SYNC request and return the commit frames streamed back.
+        async fn sync_as(
+            requester: &GroupChatProcessor,
+            responder_addr: &PeerAddr,
+            gid: &GroupId,
+            claimed_epoch: u64,
+        ) -> Vec<Vec<u8>> {
+            let mut stream = requester
+                .endpoint_ref()
+                .connect(responder_addr, crate::group::transport::ALPN_MLS_PROTOCOL)
+                .await
+                .expect("connect for SYNC");
+            stream.write_all(b"SYNC").await.expect("write SYNC header");
+            let mut req = [0u8; 40];
+            req[0..32].copy_from_slice(gid.as_bytes());
+            req[32..40].copy_from_slice(&claimed_epoch.to_le_bytes());
+            stream.write_all(&req).await.expect("write SYNC request");
+
+            let mut marker = [0u8; 4];
+            stream.read_exact(&mut marker).await.expect("read marker");
+            assert_eq!(&marker, b"OK\x00\x00", "responder refused the request");
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).await.expect("read response");
+
+            let mut out = Vec::new();
+            let mut off = 0usize;
+            while off + 4 <= rest.len() {
+                let len = u32::from_le_bytes(rest[off..off + 4].try_into().unwrap()) as usize;
+                off += 4;
+                assert!(off + len <= rest.len(), "truncated commit frame");
+                out.push(rest[off..off + len].to_vec());
+                off += len;
+            }
+            assert_eq!(off, rest.len(), "trailing bytes after the last commit frame");
+            out
+        }
+
+        let net = MockNetwork::new();
+        let (alice, _da) = build_proc_on_net(&net, "alice", 1);
+        let (bob, _db) = build_proc_on_net(&net, "bob", 2);
+        let (carol, _dc) = build_proc_on_net(&net, "carol", 3);
+        let (dave, _dd) = build_proc_on_net(&net, "dave", 4);
+        let (erin, _de) = build_proc_on_net(&net, "erin", 5);
+
+        let bob_addr = bob.local_addr().await.unwrap();
+
+        let carol_kp = carol.export_key_package().await.unwrap();
+        let dave_kp = dave.export_key_package().await.unwrap();
+        let erin_kp = erin.export_key_package().await.unwrap();
+        let bob_kp = bob.export_key_package().await.unwrap();
+
+        // Alice builds the group and admits Bob last (leaves: alice 0, carol 1,
+        // dave 2, erin 3, bob 4). On Bob's database every other member predates
+        // him and he applied none of their Adds.
+        let gid = alice.create_group().await.unwrap();
+        alice.add_member(&gid, &carol_kp).await.unwrap(); // epoch 1
+        alice.add_member(&gid, &dave_kp).await.unwrap(); // epoch 2
+        alice.add_member(&gid, &erin_kp).await.unwrap(); // epoch 3
+        let add_bob = alice.add_member(&gid, &bob_kp).await.unwrap(); // epoch 4
+        let bob_gid = bob.join_group_from_welcome(&add_bob.welcome).await.unwrap();
+        assert_eq!(bob_gid, gid);
+        assert_eq!(bob.load_group_summary(&gid).await.unwrap().epoch, 4);
+
+        // Bob's own operations: removals, which store commit history and add
+        // nobody.
+        let _remove_dave = bob.remove_member(&gid, 2).await.unwrap(); // epoch 5
+        let remove_erin = bob.remove_member(&gid, 3).await.unwrap(); // epoch 6
+        assert_eq!(bob.load_group_summary(&gid).await.unwrap().epoch, 6);
+
+        // Carol asks Bob for the delta after epoch 5. Bob never witnessed her
+        // Add, so this is the unrecorded path; his retained history starts after
+        // his own admission, which is long after hers.
+        let task = tokio::spawn(async move {
+            bob.accept_next().await.expect("bob serves carol's SYNC");
+            bob
+        });
+        let frames = sync_as(&carol, &bob_addr, &gid, 5).await;
+        let bob = task.await.unwrap();
+
+        assert_eq!(
+            frames.len(),
+            1,
+            "Carol predates every commit Bob retains: her delta must be served, \
+             not swallowed because Bob never witnessed her Add"
+        );
+        assert_eq!(frames[0], *remove_erin);
+
+        // And the floor Bob pinned is the one his own admission implies — pinned
+        // by a Remove, since that is the only kind of commit he ever applied.
+        assert_eq!(
+            bob.storage.history_floor(gid.as_bytes()).expect("floor"),
+            Some(4),
+            "a removals-only node must still pin a floor, or it can vouch for \
+             nothing and serves nobody"
+        );
     }
 
     #[tokio::test]
