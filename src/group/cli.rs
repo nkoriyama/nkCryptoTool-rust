@@ -768,9 +768,12 @@ enum PeerSource<'a> {
     Remembered,
     /// A running listener's shared recipient list. Re-derived by running
     /// [`prune_departed_recipients`] — S8's decision, cross-group vouching and
-    /// all — and then keeping the peers that survived in `recipients`. The
-    /// prune is the only thing that decides who departed; this variant just
-    /// stops the sweep from dialling whoever it dropped.
+    /// all — and then keeping the peers that survived in `recipients` **and
+    /// that this group may still be addressed at**
+    /// ([`recipients_for_group`]). The prune decides who leaves the shared
+    /// list; the scope decides who is a target of *this* group's traffic, and
+    /// a SYNC request naming this group, carrying our epoch in it, is exactly
+    /// that. This variant just stops the sweep from dialling either.
     ///
     /// Used for both REPL forms. `/resync` with no argument is the only one
     /// with more than one peer, and its list *is* the recipient list — the
@@ -834,7 +837,14 @@ impl PeerSource<'_> {
                 rosters,
             } => {
                 let note = prune_departed_recipients(processor, gid, recipients, rosters).await;
-                (recipients.lock().await.clone(), note)
+                // Scoped on the way out, not merely pruned: the prune
+                // deliberately keeps an address another operator-selected
+                // group still lists, and asking that peer for *this* group's
+                // Commits is one of the contacts a Remove here has to end.
+                (
+                    recipients_for_group(processor, gid, recipients, rosters).await,
+                    note,
+                )
             }
         };
         let keep: std::collections::HashSet<[u8; 32]> =
@@ -1733,7 +1743,13 @@ pub async fn listen_loop(
                                 }
                             };
                             let recipient = new_ticket.peer_addr();
-                            let existing = recipients.lock().await.clone();
+                            // The Commit below is *this* group's ciphertext, so
+                            // it goes to this group's targets: the shared list
+                            // minus the peers this group has removed. Same
+                            // scope as a typed line (`recipients_for_group`).
+                            let existing =
+                                recipients_for_group(&processor, &gid, &recipients, &rosters)
+                                    .await;
                             match add_member(
                                 &processor,
                                 &gid,
@@ -1798,7 +1814,13 @@ pub async fn listen_loop(
                                 }
                             };
                             let peers: Vec<PeerAddr> = if arg.is_empty() {
-                                recipients.lock().await.clone()
+                                // The shared list, scoped to the active group:
+                                // a SYNC request names that group and carries
+                                // our epoch in it, so a peer the group has
+                                // removed is not part of "everyone"
+                                // (`recipients_for_group`).
+                                recipients_for_group(&processor, &gid, &recipients, &rosters)
+                                    .await
                             } else {
                                 match arg.parse::<Ticket>() {
                                     Ok(t) => vec![t.peer_addr()],
@@ -1865,7 +1887,23 @@ pub async fn listen_loop(
                         } else {
                             // Plain text → send as application message.
                             let gid_opt = *group_id.lock().await;
-                            let recips = recipients.lock().await.clone();
+                            // Scoped to the group this line will be encrypted
+                            // to. The list is shared across every group this
+                            // loop addresses, and a peer *this* group removed
+                            // must not be dialled for it, however many other
+                            // groups keep its address alive
+                            // (`recipients_for_group`).
+                            let recips = match &gid_opt {
+                                Some(gid) => {
+                                    recipients_for_group(
+                                        &processor, gid, &recipients, &rosters,
+                                    )
+                                    .await
+                                }
+                                // No active group: the arm below reports that
+                                // and never looks at the list.
+                                None => Vec::new(),
+                            };
                             match (gid_opt, recips.is_empty()) {
                                 (None, _) => {
                                     say("[listen] no active group yet — wait for [joined] or use /gid".to_string())
@@ -2272,6 +2310,24 @@ fn seed_roster_locked(
 /// vouches for nobody, so an unreadable group can only lose an address
 /// (today's behaviour), never keep a departed one.
 ///
+/// **A keep is an address, and not a delivery target for `gid`.** Keeping the
+/// entry is only half of "one group's Commit must not revoke another's", and on
+/// its own it was the wrong half. The list it keeps the address in is the same
+/// list `listen_loop` fans `gid`'s *own* traffic out to, so the exemption meant
+/// to protect the other group also kept a peer that `gid`'s members had
+/// authenticated a Commit to evict receiving `gid`'s ciphertext, connection
+/// attempts, timing and sizes — exactly the leak this function exists to close,
+/// let back in through the door held open for someone else. The other half is
+/// [`recipients_for_group`]: every read of the shared list that becomes traffic
+/// **for one group** — the application message a typed line is encrypted into,
+/// the Commit `/add` broadcasts, the peers `/resync` asks — is filtered through
+/// it, and it withholds the ids that group's own live roster no longer lists.
+/// So a keep buys the address the *vouching* group's fan-out, which is all it
+/// was ever for, and buys `gid`'s fan-out nothing. The two halves need each
+/// other in both directions: without the keep, one group's Commit revokes
+/// another group's delivery; without the scope, one group's roster overrides
+/// another group's Commit.
+///
 /// **A keep is provisional, and that is what makes "some group still lists it"
 /// true.** The vouch is read at one instant, and the vouching group can drop the
 /// peer straight afterwards — silently, since a group that is not the active one
@@ -2309,7 +2365,10 @@ fn seed_roster_locked(
 /// ticket. It does not make the vouch *unforgeable*: such a member can still
 /// seat a leaf claiming an arbitrary node id (see below) and thereby hold an
 /// address in the list; that is a keep, by a party the operator chose, and it
-/// is the narrower of the two directions.
+/// is the narrower of the two directions — narrower still since the scope
+/// below, because what such a keep holds is an address for the vouching
+/// group's own fan-out, the delivery that group was already making to it, and
+/// not a target of the group whose Commit it survived.
 ///
 /// **What Route 1 therefore covers.** Cross-group revocation is closed for a
 /// peer that another *operator-selected* group still lists. An address vouched
@@ -2421,12 +2480,14 @@ async fn prune_departed_recipients(
         // decide whether that peer should still be addressed here.
         (0, k) => format!(
             "[mls] {k} recipient(s) left group {gid} but are still members of another \
-             group selected in this session — keeping their address(es)"
+             group selected in this session — keeping their address(es) for that \
+             group; they are no longer sent group {gid}'s messages"
         ),
         (n, 0) => format!("[mls] dropped {n} recipient(s) removed from group {gid}"),
         (n, k) => format!(
             "[mls] dropped {n} recipient(s) removed from group {gid}; kept {k} that \
-             are still members of another group selected in this session"
+             are still members of another group selected in this session, for that \
+             group's traffic only — they are no longer sent group {gid}'s messages"
         ),
     };
     if dropped > 0 && unreadable > 0 {
@@ -2500,11 +2561,7 @@ fn decide_departures(
     // No baseline yet — never looked, or the seeding read failed while the
     // group was still unjoined. Record only; a departure is measurable
     // against the next epoch change, not this one.
-    let departed: std::collections::HashSet<[u8; 32]> =
-        match snaps.get(gid).and_then(|snap| snap.members.as_ref()) {
-            Some(prev) => prev.difference(&current).copied().collect(),
-            None => std::collections::HashSet::new(),
-        };
+    let departed = departed_since_baseline(gid, &current, snaps);
     // Which of the departures another operator-selected group still vouches
     // for. Skipped entirely when nothing departed, which is the common case
     // (every Add), so the usual epoch change still costs one roster read.
@@ -2531,10 +2588,116 @@ fn decide_departures(
     // re-added to `gid` comes back inside `current` and simply stops being a
     // departure, which is why this is recorded as roster state rather than
     // as a pending-departure list that would have to be cleaned up.
+    //
+    // It is also what makes the send scope durable: `recipients_for_group`
+    // takes the same difference against this snapshot every time `gid` is
+    // about to be addressed, so an id written out of it here would silently
+    // become one of `gid`'s delivery targets again on the strength of the
+    // other group's vouch — which is the whole of what the scope refuses.
     let mut next = current;
     next.extend(vouched.iter().copied());
     snaps.entry(*gid).or_default().members = Some(next);
     Ok((departed, vouched, unreadable))
+}
+
+/// The ids this session has **watched leave** `gid`: the baseline it holds for
+/// `gid`, minus `gid`'s live roster.
+///
+/// One definition of "departed from `gid`", used by both halves of the scope —
+/// [`decide_departures`], which prunes the shared list on it, and
+/// [`recipients_for_group`], which withholds `gid`'s fan-out on it. They must
+/// not drift: the prune keeps a departed id in the baseline precisely so that
+/// the send scope can go on seeing it as a departure.
+///
+/// No baseline — never looked — is **no departure**, not "everyone departed": a
+/// departure is only visible as the difference between two observations, and
+/// the list deliberately holds addresses no roster ever listed (`/peer`,
+/// `--mls-recipient-ticket`, and the members of the other groups the session
+/// addresses), which a roster match would delete and a difference cannot.
+fn departed_since_baseline(
+    gid: &GroupId,
+    current: &std::collections::HashSet<[u8; 32]>,
+    snaps: &RosterSnapshots,
+) -> std::collections::HashSet<[u8; 32]> {
+    match snaps.get(gid).and_then(|snap| snap.members.as_ref()) {
+        Some(prev) => prev.difference(current).copied().collect(),
+        None => std::collections::HashSet::new(),
+    }
+}
+
+/// The peers on a shared recipient list that **`gid`'s own traffic** may still
+/// be sent to.
+///
+/// `listen_loop` holds *one* recipient list across every group it can address —
+/// what `resolve_recipients` produced at startup plus every `/peer` typed since
+/// — while every message it sends is encrypted to exactly one group. Fanning
+/// that one list out unfiltered is what let another group's roster override an
+/// authenticated Remove: [`prune_departed_recipients`] keeps an address a
+/// second operator-selected group still lists, deliberately, so *that* group's
+/// delivery survives a Commit its members had no say in — and the kept entry
+/// then carried `gid`'s ciphertext, connection attempts, timing and sizes to
+/// the peer `gid` had just evicted, which is the leak the prune exists to
+/// close.
+///
+/// So the **list** is shared and the **send** is scoped. An id is withheld from
+/// `gid`'s fan-out exactly when this session has watched it leave `gid`'s
+/// roster ([`departed_since_baseline`]) — the same difference the prune acts
+/// on, taken for one group at the moment that group is about to be addressed.
+///
+/// Three properties come out of that shape, and each is load-bearing:
+///
+/// - **No address provenance is needed, and no second group can reach the
+///   decision.** It reads `gid`'s baseline and `gid`'s live roster and nothing
+///   else, so a member of another group can neither pin an id into `gid`'s
+///   fan-out nor push one out of it. The vouch decides who keeps an *address*;
+///   it decides nothing here.
+/// - **An address `gid`'s baseline never held is passed through.** `/peer`
+///   and `--mls-recipient-ticket` destinations are unfiltered by design, and
+///   the other groups' members are in the list for those groups' sake; none of
+///   them is in `gid`'s baseline, so none of them is a difference against it.
+/// - **No current member is ever withheld.** Everything dropped here is absent
+///   from `gid`'s live roster by construction.
+///
+/// **Failure is open, because there is nothing to fail closed *to*.** When
+/// `gid`'s state cannot be loaded, the caller's own next step loads it too and
+/// fails before any byte leaves: `send_application_message` loads the group
+/// inside its state-consistency guard before it encrypts, `resync_sweep` reads
+/// `load_group_summary` before it dials anyone, and `/add`'s Commit exists only
+/// because `processor.add_member` already loaded it. An unreadable roster
+/// therefore leaves no fan-out to scope, while guessing a departure here could
+/// only withhold a *current* member from the send that follows.
+///
+/// **Locks.** `rosters` then `recipients` — the one order this file uses — and
+/// never both at once: the roster read is synchronous, so the map guard is
+/// released before the list guard is taken. Nothing awaits while the map is
+/// held; [`decide_departures`] says why that matters.
+///
+/// [`chat_group_loop`] needs none of this. It addresses exactly one group and
+/// is the only key in its own map, so nothing there can ever vouch and there is
+/// no second group's traffic to keep an address for.
+async fn recipients_for_group(
+    processor: &GroupChatProcessor,
+    gid: &GroupId,
+    recipients: &tokio::sync::Mutex<Vec<PeerAddr>>,
+    rosters: &tokio::sync::Mutex<RosterSnapshots>,
+) -> Vec<PeerAddr> {
+    let departed = {
+        let snaps = rosters.lock().await;
+        match processor.current_member_node_ids(gid) {
+            Ok(current) => departed_since_baseline(gid, &current, &snaps),
+            // See "Failure is open" above: the caller's own load fails too.
+            Err(_) => std::collections::HashSet::new(),
+        }
+    };
+    // The map guard is dropped above, before this is taken.
+    let rs = recipients.lock().await;
+    if departed.is_empty() {
+        return rs.clone();
+    }
+    rs.iter()
+        .filter(|a| !departed.contains(a.peer_id.as_bytes()))
+        .cloned()
+        .collect()
 }
 
 /// Run a [`resync_sweep`] for a running listener, re-checking the recipient list
@@ -3616,10 +3779,20 @@ mod tests {
     /// residual 12. What it bounds is which group's Commit may speak for an
     /// address another selected group still lists.
     ///
-    /// Driven at `prune_departed_recipients` because `listen_loop` is the only
-    /// loop with a multi-group recipient list and it reads the process's real
-    /// stdin, so it cannot be driven from a test. The three cases below differ
-    /// *only* in what the session holds for group B.
+    /// **Keeping the address is only half of the scope, and case 1 pins the
+    /// other half.** The kept entry sits in the very list `listen_loop` fans
+    /// group A's own traffic out to, so keeping it for B's sake also kept the
+    /// peer a target of *A*'s: every line the operator typed while A was active
+    /// was encrypted to A and dialled at the node A's members had authenticated
+    /// a Commit to evict, and the same address served A's `/add` Commits and
+    /// A's `/resync` requests (F5). `recipients_for_group` scopes the **send**
+    /// rather than the list, so A's fan-out stops reaching him while B's — the
+    /// delivery B never revoked and had no say in — carries on.
+    ///
+    /// Driven at `prune_departed_recipients` and `recipients_for_group` because
+    /// `listen_loop` is the only loop with a multi-group recipient list and it
+    /// reads the process's real stdin, so it cannot be driven from a test. The
+    /// three cases below differ *only* in what the session holds for group B.
     #[tokio::test]
     async fn one_groups_removal_cannot_prune_another_groups_recipient() {
         let net = MockNetwork::new();
@@ -3736,6 +3909,48 @@ mod tests {
         assert!(
             !note.contains("dropped") && note.contains("another group"),
             "a retention must not read as a drop, got {note:?}"
+        );
+        // ...and it says what the keep does not cover. Reading "keeping their
+        // address(es)" as "still delivering this group's traffic to them" is
+        // exactly the belief the scope below makes false.
+        assert!(
+            note.contains(&format!("no longer sent group {gid_a}'s messages")),
+            "a retention must say it does not extend to the traffic of the group \
+             that removed them, got {note:?}"
+        );
+
+        // ---- case 1b: the keep is B's delivery path, not A's ----------------
+        // The list is shared; the send is not. Every fan-out `listen_loop`
+        // builds for a group goes through `recipients_for_group`, so A gets the
+        // revocation its members committed and B keeps the delivery it never
+        // revoked.
+        let for_a = recipients_for_group(&carol, &gid_a, &recipients, &rosters).await;
+        assert!(
+            !for_a.iter().any(|a| a.peer_id == bob_addr.peer_id),
+            "group A must not address a peer its own Commit removed, however many \
+             other selected groups keep his address in the shared list"
+        );
+        assert!(
+            for_a.iter().any(|a| a.peer_id == alice_addr.peer_id),
+            "the scope must not withhold a current member of the group"
+        );
+        let for_b = recipients_for_group(&carol, &gid_b, &recipients, &rosters).await;
+        assert!(
+            for_b.iter().any(|a| a.peer_id == bob_addr.peer_id),
+            "group B revoked nothing, so B's fan-out must still reach bob — losing \
+             it is the availability cost the keep exists to avoid"
+        );
+        assert!(
+            for_b.iter().any(|a| a.peer_id == alice_addr.peer_id),
+            "an address B's roster never listed is passed through, the way `/peer` \
+             and --mls-recipient-ticket destinations are"
+        );
+        // The shared list itself is untouched by the scope: it is read for a
+        // send, never rewritten by one.
+        assert_eq!(
+            recipients.lock().await.len(),
+            2,
+            "scoping a send must not mutate the session's recipient list"
         );
 
         // ---- case 2: group B arrived by Welcome and was never selected ------

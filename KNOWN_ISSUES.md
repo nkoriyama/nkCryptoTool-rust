@@ -993,6 +993,41 @@ trade-off is explicit rather than forgotten.
       that group. What no roster can do is prove the node id it lists, which is
       the whole of this item. It ends where the drop direction does: at restart,
       which re-resolves the list.
+    - **What a keep can no longer do** (2026-08): the address it holds is not a
+      delivery target of the group that removed the peer. Every read
+      `listen_loop` makes of its one shared recipient list that becomes traffic
+      **for a particular group** — the application message a typed line is
+      encrypted into, the Commit `/add` broadcasts, the peers an argument-less
+      `/resync` asks, and the tail the sweep re-derives between peers — goes
+      through `cli::recipients_for_group`, which withholds the ids that group's
+      own live roster no longer lists but this session's baseline for it still
+      does. So a keep, forged or genuine, buys an address the **vouching**
+      group's fan-out — the delivery that group was already making to it, and
+      that another group's Commit had no standing to revoke — and buys the
+      evicting group's fan-out nothing: no ciphertext, no dial, no timing, no
+      size. That decision reads one group's baseline and that same group's live
+      roster and nothing else, so no second group's membership can put an id
+      into it or take one out of it, and nothing on it is a current member of
+      the group being addressed. What a keep still buys is delivery from a group
+      whose roster never listed the id at all — the position an operator-typed
+      `/peer` or `--mls-recipient-ticket` address occupies, which is the drop
+      direction's subject above rather than this one's.
+    - **What the send scope does not announce.** The epoch-change notice reports
+      a keep and says the kept address is no longer sent that group's messages,
+      but the prune that emits it runs only for the group that is **active** at
+      the time its epoch advances. A peer removed from a group that was not
+      active is therefore withheld from that group's fan-out with no notice at
+      all, the next time the operator makes it active and sends — provided this
+      session had already taken a baseline for that group before the removal,
+      since a first look can only record. That is the same authenticated Remove
+      being honoured late rather than a new drop, and the address stays in the
+      list for the other groups. Two more edges, both
+      deliberate: because the scope is a difference against a baseline, an
+      address this session watched leave a group stays withheld from that
+      group's sends even if the operator re-types it with `/peer`, and
+      `/status`'s `peers=` still counts the whole shared list rather than the
+      active group's fan-out. A restart re-resolves the list from the address
+      book and clears every baseline with it.
     - **Why it is not fixed here**: the prune site has no authenticated identity
       to key on. A `PeerAddr` — the only thing the recipient list holds — carries
       a node id and nothing else, and every ticket on the MLS path is minted as

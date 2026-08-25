@@ -79,7 +79,17 @@ group could destroy another group's in-flight transfers (`A-F3`), silently
 revoke delivery to a peer whose relationship was a different group (`A-F7`),
 or end the whole listen session (`A-F6`). The SYNC responder served history
 from before the requester joined (`A-F10`). Each is now scoped per group and
-per join epoch.
+per join epoch. For `A-F7` that scope is two-sided as of 2026-08: keeping the
+address is what stops one group's Commit from revoking another group's
+delivery, and `cli::recipients_for_group` is what stops the kept address from
+being a delivery target of the group that committed the Remove — every fan-out
+`listen_loop` builds from its one shared recipient list is filtered down to the
+peers that group's own live roster still lists, plus the addresses no baseline
+of that group ever held (`/peer` and `--mls-recipient-ticket` destinations, and
+the members of the other groups the session addresses). Without the
+second half the first was an exemption an unauthenticated, self-asserted node
+id could aim at an authenticated Remove; `KNOWN_ISSUES.md` residual 12 records
+what the pair does and does not bound.
 
 ---
 
