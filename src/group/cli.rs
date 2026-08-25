@@ -1079,13 +1079,36 @@ pub async fn send_application_message(
     Ok(())
 }
 
+/// Render an `accept_next` failure for the operator, with the dialer's own
+/// bytes gated.
+///
+/// Nothing authenticates the dialer this error is about. `accept-one` prints
+/// its `Listening at:` ticket on stdout for an inviter to use, so any node that
+/// sees it can complete the QUIC handshake with a self-generated keypair, close
+/// without ever opening a stream, and choose the application-close reason —
+/// which arrives here inside `Transport(Accept("accept_bi: …"))`. On the
+/// one-shot `--mls-cmd accept-one` path that string is the only output besides
+/// `render_event`'s `[joined] <gid>` line, and `main` prints the error this
+/// feeds verbatim, so an ungated reason could erase the real line and paint a
+/// forged one in the same format — naming a group the operator was never added
+/// to, at the moment they are deciding whether the invitation they accepted was
+/// the intended one. Strip the control/bidi characters and bound the length:
+/// the same gate `listen_loop` and `chat_group_loop`'s inbound tasks already
+/// apply to this very error. Truncating is safe here — every `GroupError`
+/// variant prints its own scaffolding (`transport: accept failed: …`) first and
+/// the peer's bytes last, so the cut can only drop attacker-chosen tail, never
+/// a diagnostic the operator needs.
+fn describe_accept_failure(e: &crate::group::GroupError) -> String {
+    crate::utils::sanitize_for_terminal_bounded(&e.to_string(), 256)
+}
+
 pub async fn accept_one(
     processor: &GroupChatProcessor,
 ) -> anyhow::Result<IncomingGroupEvent> {
     processor
         .accept_next()
         .await
-        .map_err(|e| anyhow!("accept_next: {e}"))
+        .map_err(|e| anyhow!("accept_next: {}", describe_accept_failure(&e)))
 }
 
 /// Print our own reachable address as a `Ticket` string.
@@ -4402,6 +4425,48 @@ mod tests {
         assert!(
             roster.contains("ERR\\x01") && pruned.contains("ERR\\x02"),
             "each line names the wire code it is reporting, got: {roster:?} / {pruned:?}"
+        );
+    }
+
+    /// The dialer an `accept_next` failure is about is unauthenticated: the
+    /// ticket `accept-one` prints is meant to be handed to an inviter, so
+    /// anyone who sees it can dial, complete the handshake with a self-generated
+    /// keypair, and close with a reason of its choosing instead of opening a
+    /// stream. `main` prints the error `accept_one` returns verbatim, and on
+    /// that path it is the only line the operator gets besides `[joined] <gid>`
+    /// — so the reason has to reach the terminal unable to move the cursor,
+    /// erase that line, or flood the scrollback.
+    #[test]
+    fn an_accept_failure_cannot_repaint_the_line_accept_one_shows() {
+        let forged = crate::group::GroupError::Transport(crate::p2p::P2pError::Accept(format!(
+            "accept_bi: closed by peer: \u{1b}[2K\r[joined] {}",
+            "ab".repeat(32)
+        )));
+        let line = describe_accept_failure(&forged);
+        assert!(
+            !line.contains('\u{1b}') && !line.contains('\r'),
+            "an unauthenticated dialer's close reason must not carry cursor motion or a \
+             carriage return into the operator's only line, got: {line:?}"
+        );
+        assert!(
+            line.contains("accept_bi"),
+            "while the diagnostic itself still has to survive the gate, got: {line:?}"
+        );
+
+        // Bounded too: a peer that keeps reconnecting must not be able to push
+        // the join line out of the scrollback one close reason at a time.
+        let flood =
+            crate::group::GroupError::Transport(crate::p2p::P2pError::Accept("x".repeat(4096)));
+        let bounded = describe_accept_failure(&flood);
+        assert!(
+            bounded.chars().count() <= 256 + "…[truncated]".chars().count(),
+            "got {} chars",
+            bounded.chars().count()
+        );
+        assert!(
+            bounded.starts_with("transport: accept failed:"),
+            "and the cut takes the peer's tail, not the scaffolding printed in front of \
+             it, got: {bounded:?}"
         );
     }
 
