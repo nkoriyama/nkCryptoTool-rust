@@ -1153,13 +1153,47 @@ already had.
     `.part` files. That is the cross-principal destruction commit `d689865a`
     exists to prevent.
 
-    **The untried direction is the finding's own second recommendation:
-    partition the pool** so no single principal — ideally no single group —
-    can hold more than a fraction of `MAX_CONCURRENT_TRANSFERS`. Both attempts
-    took only the first recommendation (an expiry sweep). Partitioning judges
-    no evidence and needs no clock: it removes the ability to hold more than a
-    share, which is the shape of every fix in this codebase that survived
-    review.
+    **A third fix was attempted on 2026-08-26 and also declined**, and what it
+    established is worth more than the fix would have been.
+
+    Partitioning is *partly* done already and this entry said otherwise when it
+    was first written: `MAX_TRANSFERS_PER_SENDER = 4` exists (`d689865a`), but
+    it is keyed on `(group, sender)`, so it bounds one sender within one group
+    and bounds neither a single group nor a single attacker identity spread
+    across groups. The finding's recommendation said "no single principal **and
+    ideally no single group**"; the group half is what remains untried. One
+    group with four members already fills all sixteen slots, which the file's
+    own `fill_to_cap` test helper demonstrates by holding the group fixed.
+
+    The third attempt tried to attack *permanence* instead of breadth: free a
+    group's slots when an MLS Remove Commit ejects us from it, since a Remove is
+    an authenticated fact the code already carries rather than an idleness
+    measure an attacker drives. Two premises collapsed.
+
+    First, `handle_removal` fires only when the LOCAL node is removed and
+    carries only `remover_index`, never the removed member's leaf — and
+    `--mls-cmd remove-member` runs in a different process from the `listen_loop`
+    that owns the reassembler, with no REPL or GUI path between them. **An
+    operator who ejects an abuser cannot get the slots back today, and no change
+    confined to `handle_removal` can make that work.**
+
+    Second, and this is the fact to carry forward: **the slots held by a group
+    we were removed from are not dead.** mls-rs skips `update_key_schedule`
+    entirely when the Commit removes self, so our epoch freezes at N and
+    epoch-N frames keep decrypting indefinitely — the three-epoch retention
+    limit never applies, and the remover can withhold the Commit from a sender
+    to keep that sender on epoch N for as long as it likes. A probe completed a
+    bystander's transfer *after* the removal. So freeing those slots is not
+    reclaiming dead state; it is destroying live state, and since any member may
+    Remove any leaf (there is no application-level admin check), it would let
+    any member of a group make our node unlink every other sender's staging
+    files at a moment of their choosing — the cross-principal reach the comment
+    on `MAX_CONCURRENT_TRANSFERS` explicitly forbids.
+
+    The verdict is the useful summary: the change would have closed the case an
+    attacker has no motive to enter — after it, removing us would hand the slots
+    back — while arming the case they do. An attacker who simply never removes
+    us keeps their slots regardless.
 
 15. **A ticket's `direct_addrs` are bounded in number but not in kind**
     (`p2p/backend/iroh.rs`; scan `CLAUDE-SECURITY-20260821-233021` F2, same
