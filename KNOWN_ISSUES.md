@@ -99,6 +99,23 @@ trade-off is explicit rather than forgotten.
    old code derived on a first draw, so no honest sender is turned away; what
    changed is that it is now durable, and only PUBLISH can move it afterwards.
 
+   **This fix is itself the cause of an open MEDIUM finding**
+   (`CLAUDE-SECURITY-20260821-233021`, F5 — unfixed, no patch attempted yet).
+   `prekey_level_and_mark` is called from `draw_prekey` while the
+   process-global `prekey_reserve` `std::sync::Mutex` is held, and it may open a
+   redb *write* transaction and commit; `fetch_prekey`, also inside that
+   section, always does. Two durable commits therefore run under a blocking
+   mutex on a tokio worker, driven by an **unauthenticated** FETCH — so a flood
+   stalls the whole relay: group delivery, Welcome delivery and prekey
+   publication all stop for its duration. The suggested repair is to run the
+   critical section off the async workers.
+
+   It is worth being plain about the sequence, because it is the third time in
+   this engagement that a repair became the next round's finding: this residual
+   was written to record a defence added in 2026-08, and the audit of that same
+   2026-08 range found the defence's own new call the cause of a relay stall.
+   Adding a mechanism has a cost that is not visible from the finding it closes.
+
    Regression tests: `a_forced_prune_cannot_collapse_a_victims_reserve_floor`
    runs the whole sequence (drain to the floor, flood the table with 4096
    attacker-stocked recipients, draw again) against a marked pool,
@@ -1075,3 +1092,103 @@ of unverified plaintext, the `Ticket::from_str` DoS, plaintext ECC keys, and
 the weak PBKDF2 iteration count — were fixed; see the git history.)
 
 
+
+## Open, MEDIUM, patch attempted and declined (2026-08)
+
+These are **not** accepted residuals and must not be read as the section above.
+Each is an unfixed MEDIUM finding that a fix was written for — verified, run,
+and then rejected because the fix introduced a capability worse than the one it
+closed. The rejected implementations, their diffstats and the exact objection
+that killed each are kept in the scan directories named below; those directories
+are outside git, so the summary here is the durable record.
+
+The pattern the three share, which is the reason to record them together: the
+repair added a **mechanism**, and the mechanism itself came under the
+attacker's influence. Fixes in this codebase that landed did the opposite —
+they removed attacker-controlled input from a decision using values the tree
+already had.
+
+13. **At-rest anti-rollback binds only the KEK** (`group/at_rest.rs`,
+    `group/rollback.rs`; scan `CLAUDE-SECURITY-20260820-195218`, F3). An
+    attacker who can substitute an older `groups.db` is accepted under every
+    `NK_ROLLBACK_POLICY` value, because freshness is bound to the key wrapper
+    and not to the database that holds the state.
+
+    **Four implementations, all declined.** Every one bound freshness with a
+    counter, and a counter cannot tell an attack from an accident: the
+    substituted database and the operator's own restored backup produce the
+    same mismatch. So each attempt closed the rollback and opened a
+    denial-of-recovery. The second locked an uncompromised database
+    permanently unopenable after a single run with `NK_ROLLBACK_POLICY` unset
+    — the default, which a cron job, a systemd unit or `sudo` reaches — with
+    an error accusing the operator of tampering. The fourth closed every
+    earlier objection, was independently reproduced by the verifier against
+    the production path, and still granted a new capability: an attacker with
+    the finding's own privilege deletes `groups.db`, one ordinary open
+    renumbers the empty database at anchor+1, and **the operator's newest
+    genuine backup is then refused as stale**. At the patch base, restoring
+    any copy opened.
+
+    A fifth attempt along the same design will meet the same wall. What is
+    needed is evidence that distinguishes attack from accident, from somewhere
+    an attacker cannot forge; the KEK is already bound and is what the finding
+    starts from.
+
+14. **A single group member can permanently starve inbound file transfers**
+    (`group/file_xfer.rs`; scans `CLAUDE-SECURITY-20260820-195218` F4 and
+    `CLAUDE-SECURITY-20260821-233021` F4 — found twice, from different
+    scopes). The reassembly pool holds 16 slots shared across all senders and
+    groups, and the aggregate cap refuses at the limit rather than reclaiming,
+    so one authenticated member holding all 16 stops every other transfer for
+    good.
+
+    **Two implementations, both declined**, and both failed the same way: they
+    reclaimed slots on an idleness measure the attacker drives. The first used
+    wall-clock idleness — an attacker who stalls the receiver's serialized
+    accept loop makes another sender's live transfer look abandoned. The
+    second used a service clock advancing only while the receiver ingests, but
+    every ingested frame advances it including junk, so one attacker frame per
+    60 seconds drives it at wall-clock rate; the verifier reproduced the
+    destruction of all 16 other-principal transfers and the unlinking of their
+    `.part` files. That is the cross-principal destruction commit `d689865a`
+    exists to prevent.
+
+    **The untried direction is the finding's own second recommendation:
+    partition the pool** so no single principal — ideally no single group —
+    can hold more than a fraction of `MAX_CONCURRENT_TRANSFERS`. Both attempts
+    took only the first recommendation (an expiry sweep). Partitioning judges
+    no evidence and needs no clock: it removes the ability to hold more than a
+    share, which is the shape of every fix in this codebase that survived
+    review.
+
+15. **A ticket's `direct_addrs` are bounded in number but not in kind**
+    (`p2p/backend/iroh.rs`; scan `CLAUDE-SECURITY-20260821-233021` F2, same
+    defect as the other scan's F9). `Ticket::from_str` now keeps at most 32
+    addresses (`aab8f007`), so the 65535-target fan-out is closed. What is
+    **not** closed is that an unspecified, multicast or IPv4-broadcast address
+    among those 32 still becomes a hole-punch target — a reflection primitive,
+    since one datagram reaches every listener on the victim's link.
+
+    **The filter for it was written, passed verification twice, and was
+    declined by the adversarial review**, which found it hands an attacker a
+    way to make a victim unreachable. Nothing validates the addresses a node
+    advertises about *itself*: `portmapper`'s UPnP path checks only that the
+    address is v4, iroh's `update_direct_addresses` does not check at all, and
+    `peer_addr_from_iroh` copies whatever results into the node's own tickets.
+    A LAN-adjacent host that wins the SSDP race and answers as a fake IGD — or
+    the operator of the relay in use, via the QAD observed address — can
+    therefore put a refused kind into the victim's own address set. A peer that
+    refuses the whole ticket then **drops the relay address with it**, because
+    the error returns before the address list is assembled, so the victim
+    becomes unreachable even by relay; before the patch that entry was one dead
+    dial target and the connection succeeded.
+    `group::processor::put_member_addr` re-serialises and persists the parsed
+    ticket, so the poisoning outlives the attacker.
+
+    Two directions were not tried and are the place to start: filter on the
+    **emitting** side in `peer_addr_from_iroh`, so a poisoned address never
+    reaches our own ticket; and/or drop the offending entry instead of the
+    ticket, so the relay survives. The declined diff and the full reasoning are
+    in that scan directory's `rejected-diffs/`, and the doc comment on
+    `validate_peer_relay_url` carries a short form of it so the next reader who
+    notices the missing filter finds out why it is missing.
