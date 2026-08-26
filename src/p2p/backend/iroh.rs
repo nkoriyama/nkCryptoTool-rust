@@ -82,20 +82,43 @@ fn refuse_relay_url(raw: &str, reason: &str) -> CryptoError {
 ///    (`--relay-url`) is accepted whatever it looks like. Self-hosting a relay
 ///    is a documented, privacy-motivated workflow (README §"リレー",
 ///    `docs/guides/CHAT_USAGE_GUIDE.md`, `docs/reports/ZTNA_AVAILABILITY.md`),
-///    and a LAN or lab relay lives at exactly the kind of address rule 3
-///    refuses. The operator already named this URL on their own command line,
-///    so it is their decision, not the peer's — this is the explicit opt-in
-///    that keeps the local-relay case reachable instead of silently broken.
+///    and a LAN or lab relay lives at exactly the kind of address — or bears
+///    exactly the kind of name (`relay.home.arpa`, `relay.internal`) — that
+///    rule 3 refuses. The operator already named this URL on their own command
+///    line, so it is their decision, not the peer's — this is the explicit
+///    opt-in that keeps the local-relay case reachable instead of silently
+///    broken.
 /// 2. The scheme must be `https` or `wss`. `http`/`ws` are refused because they
 ///    dial in plaintext; everything else is refused because iroh would silently
 ///    promote it to `wss` and dial anyway.
-/// 3. A literal IP host must be globally routable, and the name `localhost`
-///    (with or without a trailing dot, and `*.localhost`, which RFC 6761
-///    reserves for the loopback) is refused.
+/// 3. The host itself. Three separate claims, deliberately not merged because
+///    they are not equally strong. All are decided on the literal string;
+///    nothing is resolved.
+///
+///    - A literal IP address must be globally routable.
+///    - A name in one of the namespaces of `NON_PUBLIC_HOST_SUFFIXES` is
+///      refused. All but one are reserved — by an RFC, or by ICANN — for
+///      loopback, link-local, private, testing, documentation or
+///      never-resolved use; `.localdomain` rests on long-standing convention
+///      rather than on a reservation. Either way, none of them can denote a
+///      host on the public internet.
+///    - A single-label (dotless) name is refused. This is a weaker claim than
+///      the one above and does not rest on a reservation: ICANN prohibits
+///      dotless TLDs by contract (2013 board resolution, following SSAC's
+///      SAC053), so no dotless name is resolvable on the public internet
+///      today, and a resolver instead completes such a name through the
+///      querying host's own DNS search domains, which makes it an intranet
+///      name in practice. The cost of resting on a contractual prohibition
+///      rather than a reservation: were it ever lifted, a dotless public relay
+///      would be refused here — and rule 1 is the operator's escape hatch for
+///      that, as it is for every other refusal in this function.
 ///
 /// Residual, deliberately not closed here: this checks the *literal* host, and
-/// performs no DNS resolution. A hostname that resolves to 127.0.0.1 or an
-/// RFC1918 address still passes. Resolving instead would mean performing an
+/// performs no DNS resolution. Rule 3 can therefore refuse only what the
+/// string itself gives away; a dotted name outside those namespaces that
+/// nevertheless resolves to 127.0.0.1 or an RFC1918 address — a wildcard-DNS
+/// name such as `127.0.0.1.nip.io`, or an ordinary public A record its owner
+/// points inward — still passes. Resolving instead would mean performing an
 /// attacker-directed DNS lookup during validation and would still be a
 /// time-of-check/time-of-use gap against the resolution iroh performs when it
 /// dials, so it would buy an appearance of safety rather than safety — this is
@@ -107,14 +130,33 @@ fn refuse_relay_url(raw: &str, reason: &str) -> CryptoError {
 ///
 /// This is *not* a general validator for everything a ticket names, and must
 /// not be read as one: the same ticket's `direct_addrs` are equally
-/// attacker-chosen and are pushed into the `EndpointAddr` above unchecked. That
-/// is a deliberate scope decision, not an oversight. They are `SocketAddr`
-/// targets for iroh's QUIC/UDP holepunching — a weaker primitive than the TCP
-/// connection plus WebSocket upgrade a relay URL buys — and filtering them here
-/// would both exceed the scope of the finding this function answers and break
-/// the loopback smoke tests, which reach a peer over `127.0.0.1` direct
-/// addresses with the relay disabled. If they are to be constrained, it belongs
-/// in its own change, with the test fixtures moved off loopback first.
+/// attacker-chosen. How many of them there can be is bounded — `Ticket::from_str`
+/// keeps at most `MAX_DIRECT_ADDRS` — but *what* they are is not checked here at
+/// all, and every one that survives that bound is pushed into the `EndpointAddr`
+/// above. They are `SocketAddr` targets for iroh's QUIC/UDP holepunching, a
+/// weaker primitive than the TCP connection plus WebSocket upgrade a relay URL
+/// buys, and loopback and RFC1918 among them are load-bearing: LAN
+/// holepunching needs them, and the loopback smoke tests in this file's own
+/// `mod tests` reach a peer over `127.0.0.1` direct addresses with the relay
+/// disabled.
+///
+/// Refusing a *kind* of address here — unspecified, multicast, IPv4 broadcast,
+/// none of which any honest peer publishes — was implemented, verified twice,
+/// and then declined on 2026-08-26, for a reason worth recording so it is not
+/// simply retried: refusing the ticket hands an attacker a way to make the
+/// victim unreachable. Nothing validates the addresses a node advertises about
+/// *itself*. A LAN-adjacent host that wins the SSDP race and answers as a fake
+/// IGD, or the operator of the relay in use, can put such an address into the
+/// victim's own set (`portmapper`'s `upnp.rs` checks only that it is v4; iroh's
+/// `update_direct_addresses` does not check at all), and `peer_addr_from_iroh`
+/// below copies it into the victim's tickets unconditionally. A peer that
+/// refuses the whole ticket then drops the relay address with it — the `Err`
+/// returns before `addrs` is assembled — so the victim becomes unreachable even
+/// by relay, where before it merely carried one dead dial target.
+/// `group::processor::put_member_addr` persists the re-serialised ticket, so the
+/// poisoning outlives the attacker. Whoever constrains these next should filter
+/// on the emitting side in `peer_addr_from_iroh`, or drop the offending entry
+/// rather than the ticket, so the relay survives.
 fn validate_peer_relay_url(
     raw: &str,
     configured_relay: Option<&iroh::RelayUrl>,
@@ -166,12 +208,76 @@ fn validate_peer_relay_url(
         }
     } else {
         let name = host.trim_end_matches('.').to_ascii_lowercase();
-        if name == "localhost" || name.ends_with(".localhost") {
-            return Err(refuse_relay_url(raw, "the host names the loopback"));
+        if let Some(suffix) = non_public_host_suffix(&name) {
+            return Err(refuse_relay_url(
+                raw,
+                &format!(
+                    "the host is in `.{suffix}`, a namespace set aside for \
+                     loopback, link-local, private, testing, documentation or \
+                     never-resolved use, so it cannot name a relay on the \
+                     public internet"
+                ),
+            ));
+        }
+        if !name.contains('.') {
+            return Err(refuse_relay_url(
+                raw,
+                "the host is a dotless name; ICANN prohibits dotless TLDs, so \
+                 no such name resolves on the public internet — a resolver \
+                 completes it through this machine's own DNS search domains",
+            ));
         }
     }
 
     Ok(url)
+}
+
+/// Namespaces that cannot name a host on the public internet. Every entry but
+/// `localdomain` is reserved by an RFC or by ICANN for loopback, link-local,
+/// private, testing, documentation or never-resolved use; `localdomain` is the
+/// historical `/etc/hosts` companion of `localhost` and rests on convention,
+/// not on a reservation. A relay URL naming any of them is either a probe of
+/// the victim's own host/LAN or a name that can never resolve publicly.
+///
+/// This is a fixed table of literal strings, matched against the literal
+/// hostname. It performs no lookup of any kind and is deliberately not a
+/// substitute for one: see the residual paragraph on `validate_peer_relay_url`.
+///
+/// - `localhost`   RFC 6761 §6.3 — the loopback
+/// - `local`       RFC 6762 — mDNS; "this link only"
+/// - `home.arpa`   RFC 8375 — residential home networks
+/// - `internal`    ICANN-reserved for private use (2024)
+/// - `localdomain` the historical `/etc/hosts` companion of `localhost`
+/// - `invalid`     RFC 6761 §6.4 — guaranteed not to resolve
+/// - `test`        RFC 6761 §6.2 — testing only
+/// - `example`     RFC 6761 §6.5 — documentation only
+/// - `alt`         RFC 9476 — non-DNS namespaces
+const NON_PUBLIC_HOST_SUFFIXES: [&str; 9] = [
+    "localhost",
+    "local",
+    "home.arpa",
+    "internal",
+    "localdomain",
+    "invalid",
+    "test",
+    "example",
+    "alt",
+];
+
+/// The entry of [`NON_PUBLIC_HOST_SUFFIXES`] that `name` sits under, if any.
+/// `name` must already be lowercased with any trailing dot stripped, matching
+/// the idiom at the call site. An entry matches the whole name (`local`) or a
+/// label-aligned suffix of it (`printer.local`), never a bare substring: a name
+/// that merely contains one of these labels — `local.example.com`,
+/// `internal-relay.example.com` — is an ordinary public name and is not
+/// matched.
+fn non_public_host_suffix(name: &str) -> Option<&'static str> {
+    NON_PUBLIC_HOST_SUFFIXES.iter().copied().find(|suffix| {
+        name == *suffix
+            || name
+                .strip_suffix(suffix)
+                .is_some_and(|head| head.ends_with('.'))
+    })
 }
 
 /// Whether `ip` is an address that belongs on the public internet, i.e. not one
@@ -1497,6 +1603,116 @@ mod tests {
         ] {
             refused(url);
         }
+    }
+
+    /// The intranet half of the same primitive: a name that *cannot by
+    /// definition* denote a public host. Each of these namespaces is reserved
+    /// — by an RFC or by ICANN — for loopback, link-local, private or
+    /// never-resolved use, so a ticket naming one is pointing the victim's node
+    /// at the victim's own machine or LAN. Decided on the literal string; no
+    /// name here is resolved.
+    #[test]
+    fn peer_relay_url_refuses_namespaces_that_cannot_be_public() {
+        for url in [
+            "https://local",                 // RFC 6762 mDNS
+            "https://printer.local",
+            "https://home.arpa",             // RFC 8375
+            "https://relay.home.arpa",
+            "https://internal",              // ICANN private-use, 2024
+            "https://vault.internal",
+            "https://localdomain",           // /etc/hosts companion of localhost
+            "https://host.localdomain",
+            "https://invalid",               // RFC 6761 §6.4
+            "https://whatever.invalid",
+            "https://test",                  // RFC 6761 §6.2
+            "https://relay.test",
+            "https://example",               // RFC 6761 §6.5
+            "https://relay.example",
+            "https://alt",                   // RFC 9476
+            "https://something.alt",
+            // Case folding and the DNS root's trailing dot must not slip past,
+            // exactly as they do not for `localhost`.
+            "https://Printer.LOCAL",
+            "https://relay.home.arpa.",
+            "https://VAULT.Internal.",
+        ] {
+            let msg = refused(url);
+            assert!(
+                msg.contains("refusing the relay URL in this ticket"),
+                "{url}: refusal must say what was refused, got {msg:?}"
+            );
+        }
+    }
+
+    /// A dotless name. ICANN prohibits dotless TLDs by contract, so no such
+    /// name resolves on the public internet today, and a resolver completes it
+    /// through the querying host's own DNS search domains instead — an
+    /// intranet name in practice. Weaker than the reserved-namespace table
+    /// above, which is why rule 3 states the two separately.
+    #[test]
+    fn peer_relay_url_refuses_single_label_names() {
+        for url in [
+            "https://intranet",
+            "https://wiki:8080",
+            "https://git",
+            "https://JENKINS",
+            "https://router.", // trailing dot only — still a single label
+        ] {
+            refused(url);
+        }
+    }
+
+    /// Rule 1 still comes first and is untouched: a relay the operator named on
+    /// their own command line stays dialable even when its *name* is one rule 3
+    /// now refuses. Self-hosting `relay.home.arpa` must keep working.
+    #[test]
+    fn configured_relay_is_the_operators_opt_in_for_a_reserved_name() {
+        for (configured, from_ticket) in [
+            ("https://relay.home.arpa", "https://relay.home.arpa"),
+            // Ticket text comes out of `RelayUrl::to_string()` (trailing slash);
+            // what the operator typed usually has none.
+            ("https://relay.internal", "https://relay.internal/"),
+            ("https://nas.local:3340", "https://nas.local:3340"),
+            ("https://relay", "https://relay"), // single label
+        ] {
+            let cfg = iroh::RelayUrl::from_str(configured).unwrap();
+            assert!(
+                validate_peer_relay_url(from_ticket, Some(&cfg)).is_ok(),
+                "{from_ticket}: the operator's own relay must still be dialable"
+            );
+            assert!(
+                validate_peer_relay_url("https://someone-else.home.arpa", Some(&cfg)).is_err(),
+                "{configured}: the exemption is that one URL, not the namespace"
+            );
+        }
+    }
+
+    /// The table matches whole labels at the end of the name, never a bare
+    /// substring, so ordinary public FQDNs that merely contain one of the
+    /// reserved words are untouched.
+    #[test]
+    fn peer_relay_url_accepts_public_names_containing_a_reserved_word() {
+        for url in [
+            "https://local.example.com",
+            "https://internal-relay.example.com",
+            "https://test.relay.example.net",
+            "https://home.arpa.example.com",
+            "https://mylocal.example.com",
+            "https://relay.alternate.example.com",
+        ] {
+            assert!(
+                validate_peer_relay_url(url, None).is_ok(),
+                "{url} is an ordinary public relay and must still be dialable"
+            );
+        }
+        // The left edge of the match is a label boundary, not a character
+        // offset: a last label that merely *ends with* a reserved word is not
+        // that namespace. (Said of the matching rule, not of this name's
+        // merits as a relay.)
+        assert!(
+            validate_peer_relay_url("https://relay.notlocal", None).is_ok(),
+            "`.notlocal` is not `.local`; the suffix match must be label-aligned"
+        );
     }
 
     #[test]
