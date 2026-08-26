@@ -8,11 +8,50 @@ use serde::{Deserialize, Serialize};
 
 const CRC_ISO: Crc<u32> = Crc::<u32>::new(&CRC_32_ISO_HDLC);
 
+/// Largest number of direct addresses kept from a ticket.
+///
+/// The wire format carries the count as a `u16`, so a ticket can name up to
+/// 65535 dial targets, and every one of them becomes a QUIC / hole-punch UDP
+/// destination for whoever pastes or scans the ticket. The count is written by
+/// the ticket's author and the CRC is no barrier (the author computes it), so
+/// the only thing that can bound it is a constant.
+///
+/// Entries past this one are parsed — their bytes must be consumed, the
+/// fingerprint fields follow the list — and then dropped, rather than the
+/// ticket being refused. Truncating is not a weakening: the property this bound
+/// exists for is how many addresses we will dial, and that is 32 either way.
+/// What refusing would add is an availability failure, because nothing bounds
+/// the *emitting* side. `Endpoint::addr()` hands back the address set that
+/// iroh's `update_direct_addresses` collected, with no limit applied on the
+/// publish path, and this file's `Display` writes `len() as u16` unconditionally
+/// — so a host with more than 32 interface addresses (iroh 1.0 `socket.rs`
+/// lines 141-144 cite a real macOS machine with >25, from VPN TUN plus docker
+/// interfaces) would mint tickets that our own parser rejected, with nothing on
+/// the emitting side to tell it.
+///
+/// 32 is chosen against what iroh can actually use, not against anything it
+/// enforces when publishing: `MAX_NON_RELAY_PATHS = 30` (iroh 1.0
+/// `src/socket/remote_map/remote_state/path_state.rs:18`) is the number of
+/// non-relay paths a connection will hold, so addresses past the first 32
+/// cannot increase the number of concurrent paths. They are not, however,
+/// worthless: iroh's `prune_non_relay_paths` drops paths that have *failed*,
+/// not surplus candidates, so a further address is candidate diversity. What
+/// a peer publishing more than 32 gives up is therefore a direct path whose
+/// only working candidate sits past the cut — it reaches us by its relay
+/// instead. The same number bounds what iroh itself will accept from a remote
+/// (`MAX_QNT_ADDRESSES`, its receive-side cap), so such a peer could not have
+/// advertised more than 32 over the QUIC channel either.
+pub(crate) const MAX_DIRECT_ADDRS: usize = 32;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Ticket {
     pub version: u8,
     pub node_id: [u8; 32],
     pub relay_url: Option<String>,
+    /// Direct dial candidates. When this `Ticket` came from [`Ticket::from_str`]
+    /// this is a possibly-shortened view of what the ticket declared: at most
+    /// [`MAX_DIRECT_ADDRS`] are retained, the first that many in declaration
+    /// order. Every declared entry is still parsed and validated.
     pub direct_addrs: Vec<SocketAddr>,
     pub pqc_fp_algo: u8,
     pub pqc_sign_fp: [u8; 32],
@@ -121,26 +160,37 @@ impl FromStr for Ticket {
 
         let direct_addrs_count =
             u16::from_le_bytes(take(&mut offset, 2)?.try_into().unwrap()) as usize;
-        // Cap the pre-allocation: a bogus count can claim up to 65535 while the
-        // body is short, so size modestly and let the Vec grow as `take`
-        // actually yields verified entries.
-        let mut direct_addrs = Vec::with_capacity(direct_addrs_count.min(16));
+        // Bound the dial targets a ticket can name at `MAX_DIRECT_ADDRS` by
+        // keeping the first that many and dropping the rest. The declared count
+        // is the ticket author's and a bogus one can claim up to 65535, so it
+        // never sizes the allocation either.
+        //
+        // NOTE for the reader of this type: `direct_addrs` is therefore a
+        // possibly-shortened view of what the ticket declared. Every declared
+        // entry is still parsed and its bytes consumed — the cursor has to land
+        // on `pqc_fp_algo` after the list, and a malformed entry anywhere,
+        // including past the cap, must still fail the whole parse — but only
+        // the first `MAX_DIRECT_ADDRS` are retained.
+        let mut direct_addrs = Vec::with_capacity(direct_addrs_count.min(MAX_DIRECT_ADDRS));
         for _ in 0..direct_addrs_count {
             let family = take(&mut offset, 1)?[0];
-            match family {
+            let addr = match family {
                 4 => {
                     let ip: [u8; 4] = take(&mut offset, 4)?.try_into().unwrap();
                     let port = u16::from_le_bytes(take(&mut offset, 2)?.try_into().unwrap());
-                    direct_addrs.push(SocketAddr::new(std::net::IpAddr::V4(ip.into()), port));
+                    SocketAddr::new(std::net::IpAddr::V4(ip.into()), port)
                 }
                 6 => {
                     let ip: [u8; 16] = take(&mut offset, 16)?.try_into().unwrap();
                     let port = u16::from_le_bytes(take(&mut offset, 2)?.try_into().unwrap());
-                    direct_addrs.push(SocketAddr::new(std::net::IpAddr::V6(ip.into()), port));
+                    SocketAddr::new(std::net::IpAddr::V6(ip.into()), port)
                 }
                 other => {
                     return Err(CryptoError::Parameter(format!("Invalid IP family: {}", other)))
                 }
+            };
+            if direct_addrs.len() < MAX_DIRECT_ADDRS {
+                direct_addrs.push(addr);
             }
         }
 
@@ -264,6 +314,91 @@ mod tests {
         // length field.
         body[33..35].copy_from_slice(&80u16.to_le_bytes());
         assert!(Ticket::from_str(&encode_ticket(&body)).is_err());
+    }
+
+    /// Build a ticket carrying `n` distinct, perfectly ordinary IPv4 direct
+    /// addresses, in the exact wire form a peer would hand us.
+    fn ticket_with_direct_addrs(n: usize) -> Ticket {
+        Ticket {
+            version: 1,
+            node_id: [7u8; 32],
+            relay_url: None,
+            direct_addrs: (0..n)
+                .map(|i| {
+                    SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                            192,
+                            0,
+                            2,
+                            (i % 250) as u8 + 1,
+                        )),
+                        4433 + i as u16,
+                    )
+                })
+                .collect(),
+            pqc_fp_algo: 0,
+            pqc_sign_fp: [0u8; 32],
+            pqc_enc_fp: [0u8; 32],
+        }
+    }
+
+    #[test]
+    fn direct_addrs_count_at_the_cap_is_accepted() {
+        let t = ticket_with_direct_addrs(MAX_DIRECT_ADDRS);
+        let parsed = Ticket::from_str(&t.to_string()).expect("a ticket at the cap must parse");
+        assert_eq!(parsed.direct_addrs, t.direct_addrs);
+    }
+
+    #[test]
+    fn direct_addrs_over_the_cap_are_truncated_to_the_first_32_not_refused() {
+        // One past the cap, with every declared address actually present: the
+        // ticket parses, and exactly the first `MAX_DIRECT_ADDRS` survive, in
+        // the order the ticket gave them. A large ticket is never refused —
+        // nothing bounds the emitting side, so refusing would break a
+        // legitimately multi-homed peer.
+        let t = ticket_with_direct_addrs(MAX_DIRECT_ADDRS + 1);
+        let parsed = Ticket::from_str(&t.to_string()).expect("an over-cap ticket must still parse");
+        assert_eq!(parsed.direct_addrs.len(), MAX_DIRECT_ADDRS);
+        assert_eq!(
+            parsed.direct_addrs.as_slice(),
+            &t.direct_addrs[..MAX_DIRECT_ADDRS],
+            "the first 32 declared addresses are kept, in order"
+        );
+
+        // …and the u16 maximum, which is the shape a hostile ticket takes: a
+        // huge count over a short body. Still an error — truncating what we
+        // *keep* does not stop us parsing what was *declared*, so the body runs
+        // out and `take` refuses it.
+        let mut body = vec![4u8; 102];
+        body[0] = 1; // version
+        body[33..35].copy_from_slice(&0u16.to_le_bytes()); // relay_url_len = 0
+        body[35..37].copy_from_slice(&u16::MAX.to_le_bytes()); // direct_addrs_count
+        assert!(Ticket::from_str(&encode_ticket(&body)).is_err());
+    }
+
+    #[test]
+    fn a_malformed_direct_addr_after_the_cap_is_still_an_error() {
+        // Truncation must not turn into "stop looking after 32": the 33rd entry
+        // is never kept, but it is still parsed, and a bad family byte there
+        // fails the whole ticket exactly as it would in first position.
+        let mut body = vec![1u8]; // version
+        body.extend_from_slice(&[7u8; 32]); // node_id
+        body.extend_from_slice(&0u16.to_le_bytes()); // relay_url_len = 0
+        body.extend_from_slice(&((MAX_DIRECT_ADDRS as u16) + 1).to_le_bytes()); // count = 33
+        for i in 0..MAX_DIRECT_ADDRS as u8 {
+            body.push(4); // IPv4 family
+            body.extend_from_slice(&[192, 0, 2, i + 1]);
+            body.extend_from_slice(&4433u16.to_le_bytes());
+        }
+        body.push(9); // 33rd entry: not a family we know
+        body.push(0); // pqc_fp_algo
+        body.extend_from_slice(&[0u8; 64]); // sign + enc fingerprints
+        let err = Ticket::from_str(&encode_ticket(&body))
+            .expect_err("a malformed entry past the cap must still be an error");
+        assert!(
+            matches!(err, CryptoError::Parameter(ref m) if m.contains("Invalid IP family")),
+            "unexpected error: {err:?}"
+        );
     }
 
     // §10(B) fuzz: deterministic (fixed-seed) random strings — including
