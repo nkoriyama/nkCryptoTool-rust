@@ -1,4 +1,4 @@
-# Reproducible build of the distributable nk-crypto-tool (static musl x86_64).
+# Reproducible build of the distributable nkct (static musl x86_64).
 #
 # Purpose (Chat-Control / client-side-scanning threat model): let anyone rebuild
 # the released binary from public source and byte-compare it, so an injected
@@ -48,5 +48,5 @@ COPY . .
 RUN sh -c 'if [ -n "$EXTRA_RUSTFLAGS" ]; then export RUSTFLAGS="$EXTRA_RUSTFLAGS"; fi; \
         cargo build --release --locked \
             --target x86_64-unknown-linux-musl' \
-    && cp target/x86_64-unknown-linux-musl/release/nk-crypto-tool /nk-crypto-tool \
-    && sha256sum /nk-crypto-tool
+    && cp target/x86_64-unknown-linux-musl/release/nkct /nkct \
+    && sha256sum /nkct

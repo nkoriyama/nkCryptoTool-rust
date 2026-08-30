@@ -25,8 +25,9 @@ Rust版は、C++版の設計思想を継承しつつ、Rustのメモリ安全性
 > コピペで動くコマンド集は **[USAGE.md](./USAGE.md)** にまとめてあります。この README は
 > 機能一覧・性能・アーキテクチャの説明が中心です。
 >
-> なお本文プローズ中の `nkct` は実行バイナリ `nk-crypto-tool` の略です（コマンド例では
-> `nk-crypto-tool` を使用）。
+> **v2.2.0 で実行ファイル名が `nk-crypto-tool` から `nkct` に変わりました。**
+> crate 名も `nkct` です（`cargo install nkct`）。v2.1.0 以前を使っていた場合は、
+> スクリプトや alias の書き換えが要ります。
 
 ## **デモ: 踏み台レス PQC P2P シェル**
 
@@ -257,11 +258,44 @@ Iroh トランスポート + V3.1 PQC ハンドシェイクによるチャット
 >
 > 性能注: バルクファイル暗号化のスループットは OpenSSL が上回ります。2026-07 の実測（4 GiB, tmpfs, AES-256-GCM — 下記「パフォーマンス」節）で OpenSSL は暗号化で約 1.8 倍・復号で約 2.3 倍高速でした（RustCrypto 側は aes-gcm 0.11 世代への移行で以前の約 2.6 倍・3.7 倍差から縮小）。数十 GB 規模を日常的に扱う用途では引き続き OpenSSL 系を推奨します。デフォルトの RustCrypto は依存ゼロ・移植性を優先した選択です。
 
+## **インストール**
+
+### **crates.io から**
+
+```bash
+cargo install nkct --locked
+```
+
+実行ファイルは `~/.cargo/bin/nkct` に入ります。
+`--locked` を付けると、リリース時に検証された `Cargo.lock` の依存バージョンがそのまま使われます。
+
+デフォルトは純 Rust バックエンド (`backend-rustcrypto`) で、OpenSSL も C コンパイラも要りません。
+GUI が要る場合は `cargo install nkct --locked --features gui`。
+
+### **ビルド済みバイナリから**
+
+[Releases](https://github.com/nkoriyama/nkCryptoTool-rust/releases) に以下を置いています。
+
+| 対象 | 成果物 |
+|---|---|
+| Linux x86_64 | 静的 musl バイナリ（依存ライブラリなし） |
+| Windows x86_64 | `.exe` |
+
+各リリースに `SHA256SUMS` が付きます。Linux バイナリは
+[`packaging/reproducible-build.sh`](./packaging/reproducible-build.sh) が
+digest 固定コンテナ内で `--no-cache` ビルドを 2 回行い、両者がバイト単位で一致することを
+確認したうえで作られています。同じスクリプトをタグ付きソースに対して自分で走らせれば、
+配布バイナリが公開ソースから作られたことを検証できます
+（手順: [docs/guides/REPRODUCIBLE_BUILD.md](./docs/guides/REPRODUCIBLE_BUILD.md)）。
+
+macOS 向けのビルド済みバイナリはまだありません。`cargo install` を使ってください。
+
 ## **ビルド方法**
 
 ### **依存関係**
 
-* **Rust**: 1.75 以上 (Edition 2021)
+* **Rust**: 1.96.1 以上 (Edition 2021)。`rust-toolchain.toml` がこのバージョンを固定しており、
+  リリースバイナリもこれでビルドされます。`Cargo.toml` の `rust-version` も同じ値です。
 * **OpenSSL バックエンド使用時**: OpenSSL **3.0 以降** (PQC を使う場合は **3.5 以降** を強く推奨)
 * **TPM 機能を使用する場合**: `tpm2-tools` パッケージ
 
@@ -286,7 +320,7 @@ Iroh トランスポート + V3.1 PQC ハンドシェイクによるチャット
     cargo build --release --no-default-features --features backend-openssl
     ```
 
-ビルド成果物: `target/release/nk-crypto-tool`
+ビルド成果物: `target/release/nkct`
 
 #### **2. OpenSSL バックエンド (Vendored/静的リンク)**
 OpenSSL 3.6.2 をソースからビルドし、バイナリに静的リンクします。システム側の OpenSSL に依存したくない場合や Windows でのビルドに使用します。
@@ -308,7 +342,7 @@ cargo build --release
 cargo build --release --no-default-features --features backend-rustcrypto
 ```
 
-ビルド成果物: `target/release/nk-crypto-tool` (RustCrypto バックエンド版)
+ビルド成果物: `target/release/nkct` (RustCrypto バックエンド版)
 
 #### **4. GUI 機能の有効化**
 GUI 機能（Slint）を有効にしてビルドする場合は、`gui` フィーチャを指定します。
@@ -362,15 +396,15 @@ flowchart TD
 
 * **TPM 保護鍵ペアの生成**:
     ```bash
-    nk-crypto-tool --mode pqc --gen-enc-key --use-tpm --key-dir ~/.keys
+    nkct --mode pqc --gen-enc-key --use-tpm --key-dir ~/.keys
     ```
 * **既存の生鍵を TPM でラッピング**:
     ```bash
-    nk-crypto-tool --mode ecc --use-tpm --wrap-existing <raw_private_key.key>
+    nkct --mode ecc --use-tpm --wrap-existing <raw_private_key.key>
     ```
 * **TPM 保護鍵を解除 (アンラップ)**:
     ```bash
-    nk-crypto-tool --mode ecc --use-tpm --unwrap-key <tpm_wrapped_key.key>
+    nkct --mode ecc --use-tpm --unwrap-key <tpm_wrapped_key.key>
     ```
 
 ### **注意点 (Linux)**
@@ -386,15 +420,15 @@ Linux 環境では、TPM デバイス (`/dev/tpmrm0` 等) へのアクセス権�
 
 ## **使用法**
 
-`nk-crypto-tool` は、ECC モード (`--mode ecc`)、PQC モード (`--mode pqc`)、Hybrid モード (`--mode hybrid`) の 3 つのモードで動作します。
+`nkct` は、ECC モード (`--mode ecc`)、PQC モード (`--mode pqc`)、Hybrid モード (`--mode hybrid`) の 3 つのモードで動作します。
 
 ### **鍵ペアの生成**
 
-* **暗号化鍵ペア (ECC)**: `nk-crypto-tool --mode ecc --gen-enc-key`
-* **署名鍵ペア (ECC)**: `nk-crypto-tool --mode ecc --gen-sign-key`
-* **暗号化鍵ペア (PQC, ML-KEM)**: `nk-crypto-tool --mode pqc --gen-enc-key`
-* **署名鍵ペア (PQC, ML-DSA)**: `nk-crypto-tool --mode pqc --gen-sign-key`
-* **暗号化鍵ペア (Hybrid)**: `nk-crypto-tool --mode hybrid --gen-enc-key`
+* **暗号化鍵ペア (ECC)**: `nkct --mode ecc --gen-enc-key`
+* **署名鍵ペア (ECC)**: `nkct --mode ecc --gen-sign-key`
+* **暗号化鍵ペア (PQC, ML-KEM)**: `nkct --mode pqc --gen-enc-key`
+* **署名鍵ペア (PQC, ML-DSA)**: `nkct --mode pqc --gen-sign-key`
+* **暗号化鍵ペア (Hybrid)**: `nkct --mode hybrid --gen-enc-key`
     * これにより、ML-KEM と ECDH の鍵ペアがそれぞれ生成されます (例: `public_enc_hybrid_mlkem.key`, `private_enc_hybrid_mlkem.key`, `public_enc_hybrid_ecdh.key`, `private_enc_hybrid_ecdh.key`)
 * **受信者向け KeyBundle の発行 (`--gen-keybundle`)**: 生成済みの暗号化公開鍵を自分の ML-DSA-65 identity で署名して束ね、送信者に配布する署名付きユニット (`.nkkb`) を出力する。送信者はこれを暗号化に使う（下記「暗号化 — 署名付き KeyBundle 経由」参照）。鍵ペアではなく配布物なので、先に暗号化鍵ペアと署名鍵ペアの両方が必要。
 * **鍵ファイルを作らない生成 (`--keyring-cmd gen-my-key`)**: 鍵ペアを keyring.db 内に直接生成する
@@ -420,7 +454,7 @@ NKKB KeyBundle** に暗号化します。KeyBundle は受信者の ML-DSA-65 ide
    ML-DSA-65 (pqc/hybrid モードの `--gen-sign-key` で生成) を使う。
     ```bash
     # 暗号化鍵 (例: pqc) と ML-DSA-65 identity を用意済みとして
-    nk-crypto-tool --mode pqc --gen-keybundle --key-dir <dir> \
+    nkct --mode pqc --gen-keybundle --key-dir <dir> \
         --signing-privkey <dir>/private_sign_pqc.key \
         --keybundle-handle alice --keybundle-output alice.nkkb
     # → "…fingerprint: <64-hex>" を表示。これを電話等で送信側に共有する
@@ -431,7 +465,7 @@ NKKB KeyBundle** に暗号化します。KeyBundle は受信者の ML-DSA-65 ide
 2. **送信者**: pin した指紋で KeyBundle を検証し、束ねられた鍵で暗号化する。`--mode` が
    束の usage を選ぶ (pqc→ML-KEM / ecc→P-256 / hybrid→両方)。
     ```bash
-    nk-crypto-tool --mode pqc --encrypt \
+    nkct --mode pqc --encrypt \
         --recipient-keybundle alice.nkkb \
         --recipient-fingerprint <64-hex> \
         --output-file <encrypted.bin> <input.txt>
@@ -446,11 +480,11 @@ NKKB KeyBundle** に暗号化します。KeyBundle は受信者の ML-DSA-65 ide
 
 * **ECC モード**:
     ```bash
-    nk-crypto-tool --mode ecc --decrypt --user-privkey <priv.key> --output-file <decrypted.txt> <encrypted.bin>
+    nkct --mode ecc --decrypt --user-privkey <priv.key> --output-file <decrypted.txt> <encrypted.bin>
     ```
 * **Hybrid モード**:
     ```bash
-    nk-crypto-tool --mode hybrid --decrypt \
+    nkct --mode hybrid --decrypt \
         --user-mlkem-privkey <mlkem_priv.key> \
         --user-ecdh-privkey <ecdh_priv.key> \
         --output-file <decrypted.txt> <encrypted.bin>
@@ -462,13 +496,13 @@ NKKB KeyBundle** に暗号化します。KeyBundle は受信者の ML-DSA-65 ide
 
 * **署名**:
     ```bash
-    nk-crypto-tool --mode ecc --sign --signing-privkey <priv.key> --signature <file.sig> <input.txt>
+    nkct --mode ecc --sign --signing-privkey <priv.key> --signature <file.sig> <input.txt>
     ```
     オプション: `--digest-algo SHA3-512` (default), `SHA3-256`, `SHA-256` 等。
     keyring 取り込み済みなら `--signing-privkey` は省略可 ([USAGE.md §3.1](./USAGE.md))。
 * **検証**:
     ```bash
-    nk-crypto-tool --mode ecc --verify --signing-pubkey <pub.key> --signature <file.sig> <input.txt>
+    nkct --mode ecc --verify --signing-pubkey <pub.key> --signature <file.sig> <input.txt>
     ```
 
 ### **ネットワークモード (チャット / ファイル転送)**
@@ -477,13 +511,13 @@ P2P トランスポート Iroh を使用した、PQC 認証付きの安全な通
 
 * **チャット (サーバ)**:
     ```bash
-    nk-crypto-tool --mode pqc --serve-chat --chat \
+    nkct --mode pqc --serve-chat --chat \
         --signing-privkey <priv.key> --signing-pubkey <peer_pub.key>
     ```
     表示された `nkct1...` Ticket を対向に共有してください。
 * **チャット (クライアント)**:
     ```bash
-    nk-crypto-tool --mode pqc --connect <TICKET> --chat \
+    nkct --mode pqc --connect <TICKET> --chat \
         --signing-privkey <priv.key> --signing-pubkey <peer_pub.key>
     ```
 * **高度なオプション**:
@@ -498,7 +532,7 @@ P2P トランスポート Iroh を使用した、PQC 認証付きの安全な通
     - IP レベルの匿名性が要る場合は nkct を WireGuard 等の自前オーバーレイ上で `--no-relay` 直結するなど、別レイヤに委ねる (nkct 単体では扱わない)。
 * **ピア許可リスト併用 (推奨)**:
     ```bash
-    nk-crypto-tool ... --keyring-db <keyring.db>
+    nkct ... --keyring-db <keyring.db>
     ```
     許可指紋 (SHA3-256 (公開鍵 raw bytes) の hex 64 文字) は、ペアリングまたは
     `--keyring-cmd authorize --recipient-fingerprint <fp>` で keyring の allowlist テーブルに登録します。
@@ -542,29 +576,29 @@ P2P トランスポート Iroh を使用した、PQC 認証付きの安全な通
 
 ```bash
 # 1) Bob: 自分のアドレスを Ticket として出力
-nk-crypto-tool --mls-cmd print-local-address --mls-storage bob.db --no-relay
+nkct --mls-cmd print-local-address --mls-storage bob.db --no-relay
 # nkct1... (これを Alice に共有)
 
 # 2) Bob: KeyPackage を書き出し
-nk-crypto-tool --mls-cmd export-key-package \
+nkct --mls-cmd export-key-package \
     --mls-output bob.kp --mls-storage bob.db --no-relay
 
 # 3) Alice: グループ作成
-nk-crypto-tool --mls-cmd create-group --mls-name "team" \
+nkct --mls-cmd create-group --mls-name "team" \
     --mls-storage alice.db --no-relay
 # Created group "team": 2a84737f31fe9198...
 
 # 4) Bob: Welcome を待ち受け (別ターミナル)
-nk-crypto-tool --mls-cmd accept-one --mls-storage bob.db --no-relay
+nkct --mls-cmd accept-one --mls-storage bob.db --no-relay
 
 # 5) Alice: Bob を招待 (bob.kp と Bob の Ticket を使う)
-nk-crypto-tool --mls-cmd add-member \
+nkct --mls-cmd add-member \
     --mls-group-id 2a84737f... --mls-key-package bob.kp \
     --mls-recipient-ticket nkct1... \
     --mls-storage alice.db --no-relay
 
 # 6) Alice: 対話チャット (Bob の Ticket を recipient として指定)
-nk-crypto-tool --mls-cmd chat-group --mls-group-id 2a84737f... \
+nkct --mls-cmd chat-group --mls-group-id 2a84737f... \
     --mls-recipient-ticket nkct1... \
     --mls-storage alice.db --no-relay
 ```
@@ -592,7 +626,7 @@ nk-crypto-tool --mls-cmd chat-group --mls-group-id 2a84737f... \
 > (再送やリトライキューは存在しない)。復旧はこのコマンドで行う:
 >
 > ```bash
-> nk-crypto-tool --mls-cmd resync --mls-group-id 2a84737f... \
+> nkct --mls-cmd resync --mls-group-id 2a84737f... \
 >     --mls-recipient-ticket nkct1... \
 >     --mls-storage bob.db --no-relay
 > # resync 2a84737f...: epoch 3 → 5 after asking 1 peer(s) (1 answered, 0 failed)
@@ -682,7 +716,7 @@ nk-crypto-tool --mls-cmd chat-group --mls-group-id 2a84737f... \
 
 ```bash
 cargo build --release --features gui-mls
-./target/release/nk-crypto-tool --mls-gui --no-relay
+./target/release/nkct --mls-gui --no-relay
 ```
 
 GUI は左カラムに Groups リスト + Create / 自分の Ticket、右カラムに選択中グループの
@@ -711,7 +745,7 @@ Members / Messages / 入力欄 / Add Member サブフォーム。すべての操
 ```mermaid
 sequenceDiagram
     actor User
-    participant CLI as nk-crypto-tool
+    participant CLI as nkct
     participant TPM as TPM (Hardware)
     participant FS as File System
 
@@ -732,7 +766,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     actor User
-    participant CLI as nk-crypto-tool
+    participant CLI as nkct
     participant TPM as TPM (Hardware)
     participant FS as File System
 
@@ -753,7 +787,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     actor User
-    participant CLI as nk-crypto-tool
+    participant CLI as nkct
     participant TPM as TPM (Hardware)
     participant FS as File System
 
@@ -865,8 +899,8 @@ sequenceDiagram
 sequenceDiagram
     actor Signer
     actor Verifier
-    participant SignerCLI as nk-crypto-tool (Signer)
-    participant VerifierCLI as nk-crypto-tool (Verifier)
+    participant SignerCLI as nkct (Signer)
+    participant VerifierCLI as nkct (Verifier)
     participant Engine as Crypto Engine
 
     Signer->>SignerCLI: 署名コマンド
@@ -1096,7 +1130,7 @@ v3 `ChunkedAead` 形式 + バッファ再利用最適化を適用した現行コ
   旧 0.10 世代 (enc ~1.2 / dec ~0.67) から **+5〜6割** — 表の 1.8 / 1.1 はポータブルな
   AES-NI 経路の値。生 AEAD 単体の実測 (1 MiB チャンク) は 0.10 世代 1.59 → 0.11 世代
   2.95 GiB/s。
-* **※2 VAES 変種 (`nk-crypto-tool-vaes`)**: `aes` 0.9 の **VAES-512 バックエンド有効ビルド**
+* **※2 VAES 変種 (`nkct-vaes`)**: `aes` 0.9 の **VAES-512 バックエンド有効ビルド**
   (`--cfg aes_backend="avx512"` + AVX-512/VAES target-feature、生 AEAD 実測 ~6.0 GiB/s)。
   再現ビルド行列の第2変種として配布物に並ぶ (`packaging/reproducible-build.sh`)。
   バックエンド選択はコンパイル時固定のため **AMD Zen 4+ / Intel Ice Lake+ (サーバ系) 専用** —

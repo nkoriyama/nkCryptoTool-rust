@@ -3,7 +3,7 @@
 //!
 //! ```sh
 //! cargo run --features "backend-rustcrypto mls mobile-ffi" --bin uniffi-bindgen -- \
-//!   generate --library target/debug/libnk_crypto_tool.so --language kotlin --out-dir bindings/kotlin
+//!   generate --library target/debug/libnkct.so --language kotlin --out-dir bindings/kotlin
 //! ```
 //!
 //! See `BUILD_ANDROID.md`.

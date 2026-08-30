@@ -11,9 +11,9 @@
 //! file — and the signing twin: `--sign` with the signing key injected the
 //! same way. No private-key file exists at any point.
 
-use nk_crypto_tool::config::{CryptoConfig, CryptoMode, Operation};
-use nk_crypto_tool::keyring;
-use nk_crypto_tool::processor::CryptoProcessor;
+use nkct::config::{CryptoConfig, CryptoMode, Operation};
+use nkct::keyring;
+use nkct::processor::CryptoProcessor;
 use zeroize::Zeroizing;
 
 fn tmp_dir(tag: &str) -> std::path::PathBuf {
@@ -33,11 +33,11 @@ async fn pqc_decrypt_via_keyring_injected_pem() {
     std::fs::write(&plain_path, b"keyring auto-match round-trip").unwrap();
 
     // A key pair whose private half exists ONLY in keyring form.
-    let (raw_priv, raw_pub, _) = nk_crypto_tool::backend::pqc_keygen_kem("ML-KEM-768").unwrap();
+    let (raw_priv, raw_pub, _) = nkct::backend::pqc_keygen_kem("ML-KEM-768").unwrap();
     let enc_der =
-        nk_crypto_tool::utils::wrap_pqc_priv_to_pkcs8_encrypted(&raw_priv, "ML-KEM-768", PASS)
+        nkct::utils::wrap_pqc_priv_to_pkcs8_encrypted(&raw_priv, "ML-KEM-768", PASS)
             .unwrap();
-    let pem = nk_crypto_tool::utils::wrap_to_pem(&enc_der, "ENCRYPTED PRIVATE KEY");
+    let pem = nkct::utils::wrap_to_pem(&enc_der, "ENCRYPTED PRIVATE KEY");
 
     // Import validation builds the record (binding check + KEM self-test)...
     let (algo, role, rec) =
@@ -98,17 +98,17 @@ async fn hybrid_decrypt_via_keyring_injected_pems() {
     std::fs::write(&plain_path, b"hybrid needs both halves").unwrap();
 
     // ML-KEM half.
-    let (kem_priv, kem_pub, _) = nk_crypto_tool::backend::pqc_keygen_kem("ML-KEM-768").unwrap();
-    let kem_pem = nk_crypto_tool::utils::wrap_to_pem(
-        &nk_crypto_tool::utils::wrap_pqc_priv_to_pkcs8_encrypted(&kem_priv, "ML-KEM-768", PASS)
+    let (kem_priv, kem_pub, _) = nkct::backend::pqc_keygen_kem("ML-KEM-768").unwrap();
+    let kem_pem = nkct::utils::wrap_to_pem(
+        &nkct::utils::wrap_pqc_priv_to_pkcs8_encrypted(&kem_priv, "ML-KEM-768", PASS)
             .unwrap(),
         "ENCRYPTED PRIVATE KEY",
     );
     // P-256 half (plain PKCS#8 DER from keygen → encrypted PKCS#8 PEM).
     let (ecc_priv_der, ecc_pub_spki) =
-        nk_crypto_tool::backend::generate_ecc_key_pair("prime256v1").unwrap();
-    let ecc_pem = nk_crypto_tool::utils::wrap_to_pem(
-        &nk_crypto_tool::utils::encrypt_pkcs8_der(&ecc_priv_der, PASS).unwrap(),
+        nkct::backend::generate_ecc_key_pair("prime256v1").unwrap();
+    let ecc_pem = nkct::utils::wrap_to_pem(
+        &nkct::utils::encrypt_pkcs8_der(&ecc_priv_der, PASS).unwrap(),
         "ENCRYPTED PRIVATE KEY",
     );
 
@@ -170,9 +170,9 @@ async fn pqc_sign_via_keyring_injected_pem() {
     std::fs::write(&msg_path, b"keyring sign auto-match").unwrap();
 
     // An ML-DSA key pair whose private half exists ONLY in keyring form.
-    let (raw_priv, raw_pub, _) = nk_crypto_tool::backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
-    let pem = nk_crypto_tool::utils::wrap_to_pem(
-        &nk_crypto_tool::utils::wrap_pqc_priv_to_pkcs8_encrypted(&raw_priv, "ML-DSA-65", PASS)
+    let (raw_priv, raw_pub, _) = nkct::backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+    let pem = nkct::utils::wrap_to_pem(
+        &nkct::utils::wrap_pqc_priv_to_pkcs8_encrypted(&raw_priv, "ML-DSA-65", PASS)
             .unwrap(),
         "ENCRYPTED PRIVATE KEY",
     );
@@ -203,8 +203,8 @@ async fn pqc_sign_via_keyring_injected_pem() {
     // The signature verifies against the matching public key from a file.
     std::fs::write(
         &pub_path,
-        nk_crypto_tool::utils::wrap_to_pem(
-            &nk_crypto_tool::utils::wrap_pqc_pub_to_spki(&raw_pub, "ML-DSA-65").unwrap(),
+        nkct::utils::wrap_to_pem(
+            &nkct::utils::wrap_pqc_pub_to_spki(&raw_pub, "ML-DSA-65").unwrap(),
             "PUBLIC KEY",
         ),
     )
@@ -241,9 +241,9 @@ async fn ecc_sign_via_keyring_injected_pem() {
     // P-256 serves both roles, so the importer is told `sign` (role None from
     // classification) — exactly what `import-my-key --key-role sign` does.
     let (priv_der, pub_spki) =
-        nk_crypto_tool::backend::generate_ecc_key_pair("prime256v1").unwrap();
-    let pem = nk_crypto_tool::utils::wrap_to_pem(
-        &nk_crypto_tool::utils::encrypt_pkcs8_der(&priv_der, PASS).unwrap(),
+        nkct::backend::generate_ecc_key_pair("prime256v1").unwrap();
+    let pem = nkct::utils::wrap_to_pem(
+        &nkct::utils::encrypt_pkcs8_der(&priv_der, PASS).unwrap(),
         "ENCRYPTED PRIVATE KEY",
     );
     let (algo, role, rec) =
@@ -268,7 +268,7 @@ async fn ecc_sign_via_keyring_injected_pem() {
 
     std::fs::write(
         &pub_path,
-        nk_crypto_tool::utils::wrap_to_pem(&pub_spki, "PUBLIC KEY"),
+        nkct::utils::wrap_to_pem(&pub_spki, "PUBLIC KEY"),
     )
     .unwrap();
     let mut ver_cfg = CryptoConfig::default();
@@ -293,9 +293,9 @@ async fn hybrid_sign_delegates_injected_pem_to_pqc_half() {
     let pub_path = dir.join("sign.pub");
     std::fs::write(&msg_path, b"hybrid signs with its ML-DSA half").unwrap();
 
-    let (raw_priv, raw_pub, _) = nk_crypto_tool::backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
-    let pem = nk_crypto_tool::utils::wrap_to_pem(
-        &nk_crypto_tool::utils::wrap_pqc_priv_to_pkcs8_encrypted(&raw_priv, "ML-DSA-65", PASS)
+    let (raw_priv, raw_pub, _) = nkct::backend::pqc_keygen_dsa("ML-DSA-65").unwrap();
+    let pem = nkct::utils::wrap_to_pem(
+        &nkct::utils::wrap_pqc_priv_to_pkcs8_encrypted(&raw_priv, "ML-DSA-65", PASS)
             .unwrap(),
         "ENCRYPTED PRIVATE KEY",
     );
@@ -318,8 +318,8 @@ async fn hybrid_sign_delegates_injected_pem_to_pqc_half() {
 
     std::fs::write(
         &pub_path,
-        nk_crypto_tool::utils::wrap_to_pem(
-            &nk_crypto_tool::utils::wrap_pqc_pub_to_spki(&raw_pub, "ML-DSA-65").unwrap(),
+        nkct::utils::wrap_to_pem(
+            &nkct::utils::wrap_pqc_pub_to_spki(&raw_pub, "ML-DSA-65").unwrap(),
             "PUBLIC KEY",
         ),
     )

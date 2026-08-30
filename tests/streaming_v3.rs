@@ -11,12 +11,12 @@
  * boundary cases stay cheap. Env-var sensitive tests are serialized.
  */
 
-use nk_crypto_tool::config::{CryptoConfig, CryptoMode, Operation};
-use nk_crypto_tool::strategy::ecc::EccStrategy;
-use nk_crypto_tool::strategy::hybrid::HybridStrategy;
-use nk_crypto_tool::strategy::pqc::PqcStrategy;
-use nk_crypto_tool::strategy::CryptoStrategy;
-use nk_crypto_tool::CryptoProcessor;
+use nkct::config::{CryptoConfig, CryptoMode, Operation};
+use nkct::strategy::ecc::EccStrategy;
+use nkct::strategy::hybrid::HybridStrategy;
+use nkct::strategy::pqc::PqcStrategy;
+use nkct::strategy::CryptoStrategy;
+use nkct::CryptoProcessor;
 use serial_test::serial;
 use std::collections::HashMap;
 use std::fs;
@@ -95,7 +95,7 @@ async fn ecc_decrypt_expect_err(
     input: &std::path::Path,
     output: &std::path::Path,
     keys: &EccKeys,
-) -> nk_crypto_tool::CryptoError {
+) -> nkct::CryptoError {
     let mut p = CryptoProcessor::new(CryptoMode::ECC);
     let cfg = ecc_config(Operation::Decrypt, input, output, keys);
     p.process(&cfg, None).await.expect_err("decrypt should fail")
@@ -246,8 +246,8 @@ async fn v3_truncation_attack_detected() {
     let err = ecc_decrypt_expect_err(&tamper_path, &dec_path, &keys).await;
     let msg = format!("{}", err);
     assert!(
-        matches!(err, nk_crypto_tool::CryptoError::TruncationDetected)
-            || matches!(err, nk_crypto_tool::CryptoError::SignatureVerification),
+        matches!(err, nkct::CryptoError::TruncationDetected)
+            || matches!(err, nkct::CryptoError::SignatureVerification),
         "expected truncation or auth failure, got: {}",
         msg
     );
@@ -281,7 +281,7 @@ async fn v3_reorder_attack_detected() {
     let err = ecc_decrypt_expect_err(&tamper_path, &dec_path, &keys).await;
     assert!(matches!(
         err,
-        nk_crypto_tool::CryptoError::SignatureVerification
+        nkct::CryptoError::SignatureVerification
     ));
     assert!(!dec_path.exists());
 }
@@ -319,7 +319,7 @@ async fn v3_mix_and_match_attack_detected() {
     let err = ecc_decrypt_expect_err(&tamper, &dec_path, &keys).await;
     assert!(matches!(
         err,
-        nk_crypto_tool::CryptoError::SignatureVerification
+        nkct::CryptoError::SignatureVerification
     ));
     assert!(!dec_path.exists());
 }
@@ -353,7 +353,7 @@ async fn v3_chunk_size_tamper_detected_via_session_id() {
     let err = ecc_decrypt_expect_err(&tamper_path, &dec_path, &keys).await;
     assert!(matches!(
         err,
-        nk_crypto_tool::CryptoError::SignatureVerification
+        nkct::CryptoError::SignatureVerification
     ));
     assert!(!dec_path.exists());
 }

@@ -9,7 +9,7 @@
 **既存の rsync をトンネルに載せる**もの。認可の主体が nkct から rsyncd 側へ移る点が
 最大の違いで、本ガイドはその代償の埋め合わせ方を主題とする。
 
-以下、バイナリ名は `nk-crypto-tool` とする。記載の挙動は **rsync 3.4.4 で実測**した
+以下、バイナリ名は `nkct` とする。記載の挙動は **rsync 3.4.4 で実測**した
 （2026-07-26）。
 
 ---
@@ -21,7 +21,7 @@
   rsync client                                 rsyncd (非 root, address=127.0.0.1)
       │ rsync://127.0.0.1:18730                     ▲ 127.0.0.1:8730
       ▼                                              │
-  nk-crypto-tool --forward  ══ PQC P2P トンネル ══>  nk-crypto-tool --serve-forward
+  nkct --forward  ══ PQC P2P トンネル ══>  nkct --serve-forward
       (127.0.0.1 bind)         ML-DSA-65 相互認証         (--forward-policy: default deny)
                                P-256‖ML-KEM-768 AEAD
 ```
@@ -109,7 +109,7 @@ post-xfer exec = /data/deploy/bin/swap_release.sh
 ```
 
 ```bash
-nk-crypto-tool --serve-forward --mode pqc \
+nkct --serve-forward --mode pqc \
   --signing-privkey ~/nkkeys/private_sign_pqc.key \
   --signing-pubkey  ./client_public_sign_pqc.key \
   --forward-policy ./fwd.policy --audit-log ./fwd-audit.log
@@ -122,7 +122,7 @@ nk-crypto-tool --serve-forward --mode pqc \
 
 ```bash
 # 1) トンネルを張る（ローカル 18730 → サーバ側 127.0.0.1:8730）
-nk-crypto-tool --forward 18730:127.0.0.1:8730 --connect 'nkct1....' --mode pqc \
+nkct --forward 18730:127.0.0.1:8730 --connect 'nkct1....' --mode pqc \
   --signing-privkey ~/nkkeys/private_sign_pqc.key \
   --signing-pubkey  ./server_public_sign_pqc.key &
 

@@ -1,6 +1,6 @@
 #![cfg(feature = "backend-openssl")]
 
-use nk_crypto_tool::backend;
+use nkct::backend;
 
 #[test]
 fn test_openssl_pqc_kem_roundtrip() {
@@ -28,7 +28,7 @@ fn test_openssl_pqc_dsa_roundtrip() {
 #[cfg(all(feature = "backend-openssl", feature = "backend-rustcrypto"))]
 #[test]
 fn test_pqc_interop_rustcrypto_openssl() {
-    use nk_crypto_tool::backend::{openssl_impl, rustcrypto_impl};
+    use nkct::backend::{openssl_impl, rustcrypto_impl};
 
     // KEM Interop
     for algo in ["ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"] {
@@ -73,7 +73,7 @@ fn test_pqc_interop_rustcrypto_openssl() {
 #[cfg(all(feature = "backend-openssl", feature = "backend-rustcrypto"))]
 #[test]
 fn mldsa_ctx_interop_both_backends() {
-    use nk_crypto_tool::backend::{openssl_impl, rustcrypto_impl};
+    use nkct::backend::{openssl_impl, rustcrypto_impl};
     // Parameterized over EVERY ML-DSA algorithm the tool supports: OpenSSL's
     // `context-string` param must bind the ctx identically to fips204 for all
     // three, or one parameter set could silently drop the ctx (a quiet loss of

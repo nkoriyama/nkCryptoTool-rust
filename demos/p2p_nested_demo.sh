@@ -6,7 +6,7 @@
 # inbound port anywhere. Recorded with VHS (see p2p_nested.tape).
 set -u
 
-BIN="$PWD/target/release/nk-crypto-tool"
+BIN="$PWD/target/release/nkct"
 unset NK_PASSPHRASE RUST_LOG
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/nkct-nested-demo.XXXXXX") || exit 1
 mkdir -p "$ROOT"/{shk,shc,sck,scc,A}

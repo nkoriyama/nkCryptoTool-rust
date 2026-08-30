@@ -15,7 +15,7 @@
 # Recorded with VHS (see p2p_bundle.tape).
 set -u
 
-BIN="$PWD/target/release/nk-crypto-tool"
+BIN="$PWD/target/release/nkct"
 unset RUST_LOG
 export NK_PASSPHRASE="demo-passphrase"   # one demo secret unlocks the prekey/inbox stores — nothing prompts
 # mktemp -d gives a 0700, unpredictable dir: no fixed /tmp name for a local

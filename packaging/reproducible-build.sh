@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the distributable static-musl nk-crypto-tool reproducibly, twice, from
+# Build the distributable static-musl nkct reproducibly, twice, from
 # independent (--no-cache) container builds, and assert the two binaries are
 # byte-identical. Emits the artifact + SHA256SUMS under packaging/out/.
 #
@@ -36,7 +36,7 @@ build_once() {
     -f "$CF" -t "$tag" .
   # Extract the artifact from the image (no run, no mounts → no host variance).
   local cid; cid=$(podman create "$tag")
-  podman cp "$cid:/nk-crypto-tool" "$dest"
+  podman cp "$cid:/nkct" "$dest"
   podman rm "$cid" >/dev/null
 }
 
@@ -60,12 +60,12 @@ build_variant() {
   rm -f "$OUT/$name.b"
 }
 
-# VARIANTS=nk-crypto-tool packaging/reproducible-build.sh  → portable only
-: "${VARIANTS:=nk-crypto-tool nk-crypto-tool-vaes}"
+# VARIANTS=nkct packaging/reproducible-build.sh  → portable only
+: "${VARIANTS:=nkct nkct-vaes}"
 for v in $VARIANTS; do
   case "$v" in
-    nk-crypto-tool)      build_variant "$v" "" ;;
-    nk-crypto-tool-vaes) build_variant "$v" "$VAES_RUSTFLAGS" ;;
+    nkct)      build_variant "$v" "" ;;
+    nkct-vaes) build_variant "$v" "$VAES_RUSTFLAGS" ;;
     *) echo "unknown variant $v" >&2; exit 1 ;;
   esac
 done

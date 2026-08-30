@@ -7,7 +7,7 @@ at-rest path can be proven to still open files written by the old OpenSSL path.
 Generated with:
 
 ```
-NK_PASSPHRASE="fixture-pass-123" nk-crypto-tool \
+NK_PASSPHRASE="fixture-pass-123" nkct \
   --mls-cmd create-group --mls-name fixturegroup \
   --mls-storage <dir>/groups.db --transport iroh
 ```

@@ -8,7 +8,7 @@ nkCryptoTool の P2P シェル／ポートフォワード機能の実用コマ�
 - 暗号ストリーム … ハイブリッド ECDH‖ML-KEM 由来の AEAD（方向ごと単調カウンタ nonce）
 - NAT 越え … iroh（ホールパンチ＋リレー、`--relay-url` 不要）
 
-以下、バイナリ名は `nk-crypto-tool` とする。
+以下、バイナリ名は `nkct` とする。
 
 ---
 
@@ -18,12 +18,12 @@ nkCryptoTool の P2P シェル／ポートフォワード機能の実用コマ�
 
 ```bash
 # サーバ機・クライアント機それぞれで
-nk-crypto-tool --mode pqc --gen-sign-key --key-dir ~/nkkeys --dsa-algo ML-DSA-65
+nkct --mode pqc --gen-sign-key --key-dir ~/nkkeys --dsa-algo ML-DSA-65
 #   → ~/nkkeys/private_sign_pqc.key（秘密・厳重保管）
 #     ~/nkkeys/public_sign_pqc.key（公開・相手に渡す）
 
 # 自分の指紋（ポリシー記載や allowlist に使う 32 バイト hex）
-nk-crypto-tool --mode pqc --fingerprint --signing-pubkey ~/nkkeys/public_sign_pqc.key
+nkct --mode pqc --fingerprint --signing-pubkey ~/nkkeys/public_sign_pqc.key
 ```
 
 **相互認証のため、サーバ⇔クライアントで `public_sign_pqc.key` を事前交換**しておく
@@ -46,7 +46,7 @@ nk-crypto-tool --mode pqc --fingerprint --signing-pubkey ~/nkkeys/public_sign_pq
 ### サーバ機（待ち受け、ticket を表示）
 
 ```bash
-nk-crypto-tool --serve-shell --mode pqc \
+nkct --serve-shell --mode pqc \
   --signing-privkey ~/nkkeys/private_sign_pqc.key \
   --signing-pubkey  ./client_public_sign_pqc.key      # 許可するクライアントをピン留め
 #   → 標準出力に  [nkct] Ticket: nkct1....  と接続用 QR を表示
@@ -58,12 +58,12 @@ nk-crypto-tool --serve-shell --mode pqc \
 
 ```bash
 # 対話ログインシェル
-nk-crypto-tool --shell --connect 'nkct1....' --mode pqc \
+nkct --shell --connect 'nkct1....' --mode pqc \
   --signing-privkey ~/nkkeys/private_sign_pqc.key \
   --signing-pubkey  ./server_public_sign_pqc.key
 
 # 単発コマンド（ssh host cmd 相当・実行して終了）
-nk-crypto-tool --shell-cmd 'systemctl restart app' --connect 'nkct1....' --mode pqc \
+nkct --shell-cmd 'systemctl restart app' --connect 'nkct1....' --mode pqc \
   --signing-privkey ~/nkkeys/private_sign_pqc.key \
   --signing-pubkey  ./server_public_sign_pqc.key
 ```
@@ -90,7 +90,7 @@ a4d889f8...c00e  user=deploy  cmd-allow="systemctl restart app, journalctl -u ap
   `nnp=unavailable` と記録され、この防御なしで実行される）。
 
 ```bash
-nk-crypto-tool --serve-shell --mode pqc \
+nkct --serve-shell --mode pqc \
   --signing-privkey ~/nkkeys/private_sign_pqc.key \
   --signing-pubkey  ./client_public_sign_pqc.key \
   --shell-policy ./team.shell-policy \
@@ -130,13 +130,13 @@ ce53fe1b...9cfd  allow="127.0.0.1:5432, db.internal:5432"
 
 ```bash
 # サーバ
-nk-crypto-tool --serve-forward --mode pqc \
+nkct --serve-forward --mode pqc \
   --signing-privkey ~/nkkeys/private_sign_pqc.key \
   --signing-pubkey  ./client_public_sign_pqc.key \
   --forward-policy ./fwd.policy --audit-log ./fwd-audit.log
 
 # クライアント: ローカル 19090 → サーバ側の 127.0.0.1:5432
-nk-crypto-tool --forward 19090:127.0.0.1:5432 --connect 'nkct1....' --mode pqc \
+nkct --forward 19090:127.0.0.1:5432 --connect 'nkct1....' --mode pqc \
   --signing-privkey ~/nkkeys/private_sign_pqc.key \
   --signing-pubkey  ./server_public_sign_pqc.key
 #   → 手元で  psql -h 127.0.0.1 -p 19090  などが通る
@@ -153,7 +153,7 @@ ce53fe1b...9cfd  allow="..." bind="8080, 9000"
 
 ```bash
 # クライアント: サーバの 127.0.0.1:8080 → クライアント側 127.0.0.1:3000
-nk-crypto-tool --remote-forward 8080:127.0.0.1:3000 --connect 'nkct1....' --mode pqc \
+nkct --remote-forward 8080:127.0.0.1:3000 --connect 'nkct1....' --mode pqc \
   --signing-privkey ~/nkkeys/private_sign_pqc.key \
   --signing-pubkey  ./server_public_sign_pqc.key
 ```
@@ -177,13 +177,13 @@ nk-crypto-tool --remote-forward 8080:127.0.0.1:3000 --connect 'nkct1....' --mode
 ```bash
 # グループの検証済みメンバーごとに「<指紋>  <テンプレート>」を出力
 NK_PASSPHRASE='store-pass' \
-nk-crypto-tool --mls-cmd project-policy --mls-group-id <gid> \
+nkct --mls-cmd project-policy --mls-group-id <gid> \
   --mls-policy-template 'user=deploy cmd-allow="systemctl restart app"' \
   --signing-privkey ~/nkkeys/private_sign_pqc.key --mls-storage ~/nk-mls.redb \
   > team.shell-policy
 
 # 生成された team.shell-policy を --shell-policy（または --forward-policy）に使う
-nk-crypto-tool --serve-shell --mode pqc \
+nkct --serve-shell --mode pqc \
   --signing-privkey ~/nkkeys/private_sign_pqc.key \
   --signing-pubkey  ./client_public_sign_pqc.key \
   --shell-policy ./team.shell-policy --audit-log ./shell-audit.log

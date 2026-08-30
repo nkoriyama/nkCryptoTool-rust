@@ -13,7 +13,7 @@
 # (copy_encrypt_scp.tape).
 set -u
 
-BIN="$PWD/target/release/nk-crypto-tool"
+BIN="$PWD/target/release/nkct"
 unset RUST_LOG
 export NK_PASSPHRASE=""   # unencrypted demo keys: nothing prompts
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/nkct-ces-demo.XXXXXX") || exit 1
@@ -52,9 +52,9 @@ start_server "$ROOT/pair.log" --serve-pairing --mode pqc \
   --signing-privkey "$ROOT/srv/private_sign_pqc.key" --key-dir "$ROOT/srv" \
   --pairing-grant scp
 OTP=$(grep -aoE 'one-time token: [A-Z2-7]+' "$ROOT/pair.log" | awk '{print $3}' | head -1)
-echo "  \$ nk-crypto-tool --copy-bundle --keybundle-handle laptop   (one-time token: $OTP)"
+echo "  \$ nkct --copy-bundle --keybundle-handle laptop   (one-time token: $OTP)"
 sleep 0.6
-"$BIN" --copy-bundle --mode pqc --connect "$TICKET" --token "$OTP" \
+printf '%s' "$OTP" | "$BIN" --copy-bundle --mode pqc --connect "$TICKET" --token - \
   --signing-privkey "$ROOT/cli/private_sign_pqc.key" --keybundle-handle laptop \
   --key-dir "$ROOT/cli" 2>&1 | grep -aiE 'registered' \
   || echo "  [DEMO BUG] pairing not confirmed"
@@ -66,7 +66,7 @@ sleep 1.6
 echo "# [2/4] ENCRYPT — server encrypts to 'laptop' via the keyring (no separate key exchange)"
 sleep 0.7
 printf 'deploy secret: rotate the prod token before Friday\n' > "$ROOT/srv/secret.txt"
-echo "  \$ nk-crypto-tool --encrypt --recipient laptop  secret.txt -> share/secret.enc"
+echo "  \$ nkct --encrypt --recipient laptop  secret.txt -> share/secret.enc"
 sleep 0.6
 "$BIN" --encrypt --mode pqc --recipient laptop --key-dir "$ROOT/srv" \
   "$ROOT/srv/secret.txt" --output-file "$ROOT/srv/share/secret.enc" 2>&1 \
@@ -81,7 +81,7 @@ printf '%s read="%s" write="%s"\n' "$CFP" "$ROOT/srv/share" "$ROOT/srv/share" > 
 start_server "$ROOT/scp.log" --serve-scp --mode pqc \
   --signing-privkey "$ROOT/srv/private_sign_pqc.key" \
   --keyring-db "$KEYRING" --scp-policy "$ROOT/srv/scp.policy"
-echo "  \$ nk-crypto-tool --scp-get share/secret.enc  ->  cli/secret.enc"
+echo "  \$ nkct --scp-get share/secret.enc  ->  cli/secret.enc"
 sleep 0.6
 "$BIN" --scp-get "$ROOT/srv/share/secret.enc" "$ROOT/cli/secret.enc" --connect "$TICKET" --mode pqc \
   --signing-privkey "$ROOT/cli/private_sign_pqc.key" --key-dir "$ROOT/cli" 2>&1 \

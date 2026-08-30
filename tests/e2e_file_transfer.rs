@@ -29,12 +29,12 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use nk_crypto_tool::config::{CryptoConfig, TransportKind};
-use nk_crypto_tool::network::{
+use nkct::config::{CryptoConfig, TransportKind};
+use nkct::network::{
     FileIOProvider, IOProvider, ProgressCallback, PROGRESS_CHUNK_BYTES,
 };
-use nk_crypto_tool::p2p::NetworkProcessor;
-use nk_crypto_tool::ticket::Ticket;
+use nkct::p2p::NetworkProcessor;
+use nkct::ticket::Ticket;
 
 const E2E_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -63,7 +63,7 @@ async fn make_processor_with_file_io(
     config.allow_unauth = true;
     config.transport = TransportKind::Iroh;
     config.connect_addr = connect_addr;
-    let endpoint = Arc::new(nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&config, false).await.unwrap());
+    let endpoint = Arc::new(nkct::p2p::backend::iroh::IrohEndpoint::new(&config, false).await.unwrap());
     NetworkProcessor::new(config, endpoint, file_io)
 }
 
@@ -235,7 +235,7 @@ const ADV_AEAD: &str = "AES-256-GCM";
 
 async fn encrypt_to_wire(plaintext: &[u8], key: &[u8], iv: &[u8]) -> Vec<u8> {
     let mut wire: Vec<u8> = Vec::new();
-    nk_crypto_tool::network::NetworkProcessor::send_file(plaintext, &mut wire, ADV_AEAD, key, iv)
+    nkct::network::NetworkProcessor::send_file(plaintext, &mut wire, ADV_AEAD, key, iv)
         .await
         .expect("send_file (encrypt) should succeed");
     wire
@@ -245,9 +245,9 @@ async fn decrypt_from_wire(
     wire: &[u8],
     key: &[u8],
     iv: &[u8],
-) -> Result<Vec<u8>, nk_crypto_tool::CryptoError> {
+) -> Result<Vec<u8>, nkct::CryptoError> {
     let mut out: Vec<u8> = Vec::new();
-    nk_crypto_tool::network::NetworkProcessor::receive_file(wire, &mut out, ADV_AEAD, key, iv)
+    nkct::network::NetworkProcessor::receive_file(wire, &mut out, ADV_AEAD, key, iv)
         .await?;
     Ok(out)
 }
@@ -300,7 +300,7 @@ async fn test_e2e_chunk_len_forgery() {
         .await
         .expect_err("forged oversize chunk length must be rejected");
     match err {
-        nk_crypto_tool::CryptoError::Parameter(msg) => assert!(
+        nkct::CryptoError::Parameter(msg) => assert!(
             msg.contains("exceeds limit"),
             "expected chunk-size bound error, got: {msg}"
         ),

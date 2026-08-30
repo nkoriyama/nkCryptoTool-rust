@@ -23,7 +23,7 @@ Type "# mutual ML-DSA-65 auth, direct LAN hole-punch, no open inbound port"
 Enter
 Sleep 1200ms
 
-Type './target/release/nk-crypto-tool --shell --tui --connect "$(cat /var/home/bazzite/win_ticket2.txt)" --mode pqc --signing-privkey ~/nkct-test/keys/private_sign_pqc.key --signing-pubkey /var/mnt/data/nkct-windows-pub.key'
+Type './target/release/nkct --shell --tui --connect "$(cat /var/home/bazzite/win_ticket2.txt)" --mode pqc --signing-privkey ~/nkct-test/keys/private_sign_pqc.key --signing-pubkey /var/mnt/data/nkct-windows-pub.key'
 Enter
 Sleep 5s
 

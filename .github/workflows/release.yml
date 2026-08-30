@@ -1,0 +1,378 @@
+# Tag-driven release: build the distributable binaries, publish a GitHub
+# Release, then publish the crate to crates.io.
+#
+# Triggers: push of a `v*` tag, or workflow_dispatch with the tag to re-run
+# (NOT pull_request_target — same F4-X10 rule as ci.yml).
+#
+# PLATFORM SCOPE
+# --------------
+# Linux (static musl) and Windows (x86_64-msvc) only. Those are the two targets
+# ci.yml builds and tests as release-blocking. macOS is served by
+# `cargo install nkct` for now.
+#
+# macOS is deliberately NOT here yet, and the missing piece is evidence, not
+# work. .cargo/config.toml now carries portable floors for both Apple targets
+# (apple-m1 / x86-64-v2+aes), and ci.yml's `test-macos` builds arm64 natively
+# plus x86_64 as a cross — which is exactly the pair a universal binary is
+# lipo'd from. But every step of that job is still `continue-on-error`, because
+# macOS had never been built by CI at all and the deferral it replaced cited a
+# ring/aarch64-darwin problem it never wrote down. Shipping a binary for a
+# platform whose build has not once been observed to succeed is not a release,
+# it is a guess.
+#
+# To add it: once `test-macos` has been green for a few runs, drop its
+# continue-on-error, then add a `macos` job here that builds both Apple targets,
+# `lipo -create`s them into one universal binary, and uploads it like the two
+# below. Nothing else in this file needs to change.
+#
+# THE LINUX ARTIFACT IS THE REPRODUCIBLE ONE
+# ------------------------------------------
+# It is built by packaging/reproducible-build.sh, the same script a third party
+# runs to verify the release, inside the same digest-pinned container. The script
+# builds twice with --no-cache and fails if the two results differ, so a release
+# cannot be cut from a build that is not reproducible. Only the portable variant
+# is released: the VAES variant needs AVX-512 hardware to be worth anything and
+# would hit main()'s startup CPUID guard everywhere else, so it stays an opt-in
+# local build (docs/guides/REPRODUCIBLE_BUILD.md).
+#
+# Action pin policy (as ci.yml): widely-trusted first-party/ecosystem actions
+# pinned to major version; no third-party actions are used here.
+#
+# SECRETS
+# -------
+# `CRATES_IO_TOKEN` is read by the `publish` job only, passed to cargo through
+# the environment, and never echoed. Publishing a version to crates.io is
+# irreversible -- a version number can never be reused, even after `cargo yank`.
+# So that job sits behind the `crates-io` GitHub Environment: configure it with
+# a required reviewer, and the release stops there for a human to approve.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to re-release (e.g. v2.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# RUSTFLAGS IS SET PER JOB, NEVER WORKFLOW-WIDE
+# ---------------------------------------------
+# Host (x86_64-unknown-linux-gnu) builds need the ci.yml override: .cargo/config
+# pins that target to `target-cpu=native -Ctarget-feature=+vaes` for local dev,
+# and a runner without VAES SIGILLs when rustc runs a proc-macro built with it.
+#
+# The distributed builds must NOT have it. `RUSTFLAGS` replaces the matching
+# `[target.*].rustflags` outright rather than adding to it -- and cargo treats
+# the variable as *set* even when its value is empty, so `RUSTFLAGS: ""` is not
+# a way to opt out, it is the same override with nothing in it. Setting it
+# workflow-wide would silently drop the windows-msvc portable floor
+# (x86-64-v3 + AES-NI) and the musl `--remap-path-prefix` flags that
+# reproducibility depends on. So it is applied to individual host-build jobs and
+# steps only, exactly as windows-cross-wine.yml does.
+
+jobs:
+  # Everything that can reject the release before any artifact is built.
+  guard:
+    name: Guard (tag matches version, crate packages cleanly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Resolve the tag being released
+        id: resolve
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          TAG="${INPUT_TAG:-$REF_NAME}"
+          case "$TAG" in
+            v*) ;;
+            *) echo "::error::tag '$TAG' does not start with 'v'"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-guard
+
+      - name: Install build deps
+        run: bash scripts/ci_apt.sh pkg-config libssl-dev
+
+      # A tag that disagrees with Cargo.toml would publish the wrong version to
+      # crates.io under the right-looking release page, and crates.io will not
+      # let it be taken back. Check before anything is built.
+      - name: Assert the tag matches Cargo.toml's version
+        env:
+          WANT: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          GOT=$(cargo metadata --no-deps --format-version 1 \
+                | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          echo "Cargo.toml: $GOT   tag: v$WANT"
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::tag v$WANT does not match Cargo.toml version $GOT"
+            exit 1
+          fi
+
+      # Fails on a missing required field, a file the `exclude` list should have
+      # dropped but did not, and on a package whose extracted source no longer
+      # builds. --locked so the published crate resolves to the committed lock.
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --locked
+
+      # The published .crate must not carry the per-run security scan
+      # directories, the demo GIFs, or .cargo/config.toml's host-specific
+      # rustflags. Cargo.toml's `exclude` handles all three; this asserts it,
+      # because the failure is silent and unrecoverable once published.
+      # THE FLOOR IS NOT OPTIONAL. `cargo package --list` failing -- a dirty
+      # tree, a bad manifest -- leaves an empty file, and grepping an empty file
+      # for forbidden paths finds none and reports the crate clean. That is the
+      # same fail-open shape as the release-gate finding in F2: a check that
+      # vanishes has to be loud. So assert the list is there and plausibly
+      # sized before believing anything it says.
+      - name: Assert the packaged file list carries nothing it should not
+        run: |
+          set -euo pipefail
+          cargo package --list --locked > pkg-list.txt
+          COUNT=$(wc -l < pkg-list.txt)
+          echo "packaged files: $COUNT"
+          if [ "$COUNT" -lt 100 ]; then
+            echo "::error::only $COUNT files listed; the crate has ~150. The listing failed rather than the crate shrinking -- this check cannot run."
+            exit 1
+          fi
+          if grep -nE '^(\.cargo/|android/|docs/demos/|demos/|graphify-out/|scratch/)|CLAUDE-SECURITY|\.gif$' pkg-list.txt; then
+            echo "::error::the lines above must not appear in the published crate"
+            exit 1
+          fi
+
+  linux-musl:
+    name: Linux static musl (reproducible, built twice)
+    runs-on: ubuntu-latest
+    needs: guard
+    # Two independent --no-cache container builds of the full dependency tree.
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.guard.outputs.tag }}
+          # reproducible-build.sh derives SOURCE_DATE_EPOCH from the HEAD commit
+          # time, so the commit itself has to be present.
+          fetch-depth: 1
+
+      - name: Install podman
+        run: bash scripts/ci_apt.sh podman
+
+      - name: Reproducible build (portable variant), asserting A == B
+        env:
+          VARIANTS: nkct
+        run: bash packaging/reproducible-build.sh
+
+      - name: Name the artifact for the release page
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mv packaging/out/nkct \
+             "packaging/out/nkct-${TAG}-x86_64-unknown-linux-musl"
+          rm -f packaging/out/SHA256SUMS
+          ls -l packaging/out/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-musl
+          path: packaging/out/nkct-*
+          if-no-files-found: error
+
+  windows:
+    name: Windows x86_64-msvc (cross-built)
+    runs-on: ubuntu-latest
+    needs: guard
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.guard.outputs.tag }}
+
+      - name: Install Rust toolchain (+windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-windows
+
+      - name: Install cargo-xwin toolchain
+        # cargo-xwin itself is a host (linux-gnu) build, so it takes the ci.yml
+        # override. The cross-build step below deliberately gets none.
+        env:
+          RUSTFLAGS: "-C target-cpu=x86-64-v2"
+        run: |
+          bash scripts/ci_apt.sh clang llvm lld
+          cargo install --locked cargo-xwin
+
+      - name: Cache the xwin Windows SDK/CRT
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/cargo-xwin
+          key: xwin-sdk-${{ runner.os }}
+
+      # No RUSTFLAGS here, not even an empty one: the portable x86-64-v3 + AES-NI
+      # floor comes from .cargo/config.toml's [target.x86_64-pc-windows-msvc]
+      # section, and any value of the env var would replace it.
+      - name: Cross-build the .exe
+        run: >
+          cargo xwin build --release --locked
+          --target x86_64-pc-windows-msvc
+          --bin nkct
+          --no-default-features --features backend-rustcrypto
+
+      - name: Name the artifact for the release page
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp target/x86_64-pc-windows-msvc/release/nkct.exe \
+             "out/nkct-${TAG}-x86_64-pc-windows-msvc.exe"
+          ls -l out/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-msvc
+          path: out/nkct-*
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: [guard, linux-musl, windows]
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.guard.outputs.tag }}
+
+      - name: Download built artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Hash the assets
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum nkct-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Compose the release notes
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          set -euo pipefail
+          LINUX_SHA=$(awk '/linux-musl$/ {print $1}' dist/SHA256SUMS)
+          {
+            echo "## Install"
+            echo
+            echo '```'
+            echo "cargo install nkct --version ${VERSION} --locked"
+            echo '```'
+            echo
+            echo "Or take a binary below. \`SHA256SUMS\` covers both."
+            echo
+            echo "## Verifying the Linux binary against this source"
+            echo
+            echo "The Linux artifact is built by \`packaging/reproducible-build.sh\`"
+            echo "inside a digest-pinned container, twice, from independent"
+            echo "\`--no-cache\` builds that are asserted byte-identical. Rebuild it"
+            echo "yourself from the tagged source and compare:"
+            echo
+            echo '```'
+            echo "git checkout ${TAG}"
+            echo "VARIANTS=nkct packaging/reproducible-build.sh"
+            echo "sha256sum packaging/out/nkct"
+            echo '```'
+            echo
+            echo "Expected: \`${LINUX_SHA}\`"
+            echo
+            echo "(sha256 is over content, so the different filename on this page"
+            echo "does not affect the comparison.)"
+            echo
+            echo "An AVX-512/VAES variant is a local opt-in build, not released:"
+            echo "see docs/guides/REPRODUCIBLE_BUILD.md."
+            echo
+            echo "## Changes"
+            echo
+            echo "See [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/${TAG}/CHANGELOG.md)."
+          } > notes.md
+          cat notes.md
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            --verify-tag \
+            dist/nkct-* dist/SHA256SUMS
+
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [guard, release]
+    timeout-minutes: 30
+    # Irreversible: a crates.io version number can never be reused. Give this
+    # environment a required reviewer so the run pauses here for a human.
+    environment: crates-io
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.guard.outputs.tag }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install build deps
+        run: bash scripts/ci_apt.sh pkg-config libssl-dev
+
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish --locked

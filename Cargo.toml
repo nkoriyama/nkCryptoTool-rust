@@ -1,8 +1,54 @@
 [package]
-name = "nk-crypto-tool"
-version = "2.1.0"
+name = "nkct"
+version = "2.2.0"
 edition = "2021"
 license = "MIT"
+authors = ["Naohiro KORIYAMA <nkoriyama@gmail.com>"]
+description = "Post-quantum hybrid (ML-KEM/ML-DSA + ECC) encryption CLI: file encryption, signing, and end-to-end encrypted peer-to-peer chat, shell, and file transfer."
+repository = "https://github.com/nkoriyama/nkCryptoTool-rust"
+homepage = "https://github.com/nkoriyama/nkCryptoTool-rust"
+documentation = "https://github.com/nkoriyama/nkCryptoTool-rust/blob/main/USAGE.md"
+readme = "README.md"
+keywords = ["cryptography", "post-quantum", "encryption", "e2ee", "p2p"]
+categories = ["command-line-utilities", "cryptography", "network-programming"]
+# The toolchain this crate is developed and released against; `rust-toolchain.toml`
+# pins the same version for reproducible builds. Declared so `cargo install` on an
+# older toolchain fails with a version message instead of a wall of type errors.
+rust-version = "1.96.1"
+# The crate is published so `cargo install nkct` works. The library
+# target exists for the bin and for the mobile FFI shim -- it is NOT a supported
+# public API and carries no semver guarantee across releases.
+#
+# `exclude` keeps the published .crate to the sources needed to build and verify
+# it. Everything listed here is either large (the demo GIFs alone are 3.5 MB of a
+# 10 MB budget, and they render as broken links on crates.io anyway), specific to
+# a build host, or an artifact of a build system this crate does not drive.
+# The per-run `CLAUDE-SECURITY-*/` scan directories already self-ignore via a
+# `.gitignore` of their own, so cargo skips them when packaging from a git
+# checkout; the entry below repeats it so packaging from an exported tarball --
+# where those .gitignore files carry no weight -- cannot leak them either.
+exclude = [
+    # Host-specific build flags. `[build] rustflags = target-cpu=native` plus the
+    # `+vaes` line for x86_64-unknown-linux-gnu are correct for the machine that
+    # wrote them and wrong for everyone else: a user who unpacks the .crate and
+    # builds in place would compile VAES instructions into a binary their CPU may
+    # not have, and get a SIGILL rather than the startup CPUID error main() raises
+    # for the deliberately-opted-in VAES build. Cargo does not read a package's
+    # own `.cargo/config.toml` during `cargo install`, so shipping it buys nothing
+    # even where it is harmless.
+    "/.cargo/",
+    "/CLAUDE-SECURITY-*/",
+    "/android/",
+    "/docs/demos/",
+    "/demos/",
+    "/graphify-out/",
+    "/packaging/out/",
+    "/scratch/",
+    "/bench_keys/",
+    "/.github/",
+    "/diff.txt",
+    "/ticket.log",
+]
 
 [lints.rust]
 # `aes_backend` is the aes crate's backend-selection cfg (avx256/avx512 VAES);
@@ -13,7 +59,7 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 ] }
 
 # `rlib` keeps the normal Rust library (used by the bin and integration tests);
-# `cdylib` additionally emits a C-ABI shared library (`libnk_crypto_tool.so`) so
+# `cdylib` additionally emits a C-ABI shared library (`libnkct.so`) so
 # the chat/crypto core can be loaded from a mobile app via JNI/UniFFI. See
 # BUILD_ANDROID.md.
 [lib]

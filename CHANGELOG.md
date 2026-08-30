@@ -2,6 +2,72 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.0] - 2026-08-30
+
+2.1.0 から 60 の PR。crates.io への初回公開バージョンでもある。
+
+### Breaking
+
+- **実行ファイル名と crate 名を `nkct` に変更**: `nk-crypto-tool` から改名した。crates.io の
+  crate 名も `nkct`（`cargo install nkct`）。旧名では入らない。呼び出しているスクリプト・
+  systemd unit・alias は書き換えが必要。C-ABI 共有ライブラリも `libnkct.so` になる。
+- **`--peer-allowlist` を廃止**: 認可は keyring の grants テーブルに一本化。平文の allowlist ファイルは読まれない。
+- **`GRANT_ALL` の既定を廃止**: ペアリングで登録した相手に自動で全権が付かなくなった。keyring 経由の shell は明示的なポリシーを要求する。
+- **TCP トランスポートを削除**: P2P は iroh (QUIC) のみ。
+- **暗号ファイル v2 形式の削除**: 自前実装の AEAD を検証済みの one-shot API に置換した際に撤去 (監査 M5)。v3 のみを読む。
+- **`--listen` → `--serve-chat`**: 全サーバの語彙を `serve-*` に統一。`--listen` は alias として残置。
+- **SQLCipher → redb**: MLS / inbox / keyring のストアが純 Rust の redb に移行。`mls` は C 依存ゼロになりモバイルでビルドできる。旧 SQLCipher DB からの移行は `legacy-sqlcipher-migration` feature の移行ツールで行う。
+
+### Added
+
+- **MLS グループチャット (P1–P8)**: RFC 9420 ベース。Ed25519+ML-DSA-65 のハイブリッド署名、X25519+ML-KEM-768 のハイブリッド KEM (X-Wing)、remove_member と PCS、`nkct/mls/1` 越しの KeyPackage / Welcome、3 者ディスパッチ、Slint GUI、グループ内ファイル転送、グループ別アドレス帳、`mls rekey`。
+- **P2P シェル (Phase 0–6)**: 踏み台レスの PTY ブリッジ。認可ポリシーとコマンド allowlist、監査ログ、レート制限、setuid 権限降格、`--tui` ステータスバー (接続メトリクス / ハイブリッド秘匿スタック表示)、Windows (ConPTY) 対応、MLS グループ membership の shell/forward ポリシーへの投影。
+- **P2P scp (`nkct/scp/3`)**: 再帰転送 (`-r`)、`user=` ポリシー、レジューム付き get、ライブ進捗バー、put パイプライン化。
+- **P2P ポートフォワード (Phase 3–5)**: `nkct/fwd/1` 上の多重化ローカル転送、リモートフォワード (`-R`)、SSH 風クレジットウィンドウによるチャネル毎フロー制御。
+- **GPG 風 keyring (my-identities)**: 自分の鍵を keyring.db に封入。生成 / 復号 / 署名 / KeyBundle / P2P identity のすべてが鍵ファイル無しで動く (`gen-my-key`, sign 側の auto-match, keyring 由来のハンドシェイク identity)。
+- **ペアリング (`nkct/pairing/1`)**: `ssh-copy-id` 相当の KeyBundle 自動登録。
+- **PQ-FS / One-Time Prekey**: 静的 identity 鍵と署名付き recipient bundle、inbox 越しのワンショット封筒、PUBLISH/FETCH と NodeId 毎のレート制限、inbox COUNT による自動補充。
+- **at-rest 暗号化**: DEK を AES-256-GCM でラップ (suite 0xF102)、KEK を DB に束縛して KEK すり替えを封じ、アンチロールバックカウンタを KEK に結合、TPM 2.0 NV カウンタ対応。
+- **inbox store-and-forward (`nkct/inbox/1`)**: 保存時暗号化、ロールバックチェックポイント。
+- **v3 チャンク化ストリーミング AEAD 形式** (`StreamingAeadProcessor`)。
+- **`--qr`**: 任意の文字列を端末に QR 表示（外部ツール不要）。
+- **モバイル**: UniFFI ブリッジと `MobileChatClient`、Android の Kotlin アプリ骨格。
+- **P2P 運用系**: mDNS ローカル探索 (`--discovery local`)、永続ノード鍵による安定 NodeId、admission control の環境変数設定、n0 公開インフラにメタデータが渡る場合の警告。
+- **Windows 対応**: shell (portable-pty)、`secure_fs` によるファイル安全性ハードニング、scp confinement の post-open 実パス再検証、CI。
+
+### Changed
+
+- **既定バックエンドを RustCrypto に**: プラットフォーム依存を減らし移植性を優先。OpenSSL は明示的な opt-in。
+- **性能**: `aes-gcm` 0.11 世代への移行でファイルスループット +50〜60%。v3 チャンクの暗号化・復号でバッファ再利用と in-place 化、scp の bulk Data フレームを in-place で seal、QUIC 受信ウィンドウを 8 MiB に拡大、MLS ブロードキャストの並列ファンアウト。
+
+### Fixed
+
+- **P2P シェルの正常終了がエラー表示になっていた**: セッション終了時、サーバは `Frame::Exit`
+  を書いた直後に戻り、呼び出し側が即座に `endpoint.close()` する。QUIC の CONNECTION_CLOSE は
+  未確認のデータを捨てるので Exit フレームが失われ、クライアントは読み取りエラーを見る。
+  クライアントの受信ループは「同期ずれをクリーンな切断に見せない」ため設計上あらゆる受信
+  エラーを表示するので、Ctrl+D による普通の終了が
+  `session ended: inbound frame decode failed: connection lost` と表示され、終了コードは 255
+  になっていた。サーバは Exit 送信後に送信ストリームを finish し、クライアントが自分側を
+  閉じるのを上限つきで待つようにした（相手の EOF が配送完了の証拠。固定の sleep より厳密で、
+  実測でも待ち時間は増えない）。
+
+### Security
+
+2026-07 監査の 21 件と 2026-07-28 再スキャンの 5 件を含め、33 のセキュリティコミット。主なもの:
+
+- 認証前のリソース枯渇: inbox DEPOSIT フラッド (H1) と POLL バッチのバイト数上限、容量到達時は退避ではなく拒否、prekey 公開のコスト下限、accept の pre-auth / session プール分離 (H2)。
+- MLS: Commit / Proposal を signed cleartext ではなく PrivateMessage として封緘。SYNC 履歴を要求者自身の join epoch にクランプ。ファンアウトをそのグループに限定し、Remove 済みのロスターが保証を持ち越せないようにした。
+- 鍵と形式: ECC 秘密鍵をパスフレーズで暗号化し PBKDF2 を 600k に (H1/H3)、Ticket パースの境界チェック (H2, DoS panic)、v2 IV 長 panic (M2)、ticket fingerprint バイパス (M3)。
+- ファイルシステム: 受信ファイルを一時領域に置き AEAD タグ検証後にのみコミット、受信先ディレクトリの封じ込めを文字ブラックリストではなく `Path` で判定、中間 symlink の TOCTOU を Linux 以外にも拡張 (M4)。
+- メモリ: `SecureBuffer` の munlock リーク修正、TPM 鍵一時ファイルの安全消去。
+- リリースゲート自体の監査: ワークフローを grep ではなくパースして判定、ベースラインゲートにファイル集合の表明とフロアを追加。
+
+### Notes
+
+- ライブラリターゲット (`rlib` / `cdylib`) は bin とモバイル FFI シムのために存在するもので、**公開 API ではない**。semver 保証の対象外。
+- Linux のリリースバイナリは `packaging/reproducible-build.sh` による再現可能ビルドで作られる。
+
 ## [2.1.0] - 2026-05-10
 
 ### Added

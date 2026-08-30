@@ -14,7 +14,7 @@
 # Recorded with VHS (see p2p_cpp_rust_interop.tape).
 set -u
 
-RUST="$PWD/target/release/nk-crypto-tool"
+RUST="$PWD/target/release/nkct"
 CPP="$PWD/../nkCryptoTool/build-both/nkCryptoTool"
 unset RUST_LOG NK_PASSPHRASE
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/nkct-xrole-demo.XXXXXX") || exit 1
@@ -132,7 +132,7 @@ SRV=$!; T=$(grab_ticket "$ROOT/l5")
 OTP=$(grep -aoE 'token \(valid 5 min\): [A-Z2-7]{8}' "$ROOT/l5" | grep -aoE '[A-Z2-7]{8}$' | head -1)
 echo "   C++ pairing server up, one-time token $OTP"
 sleep 0.5
-NK_PASSPHRASE="" "$RUST" --copy-bundle --connect "$T" --token "$OTP" --keybundle-handle rust-laptop \
+printf '%s' "$OTP" | NK_PASSPHRASE="" "$RUST" --copy-bundle --connect "$T" --token - --keybundle-handle rust-laptop \
   --no-relay --mode pqc --signing-privkey "$ROOT/keys/s/private_sign_pqc.key" --key-dir "$ROOT/keys/s" 2>/dev/null | grep -aE 'registered'
 kill $SRV 2>/dev/null; SRV=""
 echo -n "   c++ keyring.db now lists: "; "$RUST" --keyring-cmd list --keyring-db "$ROOT/cdb/keyring.db" 2>/dev/null | awk '{print $2}' | paste -sd' '

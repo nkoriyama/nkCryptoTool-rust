@@ -3,7 +3,7 @@
 # Exercises: inbox-server, gen-sign-key, prekey init-identity (publish +
 # bundle), seal (fetch+seal+deposit), recv (poll+open) over iroh/no-relay.
 set -u
-BIN=target/debug/nk-crypto-tool
+BIN=target/debug/nkct
 W=$(mktemp -d "${TMPDIR:-/tmp}/pqfs-smoke.XXXXXX")
 export NK_PASSPHRASE=smoke-pass
 echo "workdir: $W"

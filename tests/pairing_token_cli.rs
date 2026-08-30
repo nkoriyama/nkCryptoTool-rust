@@ -18,7 +18,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 fn bin() -> String {
-    let b = "./target/debug/nk-crypto-tool";
+    let b = "./target/debug/nkct";
     if !Path::new(b).exists() {
         Command::new("cargo").arg("build").status().unwrap();
     }

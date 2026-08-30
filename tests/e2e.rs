@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 fn get_bin() -> String {
-    let bin = "./target/debug/nk-crypto-tool";
+    let bin = "./target/debug/nkct";
     if !Path::new(bin).exists() {
         // Try running cargo build if not exists
         Command::new("cargo").arg("build").status().unwrap();

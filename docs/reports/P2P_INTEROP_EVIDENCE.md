@@ -120,7 +120,7 @@ MLS/転送系も別途、アドレス帳・グループファイル転送・3 �
 選択された経路種別と RTT を 1 行で出力してシェルを開かず終了する:
 
 ```bash
-nk-crypto-tool --conn-metrics --connect 'nkct1...' --mode pqc \
+nkct --conn-metrics --connect 'nkct1...' --mode pqc \
   --signing-privkey ~/nkkeys/private_sign_pqc.key \
   --signing-pubkey  ./server_public_sign_pqc.key
 # => stderr: nkct-metrics relay=false rtt_ms=23
@@ -133,7 +133,7 @@ N サンプル収集の例（相手チケットを `$T` に入れて）:
 
 ```bash
 for i in $(seq 1 50); do
-  nk-crypto-tool --conn-metrics --connect "$T" --mode pqc \
+  nkct --conn-metrics --connect "$T" --mode pqc \
     --signing-privkey ~/nkkeys/private_sign_pqc.key \
     --signing-pubkey ./server_public_sign_pqc.key 2>&1 \
     | grep -oE 'nkct-metrics .*'

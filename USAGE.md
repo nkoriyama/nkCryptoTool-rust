@@ -3,7 +3,7 @@
 やりたいこと別に「こう打てばできる」をまとめた実用ガイド。設計背景は各 DESIGN ドキュメント（[docs/design/](./docs/design/)）、
 機能一覧・性能・アーキテクチャは [README](./README.md) を参照。ここはコマンドだけ。
 
-- コマンドは `nk-crypto-tool`（ビルド後は `target/release/nk-crypto-tool`）。
+- コマンドは `nkct`（ビルド後は `target/release/nkct`）。
 - `--mode` は `pqc`（ML-KEM/ML-DSA、既定推奨）/ `ecc`（P-256）/ `hybrid`（PQC＋古典の二重）。
 - 秘密鍵のパスフレーズは既定で対話入力。自動化は `NK_PASSPHRASE` 環境変数（警告が出る）。
 - `--key-dir <dir>` は鍵を**規約ファイル名**（`private_sign_pqc.key` / `public_enc_pqc.key` 等）で
@@ -24,11 +24,11 @@
 
 ```bash
 # 署名鍵ペア（ML-DSA-65）— 署名 / P2P 認証 / KeyBundle の identity に使う
-nk-crypto-tool --mode pqc --gen-sign-key --key-dir keys
+nkct --mode pqc --gen-sign-key --key-dir keys
 #   → keys/private_sign_pqc.key , keys/public_sign_pqc.key
 
 # 暗号化鍵ペア（ML-KEM-768）— 暗号化の受信者鍵に使う
-nk-crypto-tool --mode pqc --gen-enc-key --key-dir keys
+nkct --mode pqc --gen-enc-key --key-dir keys
 #   → keys/private_enc_pqc.key , keys/public_enc_pqc.key
 ```
 
@@ -43,10 +43,10 @@ nk-crypto-tool --mode pqc --gen-enc-key --key-dir keys
 （秘密鍵は暗号化 PKCS#8 のまま DB に入り、ファイルとしては一度もディスクに書かれない）:
 
 ```bash
-nk-crypto-tool --keyring-cmd gen-my-key --key-algo ML-DSA-65 --key-dir keys   # 署名 identity
-nk-crypto-tool --keyring-cmd gen-my-key --key-algo ML-KEM-768 --key-dir keys  # 暗号化鍵
+nkct --keyring-cmd gen-my-key --key-algo ML-DSA-65 --key-dir keys   # 署名 identity
+nkct --keyring-cmd gen-my-key --key-algo ML-KEM-768 --key-dir keys  # 暗号化鍵
 # hybrid にするなら P-256 も（enc/sign 両用のため役割を指定）
-nk-crypto-tool --keyring-cmd gen-my-key --key-algo P-256 --key-role enc --key-dir keys
+nkct --keyring-cmd gen-my-key --key-algo P-256 --key-role enc --key-dir keys
 ```
 
 - パスフレーズは必須（keyring は暗号化秘密鍵しか持たない）。取り込み(import-my-key)と
@@ -57,7 +57,7 @@ nk-crypto-tool --keyring-cmd gen-my-key --key-algo P-256 --key-role enc --key-di
 
 **指紋の確認**（相手を pin するとき out-of-band で照合する 64 hex）:
 ```bash
-nk-crypto-tool --mode pqc --fingerprint --signing-pubkey keys/public_sign_pqc.key
+nkct --mode pqc --fingerprint --signing-pubkey keys/public_sign_pqc.key
 #   → Fingerprint: <64-hex>
 ```
 
@@ -69,7 +69,7 @@ nk-crypto-tool --mode pqc --fingerprint --signing-pubkey keys/public_sign_pqc.ke
 
 ### 受信者側（1 回だけ、鍵を配る）
 ```bash
-nk-crypto-tool --mode pqc --gen-keybundle --key-dir keys \
+nkct --mode pqc --gen-keybundle --key-dir keys \
     --signing-privkey keys/private_sign_pqc.key \
     --keybundle-handle alice \
     --keybundle-output alice.nkkb
@@ -93,7 +93,7 @@ out-of-band（電話等）で送信者へ**渡す。指紋は §0 の `--fingerp
 
 ### 送信者側（暗号化）
 ```bash
-nk-crypto-tool --mode pqc --encrypt \
+nkct --mode pqc --encrypt \
     --recipient-keybundle alice.nkkb \
     --recipient-fingerprint <64-hex> \
     --output-file secret.enc \
@@ -116,14 +116,14 @@ nk-crypto-tool --mode pqc --encrypt \
 
 ```bash
 # pqc / ecc
-nk-crypto-tool --mode pqc --decrypt \
+nkct --mode pqc --decrypt \
     --user-privkey keys/private_enc_pqc.key \
     --output-file plain.out \
     secret.enc
 ```
 hybrid は 2 つの秘密鍵を渡す:
 ```bash
-nk-crypto-tool --mode hybrid --decrypt \
+nkct --mode hybrid --decrypt \
     --user-mlkem-privkey keys/private_enc_hybrid_mlkem.key \
     --user-ecdh-privkey  keys/private_enc_hybrid_ecdh.key \
     --output-file plain.out \
@@ -138,15 +138,15 @@ nk-crypto-tool --mode hybrid --decrypt \
 
 ```bash
 # 一度だけ: 取り込み（パスフレーズで検証してから格納。役割/アルゴは自動判定）
-nk-crypto-tool --keyring-cmd import-my-key --user-privkey keys/private_enc_pqc.key
+nkct --keyring-cmd import-my-key --user-privkey keys/private_enc_pqc.key
 # 取り込み後に元ファイルを消すなら --shred-original を付ける
 
 # 以後: 鍵指定なしで復号（hybrid も同様 — 2 スロットとも取り込んでおけば自動で両方使う）
-nk-crypto-tool --mode pqc --decrypt --output-file plain.out secret.enc
+nkct --mode pqc --decrypt --output-file plain.out secret.enc
 
 # 一覧・削除
-nk-crypto-tool --keyring-cmd list-my-keys
-nk-crypto-tool --keyring-cmd remove-my-key --key-role enc --key-algo ML-KEM-768
+nkct --keyring-cmd list-my-keys
+nkct --keyring-cmd remove-my-key --key-role enc --key-algo ML-KEM-768
 ```
 
 - P-256 鍵は enc/sign 両用のため取り込み時に `--key-role enc|sign` が必要。
@@ -161,7 +161,7 @@ nk-crypto-tool --keyring-cmd remove-my-key --key-role enc --key-algo ML-KEM-768
 自分の**署名秘密鍵**で切り離し署名（detached）を作る。
 
 ```bash
-nk-crypto-tool --mode pqc --sign \
+nkct --mode pqc --sign \
     --signing-privkey keys/private_sign_pqc.key \
     --signature doc.sig \
     doc.txt
@@ -177,10 +177,10 @@ pqc/hybrid → `--dsa-algo` の ML-DSA 鍵、ecc → P-256 鍵）:
 
 ```bash
 # 一度だけ: 取り込み（ML-DSA は役割自動判定。P-256 は --key-role sign が必要）
-nk-crypto-tool --keyring-cmd import-my-key --user-privkey keys/private_sign_pqc.key
+nkct --keyring-cmd import-my-key --user-privkey keys/private_sign_pqc.key
 
 # 以後: 鍵指定なしで署名
-nk-crypto-tool --mode pqc --sign --signature doc.sig doc.txt
+nkct --mode pqc --sign --signature doc.sig doc.txt
 ```
 
 ---
@@ -191,9 +191,9 @@ nk-crypto-tool --mode pqc --sign --signature doc.sig doc.txt
 
 ```bash
 # (推奨) まず署名者公開鍵の指紋を out-of-band 値と照合しておく
-nk-crypto-tool --mode pqc --fingerprint --signing-pubkey signer_pub.key
+nkct --mode pqc --fingerprint --signing-pubkey signer_pub.key
 
-nk-crypto-tool --mode pqc --verify \
+nkct --mode pqc --verify \
     --signing-pubkey signer_pub.key \
     --signature doc.sig \
     doc.txt
@@ -211,7 +211,7 @@ nk-crypto-tool --mode pqc --verify \
 
 ### サーバ（シェルを提供する側）
 ```bash
-nk-crypto-tool --serve-shell --mode pqc \
+nkct --serve-shell --mode pqc \
     --signing-privkey server/private_sign_pqc.key \
     --signing-pubkey  client/public_sign_pqc.key \
     [--shell-policy policy.txt] [--audit-log audit.log]
@@ -231,7 +231,7 @@ nk-crypto-tool --serve-shell --mode pqc \
 
 ### クライアント（シェルに入る側）
 ```bash
-nk-crypto-tool --shell --connect <ticket> --mode pqc \
+nkct --shell --connect <ticket> --mode pqc \
     --signing-privkey client/private_sign_pqc.key \
     --signing-pubkey  server/public_sign_pqc.key
 #   → 対話 PTY。`Server authenticated successfully (auth: ML-DSA-65)` を確認
@@ -257,7 +257,7 @@ keyring や該当スロットが無ければ従来どおり匿名で動く（勝
 
 ### サーバ（ファイルを置く側）
 ```bash
-nk-crypto-tool --serve-scp --mode pqc \
+nkct --serve-scp --mode pqc \
     --signing-privkey server/private_sign_pqc.key \
     --signing-pubkey  client/public_sign_pqc.key \
     --scp-policy scp.policy
@@ -273,12 +273,12 @@ nk-crypto-tool --serve-scp --mode pqc \
 ### クライアント（送受信する側）
 ```bash
 # アップロード（put）: ローカル → リモート
-nk-crypto-tool --scp-put local.tar /srv/local.tar --connect <ticket> --mode pqc \
+nkct --scp-put local.tar /srv/local.tar --connect <ticket> --mode pqc \
     --signing-privkey client/private_sign_pqc.key \
     --signing-pubkey  server/public_sign_pqc.key
 
 # ダウンロード（get）: リモート → ローカル
-nk-crypto-tool --scp-get /srv/remote.tar local.tar --connect <ticket> --mode pqc \
+nkct --scp-get /srv/remote.tar local.tar --connect <ticket> --mode pqc \
     --signing-privkey client/private_sign_pqc.key \
     --signing-pubkey  server/public_sign_pqc.key
 ```
@@ -299,7 +299,7 @@ KeyBundle も同じ keyring に保存する。手動での指紋登録・鍵手�
 
 ### サーバ（登録を受け付ける側・単発）
 ```bash
-nk-crypto-tool --serve-pairing --mode pqc \
+nkct --serve-pairing --mode pqc \
     --signing-privkey server/private_sign_pqc.key \
     --key-dir server \
     --pairing-grant scp        # 付与するサービス（必須。shell|scp|forward|all）
@@ -314,11 +314,11 @@ nk-crypto-tool --serve-pairing --mode pqc \
 
 ### クライアント（自分を登録してもらう側）
 ```bash
-nk-crypto-tool --copy-bundle --mode pqc --connect <ticket> --token - \
+nkct --copy-bundle --mode pqc --connect <ticket> --token - \
     --signing-privkey client/private_sign_pqc.key \
     --keybundle-handle alice --key-dir client
 #   → OTP をプロンプトで入力（端末ならエコーなし）。パイプも可:
-#      printf '%s' "$OTP" | nk-crypto-tool --copy-bundle ... --token -
+#      printf '%s' "$OTP" | nkct --copy-bundle ... --token -
 #   → "registered alice …" が出れば成功
 ```
 - **`--token` は `-` のみ受け付ける**（OTP をコマンドラインに直接書くとエラー）。
@@ -349,21 +349,21 @@ nk-crypto-tool --copy-bundle --mode pqc --connect <ticket> --token - \
 される（同一 identity の再登録は冪等）。
 
 ```bash
-nk-crypto-tool --keyring-cmd list   --key-dir server                  # 一覧（<指紋>  <handle>）
-nk-crypto-tool --keyring-cmd add    --key-dir server \                # 手動追加（pin 必須）
+nkct --keyring-cmd list   --key-dir server                  # 一覧（<指紋>  <handle>）
+nkct --keyring-cmd add    --key-dir server \                # 手動追加（pin 必須）
     --recipient-keybundle alice.nkkb --recipient-fingerprint <64-hex> --keybundle-handle alice
-nk-crypto-tool --keyring-cmd remove --key-dir server --keybundle-handle alice
-nk-crypto-tool --keyring-cmd import --key-dir server                  # 旧 received/*.nkkb を移行
+nkct --keyring-cmd remove --key-dir server --keybundle-handle alice
+nkct --keyring-cmd import --key-dir server                  # 旧 received/*.nkkb を移行
 # 認可（allowlist テーブル）: handle か --recipient-fingerprint で指定
-nk-crypto-tool --keyring-cmd authorize --key-dir server --keybundle-handle alice --pairing-grant shell,scp
-nk-crypto-tool --keyring-cmd revoke    --key-dir server --keybundle-handle alice
+nkct --keyring-cmd authorize --key-dir server --keybundle-handle alice --pairing-grant shell,scp
+nkct --keyring-cmd revoke    --key-dir server --keybundle-handle alice
 ```
 
 貯めた束は、そのまま**暗号化の宛先**に使える（`--recipient-keybundle` + `--recipient-fingerprint`
 を毎回渡す代わりに handle で引く）:
 
 ```bash
-nk-crypto-tool --encrypt --mode pqc --recipient alice --key-dir server \
+nkct --encrypt --mode pqc --recipient alice --key-dir server \
     secret.txt --output-file secret.enc
 ```
 
@@ -428,13 +428,13 @@ proof-of-work かオーバーレイ下位でのアドレス単位レート制限
 ```bash
 # 例: WireGuard で拠点間トンネルを張り、その内側(10.0.0.0/24 等)で nkct を --no-relay 直結。
 # サーバ側（オーバーレイ内アドレスで待ち受け）
-nk-crypto-tool --serve-scp --no-relay --mode pqc \
+nkct --serve-scp --no-relay --mode pqc \
     --signing-privkey server/private_sign_pqc.key \
     --keyring-db server/keyring.db --scp-policy scp.policy
 #   → ticket を out-of-band で渡す（discovery は既定の none のまま）
 
 # クライアント側（オーバーレイ経由で接続）
-nk-crypto-tool --scp-get remote/file.enc local/file.enc --no-relay --mode pqc \
+nkct --scp-get remote/file.enc local/file.enc --no-relay --mode pqc \
     --connect <ticket> --signing-privkey client/private_sign_pqc.key --key-dir client
 ```
 

@@ -441,7 +441,7 @@ round.
 - **`--token <OTP>` is rejected.** Only `--token -` is accepted; the OTP is read
   from the terminal without echo, or from stdin so it can be piped. Any script
   passing the OTP literally must change to
-  `printf '%s' "$OTP" | nk-crypto-tool … --token -`.
+  `printf '%s' "$OTP" | nkct … --token -`.
 - **`MkDir` modes are no longer honoured on pre-existing directories**, and are
   masked to drop group/other write on new ones. A `get -r` that previously
   reproduced a `0o775` or `0o777` directory now yields `0o755`.

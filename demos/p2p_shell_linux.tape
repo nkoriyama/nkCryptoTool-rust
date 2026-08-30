@@ -21,7 +21,7 @@ Type "source demos/p2p_shell_demo.sh   # keygen + start server + grab ticket"
 Enter
 Sleep 3s
 
-Type 'nk-crypto-tool --shell --tui --connect "$TICKET" --mode pqc --signing-privkey "$CKEY" --signing-pubkey "$SPUB"'
+Type 'nkct --shell --tui --connect "$TICKET" --mode pqc --signing-privkey "$CKEY" --signing-pubkey "$SPUB"'
 Enter
 Sleep 4s
 
