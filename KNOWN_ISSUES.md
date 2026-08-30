@@ -1226,3 +1226,50 @@ already had.
     in that scan directory's `rejected-diffs/`, and the doc comment on
     `validate_peer_relay_url` carries a short form of it so the next reader who
     notices the missing filter finds out why it is missing.
+
+## Closed, with a residual the fix cannot reach (2026-08)
+
+Separate from both sections above: the finding below **is fixed**, and the
+residual named with it is not a second bug but the boundary of what a fix of
+this shape can do. It is recorded so a later reader does not mistake the closed
+half for the whole.
+
+16. **The baseline's covered-file set is now asserted, but its anchor is still
+    unauthenticated** (`scripts/mandate_check.sh` check 19,
+    `scripts/check_security_baseline.sh`, `scripts/security_critical_files.txt`;
+    scan `CLAUDE-SECURITY-20260829-234711`, F1).
+
+    **What was closed.** Check 19 ran `sha256sum --check` over
+    `.security-baseline.sha256`, and `sha256sum --check` verifies only the lines
+    it is handed. That file arrives with the commit under judgement — `ci.yml`
+    checks out the pull request head and runs the gate on it — so a proposer
+    could delete a file's line, or mangle its hash to 63 hex characters (which
+    GNU coreutils warns about on the stderr the old code discarded, skips, and
+    exits 0 for), tamper with that source freely, and still be told "all
+    required checks passed". The covered set is now declared in
+    `scripts/security_critical_files.txt`, read by both the gate and
+    `scripts/rebaseline_security.sh`, and the gate asserts set equality in both
+    directions and rejects malformed entries before comparing any hash.
+
+    Measured, not reasoned: both exploit variants exit 0 on the pre-fix gate and
+    exit 1 on the fixed one, and `--strict` alone — half of the finding's own
+    recommendation — does **not** close the deleted-entry variant. The set
+    comparison is the load-bearing part.
+
+    **What remains.** `scripts/security_critical_files.txt` and
+    `scripts/check_security_baseline.sh` are now load-bearing for the gate, and
+    they arrive from the same pull-request head as everything else; the gate can
+    only require that they exist. A hash list living in the same commit as the
+    data it hashes cannot resist that commit's author, and moving the
+    declaration one file sideways does not change that — it only makes an
+    attacker edit two reviewable files instead of one. Closing this needs an
+    anchor outside the PR-controlled tree: a signed tag, or a value held by the
+    CI configuration rather than the checkout.
+
+    **What was deliberately not added.** A coverage floor (a minimum number of
+    covered files) was written, verified, and rejected. It blocked a workflow
+    this repository has actually performed — genuinely deleting a covered source,
+    removing it from the list, and rebaselining — while an attacker keeps the
+    count intact with a single decoy entry. It stopped the honest maintainer and
+    not the dishonest one. Do not re-add it; the rejected diff is in that scan
+    directory's `rejected-diffs/`.

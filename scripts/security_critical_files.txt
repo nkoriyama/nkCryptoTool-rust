@@ -1,0 +1,37 @@
+# Security-critical source files: the single source of truth for what
+# .security-baseline.sha256 is required to cover.
+#
+# Read by BOTH scripts/rebaseline_security.sh, which regenerates the baseline
+# from this list, and scripts/check_security_baseline.sh, the gate that checks
+# it (mandate_check.sh §19). They read the same file so the two cannot
+# disagree. Before this list existed the gate verified whichever lines the
+# baseline happened to contain, so deleting a line deleted the coverage and the
+# gate still reported a match.
+#
+# Format: one repo-relative path per line; '#' comments and blank lines are
+# ignored. Order matters only in that the baseline is regenerated in this
+# order -- keep it stable so a rebaseline shows a content diff, not a reshuffle.
+#
+# Editing THIS file is the decision a human has to make, and it is deliberately
+# the only place that decision can be made: add or remove a path here in the
+# same commit that adds or removes the file, and record why (HANDOFF §1.7.3).
+# The gate can prove the baseline matches this list; it cannot know whether the
+# list is the right list, so that stays in the diff where a reviewer sees it.
+#
+# INVARIANT: this list MUST include the handshake body (src/p2p/processor.rs) --
+# the mutual-auth transcript signing lives there.
+#
+# (The iroh transport moved src/network/iroh.rs -> src/p2p/backend/iroh.rs
+#  during the p2p abstraction refactor. src/network/tcp.rs was dropped from the
+#  list when the deprecated TCP transport was deleted -- iroh is the only
+#  transport now. That was an INTENTIONAL deletion, not the silent drift #24
+#  guards against: the file no longer exists.)
+src/backend/mod.rs
+src/backend/openssl_impl.rs
+src/backend/rustcrypto_impl.rs
+src/p2p/backend/iroh.rs
+src/p2p/processor.rs
+src/network/mod.rs
+src/processor.rs
+src/secure_fs.rs
+src/utils.rs
