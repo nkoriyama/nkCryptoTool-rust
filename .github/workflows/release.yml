@@ -295,6 +295,20 @@ jobs:
           lipo -info "out/nkct-${TAG}-universal-apple-darwin"
           ls -l out/
 
+      # `lipo -info` reports what the container claims, not that either slice
+      # runs. CI builds and tests the two halves separately and would otherwise
+      # never execute the thing actually shipped, so a lipo that produced a
+      # malformed binary would ship unnoticed. The runner is Apple Silicon, so
+      # this exercises the arm64 slice; the x86_64 slice is covered by the
+      # separate cross-build's own test run.
+      - name: Smoke the universal binary that actually ships
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          chmod +x "out/nkct-${TAG}-universal-apple-darwin"
+          "./out/nkct-${TAG}-universal-apple-darwin" --version
+
       - name: Upload
         uses: actions/upload-artifact@v4
         with:
