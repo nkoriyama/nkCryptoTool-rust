@@ -416,18 +416,50 @@ else
     fail "check_workflow_triggers.py self-test" "scripts/test_check_workflow_triggers.sh missing — it is tracked, so this means deletion"
 fi
 
-# 19. .security-baseline.sha256 strict match (P1-R12)
+# 19. .security-baseline.sha256 covers the listed set, and matches (P1-R12;
+#     coverage-set comparison added by the 2026-08 turn-11 audit, F1)
 # The baseline file is tracked in git, so its absence means it was deleted,
 # not that it has yet to be initialised: fail, don't warn. Skipping here would
 # let `rm .security-baseline.sha256` silence the whole integrity check.
+#
+# `sha256sum --check` used to be the whole check, and it verifies the lines it
+# is handed and nothing else. The file handing them over arrives with the commit
+# being judged — ci.yml checks out the PR head and runs this script on it — so
+# deleting one line took a file out of coverage while every remaining line still
+# matched and this check still printed OK. scripts/check_security_baseline.sh
+# compares the baseline's entries against scripts/security_critical_files.txt in
+# both directions before it looks at a hash; read its header for the property it
+# does guarantee and the one it deliberately leaves to the reviewer.
+#
+# Its output is printed on failure rather than dropped: sha256sum's stderr, which
+# used to go to /dev/null, is where "improperly formatted line" appears.
 if [ -f .security-baseline.sha256 ]; then
-    if sha256sum --check --quiet .security-baseline.sha256 2>/dev/null; then
-        pass ".security-baseline.sha256: strict match"
+    if BASELINE_OUT="$(bash scripts/check_security_baseline.sh 2>&1)"; then
+        pass ".security-baseline.sha256: covers the listed files, strict match"
     else
-        fail ".security-baseline.sha256" "hash mismatch — see HANDOFF §1.7.3 baseline reconstruction protocol"
+        fail ".security-baseline.sha256" "see HANDOFF §1.7.3 baseline reconstruction protocol"
+        printf '%s\n' "$BASELINE_OUT"
     fi
 else
     fail ".security-baseline.sha256" "missing — the file is tracked; restore it with 'git checkout -- .security-baseline.sha256', or regenerate it with scripts/rebaseline_security.sh if the baseline is intentionally being renewed"
+fi
+
+# 19b. The baseline gate's own self-test (F1).
+# Check 19 delegates to a script now, and a script can be edited into a
+# fail-open that still prints a pass — the same reasoning as 18b above. The
+# test pins the moves the coverage-set comparison exists to stop (an entry
+# deleted from the baseline, an entry the list never named, a hash mangled into
+# the malformed line sha256sum skips with exit 0) and, just as important, the
+# legitimate deletion that must keep passing. Cheap: eleven fixtures in a temp
+# directory, well under a second.
+if [ -f scripts/test_check_security_baseline.sh ]; then
+    if bash scripts/test_check_security_baseline.sh >/dev/null 2>&1; then
+        pass "check_security_baseline.sh: 11/11 self-tests (incl. the legitimate deletion that must stay clean)"
+    else
+        fail "check_security_baseline.sh self-test" "run 'bash scripts/test_check_security_baseline.sh' for the failing cases"
+    fi
+else
+    fail "check_security_baseline.sh self-test" "scripts/test_check_security_baseline.sh missing — it is tracked, so this means deletion"
 fi
 
 # 20. clippy #[allow(...)] rationale + Future plan (P1-X12 v2, diff-based)
@@ -492,7 +524,7 @@ fi
 # its own value. That WARN cannot hide a removal, which is the property F2's
 # WARN class lacked.
 CHECKS_RUN=$((PASS_COUNT + FAIL_COUNT + WARN_COUNT))
-EXPECTED_CHECKS=24
+EXPECTED_CHECKS=25
 if [ "$CHECKS_RUN" -lt "$EXPECTED_CHECKS" ]; then
     fail "check-count floor" "only $CHECKS_RUN checks ran, expected >= $EXPECTED_CHECKS — a check was deleted, renamed, or silently skipped. Compare this run's lines against git show HEAD:scripts/mandate_check.sh"
 elif [ "$CHECKS_RUN" -gt "$EXPECTED_CHECKS" ]; then

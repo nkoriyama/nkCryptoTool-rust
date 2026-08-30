@@ -11,28 +11,22 @@
 # Run from the repo root: bash scripts/rebaseline_security.sh
 set -euo pipefail
 
-# Security-critical files. Keep this list in sync with the codebase layout.
-# (iroh transport moved src/network/iroh.rs -> src/p2p/backend/iroh.rs during
-#  the p2p abstraction refactor.)
-#
-# INVARIANT: this list MUST include the handshake body (src/p2p/processor.rs) —
-# the mutual-auth transcript signing lives there. This list and the entries in
-# .security-baseline.sha256 must be identical sets; a mismatch means a security-
-# critical file silently drops out of coverage on the next rebaseline.
-# (src/network/tcp.rs was removed here when the deprecated TCP transport was
-# deleted — iroh is the only transport. That is an INTENTIONAL deletion, not the
-# silent-drop drift #24 guarded against: the file no longer exists.)
-FILES=(
-    src/backend/mod.rs
-    src/backend/openssl_impl.rs
-    src/backend/rustcrypto_impl.rs
-    src/p2p/backend/iroh.rs
-    src/p2p/processor.rs
-    src/network/mod.rs
-    src/processor.rs
-    src/secure_fs.rs
-    src/utils.rs
-)
+# Security-critical files. The list itself lives in
+# scripts/security_critical_files.txt — see that file for what belongs in it and
+# why — because the gate that checks this script's output reads the same list.
+# When the list lived here, only this script knew the covered set: mandate_check
+# §19 verified whatever entries .security-baseline.sha256 happened to contain,
+# so a deleted entry deleted the coverage with the gate none the wiser.
+LIST='scripts/security_critical_files.txt'
+[ -f "$LIST" ] || { echo "ERROR: $LIST not found — run this from the repo root." >&2; exit 1; }
+
+# Format: one path per line, '#' comments and blank lines ignored. Keep this
+# parse identical to the one in scripts/check_security_baseline.sh. (A read
+# loop rather than `mapfile`, which the bash 3.2 shipped on macOS lacks.)
+FILES=()
+while IFS= read -r f; do FILES+=("$f"); done \
+    < <(grep -vE '^[[:space:]]*(#|$)' "$LIST")
+[ "${#FILES[@]}" -gt 0 ] || { echo "ERROR: $LIST names no files." >&2; exit 1; }
 
 missing=0
 for f in "${FILES[@]}"; do
@@ -41,7 +35,7 @@ for f in "${FILES[@]}"; do
         missing=1
     fi
 done
-[ "$missing" -eq 0 ] || { echo "Fix the FILES list before rebaselining." >&2; exit 1; }
+[ "$missing" -eq 0 ] || { echo "Fix $LIST before rebaselining." >&2; exit 1; }
 
 sha256sum "${FILES[@]}" > .security-baseline.sha256
 echo "Regenerated .security-baseline.sha256 (${#FILES[@]} files):"
