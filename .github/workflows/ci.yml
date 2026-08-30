@@ -140,7 +140,8 @@ jobs:
   # tests run as a release-blocking step below; the remaining documented
   # degradation is core-dump suppression (OS/WER-level, out of process scope).
   #
-  # macOS remains deferred (ring 0.17 aarch64-darwin build issue is separate).
+  # macOS is brought up below (`test-macos`), advisory-only for now — the
+  # same rollout the windows job went through.
   test-windows:
     name: Build (Windows, rustcrypto)
     runs-on: windows-latest
@@ -184,6 +185,73 @@ jobs:
       # verified. The two trailing args are OR'd libtest name filters.
       - name: cargo test hardening (release-blocking — native windows ACL/reparse/junction semantics)
         run: cargo test --no-default-features --features backend-rustcrypto -- --nocapture secure_fs windows_confine
+
+  # macOS bring-up. ADVISORY ONLY -- every step is continue-on-error, exactly as
+  # the windows job was during its own rollout (F4-X13 allowance).
+  #
+  # WHY THIS IS ADVISORY AND NOT RELEASE-BLOCKING YET
+  # -------------------------------------------------
+  # macOS had never been built by CI at all. The note this job replaces deferred
+  # it over a "ring 0.17 aarch64-darwin build issue" and recorded nothing further
+  # -- no advisory number, no error, no entry in KNOWN_ISSUES.md. ring is 0.17.14
+  # here and ships pregenerated aarch64 asm, so the note may simply be stale, or
+  # may have been about cross-building rather than a native runner. There is no
+  # way to tell without running it, and a first run that reddens main for
+  # everyone is the wrong way to find out.
+  #
+  # Promote the build step to release-blocking (drop its continue-on-error) once
+  # this has been green for a few runs; the release workflow must not ship a
+  # macOS binary before that happens.
+  #
+  # macOS is a first-class target in the code, not an afterthought: the scp
+  # path-confinement re-check in src/scp.rs uses F_GETPATH on macOS as the peer
+  # of Linux's /proc/self/fd, and `recheck_fd_confined` fails closed on every
+  # platform that has neither. That is the behaviour these tests are here to
+  # keep honest.
+  test-macos:
+    name: Build (macOS, rustcrypto) — advisory
+    runs-on: macos-latest  # Apple Silicon
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain (stable, +x86_64-apple-darwin)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+          targets: x86_64-apple-darwin
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-stable
+
+      # No RUSTFLAGS override: unlike the linux-gnu section, the Apple targets in
+      # .cargo/config.toml already carry a portable floor (apple-m1 /
+      # x86-64-v2+aes), and an env RUSTFLAGS would replace it rather than add to
+      # it. No nasm either — ring ships pregenerated asm for both Apple targets.
+      - name: cargo build (arm64, pure-Rust backend, no OpenSSL/GUI)
+        continue-on-error: true  # F4-X13 explicit allowance — see job comment
+        run: cargo build --no-default-features --features backend-rustcrypto
+
+      # Proves the second half of the universal binary the release workflow will
+      # produce with lipo. Cross-compiled from the arm64 runner using the same
+      # Xcode SDK, so it needs no extra tooling.
+      - name: cargo build (x86_64 cross, for the universal binary)
+        continue-on-error: true  # F4-X13 explicit allowance — see job comment
+        run: cargo build --no-default-features --features backend-rustcrypto --target x86_64-apple-darwin
+
+      - name: cargo clippy
+        continue-on-error: true  # F4-X13 explicit allowance — see job comment
+        run: cargo clippy --no-default-features --features "testing backend-rustcrypto"
+
+      # Includes the scp confinement suite, which is where F_GETPATH is actually
+      # exercised. Advisory for now; this is the step whose result decides
+      # whether a macOS release artifact is defensible.
+      - name: cargo test
+        continue-on-error: true  # F4-X13 explicit allowance — see job comment
+        run: cargo test --no-default-features --features "testing backend-rustcrypto"
 
   # Release-blocking: a RUSTSEC advisory against a dependency fails the run.
   #

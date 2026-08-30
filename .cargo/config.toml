@@ -44,3 +44,27 @@ rustflags = [
   "--remap-path-prefix=/build=nkct",
   "--remap-path-prefix=/usr/local/cargo=cargo",
 ]
+
+# macOS. Both Apple targets are distributed (the release workflow lipo's them
+# into one universal binary), so neither may inherit `[build] target-cpu=native`
+# — that would bake the CI runner's CPU into a binary meant for other people's
+# machines, the same trap the Windows and musl sections above exist to avoid.
+#
+# No --remap-path-prefix here: reproducibility is claimed only for the musl
+# container build, whose fixed in-container paths make the remapping meaningful.
+# A macOS runner has no such fixed paths, so adding the flags would suggest a
+# guarantee that is not being made.
+#
+# apple-m1 is the floor for Apple Silicon, not a choice: there is no shipping
+# arm64 Mac older than the M1.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-m1"]
+
+# Intel Macs: x86-64-v2 (Nehalem+) matches the musl floor. AES-NI is safe to
+# require — every Mac that runs a macOS version this toolchain targets is
+# Westmere or later.
+[target.x86_64-apple-darwin]
+rustflags = [
+  "-C", "target-cpu=x86-64-v2",
+  "-C", "target-feature=+aes,+pclmulqdq",
+]
