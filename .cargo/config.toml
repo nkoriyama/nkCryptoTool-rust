@@ -68,3 +68,29 @@ rustflags = [
   "-C", "target-cpu=x86-64-v2",
   "-C", "target-feature=+aes,+pclmulqdq",
 ]
+
+# arm64 Linux. THE FLOOR HERE IS THE OPPOSITE OF THE x86 ONE, ON PURPOSE.
+#
+# The x86 sections above require +aes,+pclmulqdq because AES-NI is universal on
+# x86-64-v2. The ARM equivalent is not: the ARMv8 Crypto Extensions (AES/PMULL/
+# SHA) are OPTIONAL, and the Raspberry Pi does not have them -- neither the Pi
+# 4's Cortex-A72 nor the Pi 5's A76 ships them. Requiring them would produce a
+# binary that SIGILLs on exactly the hardware this target exists to serve: the
+# same trap as `target-cpu=native` baking VAES into an x86 artifact, mirrored.
+#
+# So: plain ARMv8-A, no crypto extensions. `generic` is also the correct choice
+# for a machine that DOES have them -- it costs throughput, not correctness --
+# whereas the reverse mistake costs a running program. If a crypto-extension
+# variant is ever worth shipping, it belongs beside the VAES one: an opt-in
+# build with a startup guard, not the default floor.
+#
+# Consequence worth knowing: with AES in software, ChaCha20-Poly1305 is the
+# faster AEAD on a Pi. `--aead-algo chacha20-poly1305` selects it at runtime.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=generic"]
+
+# The static target a future arm64 release artifact would use. Same floor.
+# No --remap-path-prefix: reproducibility is claimed only for the x86_64 musl
+# container build, whose base image is digest-pinned to that architecture.
+[target.aarch64-unknown-linux-musl]
+rustflags = ["-C", "target-cpu=generic"]
