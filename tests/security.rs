@@ -1,5 +1,5 @@
-use nk_crypto_tool::strategy::CryptoStrategy;
-use nk_crypto_tool::utils::{secure_erase_file, secure_write, SecureBuffer};
+use nkct::strategy::CryptoStrategy;
+use nkct::utils::{secure_erase_file, secure_write, SecureBuffer};
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -139,7 +139,7 @@ async fn test_secure_write_atomic_force() {
 #[tokio::test]
 #[serial]
 async fn test_preload_encrypted_pem() {
-    use nk_crypto_tool::config::{CryptoConfig, Operation};
+    use nkct::config::{CryptoConfig, Operation};
 
     let test_dir = "tests/temp_encrypted_key";
     let _ = fs::remove_dir_all(test_dir);
@@ -147,7 +147,7 @@ async fn test_preload_encrypted_pem() {
 
     // 1. Generate an encrypted PQC key pair
     let mut config = CryptoConfig::default();
-    config.mode = nk_crypto_tool::config::CryptoMode::PQC;
+    config.mode = nkct::config::CryptoMode::PQC;
     config.operation = Operation::GenerateSignKey;
     config.key_dir = test_dir.to_string();
     config.passphrase = Some(zeroize::Zeroizing::new("testpass".to_string()));
@@ -163,7 +163,7 @@ async fn test_preload_encrypted_pem() {
         format!("{}/public_sign_pqc.key", test_dir),
     );
 
-    let strategy = nk_crypto_tool::strategy::pqc::PqcStrategy::new();
+    let strategy = nkct::strategy::pqc::PqcStrategy::new();
     strategy
         .generate_signing_key_pair(
             &key_paths,
@@ -177,13 +177,13 @@ async fn test_preload_encrypted_pem() {
     // 2. Test extraction with correct passphrase
     let priv_bytes = fs::read(&priv_path).unwrap();
     let pem_str = String::from_utf8(priv_bytes).unwrap();
-    let der = nk_crypto_tool::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY").unwrap();
+    let der = nkct::utils::unwrap_from_pem(&pem_str, "PRIVATE KEY").unwrap();
     
-    let res = nk_crypto_tool::utils::extract_raw_private_key(&der, Some("testpass"));
+    let res = nkct::utils::extract_raw_private_key(&der, Some("testpass"));
     assert!(res.is_ok(), "Extraction failed with correct pass: {:?}", res.err());
 
     // 3. Test extraction with WRONG passphrase
-    let res_wrong = nk_crypto_tool::utils::extract_raw_private_key(&der, Some("wrongpass"));
+    let res_wrong = nkct::utils::extract_raw_private_key(&der, Some("wrongpass"));
     assert!(res_wrong.is_err(), "Extraction should fail with wrong pass");
     let err_msg = format!("{}", res_wrong.err().unwrap());
     assert!(err_msg.contains("Decryption failed") || err_msg.contains("Wrong passphrase"), "Error message should be descriptive: {}", err_msg);

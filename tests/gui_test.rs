@@ -10,7 +10,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use nk_crypto_tool::gui::{ChatWindow, TransferMode};
+    use nkct::gui::{ChatWindow, TransferMode};
 
     fn ui() -> ChatWindow {
         i_slint_backend_testing::init_no_event_loop();
@@ -85,7 +85,7 @@ mod tests {
     #[cfg(feature = "gui-notifications")]
     #[test]
     fn test_notification_body_excludes_message_content() {
-        use nk_crypto_tool::gui::notifications::{NotificationManager, MockNotificationSink};
+        use nkct::gui::notifications::{NotificationManager, MockNotificationSink};
         let sink = Arc::new(MockNotificationSink {
             history: Mutex::new(Vec::new()),
         });
@@ -106,7 +106,7 @@ mod tests {
     #[cfg(feature = "gui-notifications")]
     #[test]
     fn test_notification_suppressed_when_focused() {
-        use nk_crypto_tool::gui::notifications::{NotificationManager, MockNotificationSink};
+        use nkct::gui::notifications::{NotificationManager, MockNotificationSink};
         let sink = Arc::new(MockNotificationSink {
             history: Mutex::new(Vec::new()),
         });
@@ -121,7 +121,7 @@ mod tests {
     #[cfg(feature = "gui-notifications")]
     #[test]
     fn test_notification_rate_limited_in_burst() {
-        use nk_crypto_tool::gui::notifications::{NotificationManager, MockNotificationSink};
+        use nkct::gui::notifications::{NotificationManager, MockNotificationSink};
         let sink = Arc::new(MockNotificationSink {
             history: Mutex::new(Vec::new()),
         });
@@ -178,7 +178,7 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn test_privacy_mode_invokes_os_api() {
-        use nk_crypto_tool::gui::screen_protection::{MockScreenProtectionApi, ScreenProtectionApi};
+        use nkct::gui::screen_protection::{MockScreenProtectionApi, ScreenProtectionApi};
         let ui = ui();
         let state = Arc::new(Mutex::new(false));
         let api = MockScreenProtectionApi { state: state.clone() };
@@ -202,7 +202,7 @@ mod tests {
     /// the platforms that still are not, not deleted.
     #[test]
     fn privacy_mode_reports_unavailability_instead_of_pretending() {
-        use nk_crypto_tool::gui::screen_protection::{
+        use nkct::gui::screen_protection::{
             OsScreenProtectionApi, ScreenProtectionApi,
         };
         let ui = ui();
@@ -278,8 +278,8 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn test_file_picker_returns_path() {
-        use nk_crypto_tool::gui::file_picker::{MockFilePickerProvider, FilePickerProvider};
-        use nk_crypto_tool::gui::pick_and_apply_file;
+        use nkct::gui::file_picker::{MockFilePickerProvider, FilePickerProvider};
+        use nkct::gui::pick_and_apply_file;
 
         let ui = ui();
         let mock = MockFilePickerProvider::default();
@@ -296,8 +296,8 @@ mod tests {
     #[test]
     #[cfg(feature = "testing")]
     fn test_file_picker_save_dir_writable_check() {
-        use nk_crypto_tool::gui::file_picker::{MockFilePickerProvider, FilePickerProvider};
-        use nk_crypto_tool::gui::pick_and_apply_save_dir;
+        use nkct::gui::file_picker::{MockFilePickerProvider, FilePickerProvider};
+        use nkct::gui::pick_and_apply_save_dir;
 
         let ui = ui();
         let mock = MockFilePickerProvider::default();
@@ -314,7 +314,7 @@ mod tests {
 
     #[test]
     fn test_invalid_filename_warning() {
-        use nk_crypto_tool::gui::validate_and_apply_save_file_name;
+        use nkct::gui::validate_and_apply_save_file_name;
 
         let ui = ui();
 
@@ -395,7 +395,7 @@ mod tests {
     /// this pins the config the button hands it.
     #[test]
     fn listen_config_requires_sender_identity_by_default() {
-        use nk_crypto_tool::gui::build_file_receive_config;
+        use nkct::gui::build_file_receive_config;
 
         // The default flow: both key fields left empty.
         let config = build_file_receive_config("", "");
@@ -417,7 +417,7 @@ mod tests {
     /// longer open and must not claim to be.
     #[test]
     fn listen_config_pins_expected_sender_when_supplied() {
-        use nk_crypto_tool::gui::build_file_receive_config;
+        use nkct::gui::build_file_receive_config;
 
         let config = build_file_receive_config("/keys/mine.priv", "/keys/bob.pub");
         assert_eq!(config.signing_privkey.as_deref(), Some("/keys/mine.priv"));
@@ -431,7 +431,7 @@ mod tests {
     /// identity was established.
     #[test]
     fn peer_identity_label_shows_fixed_width_fingerprint() {
-        use nk_crypto_tool::gui::format_peer_identity;
+        use nkct::gui::format_peer_identity;
 
         let label = format_peer_identity(Some([0xabu8; 32]));
         // 64 hex chars from 32 raw bytes: no peer-controlled character reaches
@@ -495,7 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_io_provider_send_reads_file_bytes() {
-        use nk_crypto_tool::network::{FileIOProvider, IOProvider};
+        use nkct::network::{FileIOProvider, IOProvider};
         use tokio::io::AsyncReadExt;
 
         let mut tmp = std::env::temp_dir();
@@ -519,7 +519,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_io_provider_recv_writes_file_bytes() {
-        use nk_crypto_tool::network::{FileIOProvider, IOProvider};
+        use nkct::network::{FileIOProvider, IOProvider};
         use tokio::io::AsyncWriteExt;
 
         let mut tmp = std::env::temp_dir();
@@ -551,7 +551,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_io_provider_send_open_failure_propagates() {
-        use nk_crypto_tool::network::FileIOProvider;
+        use nkct::network::FileIOProvider;
         let result = FileIOProvider::new_send(std::path::PathBuf::from(
             "/nonexistent/path/that/should/never/exist/nkct_f2.bin"
         )).await;
@@ -630,7 +630,7 @@ mod tests {
             assert_eq!(ui.get_transfer_bytes(), sent);
             assert_eq!(ui.get_transfer_total(), total);
             // Verify the canonical status format reflects this state
-            let status = nk_crypto_tool::gui::format_transfer_status(sent as u64, Some(total as u64));
+            let status = nkct::gui::format_transfer_status(sent as u64, Some(total as u64));
             let pct = (p * 100.0) as u32;
             assert!(
                 status.contains(&format!("({}%)", pct)),
@@ -648,7 +648,7 @@ mod tests {
         // exercise the AEAD-free path indirectly: drive a 256 KiB read
         // through the function and ensure callback count is in the
         // expected range.
-        use nk_crypto_tool::network::PROGRESS_CHUNK_BYTES;
+        use nkct::network::PROGRESS_CHUNK_BYTES;
         assert_eq!(PROGRESS_CHUNK_BYTES, 64 * 1024);
         // Sanity: PROGRESS_CHUNK_BYTES is the documented threshold; the
         // real send_file_with_progress integration test belongs to F4 E2E.
@@ -656,7 +656,7 @@ mod tests {
 
     #[test]
     fn test_progress_status_string_format() {
-        use nk_crypto_tool::gui::format_transfer_status;
+        use nkct::gui::format_transfer_status;
 
         // Known total: bytes/total + percent
         assert_eq!(format_transfer_status(0, Some(100)), "0/100 bytes (0%)");
@@ -673,7 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_progress_pipeline_through_mpsc() {
-        use nk_crypto_tool::gui::make_progress_pipeline;
+        use nkct::gui::make_progress_pipeline;
 
         i_slint_backend_testing::init_no_event_loop();
         let ui = ChatWindow::new().unwrap();
@@ -705,7 +705,7 @@ mod tests {
 
     #[test]
     fn test_transfer_progress_clamping_via_pipeline_format() {
-        use nk_crypto_tool::gui::format_transfer_status;
+        use nkct::gui::format_transfer_status;
         // The pipeline clamps progress to [0,1] but format_transfer_status
         // treats out-of-range as floor (0%) or cap (100%).
         let s = format_transfer_status(2000, Some(1000));
@@ -721,7 +721,7 @@ mod tests {
     /// conversation must still show every message it sent, in order.
     #[test]
     fn chat_model_keeps_newest_rows_and_drops_oldest() {
-        use nk_crypto_tool::gui::{append_chat_rows, MAX_CHAT_ROWS};
+        use nkct::gui::{append_chat_rows, MAX_CHAT_ROWS};
         use slint::Model;
 
         let ui = ui();
@@ -760,7 +760,7 @@ mod tests {
     /// showing N messages cost O(N^2) row copies on the UI thread.
     #[test]
     fn chat_model_is_appended_in_place() {
-        use nk_crypto_tool::gui::append_chat_rows;
+        use nkct::gui::append_chat_rows;
         use slint::Model;
 
         let ui = ui();
@@ -782,7 +782,7 @@ mod tests {
     /// come through unchanged.
     #[test]
     fn chat_row_bounds_peer_text_but_leaves_normal_messages_intact() {
-        use nk_crypto_tool::gui::{format_chat_row, MAX_CHAT_ROW_CHARS};
+        use nkct::gui::{format_chat_row, MAX_CHAT_ROW_CHARS};
 
         // chat_loop writes the prompt decoration and the body separately.
         assert_eq!(format_chat_row(b"\r[Peer]: "), None, "decoration is not a message");
@@ -823,7 +823,7 @@ mod tests {
     /// local error still reads exactly as before.
     #[test]
     fn connection_error_cannot_forge_lines_in_the_identity_panel() {
-        use nk_crypto_tool::gui::{format_connection_error, MAX_CONNECTION_ERROR_CHARS};
+        use nkct::gui::{format_connection_error, MAX_CONNECTION_ERROR_CHARS};
 
         // Honest direction: a real error is shown verbatim.
         let honest = "Connection setup failed: connection timed out";
@@ -888,7 +888,7 @@ mod tests {
     /// schedules, and delivers, every message.
     #[test]
     fn chat_row_queue_coalesces_bursts_and_never_loses_the_next_message() {
-        use nk_crypto_tool::gui::{ChatRowQueue, MAX_CHAT_ROWS};
+        use nkct::gui::{ChatRowQueue, MAX_CHAT_ROWS};
 
         let q = ChatRowQueue::new();
 

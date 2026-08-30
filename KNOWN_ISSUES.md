@@ -736,7 +736,7 @@ trade-off is explicit rather than forgotten.
       relay's 7-day envelope TTL. In those cases the member is stuck at its old
       epoch until someone asks for the delta by hand:
 
-          nk-crypto-tool --mls-cmd resync --mls-group-id <hex> \
+          nkct --mls-cmd resync --mls-group-id <hex> \
               --mls-recipient-ticket <peer-ticket>
 
       or `/resync [ticket]` inside `--mls-cmd listen`, which is where an

@@ -90,12 +90,12 @@ Plan §13 では `--ignored` 付きの iroh 実通信 e2e テストを要求し�
 
 ```bash
 # プロセス A: create-group → 32B GroupId を出力 + sqlite に永続化
-$ ./target/release/nk-crypto-tool --mls-cmd create-group \
+$ ./target/release/nkct --mls-cmd create-group \
       --mls-name "team" --mls-storage /tmp/g.db --no-relay
 Created group "team": 2a84737f31fe9198ba8ea8020a2425f8db25d9e139335fd61d2274058de0e027
 
 # プロセス B (別の cargo run 起動): 同 db を開いて list-groups
-$ ./target/release/nk-crypto-tool --mls-cmd list-groups \
+$ ./target/release/nkct --mls-cmd list-groups \
       --mls-storage /tmp/g.db --no-relay
 2a84737f31fe9198ba8ea8020a2425f8db25d9e139335fd61d2274058de0e027
 ```

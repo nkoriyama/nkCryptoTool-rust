@@ -36,8 +36,19 @@ permissions:
 # rustc runs a proc-macro / build script compiled with those flags, so pin CI to
 # a portable floor here (RUSTFLAGS wins over the config; local dev sets no
 # RUSTFLAGS and keeps its native tuning).
-env:
-  RUSTFLAGS: "-C target-cpu=x86-64-v2"
+# RUSTFLAGS IS PER JOB, NOT WORKFLOW-WIDE. It used to be workflow-wide, which
+# was harmless while every job ran on x86 and actively wrong the moment they did
+# not: the macOS and arm64 jobs below inherited `-C target-cpu=x86-64-v2`, so
+# their logs filled with "'x86-64-v2' is not a recognized processor for this
+# target" and ring failed its NEON assertion. Worse, RUSTFLAGS REPLACES the
+# matching `[target.*].rustflags` rather than adding to it, so the portable CPU
+# floors .cargo/config.toml defines for the Apple and aarch64 targets never
+# applied at all. Both failures were invisible because those jobs are
+# continue-on-error, and a continue-on-error step reports `conclusion: success`.
+#
+# So each x86 job states it, and the non-x86 jobs state nothing and let
+# .cargo/config.toml's target sections do their job. release.yml carries the
+# same rule and the same reasoning.
 
 jobs:
   # Linux: full build + test + clippy + mandate_check (release-blocking)
@@ -45,6 +56,8 @@ jobs:
     name: Test (Linux, full)
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -140,11 +153,13 @@ jobs:
   # tests run as a release-blocking step below; the remaining documented
   # degradation is core-dump suppression (OS/WER-level, out of process scope).
   #
-  # macOS remains deferred (ring 0.17 aarch64-darwin build issue is separate).
+  # macOS is covered below (`test-macos`), release-blocking.
   test-windows:
     name: Build (Windows, rustcrypto)
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -185,6 +200,142 @@ jobs:
       - name: cargo test hardening (release-blocking — native windows ACL/reparse/junction semantics)
         run: cargo test --no-default-features --features backend-rustcrypto -- --nocapture secure_fs windows_confine
 
+  # macOS. RELEASE-BLOCKING as of the 2.2.0 release, which ships a macOS
+  # universal binary -- an artifact must not come off a platform whose failures
+  # CI is configured to swallow.
+  #
+  # It began advisory because macOS had never been built here at all, and the
+  # note that deferred it cited a "ring 0.17 aarch64-darwin build issue" without
+  # recording an advisory number, an error, or a KNOWN_ISSUES.md entry. That note
+  # was stale: on its first honest run this job built both Apple targets, linted,
+  # and passed 257 tests with 0 failures. (The runs before that looked green and
+  # were not -- see the RUSTFLAGS comment at the top of this file, and note that
+  # a continue-on-error step is reported as `conclusion: success` by the API.)
+  #
+  # macOS is a first-class target in the code, not an afterthought: the scp
+  # path-confinement re-check in src/scp.rs uses F_GETPATH on macOS as the peer
+  # of Linux's /proc/self/fd, and `recheck_fd_confined` fails closed on every
+  # platform that has neither. Until this job existed that code had never been
+  # compiled anywhere, because Rust does not type-check a disabled `cfg` branch.
+  #
+  # The x86_64 cross-build is the second half of the universal binary
+  # release.yml lipo's together.
+  test-macos:
+    name: Build (macOS, rustcrypto)
+    runs-on: macos-latest  # Apple Silicon
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # The action's `targets:` input installs into *stable*, but every cargo
+      # invocation below resolves to the 1.96.1 that rust-toolchain.toml pins --
+      # so the cross target's std landed in a toolchain nothing uses, and the
+      # x86_64 build failed with `E0463: can't find crate for core`. This is the
+      # same trap rust-toolchain.toml already documents for x86_64-pc-windows-msvc.
+      # Running rustup inside the checkout resolves the override, so the std goes
+      # where cargo will look for it.
+      - name: Add the x86_64 Apple target to the PINNED toolchain
+        run: rustup target add x86_64-apple-darwin
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-stable
+
+      # No RUSTFLAGS override: unlike the linux-gnu section, the Apple targets in
+      # .cargo/config.toml already carry a portable floor (apple-m1 /
+      # x86-64-v2+aes), and an env RUSTFLAGS would replace it rather than add to
+      # it. No nasm either — ring ships pregenerated asm for both Apple targets.
+      - name: cargo build (arm64, pure-Rust backend, no OpenSSL/GUI)
+        run: cargo build --no-default-features --features backend-rustcrypto
+
+      # Proves the second half of the universal binary the release workflow will
+      # produce with lipo. Cross-compiled from the arm64 runner using the same
+      # Xcode SDK, so it needs no extra tooling.
+      - name: cargo build (x86_64 cross, for the universal binary)
+        run: cargo build --no-default-features --features backend-rustcrypto --target x86_64-apple-darwin
+
+      - name: cargo clippy
+        run: cargo clippy --no-default-features --features "testing backend-rustcrypto"
+
+      # Includes the scp confinement suite, which is where F_GETPATH is actually
+      # exercised. Advisory for now; this is the step whose result decides
+      # whether a macOS release artifact is defensible.
+      - name: cargo test
+        run: cargo test --no-default-features --features "testing backend-rustcrypto"
+
+  # arm64 Linux. RELEASE-BLOCKING as of 2.2.0, which ships an arm64 static musl
+  # binary. Same reasoning as the macOS job above.
+  #
+  # This was the platform with the most real-world evidence and the least CI:
+  # nkct runs on a Raspberry Pi 4 (Ubuntu 24.04, aarch64) and the Android build
+  # targets aarch64, and neither had ever been built here. Unlike macOS it adds
+  # no new source -- aarch64 Linux takes the same cfg branches as x86 Linux,
+  # `shell_desktop` true and scp confining via /proc/self/fd -- so what this job
+  # covers is code generation and ring's aarch64 asm. First honest run: 258
+  # tests, 0 failures.
+  #
+  # WHAT THIS JOB CANNOT TELL YOU. GitHub's arm64 runners are server-class parts
+  # that HAVE the ARMv8 Crypto Extensions. The Raspberry Pi does not. A CPU floor
+  # that wrongly required them would pass here and SIGILL on a Pi, so the floor
+  # in .cargo/config.toml is backed by running a cross-built binary on an actual
+  # Pi 4, not by this job going green.
+  #
+  # No RUSTFLAGS: the floor comes from .cargo/config.toml's
+  # [target.aarch64-unknown-linux-gnu], and an env RUSTFLAGS would replace it
+  # rather than add to it.
+  test-linux-arm64:
+    name: Build (Linux arm64, rustcrypto)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-arm64
+
+      # `cargo test` builds every test target, and tests/gui_test.rs drags the
+      # slint dev-dependency tree in behind it -- fontdb -> yeslogic-fontconfig-sys,
+      # whose build script shells out to pkg-config and panics without
+      # libfontconfig. The build and clippy steps do not need any of this; only
+      # the test step does, which is why the first run of this job built and
+      # linted cleanly and then died in 14 seconds. Same list as test-linux.
+      - name: Install Slint / Iroh system deps
+        run: |
+          bash scripts/ci_apt.sh \
+            libfontconfig1-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: cargo build (pure-Rust backend, no OpenSSL/GUI)
+        run: cargo build --no-default-features --features backend-rustcrypto
+
+      - name: cargo clippy
+        run: cargo clippy --no-default-features --features "testing backend-rustcrypto"
+
+      # The interesting half: the P2P shell and scp suites exercise portable-pty
+      # and the /proc/self/fd confinement re-check on a real arm64 kernel.
+      - name: cargo test
+        run: cargo test --no-default-features --features "testing backend-rustcrypto"
+
   # Release-blocking: a RUSTSEC advisory against a dependency fails the run.
   #
   # This was `continue-on-error: true` until 2026-08-19, which meant the only
@@ -207,6 +358,8 @@ jobs:
     name: cargo audit (release-blocking)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      RUSTFLAGS: "-C target-cpu=x86-64-v2"
     steps:
       - name: Checkout
         uses: actions/checkout@v7

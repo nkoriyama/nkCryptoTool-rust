@@ -1,4 +1,4 @@
-use nk_crypto_tool::backend;
+use nkct::backend;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let algo = "ML-DSA-65";

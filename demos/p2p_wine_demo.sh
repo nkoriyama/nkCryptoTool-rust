@@ -10,8 +10,8 @@ WINE=/usr/lib/wine/wine64
 export WINEDEBUG=-all WINEPREFIX="$HOME/.wine-nkct"
 unset RUST_LOG
 REPO="/var/home/bazzite/ドキュメント/src/nkCryptoTool-rust"
-LINBIN="$REPO/target/release/nk-crypto-tool"
-EXE="$REPO/target/x86_64-pc-windows-msvc/release/nk-crypto-tool.exe"
+LINBIN="$REPO/target/release/nkct"
+EXE="$REPO/target/x86_64-pc-windows-msvc/release/nkct.exe"
 export NK_PASSPHRASE=demo-passphrase
 D="$(mktemp -d)"
 SRV=""

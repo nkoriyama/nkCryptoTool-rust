@@ -67,13 +67,13 @@ OLD=~/.nkkeys/2026-06     # public_enc_pqc.key / private_enc_pqc.key
 
 # 1. 新世代の鍵ペアを生成（新ディレクトリへ）
 NEW=~/.nkkeys/2026-09
-nk-crypto-tool --mode pqc --gen-enc-key --key-dir "$NEW"
+nkct --mode pqc --gen-enc-key --key-dir "$NEW"
 #   → $NEW/public_enc_pqc.key, $NEW/private_enc_pqc.key（0600）
 
 # 2. 新しい暗号化鍵を束ねた署名済み KeyBundle を発行し、印字される指紋を
 #    out-of-band で送信者に配布する（生公開鍵の直接配布は廃止）。
 #    KeyBundle の identity は常に ML-DSA-65（$NEW に pqc の署名鍵がある前提）。
-nk-crypto-tool --mode pqc --gen-keybundle --key-dir "$NEW" \
+nkct --mode pqc --gen-keybundle --key-dir "$NEW" \
     --signing-privkey "$NEW/private_sign_pqc.key" \
     --keybundle-handle me --keybundle-output "$NEW/me.nkkb"
 #   → "…fingerprint: <64-hex>" を控えて送信者に共有する
@@ -83,9 +83,9 @@ FP=<上で表示された 64-hex>
 #    一時平文はメモリ上ではなく必ずディスクに落ちる点に注意（§4 の破棄対象）。
 for ct in archive/*.bin; do
     tmp=$(mktemp)
-    nk-crypto-tool --mode pqc --decrypt \
+    nkct --mode pqc --decrypt \
         --user-privkey "$OLD/private_enc_pqc.key" --output-file "$tmp" "$ct"
-    nk-crypto-tool --mode pqc --encrypt \
+    nkct --mode pqc --encrypt \
         --recipient-keybundle "$NEW/me.nkkb" --recipient-fingerprint "$FP" \
         --output-file "$ct.new" "$tmp"
     shred -u "$tmp"            # 一時平文を確実に破棄（§4 の caveat 参照）
@@ -112,8 +112,8 @@ done
 # 手順 3 の復号側は keyring 自動マッチが使える（--user-privkey 省略可）。
 
 # 4'. 再封緘の検証後、keyring のスロットを新世代に入れ替える
-nk-crypto-tool --keyring-cmd remove-my-key --key-role enc --key-algo ML-KEM-768
-nk-crypto-tool --keyring-cmd import-my-key \
+nkct --keyring-cmd remove-my-key --key-role enc --key-algo ML-KEM-768
+nkct --keyring-cmd import-my-key \
     --user-privkey "$NEW/private_enc_pqc.key" --shred-original
 #   （--shred-original で新世代のファイル原本も抹消 → 以後は keyring のみ）
 ```
@@ -155,17 +155,17 @@ shred -u "$OLD/private_enc_pqc.key"     # ハイブリッドは mlkem/ecdh 両�
 
 ```bash
 # 生成 + KeyBundle 発行（両鍵を束ねる。identity は ML-DSA-65）
-nk-crypto-tool --mode hybrid --gen-enc-key --key-dir "$NEW"
-nk-crypto-tool --mode hybrid --gen-keybundle --key-dir "$NEW" \
+nkct --mode hybrid --gen-enc-key --key-dir "$NEW"
+nkct --mode hybrid --gen-keybundle --key-dir "$NEW" \
     --signing-privkey "$NEW/private_sign_hybrid.key" \
     --keybundle-handle me --keybundle-output "$NEW/me.nkkb"    # → 指紋 $FP を控える
 
 # 再封緘（decrypt → encrypt）
-nk-crypto-tool --mode hybrid --decrypt \
+nkct --mode hybrid --decrypt \
     --user-mlkem-privkey "$OLD/private_enc_hybrid_mlkem.key" \
     --user-ecdh-privkey  "$OLD/private_enc_hybrid_ecdh.key" \
     --output-file "$tmp" "$ct"
-nk-crypto-tool --mode hybrid --encrypt \
+nkct --mode hybrid --encrypt \
     --recipient-keybundle "$NEW/me.nkkb" --recipient-fingerprint "$FP" \
     --output-file "$ct.new" "$tmp"
 ```

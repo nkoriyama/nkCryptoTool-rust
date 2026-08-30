@@ -8,7 +8,7 @@
 # --serve-shell (one role per process). Recorded with VHS (see p2p_scp.tape).
 set -u
 
-BIN="$PWD/target/release/nk-crypto-tool"
+BIN="$PWD/target/release/nkct"
 unset RUST_LOG NK_PASSPHRASE
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/nkct-scp-demo.XXXXXX") || exit 1
 mkdir -p "$ROOT/srv" "$ROOT/cli" "$ROOT/keys"

@@ -5153,8 +5153,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "nk-crypto-tool"
-version = "2.1.0"
+name = "nkct"
+version = "2.2.0-rc.1"
 dependencies = [
  "aes-gcm 0.11.0",
  "anyhow",

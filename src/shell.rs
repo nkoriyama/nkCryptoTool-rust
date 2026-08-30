@@ -1197,7 +1197,6 @@ where
     // the shell is still running, kill it so neither the process nor the PTY
     // bridge threads leak (kill on an already-exited child is a harmless no-op);
     // otherwise the shell already exited and the waiter thread has the code.
-    reader_task.abort();
     let code = match child_code {
         Some(c) => c,
         None => {
@@ -1207,6 +1206,31 @@ where
     };
     audit_best_effort(audit_path, &peer_fp, &format!("session end exit={code}")).await;
     let _ = send_frame(&mut writer, aead_name, tx_key, &mut tx_ctr, &Frame::Exit(code)).await;
+    // Finish the send stream rather than letting it drop: a QUIC stream dropped
+    // without finishing is RESET, which discards what was buffered.
+    let _ = writer.shutdown().await;
+    // ...but finishing is not delivery. quinn's `poll_shutdown` only marks the
+    // stream finished; it does not wait for the peer to acknowledge the bytes.
+    // The caller closes the whole endpoint the moment this returns
+    // (`run_listen_once` -> `endpoint.close()`), and a QUIC CONNECTION_CLOSE
+    // drops anything still in flight -- including the Exit frame written two
+    // lines up. The client then saw a read error instead of `Frame::Exit`, and
+    // because its receive loop deliberately refuses to tell a discarded stream
+    // from a tampered one (a desync must never pass for a clean disconnect), an
+    // ordinary session end printed
+    //   [shell] session ended: inbound frame decode failed: connection lost
+    // and exited 255. Measured on the `--shell-cmd` path: 255 without this
+    // wait, 0 with it.
+    //
+    // The client closes its side of the stream once it has processed Exit, so
+    // the reader task reaching EOF is precisely the signal that delivery
+    // happened -- a tighter condition than any fixed sleep. Bounded, because a
+    // client that has already vanished, or one that keeps sending into a
+    // channel nobody drains any more, must not hold the server open; the
+    // timeout is the backstop, not the expected path. This replaces the
+    // `reader_task.abort()` that used to run before the child was reaped:
+    // letting the task end on its own is what makes the EOF observable.
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), reader_task).await;
     Ok(())
 }
 

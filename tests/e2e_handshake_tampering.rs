@@ -36,20 +36,20 @@ use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 
-use nk_crypto_tool::backend;
-use nk_crypto_tool::config::{CryptoConfig, TransportKind};
-use nk_crypto_tool::error::CryptoError;
+use nkct::backend;
+use nkct::config::{CryptoConfig, TransportKind};
+use nkct::error::CryptoError;
 // The unit struct that owns the handshake's wire codec (length-prefixed fields
 // and the transcript encoding). Using the production helpers rather than a
 // re-implementation keeps the hand-rolled initiator below byte-identical to the
 // real one.
-use nk_crypto_tool::network::NetworkProcessor as WireCodec;
-use nk_crypto_tool::network::{FileIOProvider, IOProvider, ALPN_FILE};
-use nk_crypto_tool::p2p::backend::mock::MockNetwork;
-use nk_crypto_tool::p2p::NetworkProcessor;
-use nk_crypto_tool::p2p::{P2pEndpoint, P2pProtocol, PeerAddr, PeerId};
-use nk_crypto_tool::ticket::Ticket;
-use nk_crypto_tool::utils;
+use nkct::network::NetworkProcessor as WireCodec;
+use nkct::network::{FileIOProvider, IOProvider, ALPN_FILE};
+use nkct::p2p::backend::mock::MockNetwork;
+use nkct::p2p::NetworkProcessor;
+use nkct::p2p::{P2pEndpoint, P2pProtocol, PeerAddr, PeerId};
+use nkct::ticket::Ticket;
+use nkct::utils;
 
 const E2E_TIMEOUT: Duration = Duration::from_secs(60);
 const DSA: &str = "ML-DSA-65";
@@ -79,7 +79,7 @@ fn write_pub(path: &std::path::Path, raw: &[u8]) {
 
 async fn make_processor(config: CryptoConfig, io: Arc<dyn IOProvider>) -> NetworkProcessor {
     let endpoint = Arc::new(
-        nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&config, false)
+        nkct::p2p::backend::iroh::IrohEndpoint::new(&config, false)
             .await
             .expect("iroh endpoint"),
     );

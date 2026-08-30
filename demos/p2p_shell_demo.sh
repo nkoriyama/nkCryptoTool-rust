@@ -9,7 +9,7 @@
 # keys use a fixed demo passphrase via NK_PASSPHRASE so nothing prompts.
 set -u
 
-BIN="$PWD/target/release/nk-crypto-tool"
+BIN="$PWD/target/release/nkct"
 STATE="$PWD/demos/.state"
 export NK_PASSPHRASE="demo-passphrase"     # demo only — never do this for real keys
 export PATH="$PWD/target/release:$PATH"

@@ -5,9 +5,9 @@
  */
 
 use clap::Parser;
-use nk_crypto_tool::config::{CryptoConfig, CryptoMode, Operation};
-use nk_crypto_tool::key::create_best_provider;
-use nk_crypto_tool::processor::CryptoProcessor;
+use nkct::config::{CryptoConfig, CryptoMode, Operation};
+use nkct::key::create_best_provider;
+use nkct::processor::CryptoProcessor;
 use std::sync::Arc;
 use zeroize::Zeroizing;
 
@@ -290,7 +290,7 @@ struct Args {
     dsa_algo: String,
 
     #[arg(long, value_enum, default_value = "iroh")]
-    transport: nk_crypto_tool::config::TransportKind,
+    transport: nkct::config::TransportKind,
 
     /// Dynamic peer discovery (iroh). `none` (default) reaches a node only via
     /// the addresses/relay in its ticket — most private, but works across NAT
@@ -301,7 +301,7 @@ struct Args {
     /// point. `local` (mDNS) is temporarily unsupported on iroh 1.0 and errors
     /// at startup.
     #[arg(long, value_enum, default_value = "none")]
-    discovery: nk_crypto_tool::config::DiscoveryMode,
+    discovery: nkct::config::DiscoveryMode,
 
     #[arg(long, help = "Disable Iroh relay (only direct connections)")]
     no_relay: bool,
@@ -553,7 +553,7 @@ fn resolve_key_path(key_dir: &str, p: Option<String>) -> Option<String> {
 /// needs a passphrase to load. Missing/unreadable/plaintext keys → false.
 fn private_key_file_is_encrypted(path: &Option<String>) -> bool {
     match path {
-        Some(p) => nk_crypto_tool::utils::private_key_file_is_encrypted(p),
+        Some(p) => nkct::utils::private_key_file_is_encrypted(p),
         None => false,
     }
 }
@@ -573,9 +573,9 @@ fn main() -> anyhow::Result<()> {
             && std::arch::is_x86_feature_detected!("vpclmulqdq"))
         {
             eprintln!(
-                "error: this is the VAES build of nk-crypto-tool (requires AVX-512 + VAES: \
+                "error: this is the VAES build of nkct (requires AVX-512 + VAES: \
                  AMD Zen 4+, Intel Ice Lake+ server). This CPU does not support it.\n\
-                 Use the portable `nk-crypto-tool` binary instead."
+                 Use the portable `nkct` binary instead."
             );
             std::process::exit(1);
         }
@@ -585,9 +585,9 @@ fn main() -> anyhow::Result<()> {
     // sets NO_NEW_PRIVS and execs the real command, or returns immediately
     // for every normal invocation. Must run before any CLI parsing.
     #[cfg(target_os = "linux")]
-    nk_crypto_tool::shell::nnp_exec_if_requested();
+    nkct::shell::nnp_exec_if_requested();
 
-    nk_crypto_tool::utils::disable_core_dumps();
+    nkct::utils::disable_core_dumps();
 
     // Take NK_PASSPHRASE out of the process environment (latching its value for
     // the readers below) before anything can hand that environment to a child:
@@ -598,14 +598,14 @@ fn main() -> anyhow::Result<()> {
     // `disable_core_dumps`, whose PR_SET_DUMPABLE=0 is what keeps a same-uid
     // peer from reading the execve environment residue in /proc/<pid>/environ
     // that `remove_var` cannot erase.
-    nk_crypto_tool::utils::scrub_env_passphrase();
+    nkct::utils::scrub_env_passphrase();
 
     // Sample the process umask. `umask(2)` has no read-only form, so reading it
     // is a process-global read-modify-write that must not race a thread
     // creating a file — hence here, before the runtime exists, and exactly
     // once. scp needs it to cap the peer-chosen file mode it is handed on the
     // wire at what the operator's own umask would have allowed.
-    nk_crypto_tool::scp::init_process_umask();
+    nkct::scp::init_process_umask();
 
     async_main()
 }
@@ -615,7 +615,7 @@ async fn async_main() -> anyhow::Result<()> {
     // Diagnostics: when RUST_LOG is set, install a tracing subscriber so iroh's
     // internal logs (magicsock hole-punch, relay fallback, QUIC handshake) and
     // our own tracing reach stderr. Silent by default — normal runs are
-    // unaffected. Example: `RUST_LOG=iroh=debug,nk_crypto_tool=debug nkct …`.
+    // unaffected. Example: `RUST_LOG=iroh=debug,nkct=debug nkct …`.
     if std::env::var_os("RUST_LOG").is_some() {
         use tracing_subscriber::{fmt, EnvFilter};
         let _ = fmt()
@@ -629,7 +629,7 @@ async fn async_main() -> anyhow::Result<()> {
 
     #[cfg(feature = "gui")]
     if args.gui {
-        return nk_crypto_tool::gui::run_gui().await.map_err(|e| anyhow::anyhow!(e.to_string()));
+        return nkct::gui::run_gui().await.map_err(|e| anyhow::anyhow!(e.to_string()));
     }
 
     // Standalone QR encoder: render any string (typically a ticket) as a
@@ -650,7 +650,7 @@ async fn async_main() -> anyhow::Result<()> {
         } else {
             text.to_string()
         };
-        match nk_crypto_tool::utils::render_qr_unicode(&text) {
+        match nkct::utils::render_qr_unicode(&text) {
             Some(img) => {
                 println!("{img}");
                 return Ok(());
@@ -794,7 +794,7 @@ async fn async_main() -> anyhow::Result<()> {
     }
 
     // Initial passphrase from CLI args is now removed for security.
-    let mut passphrase = if let Some(p) = nk_crypto_tool::utils::env_passphrase() {
+    let mut passphrase = if let Some(p) = nkct::utils::env_passphrase() {
         if p.is_empty() {
             None
         } else {
@@ -810,7 +810,7 @@ async fn async_main() -> anyhow::Result<()> {
     if (operation == Operation::GenerateEncKey || operation == Operation::GenerateSignKey)
         && passphrase.is_none()
     {
-        passphrase = nk_crypto_tool::utils::get_and_verify_passphrase(
+        passphrase = nkct::utils::get_and_verify_passphrase(
             "Generate new key pair",
         )?;
     }
@@ -896,7 +896,7 @@ async fn async_main() -> anyhow::Result<()> {
     if operation == Operation::Encrypt {
         let resolved: Option<(Vec<u8>, [u8; 32])> = if let Some(ref handle) = args.recipient {
             let db = keyring_db_path(args.keyring_db.as_deref(), args.key_dir.as_deref());
-            let store = nk_crypto_tool::keyring::KeyringStore::open(&db)
+            let store = nkct::keyring::KeyringStore::open(&db)
                 .map_err(|e| anyhow::anyhow!("open keyring {db:?}: {e}"))?;
             let entry = store
                 .get(handle)
@@ -930,7 +930,7 @@ async fn async_main() -> anyhow::Result<()> {
             // (see KEYBUNDLE_IDENTITY_DSA), not the sender-controlled --dsa-algo:
             // the verifier dictates the algorithm so a bundle can never downgrade
             // it, and this matches load_raw_dsa_priv's fixed ML-DSA-65 loader.
-            let vb = nk_crypto_tool::keybundle::parse_and_verify(&bytes, KEYBUNDLE_IDENTITY_DSA, &pin)
+            let vb = nkct::keybundle::parse_and_verify(&bytes, KEYBUNDLE_IDENTITY_DSA, &pin)
                 .map_err(|e| anyhow::anyhow!("recipient keybundle rejected: {e}"))?;
             let (enc, hybrid) = select_bundle_keys_for_mode(&vb, config.mode)?;
             config.recipient_enc_key_bytes = enc;
@@ -998,7 +998,7 @@ async fn async_main() -> anyhow::Result<()> {
             "--token no longer accepts the OTP on the command line: argv is readable by \
              any local user via /proc/<pid>/cmdline, which is enough to hijack the \
              pairing. Use `--token -` to be prompted, or pipe it: \
-             `printf '%s' \"$OTP\" | nk-crypto-tool --copy-bundle ... --token -`"
+             `printf '%s' \"$OTP\" | nkct --copy-bundle ... --token -`"
         ),
         None => None,
     };
@@ -1006,12 +1006,12 @@ async fn async_main() -> anyhow::Result<()> {
     // Validate forward client specs early (fail fast on a bad spec) before any
     // network setup.
     for s in &config.forward_specs {
-        if let Err(e) = nk_crypto_tool::forward::ForwardSpec::parse_local(s) {
+        if let Err(e) = nkct::forward::ForwardSpec::parse_local(s) {
             anyhow::bail!("bad --forward {s:?}: {e}");
         }
     }
     for s in &config.remote_forward_specs {
-        if let Err(e) = nk_crypto_tool::forward::ForwardSpec::parse_remote(s) {
+        if let Err(e) = nkct::forward::ForwardSpec::parse_remote(s) {
             anyhow::bail!("bad --remote-forward {s:?}: {e}");
         }
     }
@@ -1215,7 +1215,7 @@ async fn async_main() -> anyhow::Result<()> {
         .any(private_key_file_is_encrypted);
         if reads_private_key && encrypted_key_present {
             config.passphrase = Some(
-                nk_crypto_tool::utils::get_masked_passphrase()
+                nkct::utils::get_masked_passphrase()
                     .map_err(|e| anyhow::anyhow!("read private-key passphrase: {e}"))?,
             );
         }
@@ -1225,13 +1225,13 @@ async fn async_main() -> anyhow::Result<()> {
         if config.serve_pairing {
             return run_serve_pairing(config).await;
         }
-        nk_crypto_tool::network::NetworkProcessor::listen(&config).await?;
+        nkct::network::NetworkProcessor::listen(&config).await?;
         return Ok(());
     } else if operation == Operation::Connect {
         if config.copy_bundle {
             return run_copy_bundle(config, mode).await;
         }
-        nk_crypto_tool::network::NetworkProcessor::connect(&config).await?;
+        nkct::network::NetworkProcessor::connect(&config).await?;
         return Ok(());
     }
 
@@ -1275,7 +1275,7 @@ async fn async_main() -> anyhow::Result<()> {
 // This translates argv-style flags into a typed `MlsCommand`, builds an
 // `IrohEndpoint` configured per the existing `--transport` / relay
 // flags, opens a `GroupStorage` at the user-specified (or default)
-// sqlite path, and hands everything to `nk_crypto_tool::group::cli::run`.
+// sqlite path, and hands everything to `nkct::group::cli::run`.
 // -----------------------------------------------------------------------------
 
 /// Load the raw ML-DSA-65 identity private key from a PEM file, mirroring
@@ -1289,7 +1289,7 @@ fn load_raw_dsa_priv(
     path: &str,
     passphrase: &zeroize::Zeroizing<String>,
 ) -> anyhow::Result<zeroize::Zeroizing<Vec<u8>>> {
-    use nk_crypto_tool::utils;
+    use nkct::utils;
     let bytes = zeroize::Zeroizing::new(
         std::fs::read(path).map_err(|e| anyhow::anyhow!("read signing key {path}: {e}"))?,
     );
@@ -1360,8 +1360,8 @@ fn parse_fingerprint_hex(s: &str) -> anyhow::Result<[u8; 32]> {
 fn load_raw_pqc_pub(path: &str, algo: &str) -> anyhow::Result<Vec<u8>> {
     let pem = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("read public key {path}: {e}"))?;
-    let der = nk_crypto_tool::utils::unwrap_from_pem(&pem, "PUBLIC KEY")?;
-    Ok(nk_crypto_tool::utils::unwrap_pqc_pub_from_spki(&der, algo)?)
+    let der = nkct::utils::unwrap_from_pem(&pem, "PUBLIC KEY")?;
+    Ok(nkct::utils::unwrap_pqc_pub_from_spki(&der, algo)?)
 }
 
 /// Load a PEM public key file and return its SubjectPublicKeyInfo DER as-is
@@ -1369,7 +1369,7 @@ fn load_raw_pqc_pub(path: &str, algo: &str) -> anyhow::Result<Vec<u8>> {
 fn load_spki_der_pub(path: &str) -> anyhow::Result<Vec<u8>> {
     let pem = std::fs::read_to_string(path)
         .map_err(|e| anyhow::anyhow!("read public key {path}: {e}"))?;
-    Ok(nk_crypto_tool::utils::unwrap_from_pem(&pem, "PUBLIC KEY")?.to_vec())
+    Ok(nkct::utils::unwrap_from_pem(&pem, "PUBLIC KEY")?.to_vec())
 }
 
 /// Pick the recipient encryption key(s) a KeyBundle must supply for `mode`, and
@@ -1377,10 +1377,10 @@ fn load_spki_der_pub(path: &str) -> anyhow::Result<Vec<u8>> {
 /// `parse_and_verify`; the clock policy lives here). Returns
 /// `(enc_ml_kem_ek, hybrid_p256_spki_der)`.
 fn select_bundle_keys_for_mode(
-    vb: &nk_crypto_tool::keybundle::VerifiedKeyBundle,
+    vb: &nkct::keybundle::VerifiedKeyBundle,
     mode: CryptoMode,
 ) -> anyhow::Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-    use nk_crypto_tool::keybundle::{KEY_USAGE_ENC, KEY_USAGE_HYBRID};
+    use nkct::keybundle::{KEY_USAGE_ENC, KEY_USAGE_HYBRID};
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|e| anyhow::anyhow!("system clock is before the UNIX epoch: {e}"))?
@@ -1431,7 +1431,7 @@ fn keyring_automatch_decrypt(
     config: &mut CryptoConfig,
     passphrase: &mut Option<Zeroizing<String>>,
 ) -> anyhow::Result<()> {
-    use nk_crypto_tool::keyring::{self, KeyringStore};
+    use nkct::keyring::{self, KeyringStore};
 
     fn strategy_name(b: u8) -> &'static str {
         match b {
@@ -1497,7 +1497,7 @@ fn keyring_automatch_decrypt(
             Some(rec) => found.push((algo.clone(), *hybrid_half, rec)),
             None => anyhow::bail!(
                 "keyring {} has no key in slot {handle}:enc:{algo} — import it once with:\n  \
-                 nk-crypto-tool --keyring-cmd import-my-key --user-privkey <keyfile>{}",
+                 nkct --keyring-cmd import-my-key --user-privkey <keyfile>{}",
                 db.display(),
                 if handle == "me" {
                     String::new()
@@ -1512,7 +1512,7 @@ fn keyring_automatch_decrypt(
         Some(p) => p,
         None => {
             eprintln!("Keyring passphrase for {handle:?}:");
-            nk_crypto_tool::utils::get_masked_passphrase()
+            nkct::utils::get_masked_passphrase()
                 .map_err(|e| anyhow::anyhow!("read passphrase: {e}"))?
         }
     };
@@ -1548,7 +1548,7 @@ fn keyring_automatch_sign(
     config: &mut CryptoConfig,
     passphrase: &mut Option<Zeroizing<String>>,
 ) -> anyhow::Result<()> {
-    use nk_crypto_tool::keyring::{self, KeyringStore};
+    use nkct::keyring::{self, KeyringStore};
 
     let algo = match config.mode {
         CryptoMode::ECC => "P-256".to_string(),
@@ -1577,7 +1577,7 @@ fn keyring_automatch_sign(
                 .collect();
             anyhow::bail!(
                 "keyring {} has no key in slot {handle}:sign:{algo}{} — import it once with:\n  \
-                 nk-crypto-tool --keyring-cmd import-my-key --user-privkey <keyfile>{}",
+                 nkct --keyring-cmd import-my-key --user-privkey <keyfile>{}",
                 db.display(),
                 if have.is_empty() {
                     String::new()
@@ -1597,7 +1597,7 @@ fn keyring_automatch_sign(
         Some(p) => p,
         None => {
             eprintln!("Keyring passphrase for {handle:?}:");
-            nk_crypto_tool::utils::get_masked_passphrase()
+            nkct::utils::get_masked_passphrase()
                 .map_err(|e| anyhow::anyhow!("read passphrase: {e}"))?
         }
     };
@@ -1630,7 +1630,7 @@ fn keyring_automatch_p2p(
     config: &mut CryptoConfig,
     passphrase: &mut Option<Zeroizing<String>>,
 ) -> anyhow::Result<()> {
-    use nk_crypto_tool::keyring::{self, KeyringStore};
+    use nkct::keyring::{self, KeyringStore};
 
     let db = keyring_db_path(keyring_db, Some(&config.key_dir));
     // No keyring ⇒ nothing to resolve. Do NOT open (open would create the DB
@@ -1656,7 +1656,7 @@ fn keyring_automatch_p2p(
         Some(p) => p,
         None => {
             eprintln!("Keyring passphrase for {identity:?} (P2P identity):");
-            nk_crypto_tool::utils::get_masked_passphrase()
+            nkct::utils::get_masked_passphrase()
                 .map_err(|e| anyhow::anyhow!("read passphrase: {e}"))?
         }
     };
@@ -1702,8 +1702,8 @@ fn keyring_bundle_keys(
     kem_algo: &str,
     passphrase: Option<Zeroizing<String>>,
 ) -> anyhow::Result<KeyringBundleKeys> {
-    use nk_crypto_tool::keybundle::{KEY_USAGE_ENC, KEY_USAGE_HYBRID};
-    use nk_crypto_tool::keyring::{self, KeyringStore};
+    use nkct::keybundle::{KEY_USAGE_ENC, KEY_USAGE_HYBRID};
+    use nkct::keyring::{self, KeyringStore};
 
     let db = keyring_db_path(keyring_db, Some(key_dir));
     let store =
@@ -1737,7 +1737,7 @@ fn keyring_bundle_keys(
                     .collect();
                 anyhow::bail!(
                     "keyring {} has no key in slot {identity}:{role}:{algo}{} — import it once \
-                     with:\n  nk-crypto-tool --keyring-cmd import-my-key --user-privkey <keyfile>{}\n\
+                     with:\n  nkct --keyring-cmd import-my-key --user-privkey <keyfile>{}\n\
                      (or pass explicit key files via --signing-privkey)",
                     db.display(),
                     if have.is_empty() {
@@ -1777,7 +1777,7 @@ fn keyring_bundle_keys(
         Some(p) => p,
         None => {
             eprintln!("Keyring passphrase for {identity:?}:");
-            nk_crypto_tool::utils::get_masked_passphrase()
+            nkct::utils::get_masked_passphrase()
                 .map_err(|e| anyhow::anyhow!("read passphrase: {e}"))?
         }
     };
@@ -1787,15 +1787,15 @@ fn keyring_bundle_keys(
     // `load_raw_dsa_priv`.
     let pem = keyring::unlock_and_verify_identity(&sign_rec, KEYBUNDLE_IDENTITY_DSA, &pass)
         .map_err(|e| anyhow::anyhow!("{identity}:sign:{KEYBUNDLE_IDENTITY_DSA}: {e}"))?;
-    let der = nk_crypto_tool::utils::unwrap_from_pem(&pem, "PRIVATE KEY")?;
-    let plain = Zeroizing::new(nk_crypto_tool::utils::extract_raw_private_key(
+    let der = nkct::utils::unwrap_from_pem(&pem, "PRIVATE KEY")?;
+    let plain = Zeroizing::new(nkct::utils::extract_raw_private_key(
         &der,
         Some(pass.as_str()),
     )?);
     let owner_sk =
-        nk_crypto_tool::utils::unwrap_pqc_priv_from_pkcs8(&plain, KEYBUNDLE_IDENTITY_DSA)?;
+        nkct::utils::unwrap_pqc_priv_from_pkcs8(&plain, KEYBUNDLE_IDENTITY_DSA)?;
     let owner_pk =
-        nk_crypto_tool::utils::unwrap_pqc_pub_from_spki(&sign_rec.public_key_der, "any")?;
+        nkct::utils::unwrap_pqc_pub_from_spki(&sign_rec.public_key_der, "any")?;
     eprintln!(
         "[nkct] keyring: unlocked {identity}:sign:{KEYBUNDLE_IDENTITY_DSA} ({}…)",
         hex::encode(&sign_rec.fingerprint[..8])
@@ -1806,7 +1806,7 @@ fn keyring_bundle_keys(
         keyring::unlock_and_verify_identity(rec, algo, &pass)
             .map_err(|e| anyhow::anyhow!("{identity}:enc:{algo}: {e}"))?;
         let key = if *usage == KEY_USAGE_ENC {
-            nk_crypto_tool::utils::unwrap_pqc_pub_from_spki(&rec.public_key_der, algo)?
+            nkct::utils::unwrap_pqc_pub_from_spki(&rec.public_key_der, algo)?
         } else {
             rec.public_key_der.clone()
         };
@@ -1832,7 +1832,7 @@ fn keyring_db_path(keyring_db: Option<&str>, key_dir: Option<&str>) -> std::path
 /// `keyring::GRANT_*` bitmask. Grants are explicit by design (least privilege):
 /// callers that issue grants must require the flag rather than assume a default.
 fn parse_grants(spec: &str) -> anyhow::Result<u8> {
-    use nk_crypto_tool::keyring::{GRANT_ALL, GRANT_FORWARD, GRANT_SCP, GRANT_SHELL};
+    use nkct::keyring::{GRANT_ALL, GRANT_FORWARD, GRANT_SCP, GRANT_SHELL};
     let mut g = 0u8;
     for tok in spec.split(',') {
         let tok = tok.trim();
@@ -1860,7 +1860,7 @@ fn parse_grants(spec: &str) -> anyhow::Result<u8> {
 ///   `remove` — drop a handle (`--keybundle-handle`)
 ///   `import` — migrate legacy `<key-dir>/received/*.nkkb` files into the keyring
 fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
-    use nk_crypto_tool::keyring::KeyringStore;
+    use nkct::keyring::KeyringStore;
 
     let cmd = args.keyring_cmd.as_deref().unwrap();
     let db = keyring_db_path(args.keyring_db.as_deref(), args.key_dir.as_deref());
@@ -1893,7 +1893,7 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
             let pin = parse_fingerprint_hex(fp_hex)?;
             let bytes = std::fs::read(bundle_path)
                 .map_err(|e| anyhow::anyhow!("read keybundle {bundle_path}: {e}"))?;
-            let vb = nk_crypto_tool::keybundle::parse_and_verify(&bytes, KEYBUNDLE_IDENTITY_DSA, &pin)
+            let vb = nkct::keybundle::parse_and_verify(&bytes, KEYBUNDLE_IDENTITY_DSA, &pin)
                 .map_err(|e| anyhow::anyhow!("keybundle rejected: {e}"))?;
             let handle = args.keybundle_handle.clone().unwrap_or_else(|| vb.handle.clone());
             store.add(&handle, &pin, &bytes, now).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1939,9 +1939,9 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
                         }
                         let bytes = std::fs::read(&p)
                             .map_err(|e| anyhow::anyhow!("read {p:?}: {e}"))?;
-                        let fp = nk_crypto_tool::keybundle::owner_fingerprint(&bytes)
+                        let fp = nkct::keybundle::owner_fingerprint(&bytes)
                             .map_err(|e| anyhow::anyhow!("{p:?}: {e}"))?;
-                        let vb = nk_crypto_tool::keybundle::parse_and_verify(
+                        let vb = nkct::keybundle::parse_and_verify(
                             &bytes,
                             KEYBUNDLE_IDENTITY_DSA,
                             &fp,
@@ -1996,7 +1996,7 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
                      <ML-KEM-512|ML-KEM-768|ML-KEM-1024|ML-DSA-44|ML-DSA-65|ML-DSA-87|P-256>"
                 )
             })?;
-            let pass = nk_crypto_tool::utils::get_and_verify_passphrase(
+            let pass = nkct::utils::get_and_verify_passphrase(
                 "Generate keyring key pair",
             )?
             .ok_or_else(|| {
@@ -2007,34 +2007,34 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
             })?;
             let enc_der = match algo {
                 "ML-KEM-512" | "ML-KEM-768" | "ML-KEM-1024" => {
-                    let (raw_priv, _, _) = nk_crypto_tool::backend::pqc_keygen_kem(algo)?;
-                    nk_crypto_tool::utils::wrap_pqc_priv_to_pkcs8_encrypted(
+                    let (raw_priv, _, _) = nkct::backend::pqc_keygen_kem(algo)?;
+                    nkct::utils::wrap_pqc_priv_to_pkcs8_encrypted(
                         &raw_priv, algo, &pass,
                     )?
                 }
                 "ML-DSA-44" | "ML-DSA-65" | "ML-DSA-87" => {
-                    let (raw_priv, _, _) = nk_crypto_tool::backend::pqc_keygen_dsa(algo)?;
-                    nk_crypto_tool::utils::wrap_pqc_priv_to_pkcs8_encrypted(
+                    let (raw_priv, _, _) = nkct::backend::pqc_keygen_dsa(algo)?;
+                    nkct::utils::wrap_pqc_priv_to_pkcs8_encrypted(
                         &raw_priv, algo, &pass,
                     )?
                 }
                 "P-256" => {
                     let (priv_der, _) =
-                        nk_crypto_tool::backend::generate_ecc_key_pair("prime256v1")?;
+                        nkct::backend::generate_ecc_key_pair("prime256v1")?;
                     let priv_der = Zeroizing::new(priv_der);
-                    nk_crypto_tool::utils::encrypt_pkcs8_der(&priv_der, &pass)?
+                    nkct::utils::encrypt_pkcs8_der(&priv_der, &pass)?
                 }
                 other => anyhow::bail!(
                     "unsupported --key-algo {other:?}; expected \
                      ML-KEM-512|ML-KEM-768|ML-KEM-1024|ML-DSA-44|ML-DSA-65|ML-DSA-87|P-256"
                 ),
             };
-            let pem = nk_crypto_tool::utils::wrap_to_pem(&enc_der, "ENCRYPTED PRIVATE KEY");
+            let pem = nkct::utils::wrap_to_pem(&enc_der, "ENCRYPTED PRIVATE KEY");
             // Run the freshly generated key through the SAME validation as an
             // import (decrypt, OID classification, pub re-derivation + binding,
             // ML-KEM encap/decap self-test): what enters the keyring is checked
             // by one code path regardless of where it came from.
-            let (algo, inferred_role, rec) = nk_crypto_tool::keyring::build_my_identity_record(
+            let (algo, inferred_role, rec) = nkct::keyring::build_my_identity_record(
                 pem.as_bytes(),
                 &pass,
                 None,
@@ -2049,8 +2049,8 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
             println!(
                 "{} {handle}:{role}:{algo} (fingerprint {}) in keyring {} — no key file written",
                 match outcome {
-                    nk_crypto_tool::keyring::AddOutcome::Added => "Generated",
-                    nk_crypto_tool::keyring::AddOutcome::Updated => "Regenerated",
+                    nkct::keyring::AddOutcome::Added => "Generated",
+                    nkct::keyring::AddOutcome::Updated => "Regenerated",
                 },
                 hex::encode(rec.fingerprint),
                 db.display()
@@ -2067,7 +2067,7 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
             // later --shred-original both go through it, so the path cannot be
             // swapped for a link while we sit in the passphrase prompt (a
             // path-based shred would follow the swap and destroy the target).
-            let mut priv_file = nk_crypto_tool::secure_fs::open_existing_no_follow(
+            let mut priv_file = nkct::secure_fs::open_existing_no_follow(
                 std::path::Path::new(priv_path),
                 args.shred_original,
             )
@@ -2081,21 +2081,21 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
                 v
             };
             eprintln!("Passphrase for {priv_path}:");
-            let pass = nk_crypto_tool::utils::get_masked_passphrase()
+            let pass = nkct::utils::get_masked_passphrase()
                 .map_err(|e| anyhow::anyhow!("read passphrase: {e}"))?;
             let expected_pub = match args.user_pubkey.as_deref() {
                 Some(p) => {
                     let pem = std::fs::read_to_string(p)
                         .map_err(|e| anyhow::anyhow!("read {p}: {e}"))?;
                     Some(
-                        nk_crypto_tool::utils::unwrap_from_pem(&pem, "PUBLIC KEY")
+                        nkct::utils::unwrap_from_pem(&pem, "PUBLIC KEY")
                             .map_err(|e| anyhow::anyhow!("parse {p}: {e}"))?
                             .to_vec(),
                     )
                 }
                 None => None,
             };
-            let (algo, inferred_role, rec) = nk_crypto_tool::keyring::build_my_identity_record(
+            let (algo, inferred_role, rec) = nkct::keyring::build_my_identity_record(
                 &pem_bytes,
                 &pass,
                 expected_pub.as_deref(),
@@ -2110,8 +2110,8 @@ fn run_keyring_command(args: &Args) -> anyhow::Result<()> {
             println!(
                 "{} {handle}:{role}:{algo} (fingerprint {}…) in keyring {}",
                 match outcome {
-                    nk_crypto_tool::keyring::AddOutcome::Added => "Imported",
-                    nk_crypto_tool::keyring::AddOutcome::Updated => "Re-imported",
+                    nkct::keyring::AddOutcome::Added => "Imported",
+                    nkct::keyring::AddOutcome::Updated => "Re-imported",
                 },
                 hex::encode(&rec.fingerprint[..8]),
                 db.display()
@@ -2202,7 +2202,7 @@ fn resolve_my_key_role(
 /// `--keybundle-handle` (looked up in the contacts table) or an explicit
 /// `--recipient-fingerprint <64-hex>`.
 fn resolve_authz_fp(
-    store: &nk_crypto_tool::keyring::KeyringStore,
+    store: &nkct::keyring::KeyringStore,
     args: &Args,
 ) -> anyhow::Result<[u8; 32]> {
     if let Some(ref handle) = args.keybundle_handle {
@@ -2224,7 +2224,7 @@ fn resolve_authz_fp(
 /// fingerprint senders pin out-of-band. Default-compiled (keybundle is a
 /// default module).
 fn run_gen_keybundle(args: &Args, mode: CryptoMode) -> anyhow::Result<()> {
-    use nk_crypto_tool::keybundle::{self, KEY_USAGE_ENC, KEY_USAGE_HYBRID};
+    use nkct::keybundle::{self, KEY_USAGE_ENC, KEY_USAGE_HYBRID};
 
     let key_dir = args.key_dir.clone().unwrap_or_else(|| "keys".to_string());
     let handle = args.keybundle_handle.as_deref().ok_or_else(|| {
@@ -2247,7 +2247,7 @@ fn run_gen_keybundle(args: &Args, mode: CryptoMode) -> anyhow::Result<()> {
             Some(signing_priv) => {
                 // Owner ML-DSA identity: private key signs; public key is the
                 // self-referential anchor and hashes to the fingerprint senders pin.
-                let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+                let passphrase = nkct::utils::get_masked_passphrase()
                     .map_err(|e| anyhow::anyhow!("read signing key passphrase: {e}"))?;
                 let owner_sk = load_raw_dsa_priv(&signing_priv, &passphrase)?;
 
@@ -2317,7 +2317,7 @@ fn run_gen_keybundle(args: &Args, mode: CryptoMode) -> anyhow::Result<()> {
     let bundle =
         keybundle::build_signed(KEYBUNDLE_IDENTITY_DSA, &owner_sk, &owner_pk, handle, created_at, &keys)
             .map_err(|e| anyhow::anyhow!("build keybundle: {e}"))?;
-    nk_crypto_tool::utils::secure_write(output, &bundle, args.force)
+    nkct::utils::secure_write(output, &bundle, args.force)
         .map_err(|e| anyhow::anyhow!("write keybundle {output}: {e}"))?;
 
     use sha3::{Digest, Sha3_256};
@@ -2344,7 +2344,7 @@ fn build_keybundle_bytes(
     keyring_db: Option<&str>,
     passphrase: Option<Zeroizing<String>>,
 ) -> anyhow::Result<(Vec<u8>, [u8; 32])> {
-    use nk_crypto_tool::keybundle::{self, KEY_USAGE_ENC, KEY_USAGE_HYBRID};
+    use nkct::keybundle::{self, KEY_USAGE_ENC, KEY_USAGE_HYBRID};
     use sha3::{Digest, Sha3_256};
 
     let created_at = std::time::SystemTime::now()
@@ -2355,7 +2355,7 @@ fn build_keybundle_bytes(
     let (owner_sk, owner_pk, keys): (_, _, Vec<(u8, Vec<u8>, u64, Option<u64>)>) =
         match signing_priv {
             Some(signing_priv) => {
-                let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+                let passphrase = nkct::utils::get_masked_passphrase()
                     .map_err(|e| anyhow::anyhow!("read signing key passphrase: {e}"))?;
                 let owner_sk = load_raw_dsa_priv(signing_priv, &passphrase)?;
                 let owner_pub_path = signing_pub
@@ -2411,17 +2411,17 @@ async fn run_serve_pairing(mut config: CryptoConfig) -> anyhow::Result<()> {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    let token = nk_crypto_tool::pairing::generate_token();
+    let token = nkct::pairing::generate_token();
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     config.pairing_otp = Some(token.clone());
     config.pairing_deadline_secs = Some(now + 300);
 
     let endpoint =
-        Arc::new(nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&config, false).await?);
-    let mut processor = nk_crypto_tool::p2p::NetworkProcessor::new(
+        Arc::new(nkct::p2p::backend::iroh::IrohEndpoint::new(&config, false).await?);
+    let mut processor = nkct::p2p::NetworkProcessor::new(
         config.clone(),
         endpoint,
-        Arc::new(nk_crypto_tool::network::DefaultIOProvider),
+        Arc::new(nkct::network::DefaultIOProvider),
     );
     processor.preload_allowlist().await?;
 
@@ -2437,7 +2437,7 @@ async fn run_serve_pairing(mut config: CryptoConfig) -> anyhow::Result<()> {
                 // at the passphrase prompt before connecting. The token itself
                 // was printed above for the operator to carry out-of-band.
                 eprintln!(
-                    "[pairing] client runs: nk-crypto-tool --copy-bundle --connect <ticket> \
+                    "[pairing] client runs: nkct --copy-bundle --connect <ticket> \
                      --token - --signing-privkey <priv> --keybundle-handle <name> --key-dir <dir>"
                 );
                 eprintln!("[pairing]   (then paste the one-time token when prompted)");
@@ -2470,7 +2470,7 @@ async fn run_copy_bundle(mut config: CryptoConfig, mode: CryptoMode) -> anyhow::
         &hex::encode(fp)[..16]
     );
     config.pairing_bundle_bytes = Some(bytes);
-    nk_crypto_tool::network::NetworkProcessor::connect(&config).await?;
+    nkct::network::NetworkProcessor::connect(&config).await?;
     Ok(())
 }
 
@@ -2480,9 +2480,9 @@ async fn run_copy_bundle(mut config: CryptoConfig, mode: CryptoMode) -> anyhow::
 /// same PQC at-rest DEK mechanism as the MLS storage.
 #[cfg(feature = "mls")]
 async fn run_prekey_command(args: Args) -> anyhow::Result<()> {
-    use nk_crypto_tool::group::cli::default_storage_path;
-    use nk_crypto_tool::group::{resolve_dek, AtRestPaths};
-    use nk_crypto_tool::prekey::{self, PrekeyStore};
+    use nkct::group::cli::default_storage_path;
+    use nkct::group::{resolve_dek, AtRestPaths};
+    use nkct::prekey::{self, PrekeyStore};
     use std::path::PathBuf;
 
     let cmd = args.prekey_cmd.as_deref().unwrap();
@@ -2509,7 +2509,7 @@ async fn run_prekey_command(args: Args) -> anyhow::Result<()> {
     // protecting the prekey store. `beside_db` keeps a dedicated
     // `prekeys.db.at-rest.key` so it never races the shared `at-rest.key`
     // groups.db uses in the same directory.
-    let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+    let passphrase = nkct::utils::get_masked_passphrase()
         .map_err(|e| anyhow::anyhow!("read prekey storage passphrase: {e}"))?;
     let at_rest_paths = AtRestPaths::beside_db(&store_path);
     let dek = resolve_dek(&at_rest_paths, &passphrase)
@@ -2614,9 +2614,9 @@ async fn run_prekey_command(args: Args) -> anyhow::Result<()> {
 async fn build_prekey_endpoint(
     args: &Args,
     node_key_path: &std::path::Path,
-) -> anyhow::Result<std::sync::Arc<dyn nk_crypto_tool::p2p::P2pEndpoint>> {
-    use nk_crypto_tool::config::{CryptoConfig, TransportKind};
-    use nk_crypto_tool::p2p::P2pEndpoint;
+) -> anyhow::Result<std::sync::Arc<dyn nkct::p2p::P2pEndpoint>> {
+    use nkct::config::{CryptoConfig, TransportKind};
+    use nkct::p2p::P2pEndpoint;
     use std::sync::Arc;
     if args.transport != TransportKind::Iroh {
         anyhow::bail!("prekey async commands require --transport iroh");
@@ -2627,14 +2627,14 @@ async fn build_prekey_endpoint(
     cfg.relay_url = args.relay_url.clone();
     cfg.discovery = args.discovery;
     cfg.node_key_path = Some(node_key_path.to_path_buf());
-    let ep = nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&cfg, false).await?;
+    let ep = nkct::p2p::backend::iroh::IrohEndpoint::new(&cfg, false).await?;
     Ok(Arc::new(ep) as Arc<dyn P2pEndpoint>)
 }
 
 /// Parse the inbox Delivery Service address from `--inbox-url`.
 #[cfg(feature = "mls")]
-fn require_inbox_addr(args: &Args) -> anyhow::Result<nk_crypto_tool::p2p::PeerAddr> {
-    use nk_crypto_tool::ticket::Ticket;
+fn require_inbox_addr(args: &Args) -> anyhow::Result<nkct::p2p::PeerAddr> {
+    use nkct::ticket::Ticket;
     let url = args
         .inbox_url
         .as_deref()
@@ -2646,11 +2646,11 @@ fn require_inbox_addr(args: &Args) -> anyhow::Result<nk_crypto_tool::p2p::PeerAd
 }
 
 #[cfg(feature = "mls")]
-fn fs_profile(args: &Args) -> nk_crypto_tool::one_shot::FsProfile {
+fn fs_profile(args: &Args) -> nkct::one_shot::FsProfile {
     if args.strict_pqfs {
-        nk_crypto_tool::one_shot::FsProfile::StrictPqFs
+        nkct::one_shot::FsProfile::StrictPqFs
     } else {
-        nk_crypto_tool::one_shot::FsProfile::DefaultFallback
+        nkct::one_shot::FsProfile::DefaultFallback
     }
 }
 
@@ -2660,12 +2660,12 @@ fn fs_profile(args: &Args) -> nk_crypto_tool::one_shot::FsProfile {
 #[cfg(feature = "mls")]
 async fn run_prekey_init_identity(
     args: &Args,
-    store: &nk_crypto_tool::prekey::PrekeyStore,
+    store: &nkct::prekey::PrekeyStore,
     node_key_path: &std::path::Path,
     passphrase: &zeroize::Zeroizing<String>,
 ) -> anyhow::Result<()> {
-    use nk_crypto_tool::network::inbox;
-    use nk_crypto_tool::one_shot::{generate_and_store, RecipientBundle};
+    use nkct::network::inbox;
+    use nkct::one_shot::{generate_and_store, RecipientBundle};
 
     let output = args
         .prekey_output
@@ -2725,12 +2725,12 @@ async fn run_prekey_init_identity(
 #[cfg(feature = "mls")]
 async fn run_prekey_publish(
     args: &Args,
-    store: &nk_crypto_tool::prekey::PrekeyStore,
+    store: &nkct::prekey::PrekeyStore,
     node_key_path: &std::path::Path,
     passphrase: &zeroize::Zeroizing<String>,
 ) -> anyhow::Result<()> {
-    use nk_crypto_tool::network::inbox;
-    use nk_crypto_tool::one_shot::generate_and_store;
+    use nkct::network::inbox;
+    use nkct::one_shot::generate_and_store;
 
     if store.load_identity()?.is_none() {
         anyhow::bail!("no identity in this store; run `--prekey-cmd init-identity` first");
@@ -2764,12 +2764,12 @@ async fn run_prekey_publish(
 #[cfg(feature = "mls")]
 async fn run_prekey_maintain(
     args: &Args,
-    store: &nk_crypto_tool::prekey::PrekeyStore,
+    store: &nkct::prekey::PrekeyStore,
     node_key_path: &std::path::Path,
     passphrase: &zeroize::Zeroizing<String>,
 ) -> anyhow::Result<()> {
-    use nk_crypto_tool::network::inbox::MAX_PREKEYS_STORED;
-    use nk_crypto_tool::one_shot::replenish_to_target;
+    use nkct::network::inbox::MAX_PREKEYS_STORED;
+    use nkct::one_shot::replenish_to_target;
 
     if store.load_identity()?.is_none() {
         anyhow::bail!("no identity in this store; run `--prekey-cmd init-identity` first");
@@ -2809,10 +2809,10 @@ async fn run_prekey_maintain(
 #[cfg(feature = "mls")]
 async fn run_prekey_recv(
     args: &Args,
-    store: &nk_crypto_tool::prekey::PrekeyStore,
+    store: &nkct::prekey::PrekeyStore,
     node_key_path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    use nk_crypto_tool::one_shot::receive;
+    use nkct::one_shot::receive;
 
     let (static_sk, static_pk) = store
         .load_identity()?
@@ -2875,7 +2875,7 @@ fn write_plaintext_private(path: &str, bytes: &[u8]) -> anyhow::Result<()> {
     // Owner-only + never-follow-a-link, on unix (0600 + O_NOFOLLOW) and
     // windows (owner-only DACL + reparse-point refusal) alike; overwriting an
     // existing regular file re-locks its permissions.
-    nk_crypto_tool::secure_fs::write_owner_only_replace(std::path::Path::new(path), bytes)
+    nkct::secure_fs::write_owner_only_replace(std::path::Path::new(path), bytes)
         .map_err(|e| anyhow::anyhow!("write output {path}: {e}"))
 }
 
@@ -2884,7 +2884,7 @@ fn write_plaintext_private(path: &str, bytes: &[u8]) -> anyhow::Result<()> {
 /// envelope into the recipient's inbox slot.
 #[cfg(feature = "mls")]
 async fn run_prekey_seal(args: Args) -> anyhow::Result<()> {
-    use nk_crypto_tool::one_shot::{seal_and_deposit, RecipientBundle};
+    use nkct::one_shot::{seal_and_deposit, RecipientBundle};
     use std::path::PathBuf;
 
     let bundle_path = args
@@ -2929,13 +2929,13 @@ async fn run_prekey_seal(args: Args) -> anyhow::Result<()> {
 
     let node_key_path: PathBuf = match args.node_key.as_deref() {
         Some(p) => PathBuf::from(p),
-        None => nk_crypto_tool::group::cli::default_storage_path()?.with_file_name("node.key"),
+        None => nkct::group::cli::default_storage_path()?.with_file_name("node.key"),
     };
     let endpoint = build_prekey_endpoint(&args, &node_key_path).await?;
     let profile = fs_profile(&args);
 
     let sealed = seal_and_deposit(endpoint.as_ref(), &bundle, &payload, profile).await?;
-    if sealed.mode == nk_crypto_tool::prekey::MODE_FULL {
+    if sealed.mode == nkct::prekey::MODE_FULL {
         println!("Sealed with full PQ-FS and deposited to recipient inbox.");
     } else {
         println!(
@@ -2948,11 +2948,11 @@ async fn run_prekey_seal(args: Args) -> anyhow::Result<()> {
 
 #[cfg(feature = "mls")]
 async fn run_mls_command(args: Args) -> anyhow::Result<()> {
-    use nk_crypto_tool::config::CryptoConfig;
-    use nk_crypto_tool::group::cli::{self, MlsCommand};
-    use nk_crypto_tool::group::{open_at_rest_storage, AtRestPaths, GroupChatProcessor, GroupId};
-    use nk_crypto_tool::p2p::P2pEndpoint;
-    use nk_crypto_tool::ticket::Ticket;
+    use nkct::config::CryptoConfig;
+    use nkct::group::cli::{self, MlsCommand};
+    use nkct::group::{open_at_rest_storage, AtRestPaths, GroupChatProcessor, GroupId};
+    use nkct::p2p::P2pEndpoint;
+    use nkct::ticket::Ticket;
     use std::path::PathBuf;
     use std::str::FromStr;
     use std::sync::Arc;
@@ -2985,12 +2985,12 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
     // needs neither the network endpoint nor a GroupChatProcessor, so
     // handle it before any of that is built and return early.
     if cmd_name == "rekey" {
-        use nk_crypto_tool::group::{rotate_dek, AtRestPaths};
+        use nkct::group::{rotate_dek, AtRestPaths};
         let storage_path: PathBuf = match args.mls_storage {
             Some(p) => PathBuf::from(p),
             None => cli::default_storage_path()?,
         };
-        let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+        let passphrase = nkct::utils::get_masked_passphrase()
             .map_err(|e| anyhow::anyhow!("read MLS storage passphrase: {e}"))?;
         let at_rest_paths = AtRestPaths::from_db_path(&storage_path);
         rotate_dek(&at_rest_paths, &passphrase)
@@ -3009,9 +3009,9 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
                 Some(p) => PathBuf::from(p),
                 None => cli::default_storage_path()?,
             };
-            let passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+            let passphrase = nkct::utils::get_masked_passphrase()
                 .map_err(|e| anyhow::anyhow!("read MLS storage passphrase: {e}"))?;
-            match nk_crypto_tool::group::migrate::migrate_groups_db_from_sqlcipher(
+            match nkct::group::migrate::migrate_groups_db_from_sqlcipher(
                 &storage_path,
                 &passphrase,
             )
@@ -3130,7 +3130,7 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
     // passphrase decrypts the hybrid private key file (`at-rest.key`);
     // from there the DEK is recovered via HPKE open against the KEK
     // file (`groups.db.kek`).
-    let mls_passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+    let mls_passphrase = nkct::utils::get_masked_passphrase()
         .map_err(|e| anyhow::anyhow!("read MLS storage passphrase: {e}"))?;
     let at_rest_paths = AtRestPaths::from_db_path(&storage_path);
     let storage = open_at_rest_storage(&at_rest_paths, &mls_passphrase)
@@ -3154,8 +3154,8 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
     });
 
     let endpoint: Arc<dyn P2pEndpoint> = match transport_config.transport {
-        nk_crypto_tool::config::TransportKind::Iroh => Arc::new(
-            nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&transport_config, false)
+        nkct::config::TransportKind::Iroh => Arc::new(
+            nkct::p2p::backend::iroh::IrohEndpoint::new(&transport_config, false)
                 .await?,
         ),
     };
@@ -3166,8 +3166,8 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
     if let Some(signing_path) = &signing_key_path {
         if std::path::Path::new(signing_path).exists() {
             let mut dsa_passphrase = zeroize::Zeroizing::new(String::new());
-            if nk_crypto_tool::utils::private_key_file_is_encrypted(signing_path) {
-                dsa_passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+            if nkct::utils::private_key_file_is_encrypted(signing_path) {
+                dsa_passphrase = nkct::utils::get_masked_passphrase()
                     .map_err(|e| anyhow::anyhow!("read signing key passphrase: {e}"))?;
             }
             // Keep the secret in Zeroizing end-to-end (no plain-Vec copy that
@@ -3193,16 +3193,16 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
         // regression flagged here is an online cross-device hint that local
         // storage was rolled back. Advisory only — warn, never block — since
         // the server could equally lie; the local counter is authoritative.
-        match nk_crypto_tool::group::current_rollback_epoch(&at_rest_paths) {
+        match nkct::group::current_rollback_epoch(&at_rest_paths) {
             Ok(Some(epoch)) => {
-                match nk_crypto_tool::network::inbox::checkpoint(
+                match nkct::network::inbox::checkpoint(
                     endpoint.as_ref(),
                     &inbox_addr,
                     epoch,
                 )
                 .await
                 {
-                    Ok(nk_crypto_tool::network::inbox::CheckpointStatus::RollbackSuspected) => {
+                    Ok(nkct::network::inbox::CheckpointStatus::RollbackSuspected) => {
                         eprintln!(
                             "[at-rest] WARNING: inbox checkpoint reports a newer epoch than our \
                              local {epoch} — local storage may have been rolled back to an older \
@@ -3260,10 +3260,10 @@ async fn run_mls_command(args: Args) -> anyhow::Result<()> {
 
 #[cfg(feature = "mls")]
 async fn run_inbox_server(args: Args) -> anyhow::Result<()> {
-    use nk_crypto_tool::config::CryptoConfig;
-    use nk_crypto_tool::network::inbox::InboxServer;
-    use nk_crypto_tool::p2p::P2pEndpoint;
-    use nk_crypto_tool::ticket::Ticket;
+    use nkct::config::CryptoConfig;
+    use nkct::network::inbox::InboxServer;
+    use nkct::p2p::P2pEndpoint;
+    use nkct::ticket::Ticket;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -3283,7 +3283,7 @@ async fn run_inbox_server(args: Args) -> anyhow::Result<()> {
     // The inbox DB is SQLCipher-encrypted (PQC at-rest layer) so envelope
     // metadata (recipient / sender / timestamps) is never plaintext on the
     // relay's disk. The passphrase decrypts `inbox.db.at-rest.key`.
-    let inbox_passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+    let inbox_passphrase = nkct::utils::get_masked_passphrase()
         .map_err(|e| anyhow::anyhow!("read inbox storage passphrase: {e}"))?;
 
     let mut transport_config = CryptoConfig::default();
@@ -3293,8 +3293,8 @@ async fn run_inbox_server(args: Args) -> anyhow::Result<()> {
     transport_config.discovery = args.discovery;
 
     let endpoint: Arc<dyn P2pEndpoint> = match transport_config.transport {
-        nk_crypto_tool::config::TransportKind::Iroh => Arc::new(
-            nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&transport_config, false).await?,
+        nkct::config::TransportKind::Iroh => Arc::new(
+            nkct::p2p::backend::iroh::IrohEndpoint::new(&transport_config, false).await?,
         ),
     };
 
@@ -3320,9 +3320,9 @@ async fn run_inbox_server(args: Args) -> anyhow::Result<()> {
 
 #[cfg(feature = "gui-mls")]
 async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
-    use nk_crypto_tool::config::CryptoConfig;
-    use nk_crypto_tool::group::{cli, open_at_rest_storage, AtRestPaths, GroupChatProcessor};
-    use nk_crypto_tool::p2p::P2pEndpoint;
+    use nkct::config::CryptoConfig;
+    use nkct::group::{cli, open_at_rest_storage, AtRestPaths, GroupChatProcessor};
+    use nkct::p2p::P2pEndpoint;
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -3332,7 +3332,7 @@ async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
     };
     // PQC at-rest layer: passphrase → hybrid SK (at-rest.key) → DEK
     // (groups.db.kek) → SQLCipher. See SECURITY_PROFILE.md §7.3.
-    let mls_passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+    let mls_passphrase = nkct::utils::get_masked_passphrase()
         .map_err(|e| anyhow::anyhow!("read MLS storage passphrase: {e}"))?;
     let at_rest_paths = AtRestPaths::from_db_path(&storage_path);
     let storage = open_at_rest_storage(&at_rest_paths, &mls_passphrase)
@@ -3346,8 +3346,8 @@ async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
     transport_config.discovery = args.discovery;
 
     let endpoint: Arc<dyn P2pEndpoint> = match transport_config.transport {
-        nk_crypto_tool::config::TransportKind::Iroh => Arc::new(
-            nk_crypto_tool::p2p::backend::iroh::IrohEndpoint::new(&transport_config, false)
+        nkct::config::TransportKind::Iroh => Arc::new(
+            nkct::p2p::backend::iroh::IrohEndpoint::new(&transport_config, false)
                 .await?,
         ),
     };
@@ -3358,8 +3358,8 @@ async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
     if let Some(signing_path) = &signing_key_path {
         if std::path::Path::new(signing_path).exists() {
             let mut dsa_passphrase = zeroize::Zeroizing::new(String::new());
-            if nk_crypto_tool::utils::private_key_file_is_encrypted(signing_path) {
-                dsa_passphrase = nk_crypto_tool::utils::get_masked_passphrase()
+            if nkct::utils::private_key_file_is_encrypted(signing_path) {
+                dsa_passphrase = nkct::utils::get_masked_passphrase()
                     .map_err(|e| anyhow::anyhow!("read signing key passphrase: {e}"))?;
             }
             // Keep the secret in Zeroizing end-to-end (no plain-Vec copy that
@@ -3373,7 +3373,7 @@ async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
             .map_err(|e| anyhow::anyhow!("build GroupChatProcessor: {e}"))?,
     );
 
-    nk_crypto_tool::gui::group_chat::run_group_gui(processor)
+    nkct::gui::group_chat::run_group_gui(processor)
         .await
         .map_err(|e| anyhow::anyhow!("GUI loop: {e}"))
 }

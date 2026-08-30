@@ -412,7 +412,7 @@ B: Welcome を受信
 ```
 
 B の KeyPackage を A が事前に取得する経路:
-- 短期: ファイル経由 (B が `nk-crypto-tool --export-key-package > b.kp` を作成、
+- 短期: ファイル経由 (B が `nkct --export-key-package > b.kp` を作成、
   A に渡す)
 - 中期: Ticket 拡張で KeyPackage を埋め込む
 - 長期: Iroh の discovery service 上に published
@@ -479,22 +479,22 @@ A: group.propose_remove(member_id)
 
 ```bash
 # グループ作成
-nk-crypto-tool --mode hybrid --create-group "my-team"
+nkct --mode hybrid --create-group "my-team"
 
 # KeyPackage 書き出し (B が A に渡すため)
-nk-crypto-tool --mode hybrid --export-key-package > my.kp
+nkct --mode hybrid --export-key-package > my.kp
 
 # 招待 (A が B を追加)
-nk-crypto-tool --group-id <hex> --add-member b.kp --recipient-addr <PeerAddr>
+nkct --group-id <hex> --add-member b.kp --recipient-addr <PeerAddr>
 
 # 参加 (B が Welcome 受信時)
-nk-crypto-tool --listen   # ALPN_MLS で Welcome を待ち受け、自動 join
+nkct --listen   # ALPN_MLS で Welcome を待ち受け、自動 join
 
 # 送信
-nk-crypto-tool --group-id <hex> --send "hello team"
+nkct --group-id <hex> --send "hello team"
 
 # 受信 (対話モード)
-nk-crypto-tool --group-id <hex> --chat-group
+nkct --group-id <hex> --chat-group
 ```
 
 ### 8.2 GUI (Slint)

@@ -1,6 +1,6 @@
 # cargo-deny configuration (P1-R7 / P1 commit 5).
 #
-# Supply-chain policy for nk-crypto-tool. Run locally with:
+# Supply-chain policy for nkct. Run locally with:
 #   cargo install --locked cargo-deny
 #   cargo deny check
 #

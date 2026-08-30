@@ -105,7 +105,7 @@ type:
 
 ```bash
 # サーバ（常駐。allowlist と shell-policy 必須）
-nk-crypto-tool --serve-shell \
+nkct --serve-shell \
   --signing-privkey host_sign.key \
   --keyring-db keyring.db \
   --shell-policy shell-policy.txt \
@@ -113,11 +113,11 @@ nk-crypto-tool --serve-shell \
 # 起動時に自分の ticket を表示（クライアントに渡す）
 
 # クライアント（対話シェル）
-nk-crypto-tool --shell --connect <server-ticket> \
+nkct --shell --connect <server-ticket> \
   --signing-privkey my_sign.key --signing-pubkey host_pub.key
 
 # 単発コマンド
-nk-crypto-tool --shell --connect <server-ticket> ... -- systemctl restart myapp
+nkct --shell --connect <server-ticket> ... -- systemctl restart myapp
 ```
 - サーバ側 `--signing-pubkey`（クライアント公開鍵ピン）or `--keyring-db` で相手認証（既存と同形）。
 - クライアントは `--signing-pubkey`（サーバ公開鍵ピン）で MITM 防止（chat と同じ作法）。

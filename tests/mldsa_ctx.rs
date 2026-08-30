@@ -3,7 +3,7 @@
 //! argument is actually bound into the signature (domain separation), not
 //! silently dropped: a signature made under `ctx=A` verifies only under `ctx=A`.
 
-use nk_crypto_tool::backend;
+use nkct::backend;
 
 #[test]
 fn mldsa_ctx_binds_the_signature() {

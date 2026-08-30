@@ -44,3 +44,68 @@ rustflags = [
   "--remap-path-prefix=/build=nkct",
   "--remap-path-prefix=/usr/local/cargo=cargo",
 ]
+
+# macOS. Both Apple targets are distributed (the release workflow lipo's them
+# into one universal binary), so neither may inherit `[build] target-cpu=native`
+# — that would bake the CI runner's CPU into a binary meant for other people's
+# machines, the same trap the Windows and musl sections above exist to avoid.
+#
+# No --remap-path-prefix here: reproducibility is claimed only for the musl
+# container build, whose fixed in-container paths make the remapping meaningful.
+# A macOS runner has no such fixed paths, so adding the flags would suggest a
+# guarantee that is not being made.
+#
+# apple-m1 is the floor for Apple Silicon, not a choice: there is no shipping
+# arm64 Mac older than the M1.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "target-cpu=apple-m1"]
+
+# Intel Macs: x86-64-v2 (Nehalem+) matches the musl floor. AES-NI is safe to
+# require — every Mac that runs a macOS version this toolchain targets is
+# Westmere or later.
+[target.x86_64-apple-darwin]
+rustflags = [
+  "-C", "target-cpu=x86-64-v2",
+  "-C", "target-feature=+aes,+pclmulqdq",
+]
+
+# arm64 Linux. THE FLOOR HERE IS THE OPPOSITE OF THE x86 ONE, ON PURPOSE.
+#
+# The x86 sections above require +aes,+pclmulqdq because AES-NI is universal on
+# x86-64-v2. The ARM equivalent is not: the ARMv8 Crypto Extensions (AES/PMULL/
+# SHA) are OPTIONAL, and the Raspberry Pi does not have them -- neither the Pi
+# 4's Cortex-A72 nor the Pi 5's A76 ships them. Requiring them would produce a
+# binary that SIGILLs on exactly the hardware this target exists to serve: the
+# same trap as `target-cpu=native` baking VAES into an x86 artifact, mirrored.
+#
+# So: plain ARMv8-A, no crypto extensions. `generic` is also the correct choice
+# for a machine that DOES have them -- it costs throughput, not correctness --
+# whereas the reverse mistake costs a running program. If a crypto-extension
+# variant is ever worth shipping, it belongs beside the VAES one: an opt-in
+# build with a startup guard, not the default floor.
+#
+# Consequence worth knowing: with AES in software, ChaCha20-Poly1305 is the
+# faster AEAD on a Pi. `--aead-algo chacha20-poly1305` selects it at runtime.
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=generic"]
+
+# The distributable arm64 artifact. Same CPU floor, plus the same path scrubbing
+# the x86_64 musl section carries: reproducibility now covers this target too,
+# via packaging/Containerfile.repro.arm64 and its own pinned arm64 base image.
+# The remapped values are the FIXED in-container paths that Containerfile
+# guarantees, so two container builds embed identical strings; a host
+# cross-build uses different paths and is simply not scrubbed.
+#
+# Verified on real hardware rather than inferred: a binary built with this floor
+# was cross-compiled and run on a Raspberry Pi 4 (Cortex-A72, Features "fp asimd
+# evtstrm crc32 cpuid" -- no aes/pmull/sha), where it completed an ML-DSA-65 +
+# ML-KEM-768 KeyBundle round-trip under both AES-256-GCM and ChaCha20-Poly1305.
+# CI cannot establish this: GitHub's arm64 runners are server-class parts that
+# DO have the crypto extensions, so a wrong floor would stay green there and
+# SIGILL on a Pi.
+[target.aarch64-unknown-linux-musl]
+rustflags = [
+  "-C", "target-cpu=generic",
+  "--remap-path-prefix=/build=nkct",
+  "--remap-path-prefix=/usr/local/cargo=cargo",
+]

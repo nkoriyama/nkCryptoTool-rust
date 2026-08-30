@@ -1,0 +1,70 @@
+# Reproducible build of the distributable nkct (static musl aarch64).
+#
+# The arm64 sibling of Containerfile.repro, and deliberately a separate file
+# rather than a shared one parameterised by a build-arg: the whole point of the
+# pin is that it is auditable IN the file. A base image passed in as an argument
+# is a pin the caller chooses, which is not a pin at all.
+#
+# Everything else matches the x86_64 file line for line, and the two must be
+# edited together. Purpose, and the rest of the pinning rationale, are documented
+# there and in docs/guides/REPRODUCIBLE_BUILD.md.
+#
+# The two architectures are pinned INDEPENDENTLY, and the claim each file
+# supports is per-architecture: "two independent builds of THIS artifact agree
+# byte for byte". Nothing downstream needs the two binaries to have come from
+# one image revision.
+#
+# They do agree on what matters, and it was checked rather than assumed. Both
+# pinned images carry:
+#     rustc 1.96.1 (31fca3adb 2026-06-26)   on Alpine 3.24.1
+# matching the channel in rust-toolchain.toml. Re-check with:
+#     podman run --rm [--platform linux/arm64] <image>@<digest> \
+#       sh -c 'rustc -V; cat /etc/alpine-release'
+# whenever either digest is bumped.
+#
+# Do not `latest`-pin. Bump the digest and rust-toolchain.toml together.
+#
+# NO VAES-EQUIVALENT VARIANT EXISTS HERE, ON PURPOSE. The x86_64 build ships an
+# opt-in AVX-512/VAES variant. The ARM analogue would be a build requiring the
+# ARMv8 Crypto Extensions, and the machines this artifact is most for -- the
+# Raspberry Pi 4 and 5 -- do not have them. See the
+# [target.aarch64-unknown-linux-musl] comment in .cargo/config.toml.
+FROM docker.io/library/rust@sha256:ccba3c5d98fc76a5ac6eade9bcbbb946635657457c3d269982396633a66da08d
+
+# C toolchain for crates that compile native code on musl (quinn/rustls crypto
+# provider, etc.). apk versions are a residual reproducibility variable pinned
+# only as tightly as the base image's Alpine repo snapshot — documented in
+# REPRODUCIBLE_BUILD.md. build-base pulls a fixed set for this Alpine release.
+RUN apk add --no-cache build-base
+
+# Determinism knobs. SOURCE_DATE_EPOCH is honoured by any dep that timestamps;
+# Rust itself embeds no build time. CARGO_HOME is already /usr/local/cargo.
+ARG SOURCE_DATE_EPOCH=0
+# Variant hook, kept for symmetry with the x86_64 file and unused today (see the
+# note above on why there is no ARM variant). When non-empty, EXTRA_RUSTFLAGS
+# REPLACES the [target.aarch64-unknown-linux-musl] rustflags from
+# .cargo/config.toml (env beats config in cargo), so any variant MUST restate
+# the full flag set including the --remap-path-prefix pair, or reproducibility
+# breaks. Empty leaves config.toml in charge.
+ARG EXTRA_RUSTFLAGS=""
+ENV SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH} \
+    EXTRA_RUSTFLAGS=${EXTRA_RUSTFLAGS} \
+    CARGO_INCREMENTAL=0 \
+    CARGO_HOME=/usr/local/cargo \
+    TZ=UTC \
+    LC_ALL=C
+
+WORKDIR /build
+COPY . .
+
+# --locked: refuse to build if Cargo.lock would change (deps are still fetched
+# from crates.io, whose published tarballs are immutable, so the lock fully
+# determines inputs). Not --frozen: that implies --offline and the fresh image
+# has no cached registry.
+# NOTE: RUSTFLAGS is exported only when EXTRA_RUSTFLAGS is non-empty — an
+# empty-but-set RUSTFLAGS would also override config.toml (to nothing).
+RUN sh -c 'if [ -n "$EXTRA_RUSTFLAGS" ]; then export RUSTFLAGS="$EXTRA_RUSTFLAGS"; fi; \
+        cargo build --release --locked \
+            --target aarch64-unknown-linux-musl' \
+    && cp target/aarch64-unknown-linux-musl/release/nkct /nkct \
+    && sha256sum /nkct

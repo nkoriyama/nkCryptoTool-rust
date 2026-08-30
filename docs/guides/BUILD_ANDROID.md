@@ -10,7 +10,7 @@
 $ cargo ndk -t arm64-v8a build --no-default-features --features "backend-rustcrypto mls"
    Finished `dev` profile
 
-$ file target/aarch64-linux-android/debug/nk-crypto-tool
+$ file target/aarch64-linux-android/debug/nkct
 ELF 64-bit LSB pie executable, ARM aarch64, interpreter /system/bin/linker64
 
 $ llvm-readelf -d <bin> | grep NEEDED
@@ -56,17 +56,17 @@ cargo ndk -t arm64-v8a build --release \
 ## アプリ組み込み（cdylib / JNI）
 
 `Cargo.toml` の `[lib] crate-type = ["rlib", "cdylib"]` により、上記ビルドは
-実行ファイルに加えて **`libnk_crypto_tool.so`（C-ABI 共有ライブラリ）**も生成する。
+実行ファイルに加えて **`libnkct.so`（C-ABI 共有ライブラリ）**も生成する。
 
 検証済み（aarch64, NDK r27c）:
 ```
-$ file target/aarch64-linux-android/debug/libnk_crypto_tool.so
+$ file target/aarch64-linux-android/debug/libnkct.so
 ELF 64-bit LSB shared object, ARM aarch64
 $ llvm-readelf -d <so> | grep NEEDED
   libdl.so   libc.so          # libcrypto/libssl/libsqlite は無し
 ```
 
-この `.so` を Android アプリ（Kotlin/Java）から `System.loadLibrary("nk_crypto_tool")` で
+この `.so` を Android アプリ（Kotlin/Java）から `System.loadLibrary("nkct")` で
 ロードできる。なお iroh の P2P ネットワークは実機/エミュレータでの動作確認が別途必要。
 
 ### UniFFI ブリッジ（`mobile-ffi` feature）
@@ -81,8 +81,8 @@ cargo build --no-default-features --features "backend-rustcrypto mls mobile-ffi"
 # 生成（--library モードで cdylib のメタデータから生成）
 cargo run --no-default-features --features "backend-rustcrypto mls mobile-ffi" \
   --bin uniffi-bindgen -- generate \
-  --library target/debug/libnk_crypto_tool.so --language kotlin --out-dir bindings/kotlin
-# → bindings/kotlin/uniffi/nk_crypto_tool/nk_crypto_tool.kt
+  --library target/debug/libnkct.so --language kotlin --out-dir bindings/kotlin
+# → bindings/kotlin/uniffi/nkct/nkct.kt
 # （ktlint があれば自動整形。無くても生成は成功する）
 ```
 
@@ -108,5 +108,5 @@ E2E 検証メモ: 単ノードのローカル操作（group 作成・ticket・Ke
   Android では system libcrypto が無くリンクできない）。これは旧 DB 移行ツール専用で、
   デスクトップでのみ使う。
 - 旧 SQLCipher DB を持つユーザは、デスクトップで一度
-  `nk-crypto-tool --mls-cmd migrate-from-sqlcipher` を実行して redb 形式へ移行してから
+  `nkct --mls-cmd migrate-from-sqlcipher` を実行して redb 形式へ移行してから
   モバイルへ持ち込む（`migrate.rs`）。

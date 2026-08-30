@@ -8,8 +8,8 @@
 # emulates incompletely; the transport/crypto path is what this validates.)
 set -euo pipefail
 
-LIN=target/release/nk-crypto-tool
-EXE=target/x86_64-pc-windows-msvc/release/nk-crypto-tool.exe
+LIN=target/release/nkct
+EXE=target/x86_64-pc-windows-msvc/release/nkct.exe
 
 [ -x "$LIN" ] || { echo "missing linux binary: $LIN"; exit 1; }
 [ -f "$EXE" ] || { echo "missing windows exe: $EXE"; exit 1; }

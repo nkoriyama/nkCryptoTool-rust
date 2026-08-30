@@ -2,7 +2,7 @@
 //! surface over the MLS chat & crypto core so a mobile app can drive it.
 //!
 //! Compiled only with the `mobile-ffi` feature, into the `cdylib`
-//! (`libnk_crypto_tool.so`). Kotlin bindings are generated with the bundled
+//! (`libnkct.so`). Kotlin bindings are generated with the bundled
 //! `uniffi-bindgen` bin — see `BUILD_ANDROID.md`.
 //!
 //! This is the *scaffolding* increment: a small, real surface that proves the

@@ -7,11 +7,11 @@ import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.launch
-import uniffi.nk_crypto_tool.MobileChatClient
-import uniffi.nk_crypto_tool.libraryVersion
+import uniffi.nkct.MobileChatClient
+import uniffi.nkct.libraryVersion
 
 /**
- * Minimal smoke-test UI for the Rust MLS chat core (libnk_crypto_tool.so via
+ * Minimal smoke-test UI for the Rust MLS chat core (libnkct.so via
  * UniFFI). Tapping the button opens a [MobileChatClient] against the app's
  * private storage, creates an MLS group, and shows the result.
  *

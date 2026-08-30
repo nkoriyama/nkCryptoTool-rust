@@ -16,9 +16,9 @@ static INIT: Once = Once::new();
 fn get_bin(backend: &str) -> PathBuf {
     let target_dir = format!("target/interop-{}", backend);
     let bin_name = if cfg!(windows) {
-        "nk-crypto-tool.exe"
+        "nkct.exe"
     } else {
-        "nk-crypto-tool"
+        "nkct"
     };
     let bin_path = PathBuf::from(&target_dir).join("release").join(bin_name);
 
@@ -34,7 +34,7 @@ fn get_bin(backend: &str) -> PathBuf {
         cmd.arg("build")
             .arg("--release")
             .arg("--bin")
-            .arg("nk-crypto-tool");
+            .arg("nkct");
         cmd.env("CARGO_TARGET_DIR", &target_dir);
 
         if backend == "rustcrypto" {

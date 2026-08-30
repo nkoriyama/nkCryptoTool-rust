@@ -17,7 +17,7 @@
 # attack silently succeeded".
 set -u
 
-BIN="$PWD/target/release/nk-crypto-tool"
+BIN="$PWD/target/release/nkct"
 unset RUST_LOG
 export NK_PASSPHRASE=""   # unencrypted demo keys: nothing prompts, no warning prints
 ROOT=$(mktemp -d "${TMPDIR:-/tmp}/nkct-pairing-demo.XXXXXX") || exit 1
@@ -67,9 +67,9 @@ sleep 0.7
 start_server "$ROOT/pair_bad.log" --serve-pairing --mode pqc \
   --signing-privkey "$ROOT/srv/private_sign_pqc.key" --key-dir "$ROOT/srv" \
   --pairing-grant shell,scp
-echo "  \$ --copy-bundle --token WRONGTOK   (does not hold the real token)"
+echo "  \$ printf %s WRONGTOK | --copy-bundle --token -   (does not hold the real token)"
 sleep 0.5
-REFUSAL=$("$BIN" --copy-bundle --mode pqc --connect "$TICKET" --token "AAAA2345" \
+REFUSAL=$(printf '%s' "AAAA2345" | "$BIN" --copy-bundle --mode pqc --connect "$TICKET" --token - \
   --signing-privkey "$ROOT/cli/private_sign_pqc.key" --keybundle-handle laptop \
   --key-dir "$ROOT/cli" 2>&1 | grep -aioE 'invalid pairing token' | head -1)
 kill $SRV 2>/dev/null; SRV=""
@@ -88,7 +88,7 @@ start_server "$ROOT/pair.log" --serve-pairing --mode pqc \
 OTP=$(grep -aoE 'one-time token: [A-Z2-7]+' "$ROOT/pair.log" | awk '{print $3}' | head -1)
 echo "  server issued a one-time token (out-of-band):  $OTP"
 sleep 1
-"$BIN" --copy-bundle --mode pqc --connect "$TICKET" --token "$OTP" \
+printf '%s' "$OTP" | "$BIN" --copy-bundle --mode pqc --connect "$TICKET" --token - \
   --signing-privkey "$ROOT/cli/private_sign_pqc.key" --keybundle-handle laptop \
   --key-dir "$ROOT/cli" 2>&1 | grep -aiE 'registered' \
   || echo "  [DEMO BUG] registration not confirmed"
@@ -120,13 +120,13 @@ sleep 0.7
 start_server "$ROOT/shell.log" --serve-shell --mode pqc \
   --signing-privkey "$ROOT/srv/private_sign_pqc.key" \
   --keyring-db "$KEYRING" --shell-policy "$ROOT/shell.policy"
-echo "  \$ nk-crypto-tool --shell --shell-cmd 'uname -a'   (allowed)"
+echo "  \$ nkct --shell --shell-cmd 'uname -a'   (allowed)"
 sleep 0.5
 "$BIN" --shell --mode pqc --connect "$TICKET" --shell-cmd "uname -a" \
   --signing-privkey "$ROOT/cli/private_sign_pqc.key" --key-dir "$ROOT/cli" 2>&1 | grep -aiE 'Linux|GNU' \
   || echo "  [DEMO BUG] allowed command produced no output"
 sleep 1
-echo "  \$ nk-crypto-tool --shell --shell-cmd 'cat /etc/shadow'   (NOT in cmd-allow)"
+echo "  \$ nkct --shell --shell-cmd 'cat /etc/shadow'   (NOT in cmd-allow)"
 sleep 0.5
 # A denied command is refused server-side: the client just gets a closed session,
 # so surface the server's audit line to show the refusal — and assert it appeared.

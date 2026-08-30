@@ -40,8 +40,8 @@ Two variants are built by default (`VARIANTS=... ` narrows the set):
 
 | artifact | CPU floor | AES backend |
 |---|---|---|
-| `nk-crypto-tool` | x86-64-v2 (Nehalem+/Bulldozer+) | AES-NI (runtime detected) |
-| `nk-crypto-tool-vaes` | x86-64-v3 + AVX-512/VAES (Zen 4+ / Ice Lake+ server) | VAES-512 (`aes_backend="avx512"`, compile-time) |
+| `nkct` | x86-64-v2 (Nehalem+/Bulldozer+) | AES-NI (runtime detected) |
+| `nkct-vaes` | x86-64-v3 + AVX-512/VAES (Zen 4+ / Ice Lake+ server) | VAES-512 (`aes_backend="avx512"`, compile-time) |
 
 The VAES variant is ~20% faster at encrypt and ~37% faster at decrypt on the
 rustcrypto backend (see README「パフォーマンス」). Its backend is fixed at

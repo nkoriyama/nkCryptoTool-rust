@@ -20,7 +20,7 @@ cd /path/to/nkCryptoTool-rust
 cargo build --release
 ```
 
-成果物: `target/release/nk-crypto-tool` (約 30-50 MB)
+成果物: `target/release/nkct` (約 30-50 MB)
 
 ---
 
@@ -32,7 +32,7 @@ cargo build --release
 
 ```bash
 mkdir -p ~/nkct/alice
-NK_PASSPHRASE="" ./target/release/nk-crypto-tool \
+NK_PASSPHRASE="" ./target/release/nkct \
   --mode pqc --gen-sign-key \
   --key-dir ~/nkct/alice \
   --dsa-algo ML-DSA-65
@@ -44,7 +44,7 @@ NK_PASSPHRASE="" ./target/release/nk-crypto-tool \
 
 ```bash
 mkdir -p ~/nkct/bob
-NK_PASSPHRASE="" ./target/release/nk-crypto-tool \
+NK_PASSPHRASE="" ./target/release/nkct \
   --mode pqc --gen-sign-key \
   --key-dir ~/nkct/bob \
   --dsa-algo ML-DSA-65
@@ -81,7 +81,7 @@ scp ~/nkct/bob/public_sign_pqc.key alice@host:~/nkct/bob_public.key
 ## Step 4: Listener 起動 (端末 A — Alice)
 
 ```bash
-NK_PASSPHRASE="" ./target/release/nk-crypto-tool \
+NK_PASSPHRASE="" ./target/release/nkct \
   --mode pqc --chat \
   --serve-chat \
   --signing-privkey ~/nkct/alice/private_sign_pqc.key \
@@ -112,7 +112,7 @@ AES-NI is available!
 ## Step 5: Connector で接続 (端末 B — Bob)
 
 ```bash
-NK_PASSPHRASE="" ./target/release/nk-crypto-tool \
+NK_PASSPHRASE="" ./target/release/nkct \
   --mode pqc --chat \
   --connect 'nkct1AGJW355EN3QRKKFZYU7OTLYO3U4TI5C...' \
   --signing-privkey ~/nkct/bob/private_sign_pqc.key \
@@ -199,12 +199,12 @@ listener 側の keyring（redb）の allowlist テーブルに許可指紋を登
 # bob と charlie の指紋を認可する (各 32B = 64 hex chars)
 # chat/file は allowlist の membership で認可される (grant bit は shell/scp/forward 用。
 # --pairing-grant は必須なので、chat 専用 listener なら任意の 1 つで良い)
-./target/release/nk-crypto-tool --keyring-cmd authorize --pairing-grant all \
+./target/release/nkct --keyring-cmd authorize --pairing-grant all \
   --keyring-db ~/nkct/keyring.db --recipient-fingerprint ee15...90b7   # bob
-./target/release/nk-crypto-tool --keyring-cmd authorize --pairing-grant all \
+./target/release/nkct --keyring-cmd authorize --pairing-grant all \
   --keyring-db ~/nkct/keyring.db --recipient-fingerprint 8a91...c2d4   # charlie
 
-./target/release/nk-crypto-tool --chat --serve-chat \
+./target/release/nkct --chat --serve-chat \
   --signing-privkey ~/nkct/alice/private_sign_pqc.key \
   --keyring-db ~/nkct/keyring.db \
   --transport iroh
@@ -214,7 +214,7 @@ listener 側の keyring（redb）の allowlist テーブルに許可指紋を登
 公開鍵指紋の取得:
 
 ```bash
-./target/release/nk-crypto-tool --mode pqc --fingerprint \
+./target/release/nkct --mode pqc --fingerprint \
   --signing-pubkey ~/nkct/bob_public.key
 ```
 
@@ -262,13 +262,13 @@ cat my_file.bin | nkct ... --connect <ticket> --signing-privkey ...
 
 ```bash
 # Terminal 1 (listener)
-NK_PASSPHRASE="" /path/to/nk-crypto-tool --mode pqc --chat --serve-chat \
+NK_PASSPHRASE="" /path/to/nkct --mode pqc --chat --serve-chat \
   --allow-unauth --no-relay --transport iroh
 
 # Ticket をコピー、Terminal 2 へ:
 
 # Terminal 2 (connector)
-NK_PASSPHRASE="" /path/to/nk-crypto-tool --mode pqc --chat --connect '<TICKET>' \
+NK_PASSPHRASE="" /path/to/nkct --mode pqc --chat --connect '<TICKET>' \
   --allow-unauth --no-relay --transport iroh
 ```
 
