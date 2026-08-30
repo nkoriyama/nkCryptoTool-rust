@@ -33,35 +33,41 @@ fail() { printf '[mandate] %s .. \033[31mFAIL\033[0m %s\n' "$1" "${2:-}"; FAIL_C
 warn() { printf '[mandate] %s .. \033[33mWARN\033[0m %s\n' "$1" "${2:-}"; WARN_COUNT=$((WARN_COUNT + 1)); }
 
 # 1. Cargo.toml version
-# Default (development) mode accepts the most recent shipped baseline (2.1.0,
-# the v2.1.0 release) OR its predecessor (2.0.4, the previous baseline).
-# This way the script tolerates the version transition while still preventing
-# arbitrary version bumps. RELEASE_MODE=1 expects exactly the next release
-# (2.1.0 prior to its tag, will be bumped per release).
+# Default (development) mode accepts the most recent shipped baseline (2.2.0)
+# OR its predecessor (2.1.0), so the script tolerates the transition across a
+# release while still refusing an arbitrary bump. RELEASE_MODE=1 accepts the
+# same current baseline plus the next release being cut.
+#
+# BOTH WINDOWS MOVE TOGETHER, ONCE PER RELEASE, IN THE RELEASE COMMIT ITSELF.
+# That is not ceremony: this check is the only thing standing between a stray
+# version bump and a crates.io version number that can never be reused. It
+# caught the 2.2.0 bump on its first CI run, which is exactly its job -- the
+# bump was legitimate, so the gate moves with it rather than being bypassed.
+# At the next release, shift both to (2.2.0|2.3.0) and (2.3.0|2.4.0).
 if [ "${RELEASE_MODE:-0}" = "1" ]; then
-    if grep -qE '^version = "(2\.1\.0|2\.2\.0)"$' Cargo.toml; then
+    if grep -qE '^version = "(2\.2\.0|2\.3\.0)"$' Cargo.toml; then
         pass "Cargo.toml version (release mode): $(grep '^version' Cargo.toml | head -1)"
     else
-        fail "Cargo.toml version" "expected 2.1.0 or 2.2.0 in RELEASE_MODE, got: $(grep '^version' Cargo.toml | head -1)"
+        fail "Cargo.toml version" "expected 2.2.0 or 2.3.0 in RELEASE_MODE, got: $(grep '^version' Cargo.toml | head -1)"
     fi
 else
-    if grep -qE '^version = "(2\.0\.4|2\.1\.0)"$' Cargo.toml; then
+    if grep -qE '^version = "(2\.1\.0|2\.2\.0)"$' Cargo.toml; then
         pass "Cargo.toml version (dev mode, accepted baseline): $(grep '^version' Cargo.toml | head -1)"
     else
-        fail "Cargo.toml version" "expected 2.0.4 or 2.1.0 baseline, got: $(grep '^version' Cargo.toml | head -1)"
+        fail "Cargo.toml version" "expected 2.1.0 or 2.2.0 baseline, got: $(grep '^version' Cargo.toml | head -1)"
     fi
 fi
 
 # 2. Tag check: ensure no PREMATURE tags exist for unreleased versions.
-# The "released" set after v2.1.0 = v2.1.0 + all v2.0.x. Future versions
-# (v2.1.1, v2.2.0, etc.) must NOT be tagged before their respective release.
-# RELEASE_MODE=1 additionally allows the next release (v2.2.0 etc.) to be
-# tagged simultaneously with the release commit.
+# The "released" set after v2.2.0 = v2.2.0 + v2.1.0 + all v2.0.x. Future
+# versions (v2.2.1, v2.3.0, etc.) must NOT be tagged before their respective
+# release. RELEASE_MODE=1 additionally allows the next release to be tagged
+# simultaneously with the release commit. Moves with the version check above.
 ALL_TAGS="$(git tag -l 'v2.*' 2>/dev/null || true)"
-PREMATURE="$(echo "$ALL_TAGS" | grep -vE '^v2\.0\.[0-9]+$|^v2\.1\.0$' || true)"
+PREMATURE="$(echo "$ALL_TAGS" | grep -vE '^v2\.0\.[0-9]+$|^v2\.1\.0$|^v2\.2\.0$' || true)"
 if [ "${RELEASE_MODE:-0}" = "1" ]; then
     # Allow the upcoming release tags (broaden as needed at release time).
-    PREMATURE="$(echo "$PREMATURE" | grep -vE '^v2\.1\.[1-9][0-9]*$|^v2\.2\.0$' || true)"
+    PREMATURE="$(echo "$PREMATURE" | grep -vE '^v2\.2\.[1-9][0-9]*$|^v2\.3\.0$' || true)"
 fi
 if [ -z "$PREMATURE" ] || [ "$PREMATURE" = "" ]; then
     pass "no premature future-version tags"
