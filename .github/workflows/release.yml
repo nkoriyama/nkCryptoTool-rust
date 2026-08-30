@@ -147,14 +147,22 @@ jobs:
       - name: Assert the packaged file list carries nothing it should not
         run: |
           set -euo pipefail
-          cargo package --list --locked > pkg-list.txt
-          COUNT=$(wc -l < pkg-list.txt)
+          # OUTSIDE the checkout, deliberately. Writing this listing into the
+          # working directory makes the tree dirty, and `cargo package` refuses
+          # to run on a dirty tree -- so the command destroyed its own
+          # precondition and this step failed on v2.2.0-rc.1 with "1 files in
+          # the working directory contain changes that were not yet committed:
+          # pkg-list.txt". The preceding --dry-run passed only because it ran
+          # while the tree was still clean.
+          LIST="${RUNNER_TEMP:-/tmp}/pkg-list.txt"
+          cargo package --list --locked > "$LIST"
+          COUNT=$(wc -l < "$LIST")
           echo "packaged files: $COUNT"
           if [ "$COUNT" -lt 100 ]; then
             echo "::error::only $COUNT files listed; the crate has ~150. The listing failed rather than the crate shrinking -- this check cannot run."
             exit 1
           fi
-          if grep -nE '^(\.cargo/|android/|docs/demos/|demos/|graphify-out/|scratch/)|CLAUDE-SECURITY|\.gif$' pkg-list.txt; then
+          if grep -nE '^(\.cargo/|android/|docs/demos/|demos/|graphify-out/|scratch/)|CLAUDE-SECURITY|\.gif$' "$LIST"; then
             echo "::error::the lines above must not appear in the published crate"
             exit 1
           fi
