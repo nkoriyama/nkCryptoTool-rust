@@ -45,16 +45,16 @@ warn() { printf '[mandate] %s .. \033[33mWARN\033[0m %s\n' "$1" "${2:-}"; WARN_C
 # bump was legitimate, so the gate moves with it rather than being bypassed.
 # At the next release, shift both to (2.2.0|2.3.0) and (2.3.0|2.4.0).
 if [ "${RELEASE_MODE:-0}" = "1" ]; then
-    if grep -qE '^version = "(2\.2\.0|2\.3\.0)"$' Cargo.toml; then
+    if grep -qE '^version = "(2\.2\.0(-rc\.[0-9]+)?|2\.3\.0)"$' Cargo.toml; then
         pass "Cargo.toml version (release mode): $(grep '^version' Cargo.toml | head -1)"
     else
-        fail "Cargo.toml version" "expected 2.2.0 or 2.3.0 in RELEASE_MODE, got: $(grep '^version' Cargo.toml | head -1)"
+        fail "Cargo.toml version" "expected 2.2.0[-rc.N] or 2.3.0 in RELEASE_MODE, got: $(grep '^version' Cargo.toml | head -1)"
     fi
 else
-    if grep -qE '^version = "(2\.1\.0|2\.2\.0)"$' Cargo.toml; then
+    if grep -qE '^version = "(2\.1\.0|2\.2\.0(-rc\.[0-9]+)?)"$' Cargo.toml; then
         pass "Cargo.toml version (dev mode, accepted baseline): $(grep '^version' Cargo.toml | head -1)"
     else
-        fail "Cargo.toml version" "expected 2.1.0 or 2.2.0 baseline, got: $(grep '^version' Cargo.toml | head -1)"
+        fail "Cargo.toml version" "expected 2.1.0 or 2.2.0[-rc.N] baseline, got: $(grep '^version' Cargo.toml | head -1)"
     fi
 fi
 
@@ -64,7 +64,7 @@ fi
 # release. RELEASE_MODE=1 additionally allows the next release to be tagged
 # simultaneously with the release commit. Moves with the version check above.
 ALL_TAGS="$(git tag -l 'v2.*' 2>/dev/null || true)"
-PREMATURE="$(echo "$ALL_TAGS" | grep -vE '^v2\.0\.[0-9]+$|^v2\.1\.0$|^v2\.2\.0$' || true)"
+PREMATURE="$(echo "$ALL_TAGS" | grep -vE '^v2\.0\.[0-9]+$|^v2\.1\.0$|^v2\.2\.0(-rc\.[0-9]+)?$' || true)"
 if [ "${RELEASE_MODE:-0}" = "1" ]; then
     # Allow the upcoming release tags (broaden as needed at release time).
     PREMATURE="$(echo "$PREMATURE" | grep -vE '^v2\.2\.[1-9][0-9]*$|^v2\.3\.0$' || true)"

@@ -414,6 +414,15 @@ jobs:
           X86_SHA=$(awk '/x86_64-unknown-linux-musl$/ {print $1}' dist/SHA256SUMS)
           ARM_SHA=$(awk '/aarch64-unknown-linux-musl$/ {print $1}' dist/SHA256SUMS)
           {
+            case "$TAG" in
+              *-*)
+                echo "> **Release candidate.** Published to exercise the release"
+                echo "> pipeline and the four artifacts before the real tag. Not"
+                echo "> selected by \`cargo install nkct\` unless you ask for this"
+                echo "> exact version."
+                echo
+                ;;
+            esac
             echo "## Install"
             echo
             echo '```'
@@ -478,10 +487,18 @@ jobs:
           TAG: ${{ needs.guard.outputs.tag }}
         run: |
           set -euo pipefail
+          # A tag carrying a pre-release suffix (v2.2.0-rc.1) must not become the
+          # repository's "Latest release" -- that is the link every drive-by
+          # visitor clicks, and a release candidate is not what they should get.
+          PRERELEASE=""
+          case "$TAG" in
+            *-*) PRERELEASE="--prerelease" ;;
+          esac
           gh release create "$TAG" \
             --title "$TAG" \
             --notes-file notes.md \
             --verify-tag \
+            $PRERELEASE \
             dist/nkct-* dist/SHA256SUMS
 
   publish:
