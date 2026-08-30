@@ -11,9 +11,37 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-CF=packaging/Containerfile.repro
 OUT=packaging/out
 mkdir -p "$OUT"
+
+# Which architecture's artifact this run produces. Chosen by the machine running
+# the script, NOT by a flag: each Containerfile pins a base image for one
+# architecture by digest, and building arm64 under qemu on an x86 host would be
+# both glacial and a different set of inputs than a native arm64 builder gets.
+# CI therefore runs this on a matching runner. A third party verifying a release
+# does the same: verify the arm64 artifact on an arm64 machine.
+HOST_ARCH="$(uname -m)"
+case "$HOST_ARCH" in
+  x86_64)
+    CF=packaging/Containerfile.repro
+    # Portable + the opt-in AVX-512/VAES build.
+    DEFAULT_VARIANTS="nkct nkct-vaes"
+    ;;
+  aarch64|arm64)
+    CF=packaging/Containerfile.repro.arm64
+    # One variant only. The ARM analogue of the VAES build would require the
+    # ARMv8 Crypto Extensions, which the Raspberry Pi -- the machine this
+    # artifact is most for -- does not have.
+    DEFAULT_VARIANTS="nkct"
+    ;;
+  *)
+    echo "reproducible-build.sh: no pinned base image for $HOST_ARCH." >&2
+    echo "Supported: x86_64, aarch64. Add a Containerfile with its own pinned" >&2
+    echo "digest before extending this list." >&2
+    exit 1
+    ;;
+esac
+echo "host arch: $HOST_ARCH  ->  $CF"
 
 # Reproducible timestamp: the commit being built, not "now".
 : "${SOURCE_DATE_EPOCH:=$(git log -1 --format=%ct 2>/dev/null || echo 0)}"
@@ -61,11 +89,17 @@ build_variant() {
 }
 
 # VARIANTS=nkct packaging/reproducible-build.sh  → portable only
-: "${VARIANTS:=nkct nkct-vaes}"
+: "${VARIANTS:=$DEFAULT_VARIANTS}"
 for v in $VARIANTS; do
   case "$v" in
     nkct)      build_variant "$v" "" ;;
-    nkct-vaes) build_variant "$v" "$VAES_RUSTFLAGS" ;;
+    nkct-vaes)
+      if [ "$HOST_ARCH" != "x86_64" ]; then
+        echo "nkct-vaes is an x86_64 variant; this host is $HOST_ARCH." >&2
+        exit 1
+      fi
+      build_variant "$v" "$VAES_RUSTFLAGS"
+      ;;
     *) echo "unknown variant $v" >&2; exit 1 ;;
   esac
 done

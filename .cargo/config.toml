@@ -89,8 +89,23 @@ rustflags = [
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=generic"]
 
-# The static target a future arm64 release artifact would use. Same floor.
-# No --remap-path-prefix: reproducibility is claimed only for the x86_64 musl
-# container build, whose base image is digest-pinned to that architecture.
+# The distributable arm64 artifact. Same CPU floor, plus the same path scrubbing
+# the x86_64 musl section carries: reproducibility now covers this target too,
+# via packaging/Containerfile.repro.arm64 and its own pinned arm64 base image.
+# The remapped values are the FIXED in-container paths that Containerfile
+# guarantees, so two container builds embed identical strings; a host
+# cross-build uses different paths and is simply not scrubbed.
+#
+# Verified on real hardware rather than inferred: a binary built with this floor
+# was cross-compiled and run on a Raspberry Pi 4 (Cortex-A72, Features "fp asimd
+# evtstrm crc32 cpuid" -- no aes/pmull/sha), where it completed an ML-DSA-65 +
+# ML-KEM-768 KeyBundle round-trip under both AES-256-GCM and ChaCha20-Poly1305.
+# CI cannot establish this: GitHub's arm64 runners are server-class parts that
+# DO have the crypto extensions, so a wrong floor would stay green there and
+# SIGILL on a Pi.
 [target.aarch64-unknown-linux-musl]
-rustflags = ["-C", "target-cpu=generic"]
+rustflags = [
+  "-C", "target-cpu=generic",
+  "--remap-path-prefix=/build=nkct",
+  "--remap-path-prefix=/usr/local/cargo=cargo",
+]

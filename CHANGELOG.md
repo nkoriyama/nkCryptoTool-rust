@@ -35,6 +35,29 @@ All notable changes to this project will be documented in this file.
 - **P2P 運用系**: mDNS ローカル探索 (`--discovery local`)、永続ノード鍵による安定 NodeId、admission control の環境変数設定、n0 公開インフラにメタデータが渡る場合の警告。
 - **Windows 対応**: shell (portable-pty)、`secure_fs` によるファイル安全性ハードニング、scp confinement の post-open 実パス再検証、CI。
 
+### Platforms
+
+初回の crates.io 公開に合わせ、リリース成果物を 2 つから 4 つに増やした。
+
+| 対象 | 成果物 | 再現ビルド |
+|---|---|---|
+| Linux x86_64 | 静的 musl | あり |
+| Linux arm64 | 静的 musl | あり |
+| Windows x86_64 | `.exe` | なし |
+| macOS | universal (arm64 + x86_64) | なし |
+
+- **macOS**: CI で一度もビルドされていなかった。保留の根拠は「ring 0.17 aarch64-darwin の
+  問題」とだけ記録されていたが、advisory ジョブを入れて実際に走らせたところ両 Apple ターゲット
+  のビルド・clippy・**257 テスト全通過**。根拠は陳腐化していた。`src/scp.rs` の `F_GETPATH`
+  による fd 再検証（Linux の `/proc/self/fd` と同格）は、このジョブができるまでどのターゲット
+  でもコンパイルされたことがなかった（Rust は無効な `cfg` 分岐を型検査しないため）。
+- **Linux arm64**: 258 テスト全通過。CPU フロアは crypto 拡張を**要求しない**。CI の arm64
+  ランナーはサーバ級で拡張を持つため、フロアの誤りは CI では検出できない。実際に Raspberry
+  Pi 4 上でクロスビルド版の ML-DSA-65 + ML-KEM-768 往復（AES-GCM / ChaCha20 とも）を確認した。
+- 両プラットフォームとも CI ジョブを release-blocking にした。成果物を配る以上、失敗を
+  握り潰す設定のままにはできない。
+- Windows と macOS が再現ビルドでないことは、リリースノートと README に明記する。
+
 ### Changed
 
 - **既定バックエンドを RustCrypto に**: プラットフォーム依存を減らし移植性を優先。OpenSSL は明示的な opt-in。

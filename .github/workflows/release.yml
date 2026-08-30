@@ -6,24 +6,17 @@
 #
 # PLATFORM SCOPE
 # --------------
-# Linux (static musl) and Windows (x86_64-msvc) only. Those are the two targets
-# ci.yml builds and tests as release-blocking. macOS is served by
-# `cargo install nkct` for now.
+# Linux x86_64 (static musl), Linux arm64 (static musl), Windows x86_64, and a
+# macOS universal binary. Every one of them is built and tested by a
+# release-blocking ci.yml job; nothing ships from a platform CI does not check.
 #
-# macOS is deliberately NOT here yet, and the missing piece is evidence, not
-# work. .cargo/config.toml now carries portable floors for both Apple targets
-# (apple-m1 / x86-64-v2+aes), and ci.yml's `test-macos` builds arm64 natively
-# plus x86_64 as a cross — which is exactly the pair a universal binary is
-# lipo'd from. But every step of that job is still `continue-on-error`, because
-# macOS had never been built by CI at all and the deferral it replaced cited a
-# ring/aarch64-darwin problem it never wrote down. Shipping a binary for a
-# platform whose build has not once been observed to succeed is not a release,
-# it is a guess.
-#
-# To add it: once `test-macos` has been green for a few runs, drop its
-# continue-on-error, then add a `macos` job here that builds both Apple targets,
-# `lipo -create`s them into one universal binary, and uploads it like the two
-# below. Nothing else in this file needs to change.
+# THEY DO NOT ALL CARRY THE SAME GUARANTEE, and the release notes say which is
+# which rather than letting the table imply otherwise. The two Linux artifacts
+# come out of digest-pinned containers, built twice and asserted byte-identical,
+# so a third party can reproduce them. Windows and macOS are built natively on
+# runners: verifiable as "what this page published", not as "what went into it".
+# Apple's SDK is not redistributable and there is no comparable pinned Windows
+# base, which is what rules the container approach out for those two.
 #
 # THE LINUX ARTIFACT IS THE REPRODUCIBLE ONE
 # ------------------------------------------
@@ -206,6 +199,109 @@ jobs:
           path: packaging/out/nkct-*
           if-no-files-found: error
 
+  # Same script, same guarantee, native runner. reproducible-build.sh picks
+  # packaging/Containerfile.repro.arm64 from `uname -m`, not from a flag: each
+  # Containerfile pins one architecture's base image by digest, and building
+  # arm64 under qemu on an x86 host would be both glacial and a different set of
+  # inputs than a native builder gets. A third party verifies this artifact the
+  # same way -- on an arm64 machine.
+  linux-musl-arm64:
+    name: Linux arm64 static musl (reproducible, built twice)
+    runs-on: ubuntu-24.04-arm
+    needs: guard
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.guard.outputs.tag }}
+          fetch-depth: 1
+
+      - name: Install podman
+        run: bash scripts/ci_apt.sh podman
+
+      # No VAES-equivalent variant exists for ARM, deliberately: it would require
+      # the ARMv8 Crypto Extensions, which the Raspberry Pi does not have.
+      - name: Reproducible build, asserting A == B
+        run: bash packaging/reproducible-build.sh
+
+      - name: Name the artifact for the release page
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mv packaging/out/nkct \
+             "packaging/out/nkct-${TAG}-aarch64-unknown-linux-musl"
+          rm -f packaging/out/SHA256SUMS
+          ls -l packaging/out/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-musl-arm64
+          path: packaging/out/nkct-*
+          if-no-files-found: error
+
+  # macOS universal binary. THIS ONE CARRIES A WEAKER GUARANTEE THAN THE TWO
+  # LINUX ARTIFACTS, and the release notes say so: it is built natively on the
+  # runner, not inside a digest-pinned container, so there is no byte-identity
+  # assertion behind it and no recipe a third party can rerun to reproduce it.
+  # Apple's SDK is not redistributable, which is what rules the container
+  # approach out rather than any reluctance to do the work.
+  macos:
+    name: macOS universal (arm64 + x86_64)
+    runs-on: macos-latest
+    needs: guard
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.guard.outputs.tag }}
+
+      - name: Install Rust toolchain (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      # The action's `targets:` input installs into *stable*, while cargo
+      # resolves to the 1.96.1 that rust-toolchain.toml pins -- so the std would
+      # land in a toolchain nothing uses and the cross build would fail with
+      # `E0463: can't find crate for core`. Running rustup inside the checkout
+      # resolves the override. Same trap rust-toolchain.toml documents for
+      # x86_64-pc-windows-msvc, and the same fix ci.yml uses.
+      - name: Add the x86_64 Apple target to the PINNED toolchain
+        run: rustup target add x86_64-apple-darwin
+
+      # No RUSTFLAGS: the portable floors (apple-m1 / x86-64-v2+aes) come from
+      # .cargo/config.toml, and an env RUSTFLAGS would replace those sections
+      # rather than add to them.
+      - name: Build both Apple targets
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target aarch64-apple-darwin \
+            --bin nkct --no-default-features --features backend-rustcrypto
+          cargo build --release --locked --target x86_64-apple-darwin \
+            --bin nkct --no-default-features --features backend-rustcrypto
+
+      - name: lipo the two into one universal binary
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          lipo -create \
+            target/aarch64-apple-darwin/release/nkct \
+            target/x86_64-apple-darwin/release/nkct \
+            -output "out/nkct-${TAG}-universal-apple-darwin"
+          lipo -info "out/nkct-${TAG}-universal-apple-darwin"
+          ls -l out/
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-universal
+          path: out/nkct-*
+          if-no-files-found: error
+
   windows:
     name: Windows x86_64-msvc (cross-built)
     runs-on: ubuntu-latest
@@ -272,7 +368,7 @@ jobs:
   release:
     name: GitHub Release
     runs-on: ubuntu-latest
-    needs: [guard, linux-musl, windows]
+    needs: [guard, linux-musl, linux-musl-arm64, macos, windows]
     timeout-minutes: 15
     permissions:
       contents: write
@@ -301,7 +397,8 @@ jobs:
           VERSION: ${{ needs.guard.outputs.version }}
         run: |
           set -euo pipefail
-          LINUX_SHA=$(awk '/linux-musl$/ {print $1}' dist/SHA256SUMS)
+          X86_SHA=$(awk '/x86_64-unknown-linux-musl$/ {print $1}' dist/SHA256SUMS)
+          ARM_SHA=$(awk '/aarch64-unknown-linux-musl$/ {print $1}' dist/SHA256SUMS)
           {
             echo "## Install"
             echo
@@ -309,14 +406,23 @@ jobs:
             echo "cargo install nkct --version ${VERSION} --locked"
             echo '```'
             echo
-            echo "Or take a binary below. \`SHA256SUMS\` covers both."
+            echo "Or take a binary below. \`SHA256SUMS\` covers all of them."
             echo
-            echo "## Verifying the Linux binary against this source"
+            echo "| Platform | Artifact | Reproducible |"
+            echo "|---|---|---|"
+            echo "| Linux x86_64 | static musl | yes |"
+            echo "| Linux arm64 | static musl | yes |"
+            echo "| Windows x86_64 | \`.exe\` | no |"
+            echo "| macOS | universal (arm64 + x86_64) | no |"
             echo
-            echo "The Linux artifact is built by \`packaging/reproducible-build.sh\`"
-            echo "inside a digest-pinned container, twice, from independent"
-            echo "\`--no-cache\` builds that are asserted byte-identical. Rebuild it"
-            echo "yourself from the tagged source and compare:"
+            echo "## Verifying the Linux binaries against this source"
+            echo
+            echo "Both are built by \`packaging/reproducible-build.sh\` inside a"
+            echo "digest-pinned container, twice, from independent \`--no-cache\`"
+            echo "builds asserted byte-identical. Rebuild from the tagged source"
+            echo "and compare. **Verify on a machine of the same architecture**:"
+            echo "the script picks its Containerfile from \`uname -m\`, because each"
+            echo "one pins a base image for one architecture by digest."
             echo
             echo '```'
             echo "git checkout ${TAG}"
@@ -324,13 +430,27 @@ jobs:
             echo "sha256sum packaging/out/nkct"
             echo '```'
             echo
-            echo "Expected: \`${LINUX_SHA}\`"
+            echo "Expected on x86_64: \`${X86_SHA}\`"
+            echo "Expected on arm64:  \`${ARM_SHA}\`"
             echo
             echo "(sha256 is over content, so the different filename on this page"
             echo "does not affect the comparison.)"
             echo
-            echo "An AVX-512/VAES variant is a local opt-in build, not released:"
-            echo "see docs/guides/REPRODUCIBLE_BUILD.md."
+            echo "An AVX-512/VAES variant is a local opt-in x86_64 build, not"
+            echo "released: see docs/guides/REPRODUCIBLE_BUILD.md. There is no ARM"
+            echo "analogue, deliberately -- it would require the ARMv8 Crypto"
+            echo "Extensions, which the Raspberry Pi does not have. The arm64"
+            echo "artifact is built for the baseline without them, and was checked"
+            echo "on a Pi 4 rather than only on CI, whose ARM runners do have them."
+            echo
+            echo "## The Windows and macOS binaries are NOT reproducible"
+            echo
+            echo "They are built natively on CI runners, not inside a pinned"
+            echo "container, so no byte-identity assertion stands behind them and"
+            echo "there is no recipe here you can rerun to reproduce them. If that"
+            echo "matters for your threat model, use a Linux artifact or build from"
+            echo "source. \`SHA256SUMS\` still lets you verify you received what"
+            echo "this page published; it does not tell you what went into it."
             echo
             echo "## Changes"
             echo

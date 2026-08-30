@@ -276,19 +276,33 @@ GUI が要る場合は `cargo install nkct --locked --features gui`。
 
 [Releases](https://github.com/nkoriyama/nkCryptoTool-rust/releases) に以下を置いています。
 
-| 対象 | 成果物 |
-|---|---|
-| Linux x86_64 | 静的 musl バイナリ（依存ライブラリなし） |
-| Windows x86_64 | `.exe` |
+| 対象 | 成果物 | 再現ビルド |
+|---|---|---|
+| Linux x86_64 | 静的 musl バイナリ（依存ライブラリなし） | **あり** |
+| Linux arm64 | 静的 musl バイナリ（Raspberry Pi 等） | **あり** |
+| Windows x86_64 | `.exe` | なし |
+| macOS | universal バイナリ（arm64 + x86_64） | なし |
 
-各リリースに `SHA256SUMS` が付きます。Linux バイナリは
-[`packaging/reproducible-build.sh`](./packaging/reproducible-build.sh) が
+各リリースに `SHA256SUMS` が付きます。
+
+**Linux の 2 つ**は [`packaging/reproducible-build.sh`](./packaging/reproducible-build.sh) が
 digest 固定コンテナ内で `--no-cache` ビルドを 2 回行い、両者がバイト単位で一致することを
 確認したうえで作られています。同じスクリプトをタグ付きソースに対して自分で走らせれば、
 配布バイナリが公開ソースから作られたことを検証できます
 （手順: [docs/guides/REPRODUCIBLE_BUILD.md](./docs/guides/REPRODUCIBLE_BUILD.md)）。
+**検証は同じアーキテクチャの機械で行ってください** — スクリプトは `uname -m` で
+Containerfile を選びます（各ファイルが 1 アーキテクチャ分のベースイメージを digest で
+固定しているため）。
 
-macOS 向けのビルド済みバイナリはまだありません。`cargo install` を使ってください。
+**Windows と macOS は再現ビルドではありません。** ランナー上でネイティブにビルドしており、
+バイト一致の表明も、あなたが手元で再実行できる再現手順もありません。`SHA256SUMS` は
+「このページが公開したものを受け取れたか」は保証しますが、「何が入っているか」は語りません。
+それが問題になる用途では Linux の成果物を使うか、ソースからビルドしてください。
+
+> **Raspberry Pi について**: arm64 バイナリは ARMv8 の Crypto Extensions を**要求しない**
+> ビルドです。Pi 4 / Pi 5 はこの拡張を持たないため、要求するビルドは起動できません。
+> なお拡張が無い環境では AES がソフトウェア実装になるので、`--aead-algo chacha20-poly1305`
+> のほうが速いはずです。
 
 ## **ビルド方法**
 

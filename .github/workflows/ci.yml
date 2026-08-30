@@ -153,8 +153,7 @@ jobs:
   # tests run as a release-blocking step below; the remaining documented
   # degradation is core-dump suppression (OS/WER-level, out of process scope).
   #
-  # macOS is brought up below (`test-macos`), advisory-only for now — the
-  # same rollout the windows job went through.
+  # macOS is covered below (`test-macos`), release-blocking.
   test-windows:
     name: Build (Windows, rustcrypto)
     runs-on: windows-latest
@@ -201,30 +200,28 @@ jobs:
       - name: cargo test hardening (release-blocking — native windows ACL/reparse/junction semantics)
         run: cargo test --no-default-features --features backend-rustcrypto -- --nocapture secure_fs windows_confine
 
-  # macOS bring-up. ADVISORY ONLY -- every step is continue-on-error, exactly as
-  # the windows job was during its own rollout (F4-X13 allowance).
+  # macOS. RELEASE-BLOCKING as of the 2.2.0 release, which ships a macOS
+  # universal binary -- an artifact must not come off a platform whose failures
+  # CI is configured to swallow.
   #
-  # WHY THIS IS ADVISORY AND NOT RELEASE-BLOCKING YET
-  # -------------------------------------------------
-  # macOS had never been built by CI at all. The note this job replaces deferred
-  # it over a "ring 0.17 aarch64-darwin build issue" and recorded nothing further
-  # -- no advisory number, no error, no entry in KNOWN_ISSUES.md. ring is 0.17.14
-  # here and ships pregenerated aarch64 asm, so the note may simply be stale, or
-  # may have been about cross-building rather than a native runner. There is no
-  # way to tell without running it, and a first run that reddens main for
-  # everyone is the wrong way to find out.
-  #
-  # Promote the build step to release-blocking (drop its continue-on-error) once
-  # this has been green for a few runs; the release workflow must not ship a
-  # macOS binary before that happens.
+  # It began advisory because macOS had never been built here at all, and the
+  # note that deferred it cited a "ring 0.17 aarch64-darwin build issue" without
+  # recording an advisory number, an error, or a KNOWN_ISSUES.md entry. That note
+  # was stale: on its first honest run this job built both Apple targets, linted,
+  # and passed 257 tests with 0 failures. (The runs before that looked green and
+  # were not -- see the RUSTFLAGS comment at the top of this file, and note that
+  # a continue-on-error step is reported as `conclusion: success` by the API.)
   #
   # macOS is a first-class target in the code, not an afterthought: the scp
   # path-confinement re-check in src/scp.rs uses F_GETPATH on macOS as the peer
   # of Linux's /proc/self/fd, and `recheck_fd_confined` fails closed on every
-  # platform that has neither. That is the behaviour these tests are here to
-  # keep honest.
+  # platform that has neither. Until this job existed that code had never been
+  # compiled anywhere, because Rust does not type-check a disabled `cfg` branch.
+  #
+  # The x86_64 cross-build is the second half of the universal binary
+  # release.yml lipo's together.
   test-macos:
-    name: Build (macOS, rustcrypto) — advisory
+    name: Build (macOS, rustcrypto)
     runs-on: macos-latest  # Apple Silicon
     timeout-minutes: 30
     steps:
@@ -256,48 +253,45 @@ jobs:
       # x86-64-v2+aes), and an env RUSTFLAGS would replace it rather than add to
       # it. No nasm either — ring ships pregenerated asm for both Apple targets.
       - name: cargo build (arm64, pure-Rust backend, no OpenSSL/GUI)
-        continue-on-error: true  # F4-X13 explicit allowance — see job comment
         run: cargo build --no-default-features --features backend-rustcrypto
 
       # Proves the second half of the universal binary the release workflow will
       # produce with lipo. Cross-compiled from the arm64 runner using the same
       # Xcode SDK, so it needs no extra tooling.
       - name: cargo build (x86_64 cross, for the universal binary)
-        continue-on-error: true  # F4-X13 explicit allowance — see job comment
         run: cargo build --no-default-features --features backend-rustcrypto --target x86_64-apple-darwin
 
       - name: cargo clippy
-        continue-on-error: true  # F4-X13 explicit allowance — see job comment
         run: cargo clippy --no-default-features --features "testing backend-rustcrypto"
 
       # Includes the scp confinement suite, which is where F_GETPATH is actually
       # exercised. Advisory for now; this is the step whose result decides
       # whether a macOS release artifact is defensible.
       - name: cargo test
-        continue-on-error: true  # F4-X13 explicit allowance — see job comment
         run: cargo test --no-default-features --features "testing backend-rustcrypto"
 
-  # arm64 Linux bring-up. ADVISORY ONLY, same rollout as the macOS job above.
+  # arm64 Linux. RELEASE-BLOCKING as of 2.2.0, which ships an arm64 static musl
+  # binary. Same reasoning as the macOS job above.
   #
-  # This is the platform with the most real-world evidence and the least CI:
-  # nkct runs today on a Raspberry Pi (Ubuntu 24.04 LTS, aarch64), and the
-  # Android build targets aarch64 too -- neither has ever been built here.
-  # Unlike macOS, aarch64 Linux takes exactly the same `cfg` branches as x86
-  # Linux (`shell_desktop` is true, scp confinement uses /proc/self/fd), so what
-  # this job actually covers is code generation and ring's aarch64 asm, not new
-  # source.
+  # This was the platform with the most real-world evidence and the least CI:
+  # nkct runs on a Raspberry Pi 4 (Ubuntu 24.04, aarch64) and the Android build
+  # targets aarch64, and neither had ever been built here. Unlike macOS it adds
+  # no new source -- aarch64 Linux takes the same cfg branches as x86 Linux,
+  # `shell_desktop` true and scp confining via /proc/self/fd -- so what this job
+  # covers is code generation and ring's aarch64 asm. First honest run: 258
+  # tests, 0 failures.
+  #
+  # WHAT THIS JOB CANNOT TELL YOU. GitHub's arm64 runners are server-class parts
+  # that HAVE the ARMv8 Crypto Extensions. The Raspberry Pi does not. A CPU floor
+  # that wrongly required them would pass here and SIGILL on a Pi, so the floor
+  # in .cargo/config.toml is backed by running a cross-built binary on an actual
+  # Pi 4, not by this job going green.
   #
   # No RUSTFLAGS: the floor comes from .cargo/config.toml's
   # [target.aarch64-unknown-linux-gnu], and an env RUSTFLAGS would replace it
-  # rather than add to it. That floor is `target-cpu=generic` deliberately --
-  # the ARMv8 Crypto Extensions are optional and absent on the Pi, so requiring
-  # them would SIGILL on the hardware this is for. See the comment there.
-  #
-  # A release artifact does NOT follow from this job being green: the
-  # reproducible build pins its base image by an x86_64 digest, so an arm64
-  # artifact needs a second pinned base and a parallel container path.
+  # rather than add to it.
   test-linux-arm64:
-    name: Build (Linux arm64, rustcrypto) — advisory
+    name: Build (Linux arm64, rustcrypto)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     steps:
@@ -332,17 +326,14 @@ jobs:
             pkg-config
 
       - name: cargo build (pure-Rust backend, no OpenSSL/GUI)
-        continue-on-error: true  # F4-X13 explicit allowance — see job comment
         run: cargo build --no-default-features --features backend-rustcrypto
 
       - name: cargo clippy
-        continue-on-error: true  # F4-X13 explicit allowance — see job comment
         run: cargo clippy --no-default-features --features "testing backend-rustcrypto"
 
       # The interesting half: the P2P shell and scp suites exercise portable-pty
       # and the /proc/self/fd confinement re-check on a real arm64 kernel.
       - name: cargo test
-        continue-on-error: true  # F4-X13 explicit allowance — see job comment
         run: cargo test --no-default-features --features "testing backend-rustcrypto"
 
   # Release-blocking: a RUSTSEC advisory against a dependency fails the run.
