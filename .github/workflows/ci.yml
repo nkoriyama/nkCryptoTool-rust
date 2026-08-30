@@ -314,6 +314,23 @@ jobs:
         with:
           shared-key: linux-arm64
 
+      # `cargo test` builds every test target, and tests/gui_test.rs drags the
+      # slint dev-dependency tree in behind it -- fontdb -> yeslogic-fontconfig-sys,
+      # whose build script shells out to pkg-config and panics without
+      # libfontconfig. The build and clippy steps do not need any of this; only
+      # the test step does, which is why the first run of this job built and
+      # linted cleanly and then died in 14 seconds. Same list as test-linux.
+      - name: Install Slint / Iroh system deps
+        run: |
+          bash scripts/ci_apt.sh \
+            libfontconfig1-dev \
+            libxcb1-dev \
+            libxkbcommon-dev \
+            libwayland-dev \
+            libgtk-3-dev \
+            libssl-dev \
+            pkg-config
+
       - name: cargo build (pure-Rust backend, no OpenSSL/GUI)
         continue-on-error: true  # F4-X13 explicit allowance — see job comment
         run: cargo build --no-default-features --features backend-rustcrypto
