@@ -47,11 +47,34 @@ for _ in $(seq 1 60); do
 done
 [ -n "$TICKET" ] || { echo "no ticket after 60s:" >&2; cat "$D/srv.log" >&2; exit 1; }
 
+# No `timeout(1)`: macOS does not ship one (it is `gtimeout`, from a coreutils
+# install nobody has by default), and this script has to run on every platform
+# whose artifact it guards. The first macOS run failed on exactly that -- the
+# server came up and published a ticket, and the client never started.
+run_bounded() {
+    local secs="$1" out="$2"; shift 2
+    "$@" > "$out" 2>&1 &
+    local pid=$! i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$i" -ge "$secs" ]; then
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 2
+            kill -KILL "$pid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    wait "$pid"
+}
+
 MARK="p2p-smoke-$$-$RANDOM"
-OUT="$(timeout 120 "$BIN" --shell --shell-cmd "echo $MARK" --connect "$TICKET" \
+run_bounded 120 "$D/client.log" \
+    "$BIN" --shell --shell-cmd "echo $MARK" --connect "$TICKET" \
         --mode pqc --key-dir "$D" \
         --signing-privkey "$D/private_sign_pqc.key" \
-        --signing-pubkey  "$D/public_sign_pqc.key" 2>&1)" || true
+        --signing-pubkey  "$D/public_sign_pqc.key" || true
+OUT="$(cat "$D/client.log" 2>/dev/null || true)"
 
 if printf '%s' "$OUT" | grep -q "$MARK"; then
     echo "P2P smoke OK: remote command output came back over iroh"
