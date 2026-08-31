@@ -190,6 +190,13 @@ jobs:
           VARIANTS: nkct
         run: bash packaging/reproducible-build.sh
 
+      # Run the artifact, doing the thing the tool is for. Building it, hashing
+      # it and comparing two builds says nothing about whether it works: v2.2.0's
+      # musl binaries passed every one of those and aborted on the first UDP
+      # packet they received (n0-computer/noq#774).
+      - name: P2P smoke on the artifact that ships
+        run: bash ci/artifact_p2p_smoke.sh packaging/out/nkct
+
       - name: Name the artifact for the release page
         env:
           TAG: ${{ needs.guard.outputs.tag }}
@@ -232,6 +239,11 @@ jobs:
       # the ARMv8 Crypto Extensions, which the Raspberry Pi does not have.
       - name: Reproducible build, asserting A == B
         run: bash packaging/reproducible-build.sh
+
+      # See the same step in the x86_64 job. This is the architecture where the
+      # bug was first observed, on a Raspberry Pi.
+      - name: P2P smoke on the artifact that ships
+        run: bash ci/artifact_p2p_smoke.sh packaging/out/nkct
 
       - name: Name the artifact for the release page
         env:
@@ -309,13 +321,17 @@ jobs:
       # malformed binary would ship unnoticed. The runner is Apple Silicon, so
       # this exercises the arm64 slice; the x86_64 slice is covered by the
       # separate cross-build's own test run.
-      - name: Smoke the universal binary that actually ships
+      # `--version` proves the slices linked; it does not open a socket, and a
+      # socket is where v2.2.0's Linux artifacts died. Run the same round-trip
+      # the Linux jobs do, against the lipo'd binary that actually ships.
+      - name: P2P smoke on the universal binary that ships
         env:
           TAG: ${{ needs.guard.outputs.tag }}
         run: |
           set -euo pipefail
           chmod +x "out/nkct-${TAG}-universal-apple-darwin"
           "./out/nkct-${TAG}-universal-apple-darwin" --version
+          bash ci/artifact_p2p_smoke.sh "$PWD/out/nkct-${TAG}-universal-apple-darwin"
 
       - name: Upload
         uses: actions/upload-artifact@v4

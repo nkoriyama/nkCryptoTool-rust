@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.2.1] - 2026-08-31
+
+2.2.0 の Linux 成果物は **P2P が一切できなかった**。ビルドも、再現ビルドの
+バイト一致も、ハッシュ照合も、実機での暗号往復も署名検証も通っていたが、そのどれも
+ソケットを開かない。
+
+### Fixed
+
+- **musl ビルドが UDP パケット受信時に abort する** (`noq-udp` 1.1.0 → 1.2.0):
+  `noq-udp` はソケットに `SO_TIMESTAMPNS` を設定し、返ってきた制御メッセージを
+  `assert!(align_of::<T>() <= align_of::<C>())` を持つ `decode` で読む。musl の
+  `cmsghdr` はアライメント 4（`cmsg_len` が `socklen_t`）、glibc は 8（`size_t`）。
+  読む型 `timespec` はアライメント 8 なので、**musl では最初の 1 パケットで必ず落ちる**。
+  アーキテクチャにも通信相手にも依存しない libc の ABI 差で、x86_64 と aarch64 の
+  両方で再現した。上流 [n0-computer/noq#774](https://github.com/n0-computer/noq/issues/774)
+  の既知問題で、[#776](https://github.com/n0-computer/noq/pull/776) が 1.2.0 で
+  `SO_TIMESTAMPNS` を暫定的に無効化している（根本修正の #775 / #778 は未マージ）。
+  この repo のコード変更は不要で、`Cargo.lock` の更新のみ。
+
+### Added
+
+- **`ci/artifact_p2p_smoke.sh`**: 成果物を起動し、iroh 越しに P2P シェルを張って
+  リモートコマンドの出力が返ることを要求する。リリースワークフローの Linux x86_64 /
+  Linux arm64 / macOS の各ジョブに追加した。
+
+  この検査が無かったことが 2.2.0 の直接の原因である。CI のテストは **gnu** ビルドで
+  走っており、musl バイナリはコンテナ内で作られるだけで**一度も実行されていなかった**。
+  スクリプト自体は、修正版バイナリで通り 2.2.0-rc.2 の成果物で落ちることを確認して
+  いる（上流も [#777](https://github.com/n0-computer/noq/pull/777) で musl の CI を
+  追加しており、同じ結論に達している）。
+
+### Notes
+
+- 2.2.0 は crates.io に公開されていない。GitHub Release のみ存在する。
+
 ## [2.2.0] - 2026-08-30
 
 2.1.0 から 60 の PR。crates.io への初回公開バージョンでもある。
