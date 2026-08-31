@@ -272,6 +272,23 @@ cargo install nkct --locked
 デフォルトは純 Rust バックエンド (`backend-rustcrypto`) で、OpenSSL も C コンパイラも要りません。
 GUI が要る場合は `cargo install nkct --locked --features gui`。
 
+> **Rust 1.96.1 以上が必要です。** `rust-toolchain.toml` と `Cargo.toml` の `rust-version` が
+> 同じ値を指しています。
+>
+> **ツールチェーンが古いと、必要バージョンが表示されないことがあります。** 依存解決が
+> `rust-version` の検査より先に失敗するためで、`nkct` とは無関係に見えるエラーが出ます:
+>
+> | cargo | 出るもの |
+> |---|---|
+> | 1.78 以上 | `it requires rustc 1.96.1 or newer` — 意図した通りのメッセージ |
+> | 1.78 未満 | `lock file version 4 was found` — 同梱の `Cargo.lock` が読めない |
+> | 1.78 未満 + `--locked` 無し | 依存クレートの `edition 2024` エラー |
+>
+> いずれも `rustup update` で解決します。1.78 が境目なのは、`Cargo.lock` の v4 形式を
+> 読めるようになるのがそのバージョンだからです。
+>
+> （実測: macOS / Apple M1 上の cargo 1.72.1 で 2 番目と 3 番目、cargo 1.83.0 で 1 番目を確認）
+
 ### **ビルド済みバイナリから**
 
 [Releases](https://github.com/nkoriyama/nkCryptoTool-rust/releases) に以下を置いています。
