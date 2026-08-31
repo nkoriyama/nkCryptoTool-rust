@@ -6,7 +6,7 @@ CHANGELOG）。それ以外は用途別に本フォルダへ分類する。
 
 | フォルダ | 中身 | 性質 |
 |---|---|---|
-| [guides/](./guides/) | P2P ssh・チャット・鍵ローテーション・rsync 連携デプロイ・Android ビルド・再現ビルドの運用ガイド | 生きた文書（機能に追従して更新） |
+| [guides/](./guides/) | P2P ssh・チャット・鍵ローテーション・rsync 連携デプロイ・Android ビルド・再現ビルド・[リリース規約と手順](./guides/RELEASING.md)の運用ガイド | 生きた文書（機能に追従して更新） |
 | [security/](./security/) | セキュリティ評価（SECURITY_PROFILE / GUI 版）と監査対応記録（[2026-07](./security/AUDIT_2026-07_REMEDIATION.md) / [2026-08](./security/AUDIT_2026-08_REMEDIATION.md) Claude Security、[7ターン横断分析](./security/AUDIT_CROSS_ANALYSIS.md)） | 生きた文書＋記録 |
 | [reports/](./reports/) | 実装後の検証レポート・比較・エビデンス | 記録（時点スナップショット） |
 | [design/](./design/) | 実装済み設計文書のアーカイブ（[索引](./design/README.md)） | 歴史（root の仕様文書が正） |

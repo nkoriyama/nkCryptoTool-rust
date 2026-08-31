@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+リリース時は `[Unreleased]` を `[X.Y.Z] - YYYY-MM-DD` に書き換える。番号の意味と
+手順は [docs/guides/RELEASING.md](./docs/guides/RELEASING.md)。
+
+## [Unreleased]
+
+### Added
+
+- **[リリース規約と手順](./docs/guides/RELEASING.md)**: バージョン番号がこの repo で
+  何を意味するか（互換性の契約は crate の版ではなく ALPN の版が担う）、いつ出すか、
+  rc をいつ使うか、リリースの手順、失敗したときの戻し方、そして 2.2.0 の失敗から来る
+  8 つの不変条件。
+
+### Documentation
+
+- README の install 節に、古いツールチェーンで `rust-version` が表示されない件を追記
+  （cargo 1.78 未満は lockfile v4 を読めず、要求バージョンに到達する前に止まる）。
+
+
 ## [2.2.1] - 2026-08-31
 
 2.2.0 の Linux 成果物は **P2P が一切できなかった**。ビルドも、再現ビルドの
