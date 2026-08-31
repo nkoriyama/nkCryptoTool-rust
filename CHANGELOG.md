@@ -57,6 +57,11 @@ All notable changes to this project will be documented in this file.
 - 両プラットフォームとも CI ジョブを release-blocking にした。成果物を配る以上、失敗を
   握り潰す設定のままにはできない。
 - Windows と macOS が再現ビルドでないことは、リリースノートと README に明記する。
+- **macOS の Gatekeeper**: ブラウザで落とした成果物は quarantine 属性が付き、初回実行が
+  必ずブロックされる（ダイアログの選択肢は「ゴミ箱に入れる」と「完了」だけで、そこからは
+  開けない）。原因は notarization を行っていないことで、署名だけでは解決しない。
+  `xattr -d com.apple.quarantine` で回避できることを含め README に記載した。
+  リリース候補 v2.2.0-rc.2 を実機（macOS 26.6.2 / Apple M1）で踏んで確認した挙動。
 
 ### Changed
 
