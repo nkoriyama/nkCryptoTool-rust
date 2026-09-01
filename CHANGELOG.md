@@ -14,6 +14,16 @@ All notable changes to this project will be documented in this file.
   rc をいつ使うか、リリースの手順、失敗したときの戻し方、そして 2.2.0 の失敗から来る
   8 つの不変条件。
 
+### Changed
+
+- **macOS universal バイナリの x86_64 スライスをリリース CI で実行するようにした。**
+  これまで `ci.yml` はこのターゲットを `cargo build` するだけ（`cargo test` に
+  `--target` はない）で、`release.yml` の P2P smoke は Apple Silicon ランナー上で
+  走るため arm64 スライスを選ぶ。つまり出荷している fat バイナリの半分は、
+  コンパイルされ lipo され公開されるまで一度も起動されていなかった（不変条件 2）。
+  Rosetta 2 経由で `ci/artifact_p2p_smoke.sh` をもう一度走らせ、両スライスとも
+  iroh 越しのラウンドトリップを要求する。
+
 ### Documentation
 
 - README の install 節に、古いツールチェーンで `rust-version` が表示されない件を追記
