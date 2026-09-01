@@ -316,15 +316,17 @@ jobs:
           ls -l out/
 
       # `lipo -info` reports what the container claims, not that either slice
-      # runs. CI builds and tests the two halves separately and would otherwise
-      # never execute the thing actually shipped, so a lipo that produced a
-      # malformed binary would ship unnoticed. The runner is Apple Silicon, so
-      # this exercises the arm64 slice; the x86_64 slice is covered by the
-      # separate cross-build's own test run.
+      # runs. CI builds the two halves and tests only the arm64 one, so without
+      # this the thing actually shipped is never executed and a lipo that
+      # produced a malformed binary would ship unnoticed. The runner is Apple
+      # Silicon, so this step exercises the arm64 slice; the x86_64 slice is
+      # covered by the Rosetta step below, NOT by the cross-build in ci.yml --
+      # that job only compiles the target (its `cargo test` carries no
+      # `--target`), which is a different claim entirely.
       # `--version` proves the slices linked; it does not open a socket, and a
       # socket is where v2.2.0's Linux artifacts died. Run the same round-trip
       # the Linux jobs do, against the lipo'd binary that actually ships.
-      - name: P2P smoke on the universal binary that ships
+      - name: P2P smoke on the arm64 slice of the universal binary that ships
         env:
           TAG: ${{ needs.guard.outputs.tag }}
         run: |
@@ -332,6 +334,40 @@ jobs:
           chmod +x "out/nkct-${TAG}-universal-apple-darwin"
           "./out/nkct-${TAG}-universal-apple-darwin" --version
           bash ci/artifact_p2p_smoke.sh "$PWD/out/nkct-${TAG}-universal-apple-darwin"
+
+      # The step above runs the arm64 half of what ships. Nothing ran the x86_64
+      # half at all until it was executed by hand on an M1 on 2026-09-01: ci.yml
+      # only `cargo build`s that target, and the smoke above picks the arm64
+      # slice because the runner is Apple Silicon -- so the slice was compiled,
+      # lipo'd, hashed and published without ever having been started. That is
+      # the same shape of hole v2.2.0's musl artifacts fell through, which is
+      # the whole reason ci/artifact_p2p_smoke.sh exists. `arch -x86_64` selects
+      # the x86_64 slice out of the fat binary, so between the two steps every
+      # byte that ships has been run.
+      #
+      # Rosetta 2 is not listed in the runner image manifest, so it is probed
+      # rather than assumed: a missing Rosetta must install it, not fail the
+      # release and not silently skip the only coverage this slice has.
+      - name: P2P smoke on the x86_64 slice (Rosetta 2)
+        env:
+          TAG: ${{ needs.guard.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! arch -x86_64 /usr/bin/true 2>/dev/null; then
+            echo "Rosetta 2 not present on this runner; installing it."
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+          BIN="$PWD/out/nkct-${TAG}-universal-apple-darwin"
+          arch -x86_64 "$BIN" --version
+          # artifact_p2p_smoke.sh invokes "$BIN" directly (server and client both),
+          # so it is handed a wrapper that forces the x86_64 slice for every one
+          # of those invocations. The wrapper lives in RUNNER_TEMP, never in out/:
+          # the upload step globs `out/nkct-*`, and a shell script matching that
+          # glob would be published as a release artifact.
+          WRAP="$RUNNER_TEMP/nkct-x86_64-slice"
+          printf '#!/bin/bash\nexec arch -x86_64 "%s" "$@"\n' "$BIN" > "$WRAP"
+          chmod +x "$WRAP"
+          bash ci/artifact_p2p_smoke.sh "$WRAP"
 
       - name: Upload
         uses: actions/upload-artifact@v4

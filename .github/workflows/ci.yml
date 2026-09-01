@@ -255,9 +255,13 @@ jobs:
       - name: cargo build (arm64, pure-Rust backend, no OpenSSL/GUI)
         run: cargo build --no-default-features --features backend-rustcrypto
 
-      # Proves the second half of the universal binary the release workflow will
-      # produce with lipo. Cross-compiled from the arm64 runner using the same
-      # Xcode SDK, so it needs no extra tooling.
+      # Compiles the second half of the universal binary the release workflow
+      # will produce with lipo. Cross-compiled from the arm64 runner using the
+      # same Xcode SDK, so it needs no extra tooling. Note what this does and
+      # does not establish: `cargo test` below carries no `--target`, so it runs
+      # the arm64 build only, and nothing here ever *executes* the x86_64 slice.
+      # That is release.yml's Rosetta 2 smoke step, which runs the shipped fat
+      # binary through `arch -x86_64`.
       - name: cargo build (x86_64 cross, for the universal binary)
         run: cargo build --no-default-features --features backend-rustcrypto --target x86_64-apple-darwin
 
