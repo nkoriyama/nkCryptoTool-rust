@@ -208,7 +208,7 @@ jobs:
           ls -l packaging/out/
 
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-musl
           path: packaging/out/nkct-*
@@ -256,7 +256,7 @@ jobs:
           ls -l packaging/out/
 
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: linux-musl-arm64
           path: packaging/out/nkct-*
@@ -370,7 +370,7 @@ jobs:
           bash ci/artifact_p2p_smoke.sh "$WRAP"
 
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: macos-universal
           path: out/nkct-*
@@ -433,7 +433,7 @@ jobs:
           ls -l out/
 
       - name: Upload
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: windows-msvc
           path: out/nkct-*
