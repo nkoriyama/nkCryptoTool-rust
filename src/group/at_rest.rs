@@ -647,9 +647,9 @@ pub(crate) fn resolve_dek_with(
     };
 
     // (The old plaintext-sqlite -> SQLCipher in-place migration is gone: the
-    // redb backend has no plaintext-sqlite predecessor. Migrating an existing
-    // SQLCipher database to redb is the separate P3 `migrate-from-sqlcipher`
-    // tool behind the `legacy-sqlcipher-migration` feature.)
+    // redb backend has no plaintext-sqlite predecessor. The one-time
+    // SQLCipher -> redb migration tool has been removed too; no SQLCipher
+    // database is read anywhere.)
     Ok(dek)
 }
 

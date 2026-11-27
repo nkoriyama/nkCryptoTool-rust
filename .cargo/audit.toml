@@ -7,18 +7,20 @@
 [advisories]
 ignore = [
     # quick-xml quadratic-time / unbounded-allocation DoS on malicious XML.
-    # Severity 7.5 (DoS only — no RCE / info-leak). Pulled in transitively along
-    # THREE paths, none of which parse attacker-controlled XML:
-    #   * notify-rust -> tauri-winrt-notification  (Windows toast notification
-    #     XML the app itself constructs)
-    #   * iroh -> netwatch -> netdev -> plist       (local macOS system network
-    #     plists, not P2P wire data)
-    #   * slint -> winit -> wayland-scanner         (compile-time Wayland protocol
-    #     XML, not runtime input)
-    # The P2P / handshake wire path never reaches quick-xml, so the DoS is not
-    # remotely triggerable. Fix (quick-xml >=0.41) is blocked upstream: plist
-    # pins ^0.39.2 and tauri-winrt-notification pins ^0.37, both excluding 0.41.
-    # Re-check by 2026-10-06 (or sooner if the parents release a >=0.41 bump).
+    # Severity 7.5 (DoS only — no RCE / info-leak). Patched in quick-xml 0.41.
+    #
+    # Reviewed 2026-11-27. Two of the original three paths are now fixed by
+    # lockfile updates: plist 1.10 uses quick-xml 0.42, and
+    # tauri-winrt-notification 0.8 no longer depends on it. 0.39.4 remains on
+    # two paths, neither of which parses attacker-controlled XML:
+    #   * slint -> winit -> wayland-scanner        (proc-macro: compile-time
+    #     Wayland protocol XML, never runtime input)
+    #   * accesskit_unix -> atspi-common -> zbus-lockstep -> zbus_xml
+    #     (reads the D-Bus interface descriptions shipped inside the atspi
+    #     crate to check type signatures, not XML received from the bus)
+    # Both are GUI-only; the CLI and the P2P / handshake wire path never reach
+    # quick-xml. Drop these when wayland-scanner and zbus_xml move to >=0.41.
+    # Re-check by 2027-02-27.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]

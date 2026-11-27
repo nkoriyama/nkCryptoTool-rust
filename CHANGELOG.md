@@ -24,6 +24,26 @@ All notable changes to this project will be documented in this file.
   Rosetta 2 経由で `ci/artifact_p2p_smoke.sh` をもう一度走らせ、両スライスとも
   iroh 越しのラウンドトリップを要求する。
 
+### Security
+
+- **`cargo audit` の新規アドバイザリ 36 件を解消。**
+  - hickory-net / proto / resolver 0.26.4（iroh 経由、DNSSEC 検証の不備など 23 件）、
+    rustls 0.23.46、rustls-webpki 0.103.17、webpki-roots / root-certs 1.0.12、
+    url 2.5.9、ctutils 0.4.8、pulldown-cmark 0.13.6 に更新。
+  - **p256 0.13 → 0.14**（crypto-bigint 0.5 → 0.7.11、RUSTSEC-2026-0387）。
+    定数時間のはずの演算に秘密依存の分岐が残っていた件で、rustcrypto バックエンドの
+    P-256 ECDSA 署名と ECDH が該当する。コード変更は鍵生成の API 変更 1 か所のみ。
+- quick-xml の除外（RUSTSEC-2026-0194 / 0195）を見直し。通知と plist の経路は更新で
+  解消し、残る 2 経路（wayland-scanner、zbus_xml）はどちらも外部の XML を読まない
+  GUI 専用経路。理由を書き直し、見直し期限を 2027-02-27 に延長。
+
+### Removed
+
+- **`--mls-cmd migrate-from-sqlcipher` と `legacy-sqlcipher-migration` feature を削除。**
+  SQLCipher 形式の旧 MLS DB を redb へ一度だけ移す道具だったが、使う人はいない。
+  これで rusqlite / libsqlite3-sys / mls-rs-provider-sqlite が依存から消え、
+  SQLite のアドバイザリ RUSTSEC-2026-0459 も対象外になる。
+
 ### Documentation
 
 - README の install 節に、古いツールチェーンで `rust-version` が表示されない件を追記

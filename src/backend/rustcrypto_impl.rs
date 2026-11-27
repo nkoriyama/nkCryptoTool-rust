@@ -193,7 +193,9 @@ pub fn generate_ecc_key_pair(curve_name: &str) -> Result<(Zeroizing<Vec<u8>>, Ve
                 curve_name
             )));
         }
-        let secret_key = SecretKey::random(&mut OsRng);
+        // OS RNG via getrandom; an RNG failure is an error, not a panic.
+        let secret_key = <SecretKey as p256::elliptic_curve::Generate>::try_generate()
+            .map_err(|e| CryptoError::OpenSSL(format!("P-256 key generation: {e}")))?;
         let public_key = secret_key.public_key();
 
         let priv_der = secret_key

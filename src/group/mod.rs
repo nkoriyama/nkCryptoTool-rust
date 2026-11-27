@@ -18,17 +18,13 @@
 //! Everything is gated behind `#[cfg(feature = "mls")]` so the default
 //! crate build (and all 1:1 chat / file transfer paths) are unaffected.
 
-// `mls` is now backed by the pure-Rust redb storage (`redb_storage`); the
-// SQLCipher reader lives only under `legacy-sqlcipher-migration` for the P3
-// migration tool.
+// `mls` is backed by the pure-Rust redb storage (`redb_storage`).
 pub mod at_rest;
 pub mod binding;
 pub mod cli;
 pub mod rollback;
 pub mod crypto_adapter;
 pub mod file_xfer;
-#[cfg(feature = "legacy-sqlcipher-migration")]
-pub mod migrate;
 pub mod processor;
 pub mod redb_storage;
 pub mod storage;
