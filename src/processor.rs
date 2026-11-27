@@ -925,4 +925,75 @@ mod tests {
         dec_processor.process(&dec_config, Some(check_callback)).await.expect("Decryption failed");
         assert_eq!(fs::read(&decrypted_path).unwrap(), content);
     }
+
+    /// Regression for both halves of the ML-KEM parameter-set bug, end to end
+    /// through the processor with `pqc_kem_algo` left at its ML-KEM-768 default
+    /// on BOTH sides: encrypt to an injected ML-KEM-512 / 1024 ek (the KeyBundle
+    /// path) and decrypt with the matching private key. Before the fix the
+    /// header said "ML-KEM-768" (encrypt side), and decryption overrode the
+    /// header with the default (decrypt side); either alone broke the file.
+    #[tokio::test]
+    #[cfg(feature = "backend-rustcrypto")]
+    async fn non_default_mlkem_round_trips_with_default_kem_algo() {
+        use crate::strategy::pqc::PqcStrategy;
+        for algo in ["ML-KEM-512", "ML-KEM-1024"] {
+            let dir = tempdir().unwrap();
+            let key_dir = dir.path().join("keys");
+            fs::create_dir_all(&key_dir).unwrap();
+            let pub_path = key_dir.join("public_enc_pqc.key");
+            let priv_path = key_dir.join("private_enc_pqc.key");
+            let mut kp = HashMap::new();
+            kp.insert("public-key".to_string(), pub_path.to_str().unwrap().to_string());
+            kp.insert("private-key".to_string(), priv_path.to_str().unwrap().to_string());
+            kp.insert("kem-algo".to_string(), algo.to_string());
+            PqcStrategy::new()
+                .generate_encryption_key_pair(&kp, Some("test"), true)
+                .unwrap();
+
+            // The raw ek, as a verified KeyBundle would inject it.
+            let pem = fs::read_to_string(&pub_path).unwrap();
+            let der = crate::utils::unwrap_from_pem(&pem, "PUBLIC KEY").unwrap();
+            let ek = crate::utils::unwrap_pqc_pub_from_spki(&der, algo).unwrap();
+
+            let input = dir.path().join("in.bin");
+            let enc = dir.path().join("out.enc");
+            let dec = dir.path().join("out.dec");
+            let content = b"parameter set comes from the key, not the default".to_vec();
+            fs::write(&input, &content).unwrap();
+
+            let enc_config = CryptoConfig {
+                operation: Operation::Encrypt,
+                input_files: vec![input.to_str().unwrap().to_string()],
+                output_file: Some(enc.to_str().unwrap().to_string()),
+                recipient_enc_key_bytes: Some(ek.to_vec()),
+                passphrase: Some(Zeroizing::new("test".to_string())),
+                key_dir: key_dir.to_str().unwrap().to_string(),
+                force: true,
+                mode: CryptoMode::PQC,
+                ..CryptoConfig::default()
+            };
+            assert_eq!(enc_config.pqc_kem_algo, "ML-KEM-768", "test relies on the default");
+            CryptoProcessor::new(CryptoMode::PQC)
+                .process(&enc_config, None)
+                .await
+                .unwrap_or_else(|e| panic!("{algo}: encrypt failed: {e}"));
+
+            let dec_config = CryptoConfig {
+                operation: Operation::Decrypt,
+                input_files: vec![enc.to_str().unwrap().to_string()],
+                output_file: Some(dec.to_str().unwrap().to_string()),
+                user_privkey: Some(priv_path.to_str().unwrap().to_string()),
+                passphrase: Some(Zeroizing::new("test".to_string())),
+                key_dir: key_dir.to_str().unwrap().to_string(),
+                force: true,
+                mode: CryptoMode::PQC,
+                ..CryptoConfig::default()
+            };
+            CryptoProcessor::new(CryptoMode::PQC)
+                .process(&dec_config, None)
+                .await
+                .unwrap_or_else(|e| panic!("{algo}: decrypt failed: {e}"));
+            assert_eq!(fs::read(&dec).unwrap(), content, "{algo}");
+        }
+    }
 }

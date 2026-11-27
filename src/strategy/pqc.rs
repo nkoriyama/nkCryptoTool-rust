@@ -130,6 +130,19 @@ impl PqcStrategy {
         if let Some(algo) = key_paths.get("kem-algo") {
             self.kem_algo = algo.clone();
         }
+        // An injected ek comes from a verified KeyBundle or the keyring, and its
+        // length names its parameter set (NKKB does not record one). It wins over
+        // `--kem-algo`, which only defaults to ML-KEM-768: otherwise encrypting to
+        // an ML-KEM-1024 recipient wrote a "768" header and an undecryptable file.
+        if let Some(ek) = &self.recipient_enc_key {
+            let algo = backend::mlkem_algo_for_ek_len(ek.len()).ok_or_else(|| {
+                CryptoError::PublicKeyLoad(format!(
+                    "recipient ML-KEM key has an unsupported length ({} bytes)",
+                    ek.len()
+                ))
+            })?;
+            self.kem_algo = algo.to_string();
+        }
         // Prefer a KeyBundle-injected raw ek (already authenticated in memory):
         // encaps directly, no file read, no PEM/SPKI unwrap. Fall back to the
         // recipient pubkey file only when no bundle key was injected.
@@ -166,9 +179,11 @@ impl PqcStrategy {
         key_paths: &HashMap<String, String>,
         passphrase: &mut Option<Zeroizing<String>>,
     ) -> Result<()> {
-        if let Some(algo) = key_paths.get("kem-algo") {
-            self.kem_algo = algo.clone();
-        }
+        // `self.kem_algo` already holds the algorithm the file header names
+        // (the header is parsed before decryption is prepared), and that is the
+        // one the ciphertext was made with. `key_paths["kem-algo"]` is only the
+        // `--kem-algo` setting, which defaults to ML-KEM-768; letting it override
+        // the header made every 512 / 1024 file undecryptable without the flag.
         // Prefer a keyring-injected encrypted-PKCS#8 PEM (auto-match): no file
         // read. clone() (not take()) keeps the strategy reusable, matching the
         // recipient_enc_key convention above.
@@ -864,5 +879,44 @@ mod tests {
                 "accepted {kem:?}/{dsa:?}/{digest:?}"
             );
         }
+    }
+
+    /// Regression: encrypting to an injected (KeyBundle / keyring) ML-KEM-1024
+    /// key while `--kem-algo` still holds its ML-KEM-768 default used to
+    /// encapsulate under 1024 but record "ML-KEM-768" in the header, leaving a
+    /// file the recipient could not decrypt. The injected key now names the
+    /// parameter set, and the round trip with the recipient's key succeeds.
+    #[test]
+    #[cfg(feature = "backend-rustcrypto")]
+    fn injected_ek_length_decides_the_kem_parameter_set() {
+        for algo in ["ML-KEM-512", "ML-KEM-1024"] {
+            let (dk, ek, _) = backend::pqc_keygen_kem(algo).expect("keygen");
+
+            let mut enc = PqcStrategy::new();
+            enc.set_recipient_enc_key(ek.clone());
+            let mut paths = HashMap::new();
+            paths.insert("kem-algo".to_string(), "ML-KEM-768".to_string());
+            enc.prepare_shared_secret_encryption(&paths).expect("encrypt side");
+            assert_eq!(enc.kem_algo, algo, "header must name the recipient's set");
+
+            let ss = backend::pqc_decap(&enc.kem_algo, &dk, &enc.kem_ciphertext, None)
+                .expect("recipient decapsulates under the recorded algorithm");
+            assert_eq!(*ss, *enc.take_shared_secret());
+        }
+    }
+
+    /// `algo` is authoritative in the backend: a key of another parameter set
+    /// is refused rather than silently used.
+    #[test]
+    #[cfg(feature = "backend-rustcrypto")]
+    fn encap_and_decap_refuse_a_key_of_another_parameter_set() {
+        let (dk, ek, _) = backend::pqc_keygen_kem("ML-KEM-1024").expect("keygen");
+        assert!(backend::pqc_encap("ML-KEM-768", &ek).is_err());
+        assert!(backend::pqc_encap("ML-KEM-1024", &ek).is_ok());
+        let (_, ct) = backend::pqc_encap("ML-KEM-1024", &ek).expect("encap");
+        assert!(backend::pqc_decap("ML-KEM-768", &dk, &ct, None).is_err());
+        assert!(backend::pqc_encap("ML-KEM-999", &ek).is_err());
+        assert_eq!(backend::mlkem_algo_for_ek_len(ek.len()), Some("ML-KEM-1024"));
+        assert_eq!(backend::mlkem_algo_for_ek_len(7), None);
     }
 }
