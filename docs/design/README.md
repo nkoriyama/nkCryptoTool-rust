@@ -16,6 +16,7 @@
 | [DB_PURERUST_DESIGN.md](./DB_PURERUST_DESIGN.md) | SQLCipher → redb 純 Rust 化 | 実装済み |
 | [MLS_GROUP_CHAT_PLAN.md](./MLS_GROUP_CHAT_PLAN.md) | MLS (RFC 9420) グループチャット実装計画 | 実装済み |
 | [MLS_P2P_SYNC_DESIGN.md](./MLS_P2P_SYNC_DESIGN.md) | MLS↔P2P 同期（transport-gate 投影） | 一部撤回（commit 履歴・delta resync・NKCB binding は実装済み、gate 投影は撤回） |
+| [PQ_DIVERSITY_DESIGN.md](./PQ_DIVERSITY_DESIGN.md) | 暗号の数学的多様化（HQC 併用・Ed25519 ‖ ML-DSA ‖ SLH-DSA の AND 結合署名） | **提案（未実装）** — 例外的に実装前の文書を置いている |
 
 - 実装後の**検証レポート・比較・エビデンス**（`*_REPORT.md` / `*_COMPARISON.md` /
   `P2P_INTEROP_EVIDENCE.md` 等）は現状の能力を示す生きた記録として
