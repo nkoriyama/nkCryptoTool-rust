@@ -730,6 +730,9 @@ async fn async_main() -> anyhow::Result<()> {
     // encryption public key(s). Standalone (uses the keybundle library, not the
     // strategy operation dispatch), so it returns before operation selection.
     if args.gen_keybundle {
+        if mode == CryptoMode::ECC {
+            eprintln!("{}", ECC_ONLY_KEYBUNDLE_WARNING);
+        }
         return run_gen_keybundle(&args, mode);
     }
 
@@ -762,6 +765,10 @@ async fn async_main() -> anyhow::Result<()> {
     } else {
         anyhow::bail!("No operation specified")
     };
+
+    if let Some(w) = ecc_only_warning(mode, operation) {
+        eprintln!("{w}");
+    }
 
     // Raw recipient-pubkey abolition (encrypt only): a raw public key carries no
     // identity binding or authenticity — a MITM can swap it — so `--encrypt` now
@@ -3341,9 +3348,77 @@ async fn run_mls_gui(args: Args) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("GUI loop: {e}"))
 }
 
+/// `--mode ecc` protects new output with elliptic-curve cryptography ALONE:
+/// P-256 ECDH for encryption, P-256 ECDSA for signatures. Every other path in
+/// nkct pairs ECC with a post-quantum primitive (hybrid files, the P2P
+/// handshake, MLS), so this is the one place a break of ECC — by a quantum
+/// computer, or by a classical algorithm — exposes data on its own. Encrypted
+/// files are the worse case: ciphertext recorded today is readable the day ECC
+/// falls, so the warning fires on the operations that CREATE such output.
+/// Decrypt and verify stay silent; they are how existing ECC files are read.
+fn ecc_only_warning(mode: CryptoMode, operation: Operation) -> Option<&'static str> {
+    if mode != CryptoMode::ECC {
+        return None;
+    }
+    match operation {
+        Operation::Encrypt => Some(
+            "WARNING: --mode ecc encrypts with P-256 ECDH only, with no post-quantum layer. \
+             Anyone who records this file can read it once elliptic-curve cryptography is \
+             broken. Use --mode hybrid (P-256 + ML-KEM) for anything that must stay \
+             confidential. --mode ecc for new output is planned for deprecation.",
+        ),
+        Operation::Sign => Some(
+            "WARNING: --mode ecc signs with P-256 ECDSA only, with no post-quantum signature. \
+             Signatures can be forged once elliptic-curve cryptography is broken. Use \
+             --mode pqc or --mode hybrid (ML-DSA). --mode ecc for new output is planned \
+             for deprecation.",
+        ),
+        Operation::GenerateEncKey | Operation::GenerateSignKey => Some(
+            "WARNING: --mode ecc generates a P-256 key for use without a post-quantum \
+             counterpart. Prefer --mode hybrid. --mode ecc for new output is planned for \
+             deprecation.",
+        ),
+        _ => None,
+    }
+}
+
+/// `--gen-keybundle --mode ecc` binds only the P-256 key, so senders who encrypt
+/// to the bundle get ECC-only files. The bundle itself is still signed with
+/// ML-DSA, so its authenticity is not the concern; what it hands out is.
+const ECC_ONLY_KEYBUNDLE_WARNING: &str =
+    "WARNING: --mode ecc builds a KeyBundle that binds only your P-256 encryption key, so \
+     files encrypted to it are protected by elliptic-curve cryptography alone. Use \
+     --mode hybrid to bind both P-256 and ML-KEM.";
+
 #[cfg(test)]
 mod tests {
     use super::resolve_key_path;
+    use super::{ecc_only_warning, CryptoMode, Operation};
+
+    /// Creating ECC-only output warns; reading existing ECC output never does,
+    /// and no other mode warns at all.
+    #[test]
+    fn ecc_only_warning_fires_only_when_creating_ecc_only_output() {
+        for op in [
+            Operation::Encrypt,
+            Operation::Sign,
+            Operation::GenerateEncKey,
+            Operation::GenerateSignKey,
+        ] {
+            assert!(ecc_only_warning(CryptoMode::ECC, op).is_some(), "{op:?} should warn");
+            assert!(ecc_only_warning(CryptoMode::Hybrid, op).is_none(), "hybrid {op:?}");
+            assert!(ecc_only_warning(CryptoMode::PQC, op).is_none(), "pqc {op:?}");
+        }
+        for op in [
+            Operation::Decrypt,
+            Operation::Verify,
+            Operation::Fingerprint,
+            Operation::Listen,
+            Operation::Connect,
+        ] {
+            assert!(ecc_only_warning(CryptoMode::ECC, op).is_none(), "{op:?} must not warn");
+        }
+    }
 
     #[test]
     fn bare_filename_resolves_under_key_dir() {

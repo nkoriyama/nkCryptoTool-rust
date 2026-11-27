@@ -40,6 +40,12 @@ All notable changes to this project will be documented in this file.
 
 ### Security
 
+- **`--mode ecc` で新しい出力を作ると警告を出すようにした。** `ecc` は楕円曲線だけで守る唯一の経路で
+  （P-256 ECDH での暗号化、P-256 ECDSA での署名）、ほかの経路はすべて PQC と組み合わせている
+  （hybrid ファイル、P2P ハンドシェイク、MLS）。楕円曲線が破られると、記録された ECC 暗号文は後から読め、
+  署名は偽造できる。警告の対象は `--encrypt` / `--sign` / `--gen-enc-key` / `--gen-sign-key` /
+  `--gen-keybundle`。`--decrypt` / `--verify` は既存ファイルを読むためのものなので警告しない。
+  動作は変えておらず、新規出力での `ecc` は将来の非推奨化を予定している。
 - **`cargo audit` の新規アドバイザリ 36 件を解消。**
   - hickory-net / proto / resolver 0.26.4（iroh 経由、DNSSEC 検証の不備など 23 件）、
     rustls 0.23.46、rustls-webpki 0.103.17、webpki-roots / root-certs 1.0.12、
