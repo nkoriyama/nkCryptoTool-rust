@@ -1482,8 +1482,11 @@ where
                 send(&mut writer, aead_name, tx_key, &mut tx, &ScpFrame::Done).await?;
                 Ok::<(), CryptoError>(())
             };
+            // Every entry's reply is collected even after a `Fail`, so the
+            // sender is never left blocked on a half-read stream and the
+            // operator sees every `skipped` line, not just the first.
             let collector = async {
-                let mut done = 0usize;
+                let (mut done, mut failed) = (0usize, 0usize);
                 for e in &entries {
                     match recv(&mut reader, aead_name, rx_key, &mut rx).await? {
                         Some(ScpFrame::Ack { .. }) => {
@@ -1492,6 +1495,7 @@ where
                             }
                         }
                         Some(ScpFrame::Fail { msg, .. }) => {
+                            failed += 1;
                             // `msg` is already gated at decode; `e.remote` was
                             // not, and it is not ours either. It comes from
                             // `walk_tree` over the local tree, and a hostile scp
@@ -1508,14 +1512,31 @@ where
                         other => return Err(CryptoError::Parameter(format!("scp put: unexpected reply {other:?}"))),
                     }
                 }
-                Ok::<usize, CryptoError>(done)
+                Ok::<(usize, usize), CryptoError>((done, failed))
             };
-            let ((), done) = tokio::try_join!(sender, collector)?;
+            let ((), (done, failed)) = tokio::try_join!(sender, collector)?;
             let _ = writer.shutdown().await;
+            // A `Fail` is the server refusing that entry (policy, confinement,
+            // or a failed write): nothing was stored for it. Before this, the
+            // client still printed "uploaded" and exited 0, so a script could
+            // not tell a refused put from a completed one. Like scp(1), any
+            // refused entry makes the whole run fail, after the partial summary.
+            let remote_shown = show_path(Path::new(remote));
             if *recursive {
-                eprintln!("[nkct] uploaded {done}/{total} files → {remote}");
+                eprintln!("[nkct] uploaded {done}/{total} files → {remote_shown}");
+                if failed > 0 {
+                    return Err(CryptoError::Parameter(format!(
+                        "scp put: the server refused {failed} entr{} under {remote_shown} (see the `skipped` lines above)",
+                        if failed == 1 { "y" } else { "ies" }
+                    )));
+                }
             } else {
-                eprintln!("[nkct] uploaded {} ({} bytes) → {}", local.display(), entries[0].size, remote);
+                if failed > 0 {
+                    return Err(CryptoError::Parameter(format!(
+                        "scp put: the server refused {remote_shown}; nothing was uploaded"
+                    )));
+                }
+                eprintln!("[nkct] uploaded {} ({} bytes) → {remote_shown}", local.display(), entries[0].size);
             }
             Ok(())
         }
@@ -3043,5 +3064,84 @@ mod tests {
         assert!(confine_read(&link.to_string_lossy(), &roots).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- put: a server `Fail` must fail the client run ----------------------
+
+    /// Drive the client side of a `put` against a synthesized server reply
+    /// stream. The client's own frames go into a sink nobody reads.
+    async fn run_put_client(local: &Path, recursive: bool, replies: &[ScpFrame]) -> Result<()> {
+        let bytes = wire(replies).await;
+        let reader = &bytes[..];
+        let sink: Vec<u8> = Vec::new();
+        run_scp_client(
+            reader,
+            sink,
+            T_AEAD,
+            &T_KEY,
+            &T_KEY,
+            &ScpOp::Put {
+                local: local.to_path_buf(),
+                remote: "/srv/target".into(),
+                recursive,
+            },
+        )
+        .await
+    }
+
+    /// The bug found on real hardware: a single-file put the server refused
+    /// printed "uploaded … → <remote>" and exited 0.
+    #[tokio::test]
+    async fn put_single_file_refused_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.bin");
+        std::fs::write(&f, b"payload").expect("write");
+
+        let res = run_put_client(&f, false, &[ScpFrame::Fail { file_id: 1, msg: "denied".into() }]).await;
+        let err = res.expect_err("a refused put must not succeed");
+        assert!(err.to_string().contains("refused"), "unexpected error: {err}");
+
+        // The accepted case is unchanged.
+        run_put_client(&f, false, &[ScpFrame::Ack { file_id: 1 }])
+            .await
+            .expect("an acknowledged put succeeds");
+    }
+
+    /// A recursive put with one refused entry still sends (and reports) the
+    /// rest, then fails the run — scp(1) semantics, so a deploy script does not
+    /// read a partial tree as complete.
+    #[tokio::test]
+    async fn put_recursive_with_a_refused_entry_is_an_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tree = dir.path().join("tree");
+        std::fs::create_dir(&tree).expect("mkdir");
+        std::fs::write(tree.join("a"), b"a").expect("write");
+        std::fs::write(tree.join("b"), b"b").expect("write");
+
+        // Entries: base dir, a, b → three replies.
+        let res = run_put_client(
+            &tree,
+            true,
+            &[
+                ScpFrame::Ack { file_id: 1 },
+                ScpFrame::Fail { file_id: 2, msg: "denied".into() },
+                ScpFrame::Ack { file_id: 3 },
+            ],
+        )
+        .await;
+        let err = res.expect_err("a partially refused tree must not succeed");
+        assert!(err.to_string().contains("refused 1 entry"), "unexpected error: {err}");
+
+        run_put_client(
+            &tree,
+            true,
+            &[
+                ScpFrame::Ack { file_id: 1 },
+                ScpFrame::Ack { file_id: 2 },
+                ScpFrame::Ack { file_id: 3 },
+            ],
+        )
+        .await
+        .expect("a fully acknowledged tree succeeds");
     }
 }
