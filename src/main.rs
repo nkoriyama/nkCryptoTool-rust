@@ -283,10 +283,10 @@ struct Args {
     #[arg(long, default_value = "AES-256-GCM")]
     aead_algo: String,
 
-    #[arg(long, default_value = "ML-KEM-768")]
+    #[arg(long, default_value = "ML-KEM-768", value_parser = nkct::backend::ML_KEM_ALGOS)]
     kem_algo: String,
 
-    #[arg(long, default_value = "ML-DSA-65")]
+    #[arg(long, default_value = "ML-DSA-65", value_parser = nkct::backend::ML_DSA_ALGOS)]
     dsa_algo: String,
 
     #[arg(long, value_enum, default_value = "iroh")]

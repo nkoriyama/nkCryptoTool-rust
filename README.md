@@ -488,6 +488,7 @@ Linux 環境では、TPM デバイス (`/dev/tpmrm0` 等) へのアクセス権�
   ([USAGE.md §0.1](./USAGE.md) 参照)。
 * **TPM 保護を有効化**: `--use-tpm` を追加
 * **アルゴリズム選択**: `--kem-algo ML-KEM-768` (デフォルト) / `--dsa-algo ML-DSA-65` (デフォルト)
+  * 指定できる値は `--kem-algo` が `ML-KEM-512` / `ML-KEM-768` / `ML-KEM-1024`、`--dsa-algo` が `ML-DSA-44` / `ML-DSA-65` / `ML-DSA-87` のみ（それ以外は起動時に拒否）。
 * **保存先指定**: `--key-dir <path>`
 
 **Note**: パスフレーズはデフォルトで対話入力されます。CI 等の自動化用途では `NK_PASSPHRASE` 環境変数で指定可能 (セキュリティ警告が表示されます)。

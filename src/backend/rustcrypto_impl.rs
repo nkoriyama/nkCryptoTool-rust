@@ -557,10 +557,21 @@ pub fn pqc_verify(
     }
 }
 
-pub fn pqc_encap(_algo: &str, raw_pub: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
+pub fn pqc_encap(algo: &str, raw_pub: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec<u8>)> {
     #[cfg(feature = "backend-rustcrypto")]
     {
+        // The parameter set is the caller's `algo`, which is also what goes into
+        // the file header / transcript. It used to be inferred from the key
+        // length with `algo` ignored, so a 1024 key encrypted under a "768"
+        // label succeeded and produced a file its recipient could not decrypt.
+        let expected = crate::backend::mlkem_ek_len(algo)
+            .ok_or_else(|| CryptoError::Parameter(format!("Unsupported KEM: {algo}")))?;
         let actual_len = raw_pub.len();
+        if actual_len != expected {
+            return Err(CryptoError::PublicKeyLoad(format!(
+                "{algo} encapsulation key must be {expected} bytes, got {actual_len}"
+            )));
+        }
         if actual_len == 800 {
             use fips203::ml_kem_512::EncapsKey;
             let pk_bytes: [u8; 800] = (raw_pub)
@@ -612,7 +623,7 @@ pub fn pqc_encap(_algo: &str, raw_pub: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
     {
-        let _ = (_algo, raw_pub);
+        let _ = (algo, raw_pub);
         Err(CryptoError::Parameter(
             "RustCrypto backend not enabled".to_string(),
         ))
@@ -620,14 +631,22 @@ pub fn pqc_encap(_algo: &str, raw_pub: &[u8]) -> Result<(Zeroizing<Vec<u8>>, Vec
 }
 
 pub fn pqc_decap(
-    _algo: &str,
+    algo: &str,
     raw_priv: &[u8],
     kem_ct: &[u8],
     _passphrase: Option<&str>,
 ) -> Result<Zeroizing<Vec<u8>>> {
     #[cfg(feature = "backend-rustcrypto")]
     {
+        // As in `pqc_encap`: `algo` decides, the key length must agree.
+        let expected = crate::backend::mlkem_dk_len(algo)
+            .ok_or_else(|| CryptoError::Parameter(format!("Unsupported KEM: {algo}")))?;
         let actual_len = raw_priv.len();
+        if actual_len != expected {
+            return Err(CryptoError::PrivateKeyLoad(format!(
+                "{algo} decapsulation key must be {expected} bytes, got {actual_len}"
+            )));
+        }
         if actual_len == 1632 {
             use fips203::ml_kem_512::{CipherText, DecapsKey};
             let sk_bytes: [u8; 1632] = (raw_priv)
@@ -691,7 +710,7 @@ pub fn pqc_decap(
     }
     #[cfg(not(feature = "backend-rustcrypto"))]
     {
-        let _ = (_algo, raw_priv, kem_ct, _passphrase);
+        let _ = (algo, raw_priv, kem_ct, _passphrase);
         Err(CryptoError::Parameter(
             "RustCrypto backend not enabled".to_string(),
         ))

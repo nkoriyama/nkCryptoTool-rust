@@ -4,7 +4,7 @@
 機能一覧・性能・アーキテクチャは [README](./README.md) を参照。ここはコマンドだけ。
 
 - コマンドは `nkct`（ビルド後は `target/release/nkct`）。
-- `--mode` は `pqc`（ML-KEM/ML-DSA、既定推奨）/ `ecc`（P-256）/ `hybrid`（PQC＋古典の二重）。
+- `--mode` は `pqc`（ML-KEM/ML-DSA、既定推奨）/ `ecc`（P-256）/ `hybrid`（暗号化は PQC＋古典の二重、署名は ML-DSA のみ）。
 - 秘密鍵のパスフレーズは既定で対話入力。自動化は `NK_PASSPHRASE` 環境変数（警告が出る）。
 - `--key-dir <dir>` は鍵を**規約ファイル名**（`private_sign_pqc.key` / `public_enc_pqc.key` 等）で
   自動的に探す。`/` や `./` を含む明示パスを渡した場合はそのまま使う。
@@ -105,6 +105,7 @@ nkct --mode pqc --encrypt \
 - keyring に貯めた相手なら `--recipient <handle>`（例 `--recipient alice`）で、束・指紋を
   keyring から引ける（§7 参照）。`--recipient-keybundle`/`--recipient-fingerprint` は不要。
 - `--mode` が束から使う鍵を選ぶ: pqc→ML-KEM / ecc→P-256 / hybrid→両方。
+- ML-KEM のパラメータセット（512 / 768 / 1024）は束の鍵から決まる。`--kem-algo` は指定不要で、指定しても束の鍵が優先される。
 - 期限切れの鍵は暗号化入口で拒否される。
 - AEAD 切替: `--aead-algo AES-256-GCM`（既定）/ `ChaCha20-Poly1305`。
 
@@ -168,6 +169,8 @@ nkct --mode pqc --sign \
 #   → doc.sig（署名ファイル）
 ```
 - ダイジェストは `--digest-algo`（既定 `SHA3-512`）で変更可。検証側は指定不要（署名から自動認識）。
+- **`--mode hybrid` の署名は ML-DSA だけ**で、`--mode pqc` と同じ署名になる（P-256 ECDSA との二重署名ではない）。
+  `hybrid` が二重になるのは暗号化（P-256 ECDH ＋ ML-KEM）の側だけ。`--mode ecc` の署名は P-256 ECDSA だけ。
 
 ### 3.1 鍵リングで鍵ファイル指定を省略する（GPG 風）
 

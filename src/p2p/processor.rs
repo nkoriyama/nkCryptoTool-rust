@@ -60,12 +60,18 @@ const HANDSHAKE_CTX_IROH: &[u8] = b"nkct-handshake-iroh-v1";
 /// not the `assert!` macro). `expected == None` (unknown algorithm) skips the
 /// check and lets the backend reject the algorithm.
 fn ensure_field_len(field: &str, got: usize, expected: Option<usize>) -> Result<()> {
-    if let Some(n) = expected {
-        if got != n {
-            return Err(CryptoError::Parameter(format!(
-                "handshake field {field}: expected {n} bytes for the negotiated algorithm, got {got}"
-            )));
-        }
+    // `None` means the configured algorithm is not one nkct knows. That used to
+    // skip the check and leave rejection to the backend; refuse here instead, so
+    // an unvalidated config can never turn off the length gate.
+    let n = expected.ok_or_else(|| {
+        CryptoError::Parameter(format!(
+            "handshake field {field}: unsupported algorithm for this field"
+        ))
+    })?;
+    if got != n {
+        return Err(CryptoError::Parameter(format!(
+            "handshake field {field}: expected {n} bytes for the negotiated algorithm, got {got}"
+        )));
     }
     Ok(())
 }
@@ -2212,8 +2218,9 @@ mod tests {
         assert!(ensure_field_len("#6", 1951, backend::mldsa_pub_len("ML-DSA-65")).is_err());
         assert!(ensure_field_len("#6", 0, backend::mldsa_pub_len("ML-DSA-65")).is_err());
         assert!(ensure_field_len("sig", 100_000, backend::mldsa_sig_len("ML-DSA-65")).is_err());
-        // Unknown algorithm → None → skip (let the backend reject the algo).
-        assert!(ensure_field_len("#6", 7, backend::mldsa_pub_len("ML-DSA-999")).is_ok());
+        // Unknown algorithm → None → refused, never skipped.
+        assert!(ensure_field_len("#6", 7, backend::mldsa_pub_len("ML-DSA-999")).is_err());
+        assert!(ensure_field_len("#6", 1952, None).is_err());
     }
 
     // ------------------------------------------------------------------

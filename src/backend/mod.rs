@@ -134,8 +134,16 @@ pub fn hkdf(
 // Single source of truth for the FIPS 203/204 sizes, so the handshake parser can
 // reject a length-confused frame at the door rather than relying on the crypto
 // backend to error later (KEY_EXCHANGE_DESIGN.md §10(B), parser robustness).
-// `None` = unknown algorithm; the caller skips the check and lets the backend
-// reject the algorithm.
+// `None` = unknown algorithm. Callers treat that as an error: an algorithm this
+// table does not know is one nkct does not support (see `ML_KEM_ALGOS` /
+// `ML_DSA_ALGOS`, which the CLI validates against).
+
+/// ML-KEM parameter sets nkct supports, in the spelling used on the wire, in
+/// file headers and on the command line.
+pub const ML_KEM_ALGOS: [&str; 3] = ["ML-KEM-512", "ML-KEM-768", "ML-KEM-1024"];
+
+/// ML-DSA parameter sets nkct supports (same spelling rules as `ML_KEM_ALGOS`).
+pub const ML_DSA_ALGOS: [&str; 3] = ["ML-DSA-44", "ML-DSA-65", "ML-DSA-87"];
 
 /// Raw ML-DSA (FIPS 204) **public key** length for `algo`.
 pub fn mldsa_pub_len(algo: &str) -> Option<usize> {
@@ -166,6 +174,23 @@ pub fn mlkem_ek_len(algo: &str) -> Option<usize> {
         "ML-KEM-1024" => Some(1568),
         _ => None,
     }
+}
+
+/// Raw ML-KEM (FIPS 203) **decapsulation key** length for `algo`.
+pub fn mlkem_dk_len(algo: &str) -> Option<usize> {
+    match algo {
+        "ML-KEM-512" => Some(1632),
+        "ML-KEM-768" => Some(2400),
+        "ML-KEM-1024" => Some(3168),
+        _ => None,
+    }
+}
+
+/// The ML-KEM parameter set whose encapsulation key is `len` bytes. The three
+/// sizes are distinct, so a raw ek from an authenticated source (a verified
+/// KeyBundle, the keyring) names its own parameter set; NKKB does not record it.
+pub fn mlkem_algo_for_ek_len(len: usize) -> Option<&'static str> {
+    ML_KEM_ALGOS.into_iter().find(|a| mlkem_ek_len(a) == Some(len))
 }
 
 /// Raw ML-KEM (FIPS 203) **ciphertext** length for `algo`.

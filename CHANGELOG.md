@@ -16,6 +16,9 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **`--kem-algo` / `--dsa-algo` は、対応している値以外を起動時に拒否する**（ML-KEM-512/768/1024、
+  ML-DSA-44/65/87）。これまでは任意の文字列を受け付け、長さ表にない名前ではハンドシェイクの長さ検査が
+  素通りになっていた。ハンドシェイク側も、未知の方式は検査を飛ばさず拒否するようにした。
 - **macOS universal バイナリの x86_64 スライスをリリース CI で実行するようにした。**
   これまで `ci.yml` はこのターゲットを `cargo build` するだけ（`cargo test` に
   `--target` はない）で、`release.yml` の P2P smoke は Apple Silicon ランナー上で
@@ -23,6 +26,17 @@ All notable changes to this project will be documented in this file.
   コンパイルされ lipo され公開されるまで一度も起動されていなかった（不変条件 2）。
   Rosetta 2 経由で `ci/artifact_p2p_smoke.sh` をもう一度走らせ、両スライスとも
   iroh 越しのラウンドトリップを要求する。
+
+### Fixed
+
+- **ML-KEM-512 / 1024 の受信者へ暗号化すると、復号できないファイルができていた。** KeyBundle や keyring の
+  鍵に暗号化するとき、ヘッダの KEM 名は `--kem-algo`（既定 `ML-KEM-768`）から取っていた。一方、rustcrypto
+  バックエンドは名前を無視して鍵長で方式を選んでいた。そのため 1024 の鍵へ暗号化すると、送信は成功するのに
+  ヘッダは「768」になり、受信者は `OID mismatch` で復号できなかった。復号側も、ヘッダの KEM 名を
+  `--kem-algo` の既定値で上書きしていたので、512 / 1024 のファイルは `--kem-algo` を付けないと復号できなかった。
+  - 暗号化: 束や keyring から来た鍵は、その長さでパラメータセットを決める。
+  - 復号: ヘッダに書かれた KEM 名を使う。
+  - rustcrypto バックエンド: 渡された名前どおりに動き、鍵長が合わなければ拒否する。
 
 ### Security
 
