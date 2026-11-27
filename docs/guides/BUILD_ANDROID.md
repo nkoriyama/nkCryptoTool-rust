@@ -101,12 +101,3 @@ E2E 検証メモ: 単ノードのローカル操作（group 作成・ticket・Ke
 ピア間の招待/送受信は **2ノード（実機/エミュレータ or 2プロセス）必要**で、その疎通確認が残課題。
 
 `bindings/` は生成物なのでコミットしない（`.gitignore` 済み、上記コマンドで再生成）。
-
-## 注意
-
-- **`legacy-sqlcipher-migration` feature を付けてはいけない**（rusqlite/SQLCipher を引き戻し、
-  Android では system libcrypto が無くリンクできない）。これは旧 DB 移行ツール専用で、
-  デスクトップでのみ使う。
-- 旧 SQLCipher DB を持つユーザは、デスクトップで一度
-  `nkct --mls-cmd migrate-from-sqlcipher` を実行して redb 形式へ移行してから
-  モバイルへ持ち込む（`migrate.rs`）。

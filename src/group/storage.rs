@@ -14,9 +14,8 @@
 //! - **File mode `0o600`** (Unix): defence in depth, applied by `RedbBackend`.
 //!
 //! The previous SQLCipher backend is gone; its libcrypto dependency blocked
-//! mobile cross-compilation (see `DB_PURERUST_DESIGN.md`). The one-time reader
-//! for legacy SQLCipher databases lives behind the
-//! `legacy-sqlcipher-migration` feature (P3 migration tool).
+//! mobile cross-compilation (see `DB_PURERUST_DESIGN.md`). The one-time
+//! SQLCipher -> redb migration tool has been removed as well.
 
 use std::path::{Path, PathBuf};
 
